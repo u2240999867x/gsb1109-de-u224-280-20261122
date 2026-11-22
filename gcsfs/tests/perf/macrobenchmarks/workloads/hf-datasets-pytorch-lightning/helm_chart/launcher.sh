@@ -1,0 +1,299 @@
+#!/bin/bash
+
+# CPU emulator launcher. Each pod on c4-standard-192
+# runs this; torchrun then forks GPUS_PER_NODE worker processes per pod (4 by
+# default), so 2 nodes x 4 = 8 ranks total. Per-node ranks are capped at 4 (not
+# 8) so a checkpoint-restoring run fits the 720GB c4-standard-192 host RAM; see
+# values_base.yaml.
+
+set -euo pipefail
+
+export PYTHONUNBUFFERED=1
+
+# The default workload image is nvcr.io/nvidia/pytorch:26.10-py3 (see
+# values_base.yaml), which already ships curl/ca-certificates, so this guard is
+# a no-op there. It exists for minimal Debian-based fallback images (e.g.
+# python:3.11-slim) that omit curl/ca-certificates, which the gcloud install +
+# model download below both need. Install once per pod; subsequent pip steps
+# fail clearly if this step fails.
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Installing curl + ca-certificates (needed for gcloud download)..."
+  apt-get update -qq
+  apt-get install -y --no-install-recommends curl ca-certificates
+  rm -rf /var/lib/apt/lists/*
+fi
+
+# --- node-local bootstrap cache ---------------------------------------------
+# HOST_CACHE_PATH is a hostPath volume (chart value workload.hostCachePath) that
+# outlives the pod. The seed-checkpoint release and the measured release land on
+# the same nodes, so whatever is staged here once is reused by the second
+# generation instead of being fetched again. Unset/empty keeps the previous
+# per-pod behaviour: every path below still works, it just always misses.
+CACHE_ROOT="${HOST_CACHE_PATH:-}"
+if [[ -n "$CACHE_ROOT" ]]; then
+  mkdir -p "$CACHE_ROOT"
+  echo "Bootstrap cache: $CACHE_ROOT"
+else
+  echo "Bootstrap cache disabled; staging into the pod filesystem."
+fi
+
+# Publish a directory into the cache only once it is provably whole: populate a
+# unique staging sibling, drop a marker, then rename. The rename is atomic, so a
+# pod killed mid-download cannot leave a partial directory that the next pod
+# mistakes for a hit -- the failure the old "does the directory exist" guard
+# would have made permanent now that the cache survives pod deletion.
+#
+# Contract: the command is invoked with a staging directory as its final
+# argument and must produce exactly one entry inside it named after $dest. Both
+# `gcloud storage cp -r SRC dir/` and `tar -C dir -xf` do that naturally.
+_stage_once_body() {
+  local dest="$1"; shift
+  local name staging
+  name=$(basename "$dest")
+  if [[ -f "$dest/.complete" ]]; then
+    echo "Cache hit: $dest"
+    return 0
+  fi
+  # mktemp, not "$dest.staging.$$": every pod has its own PID namespace, so $$
+  # collides across pods routinely (two pods are both PID 7), and the staging
+  # directory lives on the hostPath they share. Colliding pods would write into
+  # one directory and delete each other's in-flight download. mktemp -d picks a
+  # name that does not already exist and creates it in one atomic step.
+  mkdir -p "$(dirname "$dest")" || return 1
+  staging=$(mktemp -d "${dest}.staging.XXXXXX") || return 1
+  # Guarded rather than bare so a failed download cleans up after itself; the
+  # `return 1` still aborts the launcher under `set -e`, which is what should
+  # happen -- a pod that cannot stage its model must fail, not train on nothing.
+  # Note this `if` also suspends errexit inside the callee for its whole dynamic
+  # extent, so each fetch helper reports its own failures explicitly.
+  if ! "$@" "$staging"; then
+    echo "stage_once: population failed for $dest" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  if [[ ! -d "$staging/$name" ]]; then
+    echo "stage_once: command did not produce $staging/$name" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  touch "$staging/$name/.complete"
+  # Re-check before touching $dest. The download above takes minutes, and two
+  # pods can share a node -- the podAntiAffinity only excludes pods of the *same*
+  # release, and singlePodPerNode is an operator toggle. If another pod published
+  # while we were downloading, deleting $dest would unlink files it already has
+  # open and leave a window with no $dest at all. Its copy is as good as ours.
+  if [[ -f "$dest/.complete" ]]; then
+    rm -rf "$staging"
+    echo "Cache populated concurrently: $dest"
+    return 0
+  fi
+  # Nothing at $dest carries a marker now, so it can only be a crashed pod's
+  # leftover. Clear it so the rename lands.
+  rm -rf "$dest"
+  # Plain `mv`, not `mv -T`: -T is GNU-only and the images are not guaranteed to
+  # ship it. $dest was just removed, so this is normally a rename within one
+  # directory (same filesystem => atomic), not a move-into-directory.
+  if ! mv "$staging/$name" "$dest"; then
+    rm -rf "$staging"
+    # The other pod's copy is equally valid, so a lost race is not an error.
+    if [[ -f "$dest/.complete" ]]; then
+      echo "Cache populated concurrently: $dest"
+      return 0
+    fi
+    echo "Failed to publish $dest" >&2
+    return 1
+  fi
+  rm -rf "$staging"
+  # The re-check above narrows the race but cannot close it: another pod can
+  # still publish between that check and this rename, and `mv` into a directory
+  # that now exists nests inside it instead of replacing it. Our own marker
+  # inside $dest/$name is the signature of that nesting (a real model directory
+  # does not contain a marked copy of itself). Theirs is authoritative, so drop
+  # ours rather than leaving a stray tree inside the cache entry.
+  if [[ -f "$dest/$name/.complete" && -f "$dest/.complete" ]]; then
+    rm -rf "$dest/$name"
+    echo "Cache populated concurrently: $dest"
+    return 0
+  fi
+  if [[ ! -f "$dest/.complete" ]]; then
+    echo "Failed to publish $dest" >&2
+    return 1
+  fi
+  echo "Cached: $dest"
+}
+
+# Serialise pods staging the same entry on one node, so N pods do not each pull
+# the same ~16GB. Strictly an efficiency win: _stage_once_body is correct on its
+# own, and this wrapper falls through to it whenever the lock is unavailable.
+# flock is released by the kernel when the holder dies, so unlike a mkdir- or
+# file-based lock there is no stale-lock state to recover from.
+stage_once() {
+  local dest="$1"; shift
+  local rc=0
+  if [[ -f "$dest/.complete" ]]; then
+    echo "Cache hit: $dest"
+    return 0
+  fi
+  # Both the lock file below and mktemp in the body need the parent to exist;
+  # every call site creates it already, but do not depend on that.
+  mkdir -p "$(dirname "$dest")" || return 1
+  if command -v flock >/dev/null 2>&1; then
+    # Subshell so fd 9 -- and with it the lock -- is released however the body
+    # exits. The body re-checks the marker first, so a waiter that was blocked
+    # by the pod which just published takes the cache-hit path.
+    #
+    # Consequence: on this path the staging command runs in a subshell, so it
+    # must communicate through the filesystem only -- a variable it sets is not
+    # visible to the caller. Every fetch helper here only writes files.
+    (
+      flock -w "${STAGE_LOCK_TIMEOUT_SECONDS:-1800}" 9 || \
+        echo "stage_once: timed out on the staging lock for $dest; proceeding without it" >&2
+      _stage_once_body "$dest" "$@"
+    ) 9>>"${dest}.lock" || rc=$?
+    return "$rc"
+  fi
+  _stage_once_body "$dest" "$@"
+}
+
+# Every fallible step needs an explicit `|| return`. This runs as the condition
+# of an `if` inside stage_once, and POSIX suspends errexit for the whole dynamic
+# extent of a condition -- so a bare failing command would not abort the
+# function, which would fall through and return the status of its last line
+# (`rm -f`, effectively always 0). A partially extracted archive would then pass
+# the shape check and be published to the node cache as complete, poisoning it
+# for every later pod.
+fetch_gcloud_sdk() {
+  local staging="$1"
+  local archive="$staging/google-cloud-cli-linux-x86_64.tar.gz"
+  curl -fsSL \
+    https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz \
+    -o "$archive" || return 1
+  tar -C "$staging" -xf "$archive" || return 1
+  rm -f "$archive" || return 1
+  return 0
+}
+
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "Installing standalone gcloud CLI..."
+  GCLOUD_PARENT="${CACHE_ROOT:-/tmp}"
+  mkdir -p "$GCLOUD_PARENT"
+  stage_once "$GCLOUD_PARENT/google-cloud-sdk" fetch_gcloud_sdk
+  export PATH="$PATH:$GCLOUD_PARENT/google-cloud-sdk/bin"
+fi
+
+# Wheels are immutable per (name, version, url), so a shared pip cache is safe
+# and saves the second pod generation the whole download+build pass. The
+# artifact under test is deliberately excluded below.
+if [[ -n "$CACHE_ROOT" ]]; then
+  export PIP_CACHE_DIR="$CACHE_ROOT/pip"
+  mkdir -p "$PIP_CACHE_DIR"
+  PIP_ARGS=()
+else
+  PIP_ARGS=(--no-cache-dir)
+fi
+
+# If MODEL_ID is a GCS path, pull the ~16GB of weights once per *node* (not
+# once per pod) into the bootstrap cache, so the measured release reuses what
+# the seed release already staged. train_pytorch_lightning.py loads it from $LOCAL_MODEL_PATH
+# with local_files_only=True, so the ranks on this node do not race on the
+# HuggingFace API. This download is deliberately outside the measurement
+# boundary (gcloud, not gcsfs) so caching it moves no metric -- it only removes
+# idle time from the run.
+fetch_model_from_gcs() {
+  # Strip trailing slash: `gcloud storage cp -r gs://bucket/dir/ dest/` would
+  # copy the *contents* of dir into dest (rsync-style), so the files would land
+  # at dest/config.json instead of dest/<basename>/config.json. stage_once
+  # requires the latter.
+  gcloud storage cp -r "${MODEL_ID%/}" "$1/" || return 1
+}
+if [[ "${MODEL_ID:-}" == gs://* ]]; then
+  echo "MODEL_ID is a GCS path: $MODEL_ID"
+  DIR_NAME=$(basename "${MODEL_ID%/}")
+  MODEL_ROOT="${CACHE_ROOT:-/tmp}"
+  mkdir -p "$MODEL_ROOT"
+  LOCAL_MODEL_PATH="$MODEL_ROOT/$DIR_NAME"
+  stage_once "$LOCAL_MODEL_PATH" fetch_model_from_gcs
+  # train_pytorch_lightning.py reads this to find the staged weights; it falls back to
+  # /tmp/<basename> when unset, which is where they used to land.
+  export LOCAL_MODEL_PATH
+fi
+
+# Install workload deps. requirements.txt is mounted alongside the .py via
+# the workload-configuration ConfigMap (see workload-config-configmap.yaml +
+# workload-job.yaml items).
+#
+# Two pip invocations:
+#   1. torch from PyTorch's CPU index (default PyPI wheel pulls the GPU
+#      variant which is ~2 GB and refuses to import without libcuda).
+#   2. everything else from requirements.txt via standard PyPI.
+#
+# Dual-mode behavior:
+#   - On an image that already ships these deps (e.g. a custom pre-built
+#     image): both pip calls become fast "Requirement already satisfied"
+#     no-ops (~5s total for resolver pass).
+#   - On the bare python:3.11-slim fallback: actually installs everything
+#     (~3 min). The version pins in requirements.txt are the canonical ones.
+pip3 install "${PIP_ARGS[@]}" --index-url https://download.pytorch.org/whl/cpu torch
+pip3 install "${PIP_ARGS[@]}" -r /workload/configs/requirements.txt
+
+if [[ -n "${REQUIREMENTS:-}" ]]; then
+  # Optional escape hatch: REQUIREMENTS lets a run install/override arbitrary
+  # packages (the gcsfs under test and/or a custom lightning build, etc.)
+  # without rebuilding the image or editing requirements.txt. It runs AFTER
+  # requirements.txt, so a spec here overrides the pinned versions there.
+  # Word-split intentional.
+  # --no-cache-dir regardless of the shared pip cache: the build under test is
+  # the one thing that must never be served from a previous pod's download, so a
+  # re-pushed artifact at an unchanged URL can never go stale here.
+  # shellcheck disable=SC2086
+  pip3 install --no-cache-dir $REQUIREMENTS
+  # Reinstall only the requested packages so their dependency graph is not
+  # unnecessarily reinstalled after the normal resolution pass above.
+  # shellcheck disable=SC2086
+  pip3 install --no-cache-dir --no-deps --force-reinstall $REQUIREMENTS
+fi
+
+# JOB_COMPLETION_INDEX is set by the K8s Indexed Job (one value per pod,
+# 0..NNODES-1). torchrun consumes it as --node_rank.
+export NODE_RANK=$JOB_COMPLETION_INDEX
+export HYDRA_FULL_ERROR=1
+
+echo "Launching Torch distributed as node rank $NODE_RANK out of $NNODES nodes"
+
+# Gloo (the CPU collective backend used by DDPStrategy in train_pytorch_lightning.py) does not
+# auto-discover the right NIC across pods reliably; pin it to the pod's
+# primary interface. With hostNetwork: false this is always eth0 inside the
+# pod regardless of the c4 host's underlying NIC name (ens4/etc.).
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}
+export TOKENIZERS_PARALLELISM=false
+
+# Parallel training strategy: ddp (default), fsdp_sharded, fsdp_full,
+# model_parallel_sharded, or model_parallel_full.
+export TRAINING_STRATEGY=${TRAINING_STRATEGY:-ddp}
+# ModelParallelStrategy mesh (model_parallel_* only); TP x DP must equal world.
+export TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-4}
+export DATA_PARALLEL_SIZE=${DATA_PARALLEL_SIZE:-2}
+
+# Training parameters. Epochs bind only if MAX_STEPS=-1.
+export NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-3}
+export PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
+export GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+
+# Enable Python fault handler so a segfault in any of the 8 ranks dumps
+# a stack trace into pod logs.
+export PYTHONFAULTHANDLER=1
+# DataLoader workers do their own tokenization; cap BLAS threads per worker
+# so 4 ranks * 16 workers stay within the 192 vCPUs on c4-standard-192.
+# (Lower DATALOADER_NUM_WORKERS if step-time IO timing looks CPU-bound:
+# 4 ranks * 16 workers = 64 procs vs 192 vCPUs.)
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export PYTHONPATH=${PYTHONPATH:-}:/workload/configs
+
+torchrun \
+  --nproc_per_node="${GPUS_PER_NODE:-4}" \
+  --nnodes="$NNODES" \
+  --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" \
+  --master_port="$MASTER_PORT" \
+  "$PYTHON_MAIN"

@@ -1,0 +1,566 @@
+import collections
+import unittest.mock as mock
+
+import pytest
+
+from gcsfs.tests.perf.microbenchmarks import runner
+from gcsfs.tests.perf.microbenchmarks.request_counter import (
+    DOWNLOAD,
+    LIST,
+    OBJECT_GET,
+    OTHER,
+)
+
+
+class MockParams:
+    def __init__(self, threads=1, processes=1, rounds=1):
+        self.threads = threads
+        self.processes = processes
+        self.rounds = rounds
+        self.files = 1
+        self.file_size_bytes = 100
+        self.chunk_size_bytes = 10
+        self.block_size_bytes = 10
+        self.pattern = "seq"
+        self.bucket_name = "test-bucket"
+        self.bucket_type = "regional"
+        self.name = "test-benchmark"
+
+
+@pytest.fixture
+def mock_benchmark():
+    benchmark = mock.Mock()
+    benchmark.extra_info = {}
+    return benchmark
+
+
+@pytest.fixture
+def mock_monitor():
+    monitor = mock.Mock()
+    monitor.__enter__ = mock.Mock(return_value=monitor)
+    monitor.__exit__ = mock.Mock(return_value=None)
+    monitor.max_cpu = 10.0
+    monitor.max_mem = 100.0
+    monitor.throughput_s = 50.0
+    monitor.vcpus = 2
+    return mock.Mock(return_value=monitor)
+
+
+def test_filter_test_cases():
+    case1 = MockParams(threads=1, processes=1)
+    case2 = MockParams(threads=2, processes=1)
+    case3 = MockParams(threads=1, processes=2)
+
+    all_cases = [case1, case2, case3]
+    st, mt, mp = runner.filter_test_cases(all_cases)
+
+    assert st == [case1]
+    assert mt == [case2]
+    assert mp == [case3]
+
+
+def test_run_single_threaded(mock_benchmark, mock_monitor):
+    params = MockParams(rounds=5)
+    func = mock.Mock()
+    args = (1, 2, 3)
+
+    runner.run_single_threaded(mock_benchmark, mock_monitor, params, func, args, "read")
+
+    assert mock_benchmark.extra_info["threads"] == 1
+    assert mock_benchmark.extra_info["processes"] == 1
+    assert mock_benchmark.group == "read"
+    assert mock_benchmark.extra_info["total_bytes"] == 100
+
+    mock_monitor.assert_called_once()
+    mock_benchmark.pedantic.assert_called_once_with(func, rounds=5, args=args)
+
+    assert mock_benchmark.extra_info["cpu_max_global"] == "10.00"
+
+    # Test explicit total_bytes passed to run_single_threaded
+    runner.run_single_threaded(
+        mock_benchmark, mock_monitor, params, func, args, "cat_ranges", total_bytes=500
+    )
+    assert mock_benchmark.extra_info["total_bytes"] == 500
+
+
+def test_run_multi_threaded(mock_benchmark, mock_monitor):
+    params = MockParams(threads=2, rounds=3)
+    worker_func = mock.Mock()
+    args_list = [(1,), (2,)]
+
+    runner.run_multi_threaded(
+        mock_benchmark, mock_monitor, params, worker_func, args_list, "write"
+    )
+
+    assert mock_benchmark.extra_info["threads"] == 2
+    assert mock_benchmark.group == "write"
+
+    mock_monitor.assert_called_once()
+    mock_benchmark.pedantic.assert_called_once()
+
+    # Extract workload and run it to verify it calls worker_func
+    args, kwargs = mock_benchmark.pedantic.call_args
+    workload = args[0]
+    assert callable(workload)
+
+    workload()
+    assert worker_func.call_count == 2
+
+
+def test_run_multi_threaded_fixed_duration(mock_benchmark, mock_monitor):
+    params = MockParams(threads=2, rounds=3)
+    params.runtime = 30
+    # 2 threads and 3 rounds means worker_func is called 6 times in total (2 calls per round).
+    # Since worker_func returns sequential values:
+    # - Round 1: calls return 10 and 20 (Sum = 30)
+    # - Round 2: calls return 30 and 40 (Sum = 70)
+    # - Round 3: calls return 50 and 60 (Sum = 110)
+    worker_func = mock.Mock(side_effect=[10, 20, 30, 40, 50, 60])
+    args_list = [(1,), (2,)]
+
+    runner.run_multi_threaded_fixed_duration(
+        mock_benchmark, mock_monitor, params, worker_func, args_list, "read"
+    )
+
+    assert mock_benchmark.extra_info["threads"] == 2
+    assert mock_benchmark.group == "read"
+    # Verify that the sum of returns matches the expected values for each of the 3 rounds
+    assert mock_benchmark.extra_info["runs"] == [30, 70, 110]
+    assert mock_benchmark.extra_info["min_run"] == 30
+    assert mock_benchmark.extra_info["max_run"] == 110
+
+    mock_monitor.assert_called_once()
+    assert worker_func.call_count == 6
+    mock_benchmark.pedantic.assert_called_once_with(
+        mock.ANY, rounds=1, iterations=1, warmup_rounds=0
+    )
+
+
+@mock.patch("gcsfs.tests.perf.microbenchmarks.runner.multiprocessing")
+def test_run_multi_process(mock_mp, mock_benchmark, mock_monitor):
+    params = MockParams(processes=2, rounds=2)
+    extended_gcs_factory = mock.Mock(return_value="gcs_instance")
+    worker_target = mock.Mock()
+    args_builder = mock.Mock(return_value=("arg1",))
+
+    # Mock multiprocessing context and process
+    mock_ctx = mock.Mock()
+    mock_mp.get_context.return_value = mock_ctx
+    mock_process = mock.Mock()
+    mock_process.exitcode = 0
+    mock_ctx.Process.return_value = mock_process
+
+    # Mock shared array
+
+    class MockArray:
+        def __setitem__(self, idx, val):
+            pass
+
+        def __getitem__(self, idx):
+            if isinstance(idx, slice):
+                return [1.0, 2.0]
+            return 1.0
+
+    mock_array = MockArray()
+    mock_ctx.Array.return_value = mock_array
+
+    runner.run_multi_process(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        extended_gcs_factory,
+        worker_target,
+        args_builder,
+        "listing",
+    )
+
+    assert mock_benchmark.extra_info["processes"] == 2
+    assert mock_benchmark.group == "listing"
+
+    mock_mp.get_context.assert_called_with("forkserver")
+    assert extended_gcs_factory.call_count == 2
+
+    # Check process creation and start
+    assert mock_ctx.Process.call_count == 4  # 2 processes * 2 rounds
+    assert mock_process.start.call_count == 4
+    assert mock_process.join.call_count == 4
+
+    # Check runs in extra_info
+    assert mock_benchmark.extra_info["runs"] == [2.0, 2.0]
+    assert mock_benchmark.extra_info["min_run"] == 2.0
+
+
+@mock.patch("gcsfs.tests.perf.microbenchmarks.runner.multiprocessing")
+def test_run_multi_process_child_fails(mock_mp, mock_benchmark, mock_monitor):
+    params = MockParams(processes=2, rounds=1)
+    extended_gcs_factory = mock.Mock(return_value="gcs_instance")
+    worker_target = mock.Mock()
+    args_builder = mock.Mock(return_value=("arg1",))
+
+    mock_ctx = mock.Mock()
+    mock_mp.get_context.return_value = mock_ctx
+
+    mock_process1 = mock.Mock()
+    mock_process1.exitcode = 1
+    mock_process1.is_alive.return_value = False
+
+    mock_process2 = mock.Mock()
+    mock_process2.exitcode = None
+    mock_process2.is_alive.return_value = True
+
+    mock_ctx.Process.side_effect = [mock_process1, mock_process2]
+
+    class MockArray:
+        def __setitem__(self, idx, val):
+            pass
+
+        def __getitem__(self, idx):
+            if isinstance(idx, slice):
+                return [1.0, 2.0]
+            return 1.0
+
+    mock_array = MockArray()
+    mock_ctx.Array.return_value = mock_array
+
+    with pytest.raises(RuntimeError, match="Worker process 0 exited with code 1"):
+        runner.run_multi_process(
+            mock_benchmark,
+            mock_monitor,
+            params,
+            extended_gcs_factory,
+            worker_target,
+            args_builder,
+            "listing",
+        )
+
+    mock_process1.join.assert_called_once()
+    mock_process1.terminate.assert_not_called()
+    mock_process2.terminate.assert_called_once()
+    mock_process2.join.assert_called_once()
+
+
+@mock.patch("gcsfs.tests.perf.microbenchmarks.runner.multiprocessing")
+def test_run_multi_process_resets_shared_data(mock_mp, mock_benchmark, mock_monitor):
+    params = MockParams(processes=2, rounds=2)
+    extended_gcs_factory = mock.Mock(return_value="gcs_instance")
+    worker_target = mock.Mock()
+    args_builder = mock.Mock(return_value=("arg1",))
+
+    mock_ctx = mock.Mock()
+    mock_mp.get_context.return_value = mock_ctx
+    mock_process = mock.Mock()
+    mock_process.exitcode = 0
+    mock_ctx.Process.return_value = mock_process
+
+    # Use a real list or dict to simulate the array so we can assert it was reset
+    shared_data = {}
+
+    class MockArray:
+        def __setitem__(self, idx, val):
+            shared_data[idx] = val
+
+        def __getitem__(self, idx):
+            if isinstance(idx, slice):
+                return [shared_data.get(0, 0.0), shared_data.get(1, 0.0)]
+            return shared_data[idx]
+
+    mock_array = MockArray()
+    mock_ctx.Array.return_value = mock_array
+
+    # Set some initial non-zero data
+    shared_data[0] = 10.0
+    shared_data[1] = 20.0
+
+    runner.run_multi_process(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        extended_gcs_factory,
+        worker_target,
+        args_builder,
+        "listing",
+    )
+
+    # If it was reset to 0 at the start of each round, and the worker target is a mock
+    # that doesn't actually run (since we mocked Process), the final results appended
+    # will be 0.0, because the array was reset and never populated by the non-running mock process.
+    assert mock_benchmark.extra_info["runs"] == [0.0, 0.0]
+
+
+class FakeRequestCounter:
+    """Stands in for RequestCounter so the runner plumbing is tested on its own.
+
+    Real counting is covered in test_request_counter.py against a stubbed
+    transport; what matters here is that the runner enters a counter and
+    divides the total by operations x rounds.
+    """
+
+    def __init__(self):
+        self.counts = collections.Counter(
+            {DOWNLOAD: 8, OBJECT_GET: 8, LIST: 0, OTHER: 0}
+        )
+
+    @property
+    def total(self):
+        return sum(self.counts.values())
+
+    def per_operation(self, operations):
+        return self.total / operations
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_run_single_threaded_counts_requests(mock_benchmark, mock_monitor):
+    """operations_per_round turns counting on and normalises per operation."""
+    params = MockParams(rounds=2)
+
+    with mock.patch.object(runner, "RequestCounter", FakeRequestCounter):
+        runner.run_single_threaded(
+            mock_benchmark,
+            mock_monitor,
+            params,
+            mock.Mock(),
+            (),
+            "cat",
+            operations_per_round=4,
+        )
+
+    extra = mock_benchmark.extra_info
+    assert extra["requests_total"] == 16
+    # 16 calls over 2 rounds of 4 operations.
+    assert extra["requests_per_op"] == 2.0
+    assert extra["requests_download"] == 8
+    assert extra["requests_object_get"] == 8
+
+
+def test_run_multi_threaded_counts_requests(mock_benchmark, mock_monitor):
+    params = MockParams(threads=2, rounds=1)
+
+    with mock.patch.object(runner, "RequestCounter", FakeRequestCounter):
+        runner.run_multi_threaded(
+            mock_benchmark,
+            mock_monitor,
+            params,
+            mock.Mock(),
+            [(), ()],
+            "cat",
+            operations_per_round=8,
+        )
+
+    assert mock_benchmark.extra_info["requests_per_op"] == 2.0
+
+
+def test_run_single_threaded_without_op_count_skips_request_metrics(
+    mock_benchmark, mock_monitor
+):
+    """Groups that cannot supply an operation count report no request columns."""
+    runner.run_single_threaded(
+        mock_benchmark, mock_monitor, MockParams(), mock.Mock(), (), "read"
+    )
+
+    assert mock_benchmark.extra_info["requests_per_op"] == "N/A"
+    assert mock_benchmark.extra_info["requests_total"] == "N/A"
+
+
+def _simulate_pedantic(target, setup=None, rounds=1, args=(), **kwargs):
+    for _ in range(rounds):
+        call_args = args
+        call_kwargs = {}
+        if setup is not None:
+            maybe = setup()
+            if maybe is not None:
+                call_args, call_kwargs = maybe
+        target(*call_args, **call_kwargs)
+
+
+def test_run_single_threaded_round_args_builder(mock_benchmark, mock_monitor):
+    params = MockParams(rounds=3)
+    mock_benchmark.pedantic.side_effect = _simulate_pedantic
+    seen = []
+
+    runner.run_single_threaded(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        lambda path: seen.append(path),
+        ("fallback",),
+        "cat",
+        round_args_builder=lambda r: (f"round_{r}/file_0",),
+    )
+
+    assert seen == ["round_0/file_0", "round_1/file_0", "round_2/file_0"]
+
+
+def test_run_single_threaded_fixed_duration_round_args_builder(
+    mock_benchmark, mock_monitor
+):
+    params = MockParams(rounds=3)
+    params.runtime = 1
+    seen = []
+
+    def fake_op(path):
+        seen.append(path)
+        return 100 * len(seen)
+
+    runner.run_single_threaded_fixed_duration(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        fake_op,
+        ("fallback",),
+        "read",
+        round_args_builder=lambda r: (f"round_{r}/file_0",),
+    )
+
+    assert seen == ["round_0/file_0", "round_1/file_0", "round_2/file_0"]
+    assert mock_benchmark.extra_info["runs"] == [100, 200, 300]
+
+
+def test_run_multi_threaded_round_args_builder(mock_benchmark, mock_monitor):
+    params = MockParams(threads=2, rounds=2)
+    mock_benchmark.pedantic.side_effect = _simulate_pedantic
+    seen_per_call = []
+
+    runner.run_multi_threaded(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        lambda path: seen_per_call.append(path),
+        [("fallback_0",), ("fallback_1",)],
+        "cat",
+        round_args_builder=lambda r: [(f"r{r}_t0",), (f"r{r}_t1",)],
+    )
+
+    assert sorted(seen_per_call[:2]) == ["r0_t0", "r0_t1"]
+    assert sorted(seen_per_call[2:]) == ["r1_t0", "r1_t1"]
+
+
+def test_run_multi_threaded_fixed_duration_round_args_builder(
+    mock_benchmark, mock_monitor
+):
+    params = MockParams(threads=2, rounds=2)
+    params.runtime = 1
+    seen_per_call = []
+
+    def worker(path):
+        seen_per_call.append(path)
+        return 10
+
+    runner.run_multi_threaded_fixed_duration(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        worker,
+        [("fallback_0",), ("fallback_1",)],
+        "read",
+        round_args_builder=lambda r: [(f"r{r}_t0",), (f"r{r}_t1",)],
+    )
+
+    assert sorted(seen_per_call[:2]) == ["r0_t0", "r0_t1"]
+    assert sorted(seen_per_call[2:]) == ["r1_t0", "r1_t1"]
+    assert mock_benchmark.extra_info["runs"] == [20, 20]
+
+
+@mock.patch("gcsfs.tests.perf.microbenchmarks.runner.multiprocessing")
+def test_run_multi_process_passes_round_num_when_accepted(
+    mock_mp, mock_benchmark, mock_monitor
+):
+    params = MockParams(processes=2, rounds=2)
+    extended_gcs_factory = mock.Mock(side_effect=["gcs_0", "gcs_1"])
+    worker_target = mock.Mock()
+
+    mock_ctx = mock.Mock()
+    mock_mp.get_context.return_value = mock_ctx
+    mock_process = mock.Mock()
+    mock_process.exitcode = 0
+    mock_ctx.Process.return_value = mock_process
+
+    class MockArray:
+        def __setitem__(self, idx, val):
+            pass
+
+        def __getitem__(self, idx):
+            if isinstance(idx, slice):
+                return [1.0, 1.0]
+            return 1.0
+
+    mock_ctx.Array.return_value = MockArray()
+
+    recorded = []
+
+    def four_arg_builder(gcs_instance, proc_idx, shared_arr, round_num):
+        recorded.append((gcs_instance, proc_idx, round_num))
+        return (gcs_instance, proc_idx, round_num)
+
+    runner.run_multi_process(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        extended_gcs_factory,
+        worker_target,
+        four_arg_builder,
+        "read",
+    )
+
+    assert recorded == [
+        ("gcs_0", 0, 0),
+        ("gcs_1", 1, 0),
+        ("gcs_0", 0, 1),
+        ("gcs_1", 1, 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    "bucket_type, expected_rcu_rapid_write",
+    [
+        ("standard_rcu_z", True),
+        ("hns_rcu_z", True),
+        ("standard_rcu_warm", False),
+        ("hns_rcu_cold", False),
+        ("zonal", None),
+        ("regional", None),
+    ],
+)
+@mock.patch("gcsfs.tests.perf.microbenchmarks.runner.multiprocessing")
+def test_run_multi_process_workers_set_rcu_rapid_write_by_bucket_type(
+    mock_mp, mock_benchmark, mock_monitor, bucket_type, expected_rcu_rapid_write
+):
+    """*_rcu_z enables rcu_rapid_write for RAPID writes; warm/cold force False for HTTP."""
+    params = MockParams(processes=2, rounds=1)
+    params.bucket_type = bucket_type
+    extended_gcs_factory = mock.Mock(return_value="gcs_instance")
+
+    mock_ctx = mock.Mock()
+    mock_mp.get_context.return_value = mock_ctx
+    mock_ctx.Process.return_value = mock.Mock(exitcode=0)
+
+    class MockArray:
+        def __setitem__(self, idx, val):
+            pass
+
+        def __getitem__(self, idx):
+            if isinstance(idx, slice):
+                return [1.0, 1.0]
+            return 1.0
+
+    mock_ctx.Array.return_value = MockArray()
+
+    runner.run_multi_process(
+        mock_benchmark,
+        mock_monitor,
+        params,
+        extended_gcs_factory,
+        mock.Mock(),
+        mock.Mock(return_value=("arg1",)),
+        "write",
+        gcs_kwargs={"block_size": 10},
+    )
+
+    expected_kwargs = {"block_size": 10}
+    if expected_rcu_rapid_write is not None:
+        expected_kwargs["rcu_rapid_write"] = expected_rcu_rapid_write
+    assert extended_gcs_factory.call_args_list == [mock.call(**expected_kwargs)] * 2

@@ -1,0 +1,17 @@
+common:
+  bucket_types:
+    - "regional"
+    - "zonal"
+    - "standard_rcu_z"
+    - "hns_rcu_z"
+  chunk_sizes_mb:
+    - 16
+    - 32
+  rounds: 3
+  runtime: 30 # 30 secs
+
+scenarios:
+  - name: "write_seq_fixed_duration"
+
+  - name: "write_seq_fixed_duration_multi_process"
+    processes: [16, 48]

@@ -1,0 +1,3101 @@
+import asyncio
+import contextlib
+import heapq
+import logging
+import os
+import uuid
+import weakref
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import Enum
+from glob import has_magic
+from typing import ClassVar
+
+import aiohttp
+import fsspec
+from fsspec import asyn
+from fsspec.callbacks import NoOpCallback
+from google.api_core import exceptions as api_exceptions
+from google.api_core.client_info import ClientInfo
+from google.api_core.client_options import ClientOptions
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import storage_control_v2
+from google.cloud.storage.asyncio.async_appendable_object_writer import (
+    AsyncAppendableObjectWriter,
+)
+from google.cloud.storage.asyncio.async_grpc_client import AsyncGrpcClient
+from google.cloud.storage.asyncio.async_multi_range_downloader import (
+    AsyncMultiRangeDownloader,
+)
+
+from gcsfs import __version__ as version
+from gcsfs import zb_hns_utils
+from gcsfs._dircache import HnsDirCacheUpdater
+from gcsfs.concurrency import split_range
+from gcsfs.core import (
+    GCSFile,
+    GCSFileSystem,
+    _get_prefetcher_and_cache_config,
+    _location,
+    _resolve_generation_match,
+    _validate_rm_concurrency,
+)
+from gcsfs.poller import poll_lro, unwrap_operation_result
+from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
+from gcsfs.telemetry.grpc import ControlPlaneTelemetryInterceptor
+from gcsfs.telemetry.wrapper import (
+    _gcs_sync_wrapper,
+    mirror_gcs_methods,
+    with_telemetry_context,
+)
+from gcsfs.utils import as_byte_buffer
+from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
+from gcsfs.zonal_file import ZonalFile
+
+logger = logging.getLogger("gcsfs")
+
+USER_AGENT = "python-gcsfs"
+STORAGE_CONTROL_RPC_TIMEOUT = 30.0
+_HNS_RENAME_FOLDER_LRO_TIMEOUT = 300.0
+
+# Default maximum number of batch delete requests that a recursive ``rm`` keeps
+# in flight on HNS buckets (including zonal buckets, which are hierarchical).
+# HNS buckets support a higher initial request rate than standard buckets
+# (https://cloud.google.com/storage/docs/hns-overview), so they get a higher
+# default than DEFAULT_RM_CONCURRENCY while still keeping deletes well below
+# that higher rate, leaving headroom for other writes to the same bucket.
+# Callers can override it with ``concurrency``.
+DEFAULT_HNS_RM_CONCURRENCY = 15
+
+
+class StorageClass(Enum):
+    RAPID = "RAPID"
+    STANDARD = "STANDARD"
+    UNKNOWN = "UNKNOWN"
+
+
+class CachingTier(Enum):
+    RAPID_CACHE = "RAPID_CACHE"
+    RAPID_CACHE_ULTRA = "RAPID_CACHE_ULTRA"
+    NONE = "NONE"
+
+
+class NamespaceLayout(Enum):
+    HIERARCHICAL = "HIERARCHICAL"
+    NON_HIERARCHICAL = "NON_HIERARCHICAL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class BucketLayout:
+    storage_class: StorageClass
+    caching_tier: CachingTier
+    namespace_layout: NamespaceLayout
+
+    UNKNOWN: ClassVar["BucketLayout"]
+
+    @property
+    def is_zonal(self):
+        """Whether the bucket is zonal (``RAPID`` storage class)."""
+        return self.storage_class == StorageClass.RAPID
+
+    @property
+    def is_rcu(self):
+        """Whether the bucket has Rapid Cache Ultra."""
+        return self.caching_tier == CachingTier.RAPID_CACHE_ULTRA
+
+    @property
+    def is_hierarchical(self):
+        """Whether the bucket has Hierarchical Namespace enabled."""
+        return self.namespace_layout == NamespaceLayout.HIERARCHICAL
+
+    @property
+    def uses_grpc_data_path(self):
+        """Whether the bucket is zonal or has Rapid Cache Ultra."""
+        return self.is_zonal or self.is_rcu
+
+
+BucketLayout.UNKNOWN = BucketLayout(
+    StorageClass.UNKNOWN, CachingTier.NONE, NamespaceLayout.UNKNOWN
+)
+
+
+class RapidCacheUltraDisabledError(OSError):
+    """Rapid Cache Ultra was disabled on a bucket cached as using it.
+
+    Raised when an appendable write cannot open because Rapid Cache Ultra is
+    no longer enabled on the bucket. The cached bucket layout is refreshed
+    before this error is raised, so the next write uses the HTTP upload path.
+    """
+
+
+def _rapid_cache_ultra_disabled_error(bucket):
+    return RapidCacheUltraDisabledError(
+        f"Rapid Cache Ultra is no longer enabled on bucket '{bucket}'. "
+        "The cached bucket layout was refreshed, so new writes use the "
+        "HTTP upload path."
+    )
+
+
+@contextlib.asynccontextmanager
+async def _get_mrd_from_pool_or_mrd(mrd_or_pool):
+    """
+    Helper function to yield an AsyncMultiRangeDownloader
+    whether a single instance or an MRDPool is provided.
+    """
+    if isinstance(mrd_or_pool, MRDPool):
+        async with mrd_or_pool.get_mrd() as m:
+            yield m
+    elif isinstance(mrd_or_pool, AsyncMultiRangeDownloader):
+        yield mrd_or_pool
+    else:
+        raise TypeError(
+            f"Expected MRDPool or AsyncMultiRangeDownloader, got {type(mrd_or_pool)}"
+        )
+
+
+async def _get_mrd_size(mrd_or_pool):
+    """Helper to extract the persisted_size from either a pool or a single MRD."""
+    if mrd_or_pool is None:
+        return None
+    async with _get_mrd_from_pool_or_mrd(mrd_or_pool) as m:
+        return m.persisted_size
+
+
+async def _close_pool(pool):
+    """Close ``pool`` to completion even if the calling task is cancelled."""
+    close_task = asyncio.ensure_future(pool.close())
+    cancelled = False
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not close_task.cancelled():
+            close_task.exception()
+        raise asyncio.CancelledError
+    return close_task.result()
+
+
+def _parse_bool_flag(value, name):
+    """Normalize a boolean option that may arrive as a string from config or env."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off", ""):
+            return False
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return bool(value)
+
+
+class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
+    """
+    This class will be used when GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT env variable is set to true.
+    ExtendedGcsFileSystem is a subclass of GCSFileSystem that adds new logic for bucket types
+    including zonal and hierarchical. For buckets without special properties, it forwards requests
+    to the parent class GCSFileSystem for default processing.
+    """
+
+    # Upper bound on concurrent MRD bidi streams per object in zonal cat_ranges.
+    # Matches the max_mrd_pool_cache_queue_size default so that MRDPoolCache
+    # can keep all of an object's streams idle for the next call to reuse.
+    MAX_ZONAL_STREAMS_PER_OBJECT = 16
+
+    def __init__(
+        self,
+        *args,
+        finalize_on_close=None,
+        mrd_pool_cache_size=16,
+        max_mrd_pool_cache_queue_size=16,
+        fast_lro_polling=True,
+        rcu_rapid_write=False,
+        **kwargs,
+    ):
+        """
+        Parameters
+        ----------
+        finalize_on_close : bool, optional
+            If set, overrides the default finalization behavior when closing
+            appendable gRPC writers. When ``None`` (the default), files in
+            Zonal buckets default to ``False`` (left unfinalized to allow
+            appends) and files in RCU buckets, which use these writers only
+            with ``rcu_rapid_write=True``, default to ``True``.
+        mrd_pool_cache_size : int, default 16
+            Maximum number of idle pools to retain in the cache.
+        max_mrd_pool_cache_queue_size : int, default 16
+            Maximum number of idle MRDs per key in the cache.
+        fast_lro_polling : bool, default True
+            Wait for HNS folder renames with gcsfs's own poller, which checks
+            often early on and gives up after a timeout. Set to False (or set
+            ``FSSPEC_GCS_FAST_LRO_POLLING=false``) to wait with
+            ``operation.result()`` from google-api-core instead. That wait
+            has no time limit and does not cancel the rename on the server
+            if ``mv`` is cancelled.
+        rcu_rapid_write : bool, default False
+            Write to Rapid Cache Ultra (RCU) buckets with the gRPC appendable
+            writer, which creates ``RAPID`` objects in the zonal cache. By
+            default, writes to RCU buckets use the HTTP upload path and create
+            ``STANDARD`` objects, as on a bucket without the cache. Reads use
+            gRPC either way. A ``RAPID`` object stays in one zone until GCS
+            copies it to regional storage, and these writes ignore
+            ``content_type``, ``metadata``, ``fixed_key_metadata`` and
+            ``kms_key_name``. Can also be set with
+            ``FSSPEC_GCS_RCU_RAPID_WRITE=true`` or
+            ``fsspec.config.conf.setdefault("gcs", {})["rcu_rapid_write"] = True``.
+            Has no effect on Zonal buckets, which always use the appendable
+            writer.
+        **kwargs : dict
+            Additional arguments passed to GCSFileSystem.
+            Supports retry configuration overrides for Storage Control API:
+            - retry_timeout: Total time to spend retrying (seconds).
+            - retry_initial: Initial delay between retries (seconds).
+            - retry_maximum: Maximum delay between retries (seconds).
+            - retry_multiplier: Multiplier for delay between retries.
+            These map to `google.api_core.retry.AsyncRetry` arguments (without 'retry_' prefix).
+        """
+        self.fast_lro_polling = fast_lro_polling
+        self.rcu_rapid_write = _parse_bool_flag(rcu_rapid_write, "rcu_rapid_write")
+        valid_keys = DEFAULT_RETRY_CONFIG.keys()
+        self.retry_config = {
+            k[6:]: v
+            for k, v in kwargs.items()
+            if k.startswith("retry_") and k[6:] in valid_keys and v is not None
+        }
+        super().__init__(*args, **kwargs)
+        # When None, gRPC writes default to False for Zonal buckets and True for
+        # RCU buckets (written over gRPC only with rcu_rapid_write).
+        self.finalize_on_close = finalize_on_close
+        self._grpc_client = None
+        self._storage_control_client = None
+        # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
+        # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
+        # but the clients expect the underlying google.auth credentials object.
+        self.credential = self.credentials.credentials
+        # When token="anon", self.credentials.credentials is None. This is
+        # often used for testing with emulators. However, the gRPC and storage
+        # control clients require a credentials object for initialization.
+        # We explicitly use AnonymousCredentials() to allow unauthenticated access.
+        if self.credentials.token == "anon":
+            self.credential = AnonymousCredentials()
+        self._storage_layout_cache = {}
+        self._memmove_executor = ThreadPoolExecutor(
+            max_workers=kwargs.get("memmove_max_workers", 8)
+        )
+        weakref.finalize(self, self._memmove_executor.shutdown)
+        self._mrd_pool_cache = zb_hns_utils.MRDPoolCache(
+            self,
+            max_idle_pools=mrd_pool_cache_size,
+            max_queue_size=max_mrd_pool_cache_queue_size,
+        )
+        weakref.finalize(
+            self,
+            self._finalize_mrd_pool_cache,
+            self.loop,
+            self._mrd_pool_cache,
+        )
+
+    async def _get_threshold_for_disk_reads(self, bucket):
+        if await self._uses_grpc_data_path(bucket):
+            return (
+                5 * 1024 * 1024
+            )  # Thanks to our in house, zero copy DirectMemmoveBuffer
+        return await super()._get_threshold_for_disk_reads(bucket)
+
+    @staticmethod
+    def _finalize_mrd_pool_cache(loop, cache):
+        """Tear down the MRDPoolCache when ExtendedGcsFileSystem is garbage collected."""
+        if cache is None or getattr(cache, "_closed", False):
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(cache.close(), loop)
+        elif current_loop is not None and current_loop.is_running():
+            asyncio.run_coroutine_threadsafe(cache.close(), current_loop)
+        elif asyn.loop[0] is not None and asyn.loop[0].is_running():
+            try:
+                asyn.sync(asyn.loop[0], cache.close, timeout=5.0)
+            except fsspec.FSTimeoutError:
+                pass
+
+    @property
+    def _user_project(self):
+        """Value used for billing - enabling "requestor pays" access"""
+        if self.requester_pays:
+            return (
+                self.requester_pays
+                if isinstance(self.requester_pays, str)
+                else self.project
+            )
+        return None
+
+    def _get_retry_config(self, **kwargs):
+        return get_storage_control_retry_config(self.retry_config, **kwargs)
+
+    @property
+    def grpc_client(self):
+        if self.asynchronous and self._grpc_client is None:
+            raise RuntimeError(
+                "Please await _get_grpc_client() before accessing grpc_client"
+            )
+        if self._grpc_client is None:
+            self._grpc_client = asyn.sync(self.loop, self._get_grpc_client)
+        return self._grpc_client
+
+    @property
+    def _grpc_location(self):
+        # The gRPC clients do not present a client certificate yet, so keep them
+        # off the mTLS endpoint that the HTTP path may use.
+        return self._endpoint or _location()
+
+    async def _get_grpc_client(self):
+        if self._grpc_client is None:
+            client_options = ClientOptions(quota_project_id=self._user_project)
+            if self._grpc_location:
+                # client_options expects only the host:port, without any protocol or path components.
+                endpoint = self._grpc_location.split("://")[-1].split("/")[0]
+                client_options.api_endpoint = endpoint
+            self._grpc_client = AsyncGrpcClient(
+                credentials=self.credential,
+                client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                client_options=client_options,
+            )
+        return self._grpc_client
+
+    async def _get_control_plane_client(self):
+        if self._storage_control_client is None:
+
+            # Initialize the storage control plane client for bucket
+            # metadata operations
+            transport_cls = (
+                storage_control_v2.StorageControlAsyncClient.get_transport_class(
+                    "grpc_asyncio"
+                )
+            )
+            channel_kwargs = {
+                "credentials": self.credential,
+                "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
+                "quota_project_id": self._user_project,
+                # Prepend before transport_cls(channel=...) appends its logging interceptor.
+                "interceptors": [ControlPlaneTelemetryInterceptor()],
+            }
+            if self._grpc_location:
+                # Extract host:port safely (strips protocol and trailing URL paths if any).
+                endpoint = self._grpc_location.split("://")[-1].split("/")[0]
+                channel_kwargs["host"] = endpoint
+
+            channel = transport_cls.create_channel(**channel_kwargs)
+
+            transport = transport_cls(channel=channel)
+            self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
+                transport=transport
+            )
+        return self._storage_control_client
+
+    async def _close_resources(self):
+        """
+        Close gRPC clients, channels, and other resources.
+
+        Order matters: pooled MRDs ride on the gRPC channel, so the MRD pool
+        cache must be drained BEFORE the gRPC transport is closed. The storage
+        control client owns a separate channel and is independent.
+        """
+        if self._mrd_pool_cache is not None:
+            try:
+                await self._mrd_pool_cache.close()
+            except Exception as e:
+                logger.warning(f"Failed to close MRDPoolCache: {e}")
+        if self._storage_control_client is not None:
+            try:
+                await self._storage_control_client.transport.close()
+            except Exception as e:
+                logger.warning(f"Failed to close storage_control_client: {e}")
+            self._storage_control_client = None
+        if self._grpc_client is not None:
+            try:
+                await self._grpc_client.grpc_client.transport.close()
+            except Exception as e:
+                logger.warning(f"Failed to close grpc_client: {e}")
+            self._grpc_client = None
+
+    async def _lookup_bucket_layout(self, bucket):
+        if bucket in self._storage_layout_cache:
+            return self._storage_layout_cache[bucket]
+        bucket_layout = await self._get_bucket_layout(bucket)
+        # Don't cache UNKNOWN storage class.
+        # This ensures that subsequent operations will retry the lookup,
+        # allowing it to recover when the transient error resolves.
+        if bucket_layout.storage_class == StorageClass.UNKNOWN:
+            return bucket_layout
+        self._storage_layout_cache[bucket] = bucket_layout
+        return self._storage_layout_cache[bucket]
+
+    # Not covered by mirror_gcs_methods (name doesn't follow the `_x` -> `x` convention).
+    _sync_lookup_bucket_layout = _gcs_sync_wrapper(_lookup_bucket_layout)
+
+    def invalidate_storage_layout_cache(self, bucket=None):
+        """Forget cached bucket layouts so the next operation looks them up again.
+
+        The layout of each bucket (zonal, hierarchical namespace, Rapid Cache
+        Ultra) is looked up the first time this filesystem instance uses the
+        bucket. It stays cached until it is invalidated here, or until an
+        appendable write to a Rapid Cache Ultra bucket fails to open and the
+        re-checked layout no longer reports Rapid Cache Ultra. Call this method
+        after enabling or disabling Rapid Cache Ultra on a bucket that this
+        instance already used, so that later reads and writes pick the
+        matching data path. It only clears in-memory state and sends no
+        request.
+
+        Parameters
+        ----------
+        bucket: str, optional
+            A bucket name, or any path inside the bucket such as
+            ``"gs://bucket/key"``. When omitted, the cached layouts of all
+            buckets are dropped. A bucket without a cached layout is ignored.
+        """
+        if bucket is None:
+            self._storage_layout_cache.clear()
+            return
+        bucket_name, _, _ = self.split_path(bucket)
+        self._storage_layout_cache.pop(bucket_name, None)
+
+    async def _get_bucket_layout(self, bucket):
+        try:
+            client = await self._get_control_plane_client()
+            bucket_name_value = f"projects/_/buckets/{bucket}/storageLayout"
+            logger.debug(f"get_storage_layout request for name: {bucket_name_value}")
+            response = await client.get_storage_layout(
+                name=bucket_name_value,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+
+            if response.location_type == "zone":
+                storage_class = StorageClass.RAPID
+            else:
+                storage_class = StorageClass.STANDARD
+
+            if response.location_type == "zone" or (
+                response.hierarchical_namespace
+                and response.hierarchical_namespace.enabled
+            ):
+                namespace_layout = NamespaceLayout.HIERARCHICAL
+            else:
+                namespace_layout = NamespaceLayout.NON_HIERARCHICAL
+
+            rapid_cache_info = getattr(response, "rapid_cache_info", None)
+            cache_type = (
+                getattr(rapid_cache_info, "cache_type", "") if rapid_cache_info else ""
+            )
+            if cache_type == "rapid-cache-ultra":
+                caching_tier = CachingTier.RAPID_CACHE_ULTRA
+            elif cache_type == "rapid-cache":
+                caching_tier = CachingTier.RAPID_CACHE
+            else:
+                caching_tier = CachingTier.NONE
+
+            return BucketLayout(
+                storage_class=storage_class,
+                caching_tier=caching_tier,
+                namespace_layout=namespace_layout,
+            )
+        except api_exceptions.NotFound:
+            logger.warning(
+                f"Error: Bucket {bucket} not found or you lack permissions for "
+                f"storage layout api used to detect bucket layout. Falling back to GCSFileSystem."
+            )
+            return BucketLayout.UNKNOWN
+        except Exception as e:
+            logger.warning(
+                f"Could not determine bucket layout for bucket name {bucket}: {e}, falling back to GCSFileSystem"
+            )
+            # Default to UNKNOWN in case bucket layout is not obtained
+            return BucketLayout.UNKNOWN
+
+    # Plain sync method (not covered by mirror_gcs_methods). The bucket-layout lookup and, for Rapid
+    # (zonal) reads, the MRD pool's `_info` request in ZonalFile.__init__ run before GCSFile.__init__
+    # caches `caller_framework`; scope telemetry for the whole open so they carry the caller's
+    # framework (detected once, on the caller thread) and GCSFile.__init__ reuses it.
+    @with_telemetry_context
+    def _open(
+        self,
+        path,
+        mode="rb",
+        block_size=None,
+        cache_options=None,
+        acl=None,
+        consistency=None,
+        metadata=None,
+        autocommit=True,
+        fixed_key_metadata=None,
+        generation=None,
+        cache_type=None,
+        **kwargs,
+    ):
+        """
+        Open a file.
+        """
+        bucket, _, _ = self.split_path(path)
+        bucket_layout = self._sync_lookup_bucket_layout(bucket)
+        if mode in ("wb", "ab", "xb"):
+            use_zonal_file = self._uses_grpc_write_path(bucket_layout)
+        else:
+            use_zonal_file = "+" not in mode and bucket_layout.uses_grpc_data_path
+        file_cls = ZonalFile if use_zonal_file else GCSFile
+        finalize_on_close = kwargs.pop("finalize_on_close", None)
+        if use_zonal_file:
+            kwargs["finalize_on_close"] = self._resolve_finalize_on_close(
+                bucket_layout, finalize_on_close
+            )
+        return file_cls(
+            self,
+            path,
+            mode,
+            block_size=block_size or self.default_block_size,
+            cache_type=cache_type or self.default_cache_type,
+            cache_options=cache_options,
+            consistency=consistency or self.consistency,
+            metadata=metadata,
+            acl=acl,
+            autocommit=autocommit,
+            fixed_key_metadata=fixed_key_metadata,
+            generation=generation,
+            **kwargs,
+        )
+
+    # Replacement method for _process_limits to support new params (offset and length) for MRD.
+    async def _process_limits_to_offset_and_length(
+        self, path, start, end, file_size=None
+    ):
+        """
+        Calculates the read offset and length from start and end parameters.
+
+        Args:
+            path (str): The path to the file.
+            start (int | None): The starting byte position.
+            end (int | None): The ending byte position.
+            file_size (int | None): The total size of the file. If None, it will be fetched via _info().
+
+        Returns:
+            tuple: A tuple containing (offset, length).
+        """
+        size = file_size
+
+        async def _get_size():
+            nonlocal size
+            if size is None:
+                size = (await self._info(path))["size"]
+            return size
+
+        if start is None:
+            offset = 0
+        elif start < 0:
+            offset = max(0, await _get_size() + start)
+        else:
+            offset = start
+
+        if end is None:
+            effective_end = await _get_size()
+        elif end < 0:
+            effective_end = await _get_size() + end
+        else:
+            effective_end = end
+
+        # If the requested end is before/ same as the start, return empty.
+        if effective_end <= offset:
+            return offset, 0
+        else:
+            length = effective_end - offset  # Normal case
+            s = await _get_size()
+            if effective_end > s:
+                length = max(0, s - offset)  # Clamp and ensure non-negative
+
+        return offset, length
+
+    # Not covered by mirror_gcs_methods (name doesn't follow the `_x` -> `x` convention).
+    sync_process_limits_to_offset_and_length = _gcs_sync_wrapper(
+        _process_limits_to_offset_and_length
+    )
+
+    async def _is_zonal_bucket(self, bucket):
+        bucket_layout = await self._lookup_bucket_layout(bucket)
+        return bucket_layout.is_zonal
+
+    async def _is_rcu_bucket(self, bucket):
+        bucket_layout = await self._lookup_bucket_layout(bucket)
+        return bucket_layout.is_rcu
+
+    async def _uses_grpc_data_path(self, bucket):
+        bucket_layout = await self._lookup_bucket_layout(bucket)
+        return bucket_layout.uses_grpc_data_path
+
+    def _uses_grpc_write_path(self, bucket_layout):
+        """Whether writes to a bucket with this layout use the appendable writer.
+
+        Zonal buckets always do, and RCU buckets only with ``rcu_rapid_write``.
+        Other writes use the HTTP upload path.
+        """
+        return bool(
+            bucket_layout.is_zonal or (bucket_layout.is_rcu and self.rcu_rapid_write)
+        )
+
+    async def _should_use_grpc_write_path(self, bucket):
+        """Whether writes to ``bucket`` use the gRPC appendable writer."""
+        return self._uses_grpc_write_path(await self._lookup_bucket_layout(bucket))
+
+    def _resolve_finalize_on_close(self, bucket_layout, finalize_on_close=None):
+        """Return the per-call value, else the filesystem default, else True for RCU."""
+        if finalize_on_close is not None:
+            return finalize_on_close
+        fs_default = getattr(self, "finalize_on_close", None)
+        if fs_default is not None:
+            return fs_default
+        return bucket_layout.is_rcu
+
+    async def _init_aaow(
+        self,
+        bucket,
+        key,
+        generation=None,
+        flush_interval_bytes=None,
+        if_generation_match=None,
+    ):
+        """Open an AsyncAppendableObjectWriter for ``bucket/key``.
+
+        RCU buckets default new objects to the ``STANDARD`` storage class,
+        which appendable writes reject, so writes to them request
+        ``storage_class="RAPID"``: the object lands in the zonal cache and the
+        server later copies it to regional storage. Zonal buckets already
+        default to ``RAPID``, so their writes leave ``storage_class`` unset.
+
+        If the cached layout is known and no longer uses the gRPC data path,
+        for example in a file opened while the bucket was cached as RCU that
+        writes after another write found RCU disabled,
+        ``RapidCacheUltraDisabledError`` is raised without opening a writer.
+
+        On a bucket cached as RCU, an open that fails with a
+        ``google.api_core`` ``GoogleAPICallError`` re-checks the layout;
+        precondition errors such as ``FileExistsError`` are not re-checked.
+        The re-check reuses a layout without RCU that another write already
+        cached, and otherwise looks the layout up once. If the layout no
+        longer reports RCU, it is cached and ``RapidCacheUltraDisabledError``
+        is raised from the original error; otherwise the original error is
+        re-raised and the cached layout is kept.
+        """
+        await self._get_grpc_client()
+        layout = await self._lookup_bucket_layout(bucket)
+        if (
+            layout.storage_class != StorageClass.UNKNOWN
+            and not layout.uses_grpc_data_path
+        ):
+            raise _rapid_cache_ultra_disabled_error(bucket)
+        is_rcu = layout.is_rcu
+        try:
+            return await zb_hns_utils.init_aaow(
+                self.grpc_client,
+                bucket,
+                key,
+                generation,
+                flush_interval_bytes,
+                if_generation_match=if_generation_match,
+                storage_class="RAPID" if is_rcu else None,
+            )
+        # Catch every API error on purpose: once RCU is disabled the server rejects
+        # writes with more than one status, e.g. InvalidArgument for new objects
+        # ("Project ... may not create storageClass RAPID buckets ...") and
+        # FailedPrecondition for appends ("Cannot write rapid object to zone ...").
+        except api_exceptions.GoogleAPICallError as e:
+            if not is_rcu:
+                raise
+            cached_layout = self._storage_layout_cache.get(bucket)
+            if cached_layout is None or cached_layout.is_rcu:
+                # No other write has refreshed the layout yet: look it up once.
+                fresh_layout = await self._get_bucket_layout(bucket)
+                if (
+                    fresh_layout.storage_class == StorageClass.UNKNOWN
+                    or fresh_layout.is_rcu
+                ):
+                    raise
+                self._storage_layout_cache[bucket] = fresh_layout
+            raise _rapid_cache_ultra_disabled_error(bucket) from e
+
+    @staticmethod
+    def _resolve_cache_config(kwargs):
+        """Resolves cache_type and cache_source from kwargs if not already provided."""
+        kwargs = kwargs or {}
+        cache_type = kwargs.get("cache_type")
+        cache_source = kwargs.get("cache_source")
+        if not cache_type or not cache_source:
+            cache_type, cache_source = _get_prefetcher_and_cache_config(
+                cache_type, kwargs
+            )
+        return cache_type, cache_source
+
+    async def _fetch_range_split(
+        self,
+        path,
+        start,
+        chunk_lengths,
+        concurrency,
+        mrd=None,
+        size=None,
+        **kwargs,
+    ):
+        """
+        Reading multiple adjacent ranges concurrently.
+
+        Delegates concurrent fetching of individual chunks directly to `_cat_file`.
+        """
+        file_size = size or await _get_mrd_size(mrd)
+        if file_size is None:
+            logger.warning(
+                f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
+                "Falling back to _info() to get the file size."
+            )
+            file_size = (await self._info(path))["size"]
+
+        start_offset = start if start is not None else 0
+        if start_offset >= file_size or start_offset + sum(chunk_lengths) > file_size:
+            raise RuntimeError("Request not satisfiable.")
+
+        pool_created_here = False
+        bucket, object_name, generation = self.split_path(path)
+
+        # Only resolve if the config wasn't already passed down (e.g., from ZonalFile)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        if mrd is None:
+            # If no mrd is provided, we create one with pool size equal to passed concurrency.
+            pool_size = min(len(chunk_lengths), concurrency)
+            mrd = await self._mrd_pool_cache.get(
+                bucket,
+                object_name,
+                generation,
+                pool_size=pool_size,
+                cache_type=cache_type,
+                cache_source=cache_source,
+            )
+            pool_created_here = True
+
+        tasks = []
+        try:
+            current_offset = start_offset
+
+            cat_kwargs = kwargs.copy()
+            cat_kwargs["cache_type"] = cache_type
+            cat_kwargs["cache_source"] = cache_source
+
+            for length in chunk_lengths:
+                end_offset = current_offset + length
+                tasks.append(
+                    asyncio.create_task(
+                        self._cat_file(
+                            path,
+                            start=current_offset,
+                            end=end_offset,
+                            mrd=mrd,
+                            # Distribute the concurrency budget proportionally.
+                            # Since these outer tasks are already concurrent, this is typically 1.
+                            # However, if a large chunk dominates the total size, it receives
+                            # higher concurrency to prevent it from becoming a bottleneck.
+                            concurrency=max(
+                                1, length * concurrency // sum(chunk_lengths)
+                            ),
+                            **cat_kwargs,
+                        )
+                    )
+                )
+                current_offset = end_offset
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Bubble up any exceptions encountered during concurrent fetching
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+
+            return results
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if pool_created_here:
+                await mrd.close()
+
+    async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
+        """Helper to handle concurrent chunk downloads cleanly."""
+        ranges = split_range(length, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY)
+
+        tasks = []
+        views = []
+        has_error = False
+
+        # The master buffer manages its own allocation under the hood
+        master_buffer = DirectMemmoveBuffer(length, self._memmove_executor)
+
+        async def _download(o, s, view, mrd_or_pool):
+            async with _get_mrd_from_pool_or_mrd(mrd_or_pool) as m_client:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"mrd path: {m_client.object_name} | "
+                        f"Requested range: [({o}, {s})]"
+                    )
+                await m_client.download_ranges([(o, s, view)])
+
+        for relative_offset, actual_size in ranges:
+            part_offset = offset + relative_offset
+
+            # Give each task a restricted view of the master buffer
+            view = master_buffer.get_view(part_offset - offset, actual_size)
+            views.append(view)
+
+            tasks.append(
+                asyncio.create_task(
+                    _download(part_offset, actual_size, view, mrd_or_pool)
+                )
+            )
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    has_error = True
+                    raise res
+            for view in views:
+                view.close()
+        except BaseException:
+            has_error = True
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            try:
+                master_buffer.close()
+            except Exception:
+                # If we are already handling a network/download exception,
+                # ignore the exception from buffer (which is just a symptom of the drop).
+                # If there's no download error, this means the buffer logic
+                # itself failed, so we must surface the error.
+                if not has_error:
+                    raise
+
+        return master_buffer.get_value()
+
+    async def _cat_file(
+        self,
+        path,
+        start=None,
+        end=None,
+        mrd=None,
+        **kwargs,
+    ):
+        """Fetch a file's contents as bytes, with an optimized path for Zonal and RCU buckets.
+
+        This method overrides the parent `_cat_file` to read objects in Zonal and RCU buckets using gRPC.
+
+        Args:
+            path (str): The full GCS path to the file (e.g., "bucket/object").
+            start (int, optional): The starting byte position to read from.
+            end (int, optional): The ending byte position to read to.
+            mrd (AsyncMultiRangeDownloader, MRDPool, optional): An existing multi-range
+                downloader instance or a pool of MRD. If not provided, a new one will be
+                created for Zonal and RCU buckets.
+
+        Returns:
+            bytes: The content of the file or file range.
+        """
+        concurrency = kwargs.pop("concurrency", 1)
+        pool_created_here = False
+
+        # A new MRDPool is required when read is done directly by the
+        # GCSFilesystem class without creating a GCSFile object first.
+        # Only resolve if the config wasn't already passed down (e.g., from ZonalFile)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        if mrd is None:
+            bucket, object_name, generation = self.split_path(path)
+            if not await self._uses_grpc_data_path(bucket):
+                # Fall back to default implementation if not a Zonal or RCU bucket
+                return await super()._cat_file(
+                    path, start=start, end=end, concurrency=concurrency, **kwargs
+                )
+
+            # Instantiate an MRDPool locally for this call
+            mrd = await self._mrd_pool_cache.get(
+                bucket,
+                object_name,
+                generation,
+                pool_size=concurrency,
+                cache_type=cache_type,
+                cache_source=cache_source,
+            )
+            pool_created_here = True
+
+        try:
+            file_size = await _get_mrd_size(mrd)
+            if file_size is None:
+                logger.warning(
+                    f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
+                    "Falling back to _info() to get the file size. "
+                    "This may result in incorrect behavior for unfinalized objects."
+                )
+                file_size = (await self._info(path))["size"]
+
+            offset, length = await self._process_limits_to_offset_and_length(
+                path, start, end, file_size
+            )
+
+            if length == 0:
+                return b""
+
+            return await self._concurrent_mrd_fetch(
+                offset,
+                length,
+                concurrency,
+                mrd,
+            )
+
+        finally:
+            # If we created a temporary pool specifically for this _cat_file call, clean it up
+            if pool_created_here:
+                await mrd.close()
+
+    @staticmethod
+    def _allocate_streams(counts, total_streams, per_object_cap):
+        """Split a stream budget across objects in proportion to their range counts.
+
+        Every object gets one stream. The rest of the budget goes out one
+        stream at a time to the object with the most ranges per stream
+        (D'Hondt), up to ``min(count, per_object_cap)`` streams per object.
+        When there are at least as many objects as streams, every object gets
+        one stream; callers must then bound how many objects run concurrently
+        to ``total_streams``.
+
+        Returns:
+            list[int]: Streams per object, same order as ``counts``. The sum is
+            ``<= max(total_streams, len(counts))``.
+        """
+        caps = [max(1, min(c, per_object_cap)) for c in counts]
+        alloc = [1] * len(counts)
+        # Max-heap on count / alloc; ties go to the lower index.
+        heap = [(-c, i) for i, c in enumerate(counts) if caps[i] > 1]
+        heapq.heapify(heap)
+        for _ in range(min(total_streams, sum(caps)) - len(counts)):
+            _, j = heapq.heappop(heap)
+            alloc[j] += 1
+            if alloc[j] < caps[j]:
+                heapq.heappush(heap, (-counts[j] / alloc[j], j))
+        return alloc
+
+    @staticmethod
+    def _split_ranges_across_streams(requests, num_streams):
+        """Partition range requests into at most ``num_streams`` byte-balanced groups.
+
+        Uses longest-processing-time-first assignment so a few large ranges do
+        not end up on the same stream. Each group is returned sorted by offset.
+
+        Args:
+            requests (list[tuple[int, int, int]]): ``(index, offset, length)`` tuples.
+            num_streams (int): Maximum number of groups to produce.
+
+        Returns:
+            list[list[tuple[int, int, int]]]: Non-empty groups of requests.
+        """
+        num_streams = max(1, min(num_streams, len(requests)))
+        if num_streams == 1:
+            return [sorted(requests, key=lambda r: r[1])] if requests else []
+
+        groups = [[] for _ in range(num_streams)]
+        # Hand each range, largest first, to the group with the fewest bytes.
+        heap = [(0, g) for g in range(num_streams)]
+        for req in sorted(requests, key=lambda r: r[2], reverse=True):
+            load, g = heapq.heappop(heap)
+            groups[g].append(req)
+            heapq.heappush(heap, (load + req[2], g))
+        return [sorted(g, key=lambda r: r[1]) for g in groups if g]
+
+    async def _download_range_group(self, pool, group):
+        """Download a group of ranges on a single MRD from ``pool``.
+
+        All ranges in the group are issued through one ``download_ranges`` call
+        (chunked at ``MRD_MAX_RANGES``), so they are multiplexed over a single
+        bidi-read stream.
+
+        Returns:
+            list[bytes]: One payload per request in ``group``, in the same order.
+        """
+        # One buffer per range. download_ranges writes each range's bytes into
+        # its view as they arrive.
+        buffers = [
+            DirectMemmoveBuffer(length, self._memmove_executor)
+            for _, _, length in group
+        ]
+        views = [buf.get_view(0, length) for buf, (_, _, length) in zip(buffers, group)]
+        has_error = False
+        try:
+            async with _get_mrd_from_pool_or_mrd(pool) as mrd:
+                for i in range(0, len(group), MRD_MAX_RANGES):
+                    chunk = range(i, min(i + MRD_MAX_RANGES, len(group)))
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"mrd path: {mrd.object_name} | Requested "
+                            f"{len(chunk)} ranges: "
+                            f"{[(group[k][1], group[k][2]) for k in chunk]}"
+                        )
+                    await mrd.download_ranges(
+                        [(group[k][1], group[k][2], views[k]) for k in chunk]
+                    )
+            # Raises BufferError if a range came back short.
+            for view in views:
+                view.close()
+        except BaseException:
+            has_error = True
+            raise
+        finally:
+            # Always close the buffers, but don't let a close error replace
+            # the error that stopped the download.
+            first_close_error = None
+            for buf in buffers:
+                try:
+                    buf.close()
+                except Exception as e:
+                    if first_close_error is None:
+                        first_close_error = e
+            if not has_error and first_close_error is not None:
+                raise first_close_error
+        return [buf.get_value() for buf in buffers]
+
+    def _zonal_file_stream_coros(
+        self, path, idxs, starts, ends, num_streams, results, limiter, **kwargs
+    ):
+        """Build ``num_streams`` coroutines that share one MRD pool for ``path``.
+
+        Each coroutine runs under ``limiter`` (an ``asyncio.Semaphore`` bounding
+        the call's concurrency). The first one to run opens the pool and splits
+        the object's non-empty ranges across streams; the last one to finish,
+        including when the streams are cancelled, closes the pool. Each
+        coroutine writes its assigned ranges into ``results``.
+        """
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+        bucket, object_name, generation = self.split_path(path)
+        init_lock = asyncio.Lock()
+        initialized = False
+        pool = None
+        groups = []
+        remaining = num_streams
+
+        async def _init():
+            nonlocal initialized, pool, groups
+            if initialized:
+                return
+            async with init_lock:
+                if initialized:
+                    return
+                try:
+                    pool = await self._mrd_pool_cache.get(
+                        bucket,
+                        object_name,
+                        generation,
+                        pool_size=num_streams,
+                        cache_type=cache_type,
+                        cache_source=cache_source,
+                    )
+                    # MRDPool.initialize() copies persisted_size from its first MRD.
+                    file_size = pool.persisted_size
+                    if file_size is None:
+                        logger.warning(
+                            f"AsyncMultiRangeDownloader (MRD) for {path} has no "
+                            "'persisted_size'. Falling back to _info() to get the file size."
+                        )
+                        file_size = (await self._info(path))["size"]
+
+                    # Empty ranges keep b"" and are not sent to the server.
+                    requests = []
+                    for i in idxs:
+                        offset, length = (
+                            await self._process_limits_to_offset_and_length(
+                                path, starts[i], ends[i], file_size
+                            )
+                        )
+                        if length > 0:
+                            requests.append((i, offset, length))
+                        else:
+                            results[i] = b""
+
+                    groups = self._split_ranges_across_streams(requests, num_streams)
+                except BaseException as e:
+                    if pool is not None:
+                        p, pool = pool, None
+                        await _close_pool(p)
+                    if not isinstance(e, Exception):
+                        raise
+                    for i in idxs:
+                        results[i] = e
+                finally:
+                    initialized = True
+
+        async def _run_stream(group_idx):
+            nonlocal remaining, pool
+            acquired = False
+            try:
+                await limiter.acquire()
+                acquired = True
+                await _init()
+                if pool is not None and group_idx < len(groups):
+                    group = groups[group_idx]
+                    try:
+                        data_list = await self._download_range_group(pool, group)
+                    except Exception as e:
+                        for i, _, _ in group:
+                            results[i] = e
+                    else:
+                        for (i, _, _), data in zip(group, data_list):
+                            results[i] = data
+            finally:
+                # Also runs when the stream is cancelled while waiting for the
+                # limiter, opening the pool or downloading. _cat_ranges starts
+                # every stream as a task and awaits them all, so the pool can
+                # only be open once all of its streams have entered this try,
+                # and the last one to leave it closes the pool before releasing
+                # its limiter slot.
+                try:
+                    remaining -= 1
+                    if remaining == 0 and pool is not None:
+                        p, pool = pool, None
+                        await _close_pool(p)
+                finally:
+                    if acquired:
+                        limiter.release()
+
+        return [_run_stream(g) for g in range(num_streams)]
+
+    async def _cat_ranges(
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        batch_size=None,
+        on_error="return",
+        **kwargs,
+    ):
+        """Get the contents of byte ranges from one or more files.
+
+        For Zonal and RCU buckets, ranges are grouped per object and served by a single
+        MRD pool per object. Each object's ranges are split into byte-balanced
+        groups, one per pooled MRD, and every group is sent as one multi-range
+        ``download_ranges`` call. ``batch_size`` bounds the total number of
+        concurrent MRD streams across all objects, subject to the per-object
+        cap (``-1`` means at most one per range; ``None`` or ``0`` select the
+        fsspec default). Paths in other buckets, and any call with ``max_gap`` set,
+        use the default fsspec implementation.
+
+        Zonal and RCU keyword arguments:
+            concurrency (int, optional): Maximum MRD streams per object,
+                instead of ``MAX_ZONAL_STREAMS_PER_OBJECT``. Also forwarded to
+                the fsspec path for files in other buckets.
+
+        With ``on_error="return"``, a failure while downloading a group of
+        ranges is returned for every range in that group, and a failure to
+        open an object is returned for all of that object's ranges.
+        """
+        if max_gap is not None:
+            return await super()._cat_ranges(
+                paths,
+                starts,
+                ends,
+                max_gap=max_gap,
+                batch_size=batch_size,
+                on_error=on_error,
+                **kwargs,
+            )
+        # Same argument checks as fsspec's _cat_ranges.
+        if not isinstance(paths, list):
+            raise TypeError
+        if not isinstance(starts, Iterable):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, Iterable):
+            ends = [ends] * len(paths)
+        starts, ends = list(starts), list(ends)
+        if len(starts) != len(paths) or len(ends) != len(paths):
+            raise ValueError
+
+        # Group range indices by path so ranges for the same object share one MRD pool.
+        by_path = {}
+        for i, p in enumerate(paths):
+            by_path.setdefault(p, []).append(i)
+
+        zonal, other = {}, []
+        for p, idxs in by_path.items():
+            bucket, _, _ = self.split_path(p)
+            if await self._uses_grpc_data_path(bucket):
+                zonal[p] = idxs
+            else:
+                other.extend(idxs)
+
+        if not zonal:
+            return await super()._cat_ranges(
+                paths,
+                starts,
+                ends,
+                batch_size=batch_size,
+                on_error=on_error,
+                **kwargs,
+            )
+
+        concurrency = kwargs.pop("concurrency", None)
+        per_object_cap = (
+            max(1, int(concurrency))
+            if concurrency is not None
+            else self.MAX_ZONAL_STREAMS_PER_OBJECT
+        )
+        # None or 0 selects the same default as fsspec.
+        batch_size = batch_size or self.batch_size or asyn._get_batch_size(True)
+        n_zonal = sum(len(idxs) for idxs in zonal.values())
+        if batch_size == -1:
+            # fsspec's "no limit": at most one stream per range.
+            stream_budget = n_zonal
+        elif batch_size > 0:
+            stream_budget = min(batch_size, n_zonal)
+        else:
+            raise ValueError(f"batch_size must be positive or -1, got {batch_size}")
+        total_streams = max(1, stream_budget)
+
+        results = [None] * len(paths)
+        zonal_items = list(zonal.items())
+        allocs = self._allocate_streams(
+            [len(idxs) for _, idxs in zonal_items],
+            total_streams,
+            per_object_cap,
+        )
+        # Bounds concurrently running coroutines (zonal streams plus non-zonal
+        # ranges), like fsspec's _run_coros_in_chunks does.
+        limiter = asyncio.Semaphore(len(paths) if batch_size == -1 else batch_size)
+        coros = []
+        for (p, idxs), num_streams in zip(zonal_items, allocs):
+            coros.extend(
+                self._zonal_file_stream_coros(
+                    p,
+                    idxs,
+                    starts,
+                    ends,
+                    num_streams,
+                    results,
+                    limiter,
+                    **kwargs,
+                )
+            )
+        if other:
+            # Same per-range _cat_file implementation as fsspec's _cat_ranges.
+            other_kwargs = dict(kwargs)
+            if concurrency is not None:
+                other_kwargs["concurrency"] = concurrency
+
+            async def _cat_other(i):
+                async with limiter:
+                    try:
+                        results[i] = await self._cat_file(
+                            paths[i], start=starts[i], end=ends[i], **other_kwargs
+                        )
+                    except Exception as e:
+                        results[i] = e
+
+            for i in other:
+                coros.append(_cat_other(i))
+
+        # Every coroutine runs as a task of this call. Unlike gather,
+        # asyncio.wait leaves the tasks alone when this call is cancelled, so
+        # the except block is the only place that cancels them: each task is
+        # cancelled once and awaited, so in-flight streams release their MRDs,
+        # each object's pool is closed by its last stream, and (unless this
+        # call is cancelled again while waiting) no task outlives this call.
+        tasks = [asyncio.create_task(c) for c in coros]
+        try:
+            await asyncio.wait(tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.wait(tasks)
+            raise
+        # The tasks store ordinary errors in `results`, so this only re-raises
+        # a cancellation or an error from closing a pool.
+        for t in tasks:
+            t.result()
+
+        # Like fsspec, raise the first error in input order.
+        if on_error != "return":
+            for r in results:
+                if isinstance(r, BaseException):
+                    raise r
+        return results
+
+    async def _is_bucket_hns_enabled(self, bucket):
+        """Checks if a bucket has Hierarchical Namespace enabled."""
+        try:
+            bucket_layout = await self._lookup_bucket_layout(bucket)
+        except Exception as e:
+            logger.warning(
+                f"Could not determine if bucket '{bucket}' is HNS-enabled, falling back to default non-HNS: {e}",
+                stack_info=True,
+            )
+            return False
+
+        return bucket_layout.is_hierarchical
+
+    async def _wait_for_folder_rename(
+        self, operation, path1, path2, request_id, timeout
+    ):
+        """Waits for a RenameFolder operation with poll_lro; raises TimeoutError on timeout."""
+        try:
+            await poll_lro(operation, timeout=timeout)
+        except asyncio.TimeoutError as e:
+            op_name = operation.operation.name or request_id
+            raise TimeoutError(
+                f"HNS folder rename from '{path1}' to '{path2}' (op: {op_name}) "
+                f"did not finish within {timeout:g}s. The rename "
+                "may still complete on the server; check the destination before "
+                "retrying."
+            ) from e
+
+    async def _mv(self, path1, path2, **kwargs):
+        """
+        Move a file or directory. Overrides the parent `_mv` to provide an
+        optimized, atomic implementation for renaming folders and moving files
+        in HNS-enabled buckets. Falls back to the parent's object-level
+        copy-and-delete implementation for non-HNS buckets.
+
+        Pass ``poll_timeout`` (seconds, default 300, ``None`` for no
+        limit) to change how long an HNS folder rename waits before raising
+        ``TimeoutError``. It has no effect when ``fast_lro_polling`` is False.
+        """
+        # Strip the folder-only option before any fallback delegates to object copy.
+        poll_timeout = kwargs.pop("poll_timeout", _HNS_RENAME_FOLDER_LRO_TIMEOUT)
+        if poll_timeout is not None and (
+            isinstance(poll_timeout, bool) or not (0 < poll_timeout < float("inf"))
+        ):
+            raise ValueError(
+                "poll_timeout must be a finite positive number of seconds, "
+                f"or None for no limit; got {poll_timeout!r}"
+            )
+
+        if path1 == path2:
+            logger.debug(
+                "%s mv: The paths are the same, so no files/directories were moved.",
+                self,
+            )
+            return
+
+        if (
+            isinstance(path1, list)
+            or isinstance(path2, list)
+            or (isinstance(path1, str) and has_magic(path1))
+        ):
+            return await super()._mv(path1, path2, **kwargs)
+
+        bucket1, key1, _ = self.split_path(path1)
+        bucket2, key2, _ = self.split_path(path2)
+
+        is_hns = await self._is_bucket_hns_enabled(bucket1)
+
+        if not is_hns:
+            logger.debug(
+                f"Not an HNS bucket. Falling back to object-level mv for '{path1}' to '{path2}'."
+            )
+            return await super()._mv(path1, path2, **kwargs)
+
+        rename_submitted = False
+        try:
+            info1 = await self._info(path1)
+            is_folder = info1.get("type") == "directory"
+
+            # We only use HNS rename if the source is a folder and the move is
+            # within the same bucket.
+            if is_folder and bucket1 == bucket2 and key1:
+                logger.debug(
+                    f"Using HNS-aware folder rename for '{path1}' to '{path2}'."
+                )
+                source_folder_name = f"projects/_/buckets/{bucket1}/folders/{key1}"
+                destination_folder_id = key2 or key1.rstrip("/").split("/")[-1]
+
+                request = storage_control_v2.RenameFolderRequest(
+                    name=source_folder_name,
+                    destination_folder_id=destination_folder_id,
+                    request_id=str(uuid.uuid4()),
+                )
+
+                logger.debug(f"rename_folder request: {request}")
+                client = await self._get_control_plane_client()
+                operation = await client.rename_folder(
+                    request=request,
+                    retry=self._get_retry_config(),
+                    timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+                )
+                rename_submitted = True
+                try:
+                    if self.fast_lro_polling:
+                        await self._wait_for_folder_rename(
+                            operation,
+                            path1,
+                            path2,
+                            request.request_id,
+                            poll_timeout,
+                        )
+                    else:
+                        await unwrap_operation_result(operation)
+                    self._update_dircache_after_rename(
+                        path1, f"{bucket2}/{destination_folder_id.rstrip('/')}"
+                    )
+                except BaseException as e:
+                    # The rename may still be running or may already have
+                    # finished, so cached listings can't be trusted.
+                    self.invalidate_cache(path1)
+                    self.invalidate_cache(path2)
+                    logger.warning(
+                        "HNS rename '%s' -> '%s' did not complete (op: %s): %r",
+                        path1,
+                        path2,
+                        operation.operation.name or request.request_id,
+                        e,
+                    )
+                    raise
+
+                logger.debug(
+                    "Successfully renamed folder from '%s' to '%s'", path1, path2
+                )
+                return
+            elif not is_folder:
+                await self._mv_file(path1, path2)
+                return
+        except Exception as e:
+            if isinstance(e, FileNotFoundError):
+                # If the source doesn't exist, fail fast.
+                raise
+            if isinstance(e, api_exceptions.NotFound):
+                raise FileNotFoundError(
+                    f"Source '{path1}' not found for move operation."
+                ) from e
+            if isinstance(e, api_exceptions.Conflict):
+                # This occurs if the destination folder already exists.
+                # Raise FileExistsError for fsspec compatibility.
+                raise FileExistsError(
+                    f"HNS rename failed due to conflict for '{path1}' to '{path2}'"
+                ) from e
+            if isinstance(e, api_exceptions.FailedPrecondition):
+                raise OSError(f"HNS rename failed: {e}") from e
+            if rename_submitted:
+                # Fall back to copy-and-delete only when the server operation failed,
+                # because after a timeout or cache error the server move may be
+                # active or complete.
+                if not (
+                    operation.operation.done and operation.operation.HasField("error")
+                ):
+                    raise
+
+            logger.warning(f"Could not perform HNS-aware mv: {e}")
+
+        logger.debug(f"Falling back to object-level mv for '{path1}' to '{path2}'.")
+        return await super()._mv(path1, path2, **kwargs)
+
+    async def _list_objects(self, path, prefix="", versions=False, **kwargs):
+        try:
+            return await super()._list_objects(
+                path, prefix=prefix, versions=versions, **kwargs
+            )
+        except FileNotFoundError:
+            bucket, key, _ = self.split_path(path)
+            if key and await self._is_bucket_hns_enabled(bucket):
+                try:
+                    await self._get_directory_info(path, bucket, key, None)
+                    return []
+                except (FileNotFoundError, Exception):
+                    pass
+            raise
+
+    async def _mkdir(
+        self,
+        path,
+        create_parents=False,
+        enable_hierarchical_namespace=False,
+        placement=None,
+        location=None,
+        **kwargs,
+    ):
+        """
+        Create a directory or bucket.
+
+        If the path refers to a bucket (no object key), a new bucket is created.
+        If the path refers to a directory (includes object key), a directory is created.
+
+        Parameters
+        ----------
+        path : str
+            Path to create.
+        create_parents : bool
+            If True, create parent directories if they do not exist.
+            If the path includes a bucket that does not exist, the bucket will also be created.
+        enable_hierarchical_namespace : bool
+            If True, and a bucket is being created, the bucket will have Hierarchical
+            Namespace (HNS) enabled.
+        placement : str, optional
+            If set to a zone (e.g. "us-central1-a"), a Zonal bucket is created.
+            Zonal buckets are HNS-enabled by default.
+            When creating a Zonal bucket, `location` must be passed as a
+            region (e.g. "us-central1"). If `location` is not specified, it defaults
+            to `self.default_location`. The zone specified in `placement` must belong
+            to the region specified in `location`.
+        location : str, optional
+            Location where buckets are created, like 'US' or 'EUROPE-WEST3'.
+            If not provided, defaults to `self.default_location`.
+        **kwargs : dict
+            Additional arguments passed to the bucket creation API.
+
+        Notes
+        -----
+        - For HNS-enabled buckets (including Zonal buckets), this method creates a
+          native folder object.
+        - If `create_parents` is False and a parent directory does not exist in an
+          HNS/Zonal bucket, a FileNotFoundError is raised.
+        - For non-HNS buckets, this falls back to the parent implementation. Since
+          standard GCS has no true directories, `mkdir` on a path with a key is
+          typically a no-op unless `create_parents=True` triggers bucket creation.
+        """
+        path = self._strip_protocol(path)
+        bucket, key, _ = self.split_path(path)
+
+        # Determine if we are requesting creation of a Zonal or HNS bucket
+        should_create_zonal_bucket = placement is not None
+        should_create_hns_bucket = (
+            enable_hierarchical_namespace or should_create_zonal_bucket
+        )
+
+        # Prepare arguments for bucket creation
+        bucket_kwargs = kwargs.copy()
+        if location:
+            bucket_kwargs["location"] = location
+        if should_create_zonal_bucket:
+            bucket_kwargs["customPlacementConfig"] = {"dataLocations": [placement]}
+            bucket_kwargs["storageClass"] = "RAPID"
+
+        if should_create_hns_bucket:
+            bucket_kwargs["hierarchicalNamespace"] = {"enabled": True}
+            # HNS buckets require uniform bucket-level access.
+            bucket_kwargs["iamConfiguration"] = {
+                "uniformBucketLevelAccess": {"enabled": True}
+            }
+            # When uniformBucketLevelAccess is enabled, ACLs cannot be used.
+            # We must explicitly set them to None to prevent the parent
+            # method from using default ACLs.
+            bucket_kwargs["acl"] = None
+            bucket_kwargs["default_acl"] = None
+
+        # Case 1: Path is just a bucket
+        if not key:
+            return await super()._mkdir(
+                path, create_parents=create_parents, **bucket_kwargs
+            )
+
+        # Case 2: Path is a folder
+        is_hns_bucket = False
+
+        # If creating parents and HNS/Zonal requested, ensure bucket exists with correct config
+        if create_parents and should_create_hns_bucket:
+            if not await self._exists(bucket):
+                await super()._mkdir(bucket, create_parents=True, **bucket_kwargs)
+                is_hns_bucket = True
+
+        if not is_hns_bucket:
+            is_hns_bucket = await self._is_bucket_hns_enabled(bucket)
+
+        if is_hns_bucket:
+            return await self._create_hns_folder(path, bucket, key, create_parents)
+
+        return await super()._mkdir(
+            path, create_parents=create_parents, **bucket_kwargs
+        )
+
+    async def _create_hns_folder(
+        self, path, bucket, key, create_parents, exist_ok=True
+    ):
+        path = self._strip_protocol(path).rstrip("/")
+        key = key.rstrip("/")
+        logger.debug(f"Using HNS-aware mkdir for '{path}'.")
+
+        # Preemptively check if the path already exists to ensure fsspec compatibility.
+        # This check is required because GCS natively allows a file and a folder
+        # with the exact same name to co-exist at the same level. Consequently, the GCS
+        # server's create_folder API will succeed silently and not raise a Conflict
+        # if a file already exists at the target path. To enforce standard POSIX/fsspec
+        # filesystem semantics (forbidding file/directory name collisions), we need to
+        # explicitly verify client-side that no file occupies the target path.
+        try:
+            info = await self._info(path)
+            if info["type"] != "directory":
+                raise FileExistsError(f"A file already exists at the path: {path}")
+            if not exist_ok:
+                raise FileExistsError(f"Directory already exists: {path}")
+            return
+        except FileNotFoundError:
+            pass
+
+        parent = f"projects/_/buckets/{bucket}"
+        folder_id = f"{key}/"
+        request = storage_control_v2.CreateFolderRequest(
+            parent=parent,
+            folder_id=folder_id,
+            recursive=create_parents,
+            request_id=str(uuid.uuid4()),
+        )
+        try:
+            logger.debug(f"create_folder request: {request}")
+            client = await self._get_control_plane_client()
+            await client.create_folder(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+            # Instead of invalidating the parent cache, update it (and any cached
+            # ancestors when create_parents=True) to add the new folder entry.
+            self._update_dircache_after_mkdir(path, create_parents=create_parents)
+        except api_exceptions.Conflict as e:
+            logger.debug(f"Conflict detected for path: {path}: {e}")
+            # Under race conditions, folder might have been created concurrently
+            if not exist_ok:
+                raise FileExistsError(f"Directory already exists: {path}") from e
+        except api_exceptions.FailedPrecondition as e:
+            # This error can occur if create_parents=False and the parent dir doesn't exist.
+            # Translate it to FileNotFoundError for fsspec compatibility.
+            raise FileNotFoundError(
+                f"mkdir for '{path}' failed due to a precondition error: {e}"
+            ) from e
+
+    async def _makedirs(self, path, exist_ok=False):
+        """Recursively make directories.
+
+        For HNS-enabled buckets, this natively creates the folder objects recursively.
+        For standard GCS buckets, since folders are simulated, this is a no-op.
+
+        Parameters
+        ----------
+        path : str
+            Leaf directory name.
+        exist_ok : bool (False)
+            If False, will error if the target directory already exists.
+            If True, will succeed silently if it exists as a directory, but
+            will still error if it exists as a file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the target bucket does not exist.
+        FileExistsError
+            If `exist_ok` is False and the directory already exists, or if a
+            file already exists at the target path regardless of `exist_ok`.
+        """
+        path = self._strip_protocol(path)
+        bucket, key, _ = self.split_path(path)
+
+        if bucket in ["", "/"]:
+            raise ValueError("Cannot create root bucket")
+
+        # First, check if the bucket exists
+        if not await self._exists(bucket):
+            raise FileNotFoundError(f"Bucket does not exist: {bucket}")
+
+        if not key:
+            # Bucket-only case: makedirs is not for bucket creation.
+            # Since the bucket exists, raise FileExistsError if not exist_ok.
+            if not exist_ok:
+                raise FileExistsError(f"Bucket already exists: {bucket}")
+            return
+
+        # Check if the bucket is HNS-enabled
+        is_hns = await self._is_bucket_hns_enabled(bucket)
+        if not is_hns:
+            # For non-HNS buckets, directory creation is a no-op
+            return
+
+        # Recursively create the native folders in the HNS bucket
+        await self._create_hns_folder(
+            path, bucket, key, create_parents=True, exist_ok=exist_ok
+        )
+
+    async def _get_directory_info(self, path, bucket, key, generation):
+        """
+        Override to use Storage Control API's get_folder for HNS buckets.
+        For HNS, we avoid calling _ls (_list_objects) entirely.
+        """
+        is_hns = await self._is_bucket_hns_enabled(bucket)
+
+        # If bucket is HNS, use get folder metadata api to determine a directory
+        if is_hns:
+            try:
+                # folder_id is the path relative to the bucket
+                folder_id = key.rstrip("/")
+                folder_resource_name = (
+                    f"projects/_/buckets/{bucket}/folders/{folder_id}"
+                )
+
+                request = storage_control_v2.GetFolderRequest(
+                    name=folder_resource_name, request_id=str(uuid.uuid4())
+                )
+
+                # Verify existence using get_folder API
+                client = await self._get_control_plane_client()
+                response = await client.get_folder(
+                    request=request,
+                    retry=self._get_retry_config(),
+                    timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+                )
+
+                # If successful, return directory metadata
+                return {
+                    "bucket": bucket,
+                    "name": path,
+                    "size": 0,
+                    "storageClass": "DIRECTORY",
+                    "type": "directory",
+                    "ctime": response.create_time,
+                    "mtime": response.update_time,
+                    "metageneration": response.metageneration,
+                }
+            except api_exceptions.NotFound:
+                # If get_folder fails, the folder does not exist.
+                raise FileNotFoundError(path)
+            except Exception as e:
+                # Log unexpected errors
+                logger.error(f"Error fetching folder metadata for {path}: {e}")
+                raise e
+
+        # Fallback to standard GCS behavior for non-HNS buckets
+        return await super()._get_directory_info(path, bucket, key, generation)
+
+    async def _rmdir(self, path):
+        """
+        Deletes an empty directory. Overrides the parent `_rmdir` to delete
+        empty directories in HNS-enabled buckets.
+        """
+        return await self._hns_rmdir(path, delete_placeholder=True)
+
+    async def _hns_rmdir(self, path, delete_placeholder=True):
+        """
+        Internal helper to delete an empty directory in HNS-enabled buckets.
+
+        Args:
+            path (str): The directory path to delete.
+            delete_placeholder (bool): Whether to attempt deleting the zero-byte
+                placeholder object (`"{path}/"`) before calling `delete_folder`.
+                Defaults to True.
+        """
+        path = self._strip_protocol(path).rstrip("/")
+        bucket, key, _ = self.split_path(path)
+
+        # The parent _rmdir is only for deleting buckets. If key is empty,
+        # given path is a bucket, we can fall back.
+        if not key:
+            return await super()._rmdir(path)
+
+        is_hns = await self._is_bucket_hns_enabled(bucket)
+        if not is_hns:
+            return await super()._rmdir(path)
+
+        # In HNS buckets, a placeholder object (e.g., 'a/b/c/') might exist,
+        # which would cause rmdir('a/b/c') to fail because the directory is not empty.
+        # To handle this, we first attempt to delete the placeholder object
+        # (unless skipped via `delete_placeholder=False` during unbounded
+        # recursive `rm`, where `_find` + `_delete_files` has already listed
+        # and batch-deleted any placeholder objects).
+        # If it doesn't exist, _rm_file will raise a FileNotFoundError, which we can
+        # safely ignore and proceed with the directory deletion.
+        #
+        # Note: This may delete the placeholder even if the directory contains
+        # other files and the final `delete_folder` call fails. This side
+        # effect is acceptable because placeholder objects are used to simulate
+        # folders and are not strictly necessary in HNS-enabled buckets, which
+        # have native folder entities.
+        if delete_placeholder:
+            try:
+                placeholder_path = f"{path}/"
+
+                await self._rm_file(placeholder_path)
+                logger.debug(
+                    f"Removed placeholder object '{placeholder_path}' before rmdir."
+                )
+            except FileNotFoundError:
+                # This is expected if no placeholder object exists and can be safely ignored.
+                pass
+
+        try:
+            logger.debug(f"Using HNS-aware rmdir for '{path}'.")
+            folder_name = f"projects/_/buckets/{bucket}/folders/{key}"
+            request = storage_control_v2.DeleteFolderRequest(
+                name=folder_name,
+                request_id=str(uuid.uuid4()),
+            )
+
+            logger.debug(f"delete_folder request: {request}")
+            client = await self._get_control_plane_client()
+            await client.delete_folder(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+
+            # Remove the directory from the cache and from its parent's listing.
+            self.dircache.pop(path, None)
+            # Remove the deleted directory entry from the parent's listing.
+            self._cache_drop_entries(self._parent(path), {path}, entry_type="directory")
+            return
+        except api_exceptions.NotFound as e:
+            # This can happen if the directory does not exist, or if the path
+            # points to a file object instead of a directory.
+            raise FileNotFoundError(f"rmdir failed for path: {path}: {e}") from e
+        except api_exceptions.FailedPrecondition as e:
+            # This can happen if the directory is not empty.
+            raise OSError(
+                f"Pre condition failed for rmdir for path: {path}: {e}"
+            ) from e
+        except Exception as e:
+            logger.error(f"HNS rmdir: Failed to delete folder '{path}': {e}")
+            raise
+
+    # TODO: This method is only added to be used in rm method, can be deleted once
+    # rm method is integrated with recursive API
+    async def _expand_path_with_details(
+        self, path, recursive=False, maxdepth=None, detail=False, assume_literal=False
+    ):
+        """
+        Expand path with details, similar to `_expand_path` but returning full details.
+
+        This method is used in `_rm` to get a list of files and directories to delete
+        in HNS-enabled buckets.
+        It handles special characters in filenames by avoiding re-globbing concrete paths
+        found during recursive expansion.
+
+        With ``detail=True``, an object "a" and a folder "a/" that coexist below a
+        recursively expanded directory are returned as two separate entries (one
+        "file" and one "directory") rather than being collapsed by name.
+
+        Parameters
+        ----------
+        path : str or list
+            The path or list of paths to expand.
+        recursive : bool, default False
+            Whether to recursively expand directories.
+        maxdepth : int, optional
+            Maximum depth to traverse for expansion.
+        detail : bool, default False
+            If True, returns a list of dictionaries with file details;
+            otherwise, returns a list of path strings.
+        assume_literal : bool, default False
+            If True, treats the paths as literal even if they contain magic characters.
+            This is used in recursive calls to prevent re-globbing concrete paths.
+        """
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+
+        if isinstance(path, str):
+            return await self._expand_path_with_details(
+                [path],
+                recursive,
+                maxdepth,
+                detail=detail,
+                assume_literal=assume_literal,
+            )
+        else:
+            # With detail=True, entries are keyed by (name, type) so that an
+            # object and a folder sharing a name are both kept.
+            out = {} if detail else set()
+            path = [self._strip_protocol(p) for p in path]
+
+            for p in path:
+                if not assume_literal and has_magic(p):
+                    bit = await self._glob(p, maxdepth=maxdepth, detail=detail)
+                    if detail:
+                        for info in bit.values():
+                            out[(info["name"], info["type"])] = info
+                        bit_paths = list(bit.keys())
+                    else:
+                        bit_set = set(bit)
+                        out |= bit_set
+                        bit_paths = list(bit_set)
+
+                    if recursive:
+                        if maxdepth is not None and maxdepth <= 1:
+                            continue
+                        rec = await self._expand_path_with_details(
+                            bit_paths,
+                            recursive=recursive,
+                            maxdepth=maxdepth - 1 if maxdepth is not None else None,
+                            detail=detail,
+                            assume_literal=True,
+                        )
+                        if detail:
+                            for info in rec:
+                                out[(info["name"], info["type"])] = info
+                        else:
+                            out |= set(rec)
+                    continue
+                elif recursive:
+                    if detail:
+                        bucket, _, _ = self.split_path(p)
+                        rec = await self._find_hns_entries(
+                            p, bucket, withdirs=True, maxdepth=maxdepth
+                        )
+                        for info in rec:
+                            out[(info["name"], info["type"])] = info
+                    else:
+                        rec = await self._find(
+                            p, maxdepth=maxdepth, withdirs=True, detail=detail
+                        )
+                        out |= set(rec)
+
+                if detail:
+                    if (p, "file") not in out and (p, "directory") not in out:
+                        try:
+                            info = await self._info(p)
+                            out[(info["name"], info["type"])] = info
+                        except (FileNotFoundError, OSError):
+                            pass
+                elif p not in out and (recursive is False or (await self._exists(p))):
+                    out.add(p)
+
+            if detail:
+                out = list(out.values())
+            else:
+                out = sorted(out)
+
+        if not out:
+            raise FileNotFoundError(path)
+        return out
+
+    async def _rm(
+        self, path, recursive=False, maxdepth=None, batchsize=100, concurrency=None
+    ):
+        """
+        Deletes files and directories.
+
+        This method overrides the parent `_rm` to correctly handle directory
+        deletion in HNS-enabled buckets. Input paths are grouped by bucket and
+        each bucket is routed independently: HNS buckets use HNS-specific
+        deletion, while non-HNS buckets fall back to the parent implementation.
+        This means a single call may mix paths from HNS and flat buckets, and
+        the per-bucket groups are deleted concurrently.
+
+        For HNS buckets, it first expands the path to get a list of all files
+        and directories, then categorizes them. It deletes files in batches
+        and then deletes directories individually.
+
+        Args:
+            path (str or list): The path(s) to delete.
+            recursive (bool): If True, deletes directories and their contents.
+            maxdepth (int, optional): The maximum depth to traverse for deletion.
+            batchsize (int): The number of files to delete in a single batch request.
+            concurrency (int, optional): The maximum number of batch delete
+                requests in flight at once (a positive integer). None (default)
+                uses ``DEFAULT_HNS_RM_CONCURRENCY`` for HNS (including zonal)
+                buckets and ``DEFAULT_RM_CONCURRENCY`` for standard buckets.
+        """
+        _validate_rm_concurrency(concurrency)
+        # Normalize to a list so single-path and multi-path inputs share a
+        # single code path.
+        if isinstance(path, str):
+            path = [path]
+
+        if not path:
+            return []
+
+        # Group paths by bucket so each bucket is routed independently to the
+        # correct deletion strategy (HNS vs. flat), while same-bucket paths are
+        # still batched together.
+        grouped = {}
+        for p in path:
+            bucket, _, _ = self.split_path(p)
+            grouped.setdefault(bucket, []).append(p)
+
+        # Buckets are independent of one another, so delete each group
+        # concurrently.
+        bucket_results = await asyn._run_coros_in_chunks(
+            [
+                self._rm_bucket_paths(
+                    bucket,
+                    bucket_paths,
+                    recursive=recursive,
+                    maxdepth=maxdepth,
+                    batchsize=batchsize,
+                    concurrency=concurrency,
+                )
+                for bucket, bucket_paths in grouped.items()
+            ],
+            return_exceptions=True,
+        )
+
+        results = []
+        succeeded = False
+        for res in bucket_results:
+            if isinstance(res, FileNotFoundError):
+                # A bucket group matched nothing; tolerated unless every group
+                # fails.
+                continue
+            if isinstance(res, Exception):
+                raise res
+            succeeded = True
+            if res:
+                results.extend(res)
+
+        if not succeeded:
+            raise FileNotFoundError(path)
+
+        return results
+
+    async def _rm_bucket_paths(
+        self,
+        bucket,
+        path,
+        recursive=False,
+        maxdepth=None,
+        batchsize=100,
+        *,
+        concurrency,
+    ):
+        """Helper method to handle the rm operation for paths within a single bucket."""
+        if not await self._is_bucket_hns_enabled(bucket):
+            # concurrency=None makes the parent use DEFAULT_RM_CONCURRENCY.
+            return await super()._rm(
+                path,
+                recursive=recursive,
+                maxdepth=maxdepth,
+                batchsize=batchsize,
+                concurrency=concurrency,
+            )
+
+        if concurrency is None:
+            concurrency = DEFAULT_HNS_RM_CONCURRENCY
+
+        paths = await self._expand_path_with_details(
+            path, recursive=recursive, maxdepth=maxdepth, detail=True
+        )
+
+        # Separate files and directories based on their type. Directories are
+        # sorted in reverse so they are deleted from the deepest first.
+        files = {p["name"] for p in paths if p["type"] == "file"}
+        dir_names = {p["name"] for p in paths if p["type"] == "directory"}
+        dirs = sorted(dir_names, reverse=True)
+
+        # In HNS buckets an object "a" and a folder "a/" can coexist. For a
+        # directory listed below another directory being removed, the
+        # recursive listing returns the object as a separate "file" entry, so
+        # it is already in `files`. Otherwise (explicit targets, glob matches,
+        # or any directory when the expansion is not an unbounded recursive
+        # listing) the object may be hidden: e.g. for `rm("run/a",
+        # recursive=True)` the object "run/a" sits next to the prefix "run/a/"
+        # and isn't listed when that prefix contains objects. Delete those
+        # directory names as objects too; "not found" errors for names
+        # without an object are ignored by `_perform_rm`.
+        listed_below_parent = recursive and maxdepth is None
+        files.update(
+            d
+            for d in dir_names
+            if self.split_path(d)[1]
+            and not (listed_below_parent and self._parent(d) in dir_names)
+        )
+        files = list(files)
+
+        # When recursive=True and maxdepth is None, _find lists all placeholder
+        # objects ("dir/") in `files`, so _delete_files already batch-deletes
+        # them. When maxdepth is set, a boundary child directory ("dir/sub") is
+        # included in `dirs` while its placeholder ("dir/sub/", which has one
+        # extra "/") is filtered out by _find's slash-count check, so
+        # _hns_rmdir must still delete placeholders in that case.
+        return await self._perform_rm(
+            files,
+            dirs,
+            path,
+            batchsize=batchsize,
+            concurrency=concurrency,
+            delete_placeholder=not (recursive and maxdepth is None),
+        )
+
+    async def _perform_rm(
+        self, files, dirs, path, batchsize, *, concurrency, delete_placeholder=True
+    ):
+        """
+        Helper method to perform the deletion of files and directories.
+
+        Args:
+            files (list[str]): A list of file paths to delete.
+            dirs (list[str]): A list of directory paths to delete, sorted from
+                              deepest to shallowest.
+            path (str): The original path for the rm operation, for error reporting.
+            batchsize (int): The number of files to delete in a single batch request.
+            concurrency (int): The maximum number of batch delete requests for
+                files in flight at once.
+            delete_placeholder (bool): Whether `_hns_rmdir` should attempt to delete
+                each directory's placeholder object before deleting the folder.
+
+        Returns:
+            list: A list of exceptions that occurred during deletion.
+        """
+        # If no files or directories were found to delete, raise FileNotFoundError.
+        if not files and not dirs:
+            raise FileNotFoundError(path)
+
+        exs = await self._delete_files(files, batchsize, concurrency=concurrency)
+        # For directories, we must delete them from deepest to shallowest
+        # to avoid race conditions where a parent is deleted before its child.
+        # We group directories by depth and delete them level by level.
+        dirs_by_depth = {}
+        for d in dirs:
+            depth = d.count("/")
+            dirs_by_depth.setdefault(depth, []).append(d)
+
+        for depth in sorted(dirs_by_depth.keys(), reverse=True):
+            level_dirs = dirs_by_depth[depth]
+            results = await asyn._run_coros_in_chunks(
+                [
+                    self._hns_rmdir(d, delete_placeholder=delete_placeholder)
+                    for d in level_dirs
+                ],
+                batch_size=batchsize,
+                return_exceptions=True,
+            )
+            for res in results:
+                if isinstance(res, Exception):
+                    exs.append(res)
+
+        errors = [
+            ex
+            for ex in exs
+            if isinstance(ex, Exception)
+            and not isinstance(ex, (FileNotFoundError, api_exceptions.NotFound))
+            and "No such object" not in str(ex)
+        ]
+
+        if errors:
+            raise errors[0]
+
+        # Filter out non-critical "not found" errors from the final list.
+        # A successful rm should return an empty list.
+        return [
+            e
+            for e in exs
+            if e is not None
+            and not isinstance(e, (FileNotFoundError, api_exceptions.NotFound))
+            and "No such object" not in str(e)
+        ]
+
+    async def _find(
+        self,
+        path,
+        withdirs=False,
+        detail=False,
+        prefix="",
+        versions=False,
+        maxdepth=None,
+        **kwargs,
+    ):
+        """
+        HNS-aware find. Overrides the parent to correctly list empty folders in HNS buckets.
+
+        For HNS buckets this method uses a hybrid approach for fetching files and directories:
+        1. It fetches all files in a single recursive API call (like the parent).
+        2. It concurrently fetches all folder objects (including empty ones)
+           using a recursive walk with the Storage Control API.
+        3. It merges these results for a complete listing.
+
+        For buckets with flat structure, it falls back to the parent implementation.
+        """
+        path = self._strip_protocol(path)
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+        bucket, _, _ = self.split_path(path)
+
+        is_hns = await self._is_bucket_hns_enabled(bucket)
+        if not is_hns:
+            # Use parent implementation if bucket is not HNS.
+            return await super()._find(
+                path,
+                withdirs=withdirs,
+                detail=detail,
+                prefix=prefix,
+                versions=versions,
+                maxdepth=maxdepth,
+                **kwargs,
+            )
+
+        all_objects = await self._find_hns_entries(
+            path,
+            bucket,
+            withdirs=withdirs,
+            prefix=prefix,
+            versions=versions,
+            maxdepth=maxdepth,
+            **kwargs,
+        )
+
+        if detail:
+            if versions:
+                return {
+                    (
+                        f"{o['name']}#{o['generation']}"
+                        if "generation" in o
+                        else o["name"]
+                    ): o
+                    for o in all_objects
+                }
+            return {o["name"]: o for o in all_objects}
+
+        if versions:
+            return [
+                f"{o['name']}#{o['generation']}" if "generation" in o else o["name"]
+                for o in all_objects
+            ]
+        return [o["name"] for o in all_objects]
+
+    async def _find_hns_entries(
+        self,
+        path,
+        bucket,
+        withdirs=False,
+        prefix="",
+        versions=False,
+        maxdepth=None,
+        **kwargs,
+    ):
+        """
+        List the file and folder entries under `path` in an HNS bucket.
+
+        `path` must already be stripped of its protocol. Returns a list of
+        detail dicts sorted by name. Unlike the name-keyed mapping returned
+        by `_find(detail=True)`, an object "a" and a folder "a/", which can
+        coexist in HNS buckets and share the name "a", are returned as two
+        separate entries (one "file" and one "directory").
+        """
+        # Hybrid approach for HNS enabled buckets
+        # 1. Fetch all files from super find() method by passing withdirs as False.
+        # We pass maxdepth as None here to ensure we fetch all files for caching,
+        # and then filter by maxdepth at the end of this method.
+        files_task = asyncio.create_task(
+            super()._find(
+                path,
+                withdirs=False,  # Fetch files only
+                detail=True,  # Get full details for merging and populating cache
+                prefix=prefix,
+                versions=versions,
+                maxdepth=None,
+                update_cache=False,  # Defer caching until merging files and folders
+                **kwargs,
+            )
+        )
+
+        # 2. Fetch all folders recursively. This is necessary to find all folders,
+        # especially empty ones.
+        folders_task = asyncio.create_task(
+            self._get_all_folders(path, bucket, prefix=prefix)
+        )
+        # 3. Run tasks concurrently and merge results.
+        files_result, folders_result = await asyncio.gather(files_task, folders_task)
+
+        # Always update the cache with both files and folders for consistency.
+        cacheable_objects = list(files_result.values()) + folders_result
+        self._get_dirs_and_update_cache(path, cacheable_objects, prefix=prefix)
+
+        if not withdirs:
+            # If not including directories, the final output should only contain files.
+            all_objects = list(files_result.values())
+        else:
+            all_objects = cacheable_objects
+
+        all_objects.sort(key=lambda o: o["name"])
+
+        # Final filtering. `all_objects` now contains a complete list of all
+        # files and folders.
+        if maxdepth:
+            depth = path.rstrip("/").count("/") + maxdepth
+            all_objects = [o for o in all_objects if o["name"].count("/") <= depth]
+
+        return all_objects
+
+    async def _get_all_folders(self, path, bucket, prefix=""):
+        """
+        Recursively fetches all folder objects under a given path using the
+        Storage Control API.
+        """
+        _, base_path, _ = self.split_path(path)
+        base_path = "" if not base_path else base_path.rstrip("/") + "/"
+        full_prefix = f"{base_path}{prefix}"
+
+        # To find folders matching a partial prefix, we need to list their parent.
+        if full_prefix and not full_prefix.endswith("/"):
+            partition = full_prefix.rpartition("/")
+            start_dir = partition[0] + partition[1]
+        else:
+            start_dir = full_prefix
+
+        folders = []
+        client = await self._get_control_plane_client()
+        parent = f"projects/_/buckets/{bucket}"
+
+        request = storage_control_v2.ListFoldersRequest(
+            parent=parent, prefix=start_dir, request_id=str(uuid.uuid4())
+        )
+        logger.debug(f"list_folders request: {request}")
+
+        try:
+            async for folder in await client.list_folders(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            ):
+                entry = self._create_folder_entry(bucket, folder)
+                _, key, _ = self.split_path(entry["name"])
+                # Key from _create_folder_entry does not have a trailing slash
+                key_with_slash = key + "/"
+
+                if key.startswith(full_prefix) or key_with_slash.startswith(
+                    full_prefix
+                ):
+                    folders.append(entry)
+        except api_exceptions.NotFound:
+            # If the start_dir itself doesn't exist, we just return empty
+            pass
+
+        return folders
+
+    def _create_folder_entry(self, bucket, folder):
+        """Helper to create a dictionary representing a folder entry."""
+        path = f"{bucket}/{folder.name.split('/folders/')[1]}".rstrip("/")
+        _, key, _ = self.split_path(path)
+        return {
+            "Key": key,
+            "Size": 0,
+            "name": path,
+            "size": 0,
+            "type": "directory",
+            "storageClass": "DIRECTORY",
+            "ctime": folder.create_time,
+            "mtime": folder.update_time,
+            "metageneration": folder.metageneration,
+        }
+
+    async def _put_file(
+        self,
+        lpath,
+        rpath,
+        metadata=None,
+        consistency=None,
+        content_type=None,
+        chunksize=50 * 2**20,
+        callback=None,
+        fixed_key_metadata=None,
+        mode="overwrite",
+        if_generation_match=None,
+        **kwargs,
+    ):
+        """Upload a local file.
+
+        Uploads to Zonal buckets, and to RCU buckets with ``rcu_rapid_write``,
+        use gRPC. By default, files in Zonal buckets are left *unfinalized*
+        (unless `finalize_on_close` is set to True), whereas files in RCU
+        buckets are finalized on close by default.
+        A gRPC overwrite replaces the existing object as soon as the writer
+        opens, so a failed write leaves the partially written object in its
+        place, unfinalized.
+        For other buckets, it delegates to the parent class's implementation.
+
+        Parameters
+        ----------
+        lpath: str
+            Path to the local file to be uploaded.
+        rpath: str
+            Path on GCS to upload the file to.
+        metadata: dict, optional
+            Ignored by gRPC uploads.
+        consistency: str, optional
+            Ignored by gRPC uploads.
+        content_type: str, optional
+            Ignored by gRPC uploads, except for the default.
+        chunksize: int, optional
+            The size of chunks to upload data in.
+        callback: fsspec.callbacks.Callback, optional
+            Callback to monitor the upload progress.
+        fixed_key_metadata: dict, optional
+            Ignored by gRPC uploads.
+        mode: str, optional
+            The write mode, either 'overwrite' or 'create'.
+        if_generation_match: int, optional
+            Only write if the object's current generation matches this value.
+        """
+        bucket, key, generation = self.split_path(rpath)
+        layout = await self._lookup_bucket_layout(bucket)
+        if self._uses_grpc_write_path(layout):
+            if os.path.isdir(lpath):
+                return
+
+            if generation:
+                raise ValueError("Cannot write to specific object generation")
+
+            finalize_on_close = self._resolve_finalize_on_close(
+                layout, kwargs.get("finalize_on_close")
+            )
+            with open(lpath, "rb") as f:
+                try:
+                    writer = await self._init_aaow(
+                        bucket,
+                        key,
+                        if_generation_match=_resolve_generation_match(
+                            mode, if_generation_match
+                        ),
+                    )
+                except RapidCacheUltraDisabledError as e:
+                    logger.warning("%s Retrying the write over HTTP.", e)
+                else:
+                    if (
+                        metadata
+                        or fixed_key_metadata
+                        or consistency
+                        or (content_type and content_type != "application/octet-stream")
+                    ):
+                        logger.warning(
+                            "Zonal and RCU buckets do not support content_type, metadata, "
+                            "fixed_key_metadata or consistency during upload. "
+                            "These parameters will be ignored."
+                        )
+                    # The open writer has already replaced the object, so update
+                    # the cache even if the write fails.
+                    callback = callback or NoOpCallback()
+                    callback.set_size(os.fstat(f.fileno()).st_size)
+                    try:
+                        try:
+                            while chunk := f.read(chunksize):
+                                await writer.append(chunk)
+                                callback.relative_update(len(chunk))
+                        except BaseException:
+                            # Leave a partially written object unfinalized.
+                            await zb_hns_utils.close_aaow(
+                                writer, finalize_on_close=False
+                            )
+                            raise
+                        await zb_hns_utils.close_aaow(
+                            writer, finalize_on_close=finalize_on_close
+                        )
+                    finally:
+                        await self._write_file_cache_update(rpath)
+                    return
+
+        return await super()._put_file(
+            lpath,
+            rpath,
+            metadata=metadata,
+            consistency=consistency,
+            content_type=content_type,
+            chunksize=chunksize,
+            callback=callback,
+            fixed_key_metadata=fixed_key_metadata,
+            mode=mode,
+            if_generation_match=if_generation_match,
+            **kwargs,
+        )
+
+    async def _pipe_file(
+        self,
+        path,
+        data,
+        metadata=None,
+        consistency=None,
+        content_type="application/octet-stream",
+        fixed_key_metadata=None,
+        chunksize=50 * 2**20,
+        mode="overwrite",
+        if_generation_match=None,
+        **kwargs,
+    ):
+        """Upload bytes to a file.
+
+        Uploads to Zonal buckets, and to RCU buckets with ``rcu_rapid_write``,
+        use gRPC. By default, files in Zonal buckets are left *unfinalized*
+        (unless `finalize_on_close` is set to True), whereas files in RCU
+        buckets are finalized on close by default.
+        A gRPC overwrite replaces the existing object as soon as the writer
+        opens, so a failed write leaves the partially written object in its
+        place, unfinalized.
+        For other buckets, it delegates to the parent class's implementation.
+
+        Parameters
+        ----------
+        path: str
+            Path to the file to be written.
+        data: bytes-like
+            The content to write to the file.
+        metadata: dict, optional
+            Ignored by gRPC uploads.
+        consistency: str, optional
+            Ignored by gRPC uploads.
+        content_type: str, optional
+            Ignored by gRPC uploads, except for the default.
+        fixed_key_metadata: dict, optional
+            Ignored by gRPC uploads.
+        chunksize: int, optional
+            The size of chunks to upload data in.
+        mode: str, optional
+            The write mode, either 'overwrite' or 'create'.
+        if_generation_match: int, optional
+            Only write if the object's current generation matches this value.
+        """
+        # Before the writer opens and replaces the object, so that data that is
+        # not bytes-like fails first; chunksize then counts bytes.
+        data = as_byte_buffer(data)
+        bucket, key, generation = self.split_path(path)
+        layout = await self._lookup_bucket_layout(bucket)
+        if self._uses_grpc_write_path(layout):
+            finalize_on_close = self._resolve_finalize_on_close(
+                layout, kwargs.get("finalize_on_close")
+            )
+            try:
+                writer = await self._init_aaow(
+                    bucket,
+                    key,
+                    if_generation_match=_resolve_generation_match(
+                        mode, if_generation_match
+                    ),
+                )
+            except RapidCacheUltraDisabledError as e:
+                logger.warning("%s Retrying the write over HTTP.", e)
+            else:
+                if (
+                    metadata
+                    or fixed_key_metadata
+                    or (content_type and content_type != "application/octet-stream")
+                ):
+                    logger.warning(
+                        "Zonal and RCU buckets do not support content_type, metadata or "
+                        "fixed_key_metadata during upload. These parameters will be ignored."
+                    )
+                # The open writer has already replaced the object, so update the
+                # cache even if the write fails.
+                try:
+                    try:
+                        # data is bytes or a flat byte view, so slices count
+                        # bytes. A bytes slice copies only what io.BytesIO
+                        # would copy from a view slice, and a slice covering
+                        # all of bytes is the object itself, which io.BytesIO
+                        # shares.
+                        for i in range(0, len(data), chunksize):
+                            await writer.append(data[i : i + chunksize])
+                    except BaseException:
+                        # Leave a partially written object unfinalized.
+                        await zb_hns_utils.close_aaow(writer, finalize_on_close=False)
+                        raise
+                    await zb_hns_utils.close_aaow(
+                        writer, finalize_on_close=finalize_on_close
+                    )
+                finally:
+                    await self._write_file_cache_update(path)
+                return
+
+        return await super()._pipe_file(
+            path,
+            data,
+            metadata=metadata,
+            consistency=consistency,
+            content_type=content_type,
+            fixed_key_metadata=fixed_key_metadata,
+            chunksize=chunksize,
+            mode=mode,
+            if_generation_match=if_generation_match,
+        )
+
+    async def _get_file_request(
+        self, rpath, lpath, *args, headers=None, callback=None, **kwargs
+    ):
+        """
+        Downloads a file from GCS to a local path.
+
+        For Zonal and RCU buckets, it uses gRPC client for optimized downloads.
+        For other buckets, it delegates to the parent class implementation.
+
+        Parameters
+        ----------
+        rpath: str
+            Path on GCS to download the file from.
+        lpath: str
+            Path to the local file to be downloaded.
+        callback: fsspec.callbacks.Callback, optional
+            Callback to monitor the download progress.
+        **kwargs:
+            For Zonal and RCU buckets, `chunksize` bytes (int) can be provided to control
+            the download chunk size (default is 128KB).
+        """
+        bucket, key, path_generation = self.split_path(rpath)
+
+        if not await self._uses_grpc_data_path(bucket):
+            return await super()._get_file_request(
+                rpath, lpath, *args, headers=headers, callback=callback, **kwargs
+            )
+
+        if os.path.isdir(lpath):
+            return
+
+        # Coalesce generation: URL parsed vs kwargs
+        generation = path_generation or kwargs.get("generation")
+        callback = callback or NoOpCallback()
+
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        mrd_pool = await self._mrd_pool_cache.get(
+            bucket,
+            key,
+            generation,
+            pool_size=1,
+            cache_type=cache_type,
+            cache_source=cache_source,
+        )
+        try:
+            async with mrd_pool.get_mrd() as mrd:
+                size = mrd.persisted_size
+                if size is None:
+                    logger.warning(
+                        f"AsyncMultiRangeDownloader (MRD) for {rpath} has no 'persisted_size'. "
+                        "Falling back to _info() to get the file size. "
+                        "This may result in incorrect behavior for unfinalized objects."
+                    )
+                    size = (await self._info(rpath, **kwargs)).get("size", 0)
+
+                callback.set_size(size)
+
+                lparent = os.path.dirname(lpath) or os.curdir
+                os.makedirs(lparent, exist_ok=True)
+
+                chunksize = kwargs.get("chunksize", 4096 * 32)  # 128KB default
+                offset = 0
+
+                with open(lpath, "wb") as f2:
+                    while True:
+                        if offset >= size:
+                            break
+
+                        data = await zb_hns_utils.download_range(
+                            offset=offset, length=chunksize, mrd=mrd
+                        )
+                        if not data:
+                            break
+
+                        f2.write(data)
+                        offset += len(data)
+                        callback.relative_update(len(data))
+
+                if offset != size:
+                    raise aiohttp.ClientError(
+                        f"Expected {size} bytes, but only received {offset} bytes"
+                    )
+        except Exception as e:
+            # Clean up the corrupted file before raising error
+            if os.path.exists(lpath):
+                os.remove(lpath)
+            raise e
+        finally:
+            await mrd_pool.close()
+
+    async def _get_file_concurrent(
+        self,
+        rpath,
+        lpath,
+        concurrency,
+        chunk_size,
+        max_prefetch_size,
+        headers=None,
+        callback=None,
+        fetcher_fn=None,
+        **kwargs,
+    ):
+        bucket, key, path_generation = self.split_path(rpath)
+
+        # Delegate standard buckets to the original implementation
+        if not await self._uses_grpc_data_path(bucket):
+            return await super()._get_file_concurrent(
+                rpath,
+                lpath,
+                concurrency,
+                chunk_size,
+                max_prefetch_size,
+                headers=headers,
+                callback=callback,
+                fetcher_fn=fetcher_fn,
+                **kwargs,
+            )
+
+        generation = path_generation or kwargs.get("generation")
+
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        # Initialize the MRDPool once for this concurrent operation
+        mrd_pool = await self._mrd_pool_cache.get(
+            bucket,
+            key,
+            generation,
+            pool_size=concurrency,
+            cache_type=cache_type,
+            cache_source=cache_source,
+        )
+
+        # Define a custom fetcher that passes the pool to _cat_file
+        async def custom_fetcher(start, size, split_factor=1):
+            return await self._cat_file(
+                rpath,
+                start=start,
+                end=start + size,
+                mrd=mrd_pool,  # Inject the shared pool here
+                concurrency=split_factor,
+                headers=headers,
+                **kwargs,
+            )
+
+        try:
+            details = dict(mrd_pool.details or {})
+            size = await _get_mrd_size(mrd_pool)
+            if size is None:
+                logger.warning(
+                    f"AsyncMultiRangeDownloader (MRD) for {rpath} has no 'persisted_size'. "
+                    "Falling back to cached details to get the file size. "
+                    "This may result in incorrect behavior for unfinalized objects."
+                )
+                size = details.get("size", 0)
+            elif int(details.get("size", -1)) != size:
+                # Metadata hashes don't describe the bytes the MRD will serve.
+                details.pop("crc32c", None)
+                details.pop("md5Hash", None)
+                if kwargs.get("consistency", self.consistency) in ("md5", "crc32c"):
+                    kwargs["consistency"] = "size"
+            details["size"] = size
+
+            return await super()._get_file_concurrent(
+                rpath,
+                lpath,
+                concurrency,
+                chunk_size,
+                max_prefetch_size,
+                headers=headers,
+                callback=callback,
+                fetcher_fn=custom_fetcher,  # Pass our custom fetcher up the chain
+                details=details,
+                **kwargs,
+            )
+        finally:
+            # Ensure the pool is closed when the download completes or fails
+            await mrd_pool.close()
+
+    async def _do_list_objects(
+        self,
+        path,
+        max_results=None,
+        delimiter="/",
+        prefix="",
+        versions=False,
+        **kwargs,
+    ):
+        """
+        Lists objects in a bucket.
+
+        For HNS-enabled buckets, it sets `includeFoldersAsPrefixes` to True
+        when the delimiter is '/'.
+        """
+        bucket, _, _ = self.split_path(path)
+        if await self._is_bucket_hns_enabled(bucket) and delimiter == "/":
+            kwargs["includeFoldersAsPrefixes"] = "true"
+
+        return await super()._do_list_objects(
+            path,
+            max_results=max_results,
+            delimiter=delimiter,
+            prefix=prefix,
+            versions=versions,
+            **kwargs,
+        )
+
+    async def _cp_file(self, path1, path2, acl=None, **kwargs):
+        """Duplicate remote file.
+
+        For Standard GCS buckets, falls back to the parent class's implementation
+
+        Zonal Bucket Support:
+        Server-side copy is currently NOT supported for Zonal buckets because
+        the `RewriteObject` API is unavailable for them.
+
+        The following scenarios will raise a `NotImplementedError`:
+        * Intra-zonal: Copying within the same Zonal bucket.
+        * Inter-zonal: Copying between two different Zonal buckets.
+        * Mixed: Copying between a Zonal bucket and a Standard bucket.
+
+        """
+        b1, _, _ = self.split_path(path1)
+        b2, _, _ = self.split_path(path2)
+
+        is_zonal_source, is_zonal_dest = await asyncio.gather(
+            self._is_zonal_bucket(b1), self._is_zonal_bucket(b2)
+        )
+
+        # 1. Standard -> Standard (Delegate to core implementation)
+        if not is_zonal_source and not is_zonal_dest:
+            return await super()._cp_file(path1, path2, acl=acl, **kwargs)
+
+        # 2. Zonal Scenarios (Currently Unsupported)
+        raise NotImplementedError(
+            "Server-side copy involving Zonal buckets is not supported. "
+            "Zonal objects do not support rewrite."
+        )
+
+    async def _merge(self, path, paths, acl=None):
+        """Concatenate objects within a single bucket.
+
+        For Standard GCS buckets, falls back to the parent class's implementation
+
+        Zonal Bucket Support:
+        Server-side compose is currently NOT supported for Zonal buckets.
+        """
+        bucket, _, _ = self.split_path(path)
+
+        if await self._is_zonal_bucket(bucket):
+            raise NotImplementedError(
+                "Server-side compose/merge is not supported for Zonal buckets."
+            )
+
+        return await super()._merge(path, paths, acl=acl)
+
+
+# Wrap ExtendedGcsFileSystem's own sync/async overrides (e.g. `mv`, `rm`, `_cat_file`, `_find`)
+# so they propagate caller framework telemetry; inherited GCSFileSystem methods are already wrapped.
+mirror_gcs_methods(ExtendedGcsFileSystem)
+
+
+async def upload_chunk(fs, location, data, offset, size, content_type):
+    """
+    Uploads a chunk of data using AsyncAppendableObjectWriter for Zonal buckets,
+    and for RCU buckets with ``rcu_rapid_write``.
+    Finalizes the upload when the total uploaded data size reaches the specified size.
+    Delegates to core upload_chunk implementation for other buckets.
+    """
+    # If `location` is an HTTP resumable-upload URL (string), delegate to core upload_chunk
+    # for Standard buckets.
+    if isinstance(location, (str, bytes)):
+        from gcsfs.core import upload_chunk as core_upload_chunk
+
+        return await core_upload_chunk(fs, location, data, offset, size, content_type)
+
+    if not isinstance(location, AsyncAppendableObjectWriter):
+        raise TypeError(
+            "upload_chunk for Zonal and RCU buckets expects an AsyncAppendableObjectWriter instance."
+        )
+
+    if offset or size or content_type:
+        logger.warning(
+            "Zonal and RCU buckets do not support offset, or content_type during upload. "
+            "These parameters will be ignored."
+        )
+
+    if not location._is_stream_open:
+        raise ValueError("Writer is closed. Please initiate a new upload.")
+
+    try:
+        await location.append(data)
+    except Exception as e:
+        logger.error(
+            f"Error uploading chunk at offset {location.offset}: {e}. Closing stream."
+        )
+        # Don't finalize the upload on error
+        await zb_hns_utils.close_aaow(location, finalize_on_close=False)
+        raise
+
+    if (location.offset or 0) >= size:
+        logger.debug("Uploaded data is equal or greater than size. Finalizing upload.")
+        await zb_hns_utils.close_aaow(location, finalize_on_close=True)
+
+
+async def initiate_upload(
+    fs,
+    bucket,
+    key,
+    content_type="application/octet-stream",
+    metadata=None,
+    fixed_key_metadata=None,
+    mode="overwrite",
+    kms_key_name=None,
+    if_generation_match=None,
+):
+    """
+    Initiates a gRPC upload by creating an AsyncAppendableObjectWriter for Zonal
+    buckets, and for RCU buckets with ``rcu_rapid_write``.
+    Delegates to core initiate_upload implementation for other buckets.
+
+    Parameters
+    ----------
+    fs: GCSFileSystem
+        The GCS filesystem instance.
+    bucket: str
+        The target bucket name.
+    key: str
+        The target object key.
+    content_type: str, optional
+        Ignored by gRPC uploads, except for the default.
+    metadata: dict, optional
+        Ignored by gRPC uploads.
+    fixed_key_metadata: dict, optional
+        Ignored by gRPC uploads.
+    mode: str, optional
+        The write mode, either 'overwrite' or 'create'.
+    kms_key_name: str, optional
+        Ignored by gRPC uploads.
+    if_generation_match: int, optional
+        Only write if the object's current generation matches this value.
+    """
+    layout = await fs._lookup_bucket_layout(bucket)
+    if fs._uses_grpc_write_path(layout):
+        try:
+            writer = await fs._init_aaow(
+                bucket,
+                key,
+                if_generation_match=_resolve_generation_match(
+                    mode, if_generation_match
+                ),
+            )
+        except RapidCacheUltraDisabledError as e:
+            logger.warning("%s Retrying the write over HTTP.", e)
+        else:
+            if (
+                metadata
+                or fixed_key_metadata
+                or kms_key_name
+                or (content_type and content_type != "application/octet-stream")
+            ):
+                logger.warning(
+                    "Zonal and RCU buckets do not support content_type, metadata, fixed_key_metadata, "
+                    "or kms_key_name during upload. These parameters will be ignored."
+                )
+            return writer
+
+    from gcsfs.core import initiate_upload as core_initiate_upload
+
+    return await core_initiate_upload(
+        fs,
+        bucket,
+        key,
+        content_type,
+        metadata,
+        fixed_key_metadata,
+        mode,
+        kms_key_name,
+        if_generation_match=if_generation_match,
+    )
+
+
+async def simple_upload(
+    fs,
+    bucket,
+    key,
+    datain,
+    metadatain=None,
+    consistency=None,
+    content_type="application/octet-stream",
+    fixed_key_metadata=None,
+    mode="overwrite",
+    kms_key_name=None,
+    if_generation_match=None,
+    **kwargs,
+):
+    """
+    Performs a simple, single-request gRPC upload to Zonal buckets, and to RCU
+    buckets with ``rcu_rapid_write``.
+    By default, files in Zonal buckets are left *unfinalized* (unless
+    `finalize_on_close` is set to True), whereas files in RCU buckets are
+    finalized on close by default. A failed upload is never finalized.
+    A gRPC overwrite replaces the existing object as soon as the writer opens,
+    so a failed write leaves the partially written object in its place,
+    unfinalized.
+    Delegates to core simple_upload implementation for other buckets.
+
+    Parameters
+    ----------
+    fs: GCSFileSystem
+        The GCS filesystem instance.
+    bucket: str
+        The target bucket name.
+    key: str
+        The target object key.
+    datain: bytes
+        The data to be uploaded.
+    metadatain: dict, optional
+        Ignored by gRPC uploads.
+    consistency: str, optional
+        Ignored by gRPC uploads.
+    content_type: str, optional
+        Ignored by gRPC uploads, except for the default.
+    fixed_key_metadata: dict, optional
+        Ignored by gRPC uploads.
+    mode: str, optional
+        The write mode, either 'overwrite' or 'create'.
+    kms_key_name: str, optional
+        Ignored by gRPC uploads.
+    if_generation_match: int, optional
+        Only write if the object's current generation matches this value.
+    """
+    layout = await fs._lookup_bucket_layout(bucket)
+    if fs._uses_grpc_write_path(layout):
+        finalize_on_close = fs._resolve_finalize_on_close(
+            layout, kwargs.get("finalize_on_close")
+        )
+        try:
+            writer = await fs._init_aaow(
+                bucket,
+                key,
+                if_generation_match=_resolve_generation_match(
+                    mode, if_generation_match
+                ),
+            )
+        except RapidCacheUltraDisabledError as e:
+            logger.warning("%s Retrying the write over HTTP.", e)
+        else:
+            if (
+                metadatain
+                or fixed_key_metadata
+                or kms_key_name
+                or consistency
+                or (content_type and content_type != "application/octet-stream")
+            ):
+                logger.warning(
+                    "Zonal and RCU buckets do not support content_type, metadatain, fixed_key_metadata, "
+                    "consistency or kms_key_name during upload. These parameters will be ignored."
+                )
+            try:
+                await writer.append(datain)
+            except BaseException:
+                # Leave a partially written object unfinalized.
+                await zb_hns_utils.close_aaow(writer, finalize_on_close=False)
+                raise
+            await zb_hns_utils.close_aaow(writer, finalize_on_close=finalize_on_close)
+            return
+
+    from gcsfs.core import simple_upload as core_simple_upload
+
+    return await core_simple_upload(
+        fs,
+        bucket,
+        key,
+        datain,
+        metadatain,
+        consistency,
+        content_type,
+        fixed_key_metadata,
+        mode,
+        kms_key_name,
+        if_generation_match=if_generation_match,
+    )

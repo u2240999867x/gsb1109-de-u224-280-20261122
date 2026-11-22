@@ -1,0 +1,450 @@
+import asyncio
+import gc
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import weakref
+from unittest import mock
+
+import fsspec.asyn
+import pytest
+
+from gcsfs import core
+from gcsfs.zb_hns_utils import _defer_task, _deferred_close_tasks
+from gcsfs.zonal_file import ZonalFile
+
+
+def wait_until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+@pytest.fixture
+def io_loop():
+    return fsspec.asyn.get_loop()
+
+
+@pytest.fixture
+def fake_fs(io_loop):
+    fs = mock.Mock()
+    fs.split_path.return_value = ("b", "test-key", "1")
+    fs.info.return_value = {"size": 1000, "generation": "1", "name": "test-key"}
+    fs.loop = io_loop
+    return fs
+
+
+def make_read_file(fake_fs, pool_close):
+    pool = mock.Mock(persisted_size=1000, details=None, close=pool_close)
+    fake_fs._mrd_pool_cache.get = mock.AsyncMock(return_value=pool)
+    return ZonalFile(gcsfs=fake_fs, path="gs://b/test-key", mode="rb")
+
+
+def finalize_on_loop(io_loop, holder):
+    async def _drop_and_collect():
+        holder.clear()
+        gc.collect()
+
+    fsspec.asyn.sync(io_loop, _drop_and_collect)
+
+
+def test_read_file_finalized_on_loop_thread_releases_mrd_pool(
+    fake_fs, io_loop, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(sys, "unraisablehook", seen.append)
+    closed = threading.Event()
+    zf = make_read_file(fake_fs, lambda: closed.set() or asyncio.sleep(0))
+    holder = [zf]
+    del zf
+    finalize_on_loop(io_loop, holder)
+    assert wait_until(closed.is_set), "mrd_pool.close() was never awaited"
+    assert seen == [], f"exception escaped the finalizer: {seen}"
+
+
+def test_write_file_finalized_on_loop_thread_flushes_and_finalizes(fake_fs, io_loop):
+    zf = ZonalFile(
+        gcsfs=fake_fs, path="gs://b/test-key", mode="wb", finalize_on_close=True
+    )
+    aaow = mock.Mock()
+    aaow.flush = mock.AsyncMock()
+    aaow.close = mock.AsyncMock()
+    zf.aaow = aaow
+    zf.buffer.write(b"important data")
+    zf.loc = 14
+    holder = [zf]
+    del zf
+    finalize_on_loop(io_loop, holder)
+    assert wait_until(lambda: aaow.flush.called), "buffered data was never flushed"
+    assert wait_until(lambda: aaow.close.called), "writer was never finalized"
+    assert aaow.close.call_args.kwargs.get("finalize_on_close") is True
+
+
+def test_close_on_loop_thread_is_idempotent(fake_fs, io_loop):
+    calls = []
+
+    async def pool_close():
+        calls.append(1)
+
+    zf = make_read_file(fake_fs, pool_close)
+
+    async def close_twice():
+        zf.close()
+        zf.close()
+
+    fsspec.asyn.sync(io_loop, close_twice)
+    assert wait_until(lambda: len(calls) == 1), "teardown did not run exactly once"
+    time.sleep(0.2)
+    assert calls == [1], f"mrd_pool.close() ran {len(calls)} times"
+
+
+def test_deferred_closes_share_a_bounded_thread_pool(fake_fs, io_loop):
+    n_files = 64
+    workers = []
+    lock = threading.Lock()
+
+    class RecordingZonalFile(ZonalFile):
+        def _close_impl(self):
+            current = threading.current_thread()
+            with lock:
+                workers.append((current.ident, current.name))
+            super()._close_impl()
+
+    async def pool_close():
+        pass
+
+    files = []
+    for _ in range(n_files):
+        pool = mock.Mock(persisted_size=1000, details=None, close=pool_close)
+        fake_fs._mrd_pool_cache.get = mock.AsyncMock(return_value=pool)
+        zf = RecordingZonalFile(gcsfs=fake_fs, path="gs://b/test-key", mode="rb")
+        zf.mrd_pool = pool
+        files.append(zf)
+
+    async def close_all():
+        for zf in files:
+            zf.close()
+
+    fsspec.asyn.sync(io_loop, close_all)
+
+    assert wait_until(
+        lambda: len(workers) == n_files
+    ), f"only {len(workers)}/{n_files} deferred closes ran"
+    idents = {ident for ident, _ in workers}
+    assert len(idents) == 1, (
+        f"{len(idents)} threads used for {n_files} closes; deferred closes "
+        "should share one worker"
+    )
+    assert all(
+        name.startswith(core._DEFERRED_CLOSE_THREAD_NAME) for _, name in workers
+    ), f"closes ran on unexpected threads: {sorted({n for _, n in workers})}"
+
+
+def test_off_loop_close_still_blocks_and_propagates_errors(fake_fs):
+    started = threading.Event()
+
+    async def failing_close():
+        started.set()
+        raise RuntimeError("MRD pool teardown failed")
+
+    zf = make_read_file(fake_fs, failing_close)
+    with pytest.raises(RuntimeError, match="MRD pool teardown failed"):
+        zf.close()
+    assert started.is_set(), "close() must run the teardown synchronously"
+
+
+def test_gcsfile_finalizer_when_already_closed_or_deferred(fake_fs):
+    f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb")
+    f.closed = True
+    with mock.patch.object(core, "_defer_close") as mock_defer:
+        f.__del__()
+        mock_defer.assert_not_called()
+
+    f2 = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb")
+    f2._close_deferred = True
+    with mock.patch.object(core, "_defer_close") as mock_defer:
+        f2.__del__()
+        mock_defer.assert_not_called()
+
+
+def test_gcsfile_finalizer_when_sys_finalizing(fake_fs, monkeypatch):
+    monkeypatch.setattr(sys, "is_finalizing", lambda: True)
+    f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb")
+    with mock.patch.object(core, "_defer_close") as mock_defer:
+        f.__del__()
+        assert f.closed is True
+        mock_defer.assert_not_called()
+
+
+def test_gcsfile_finalizer_when_queue_is_none(fake_fs, monkeypatch):
+    f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb", cache_type="readahead")
+    monkeypatch.setattr(core, "_deferred_close_queue", None)
+    with mock.patch.object(core, "_defer_close") as mock_defer:
+        f.__del__()
+        assert f.closed is True
+        mock_defer.assert_not_called()
+
+
+def test_gcsfile_finalized_on_loop_thread_defers_close(fake_fs, io_loop, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sys, "unraisablehook", seen.append)
+    closed = threading.Event()
+
+    class RecordingGCSFile(core.GCSFile):
+        def _close_impl(self):
+            closed.set()
+            super()._close_impl()
+
+    gf = RecordingGCSFile(fake_fs, "gs://b/test-key", mode="rb", cache_type="readahead")
+    holder = [gf]
+    del gf
+    finalize_on_loop(io_loop, holder)
+    assert wait_until(closed.is_set), "GCSFile._close_impl() was never called"
+    assert seen == [], f"exception escaped the finalizer: {seen}"
+
+
+def test_defer_task_tracks_and_discards_task(io_loop):
+    step1 = threading.Event()
+    step2 = threading.Event()
+
+    async def sample_coro():
+        step1.set()
+        while not step2.is_set():
+            await asyncio.sleep(0.01)
+
+    async def schedule():
+        return _defer_task(io_loop, sample_coro(), description="sample")
+
+    task = fsspec.asyn.sync(io_loop, schedule)
+    assert step1.wait(timeout=5.0)
+    assert task in _deferred_close_tasks
+
+    step2.set()
+    assert wait_until(lambda: task not in _deferred_close_tasks, timeout=5.0)
+    assert task.done()
+
+
+def test_defer_task_logs_exception(io_loop, caplog):
+    import logging
+
+    async def boom():
+        raise ValueError("custom boom error")
+
+    async def schedule():
+        task = _defer_task(
+            io_loop,
+            boom(),
+            description="custom boom",
+            logger=logging.getLogger("gcsfs"),
+            log_level=logging.ERROR,
+        )
+        await asyncio.sleep(0.05)
+        return task
+
+    with caplog.at_level(logging.ERROR, logger="gcsfs"):
+        task = fsspec.asyn.sync(io_loop, schedule)
+        assert wait_until(lambda: task not in _deferred_close_tasks, timeout=5.0)
+
+    assert any(
+        "custom boom" in r.message and "custom boom error" in r.message
+        for r in caplog.records
+    )
+
+
+def test_gcsfile_cache_del_does_not_block_gc(fake_fs):
+    f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb", cache_type="adaptive")
+    cache = f.cache
+    assert getattr(cache, "_prefetcher", None) is not None
+
+    with mock.patch("fsspec.prefetcher.sync_teardown") as mock_teardown:
+        cache.__del__()
+        mock_teardown.assert_not_called()
+
+    f.close()
+    assert getattr(cache, "_prefetcher", None) is None
+
+
+def test_gcsfile_adaptive_cache_binds_to_fs_loop_after_reset_lock(
+    fake_fs, io_loop, monkeypatch
+):
+    payload = b"regional-adaptive-payload-" * 64
+    fake_fs.info.return_value = {
+        "size": len(payload),
+        "generation": "1",
+        "name": "test-key",
+    }
+
+    async def fake_cat_file_concurrent(
+        path, start=None, end=None, concurrency=1, **kwargs
+    ):
+        fut = io_loop.create_future()
+        io_loop.call_soon(fut.set_result, payload[start:end])
+        return await fut
+
+    fake_fs._cat_file_concurrent = fake_cat_file_concurrent
+    orig_iothread = fsspec.asyn.iothread[0]
+
+    # Simulate fsspec <= 2026.9.0 where AdaptiveReadaheadCache does not inspect
+    # fetcher.__self__.fs.loop and instead binds its prefetcher to get_loop().
+    orig_cache_init = fsspec.caching.AdaptiveReadaheadCache.__init__
+    monkeypatch.setattr(
+        fsspec.caching.AdaptiveReadaheadCache,
+        "__init__",
+        lambda self, blocksize, fetcher, size, *args, **kwargs: orig_cache_init(
+            self, blocksize, lambda s, e: fetcher(s, e), size, *args, **kwargs
+        ),
+    )
+
+    loop2 = None
+    thread2 = None
+    try:
+        fsspec.asyn.reset_lock()
+        assert fsspec.asyn.loop[0] is None
+
+        f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb", cache_type="adaptive")
+        # AdaptiveReadaheadCache called fsspec.asyn.get_loop(), which created a
+        # second global loop; GCSFile must rebind the prefetcher to fake_fs.loop.
+        loop2 = fsspec.asyn.loop[0]
+        thread2 = fsspec.asyn.iothread[0]
+        try:
+            assert loop2 is not None and loop2 is not io_loop
+            assert f.cache._prefetcher.loop is io_loop
+            assert f.read(128) == payload[:128]
+        finally:
+            f.close()
+    finally:
+        fsspec.asyn.loop[0] = io_loop
+        fsspec.asyn.iothread[0] = orig_iothread
+        if loop2 is not None and loop2 is not io_loop:
+            if loop2.is_running():
+                loop2.call_soon_threadsafe(loop2.stop)
+            if thread2 is not None:
+                thread2.join(timeout=5)
+            if not loop2.is_running():
+                loop2.close()
+
+
+# Runs in a separate interpreter: if the regression returns, the forked child hangs before
+# `execve` and `subprocess.Popen()` itself blocks (so `proc.wait(timeout=...)` is never reached).
+_POPEN_PREEXEC_SCENARIO = """
+import gc, subprocess, sys, time, weakref
+
+import fsspec.asyn
+
+from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+
+async def init_clients(fs):
+    await fs._set_session()
+    await fs._get_control_plane_client()
+    await fs._get_grpc_client()
+
+
+def make_cached_only_fs():
+    # Use ExtendedGcsFileSystem directly: gcsfs.GCSFileSystem is the base class
+    # (without gRPC clients) when GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT is off.
+    fs = ExtendedGcsFileSystem(token="anon")
+    fsspec.asyn.sync(fs.loop, init_clients, fs)
+    return weakref.ref(fs), fs._session
+
+
+ExtendedGcsFileSystem.clear_instance_cache()
+fs_ref, session = make_cached_only_fs()
+assert fs_ref() is not None
+
+proc = subprocess.Popen([sys.executable, "-c", "pass"], preexec_fn=lambda: None)
+assert proc.wait(timeout=30) == 0
+assert not session.closed
+
+# In the parent, clearing the cache must still collect and finalize the instance.
+ExtendedGcsFileSystem.clear_instance_cache()
+gc.collect()
+assert fs_ref() is None
+deadline = time.monotonic() + 5
+while not session.closed and time.monotonic() < deadline:
+    time.sleep(0.01)
+assert session.closed
+print("SCENARIO_OK")
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+@pytest.mark.timeout(120)
+def test_cached_filesystem_with_grpc_survives_popen_preexec_fn():
+    """Regression test for a hang in ``ray.init()``.
+
+    ``subprocess.Popen(..., preexec_fn=...)`` forks, and fsspec clears
+    ``cls._cache`` in the child before ``execve``. A filesystem referenced only by
+    the cache must not be torn down there: deallocating its inherited
+    ``grpc.aio`` channel in the child hangs or crashes.
+
+    The scenario runs in its own process group with a timeout, so a regression
+    fails fast instead of hanging the test run (and leaving a spinning child).
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _POPEN_PREEXEC_SCENARIO],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        try:
+            # Also kills the hung forked grandchild, which shares the process group.
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass  # The group already exited; still report the hang below.
+        output, _ = proc.communicate()
+        pytest.fail(
+            "Popen(preexec_fn=...) hung with a cached gRPC-holding filesystem "
+            f"(fork-child teardown regression). Output:\n{output}"
+        )
+    assert proc.returncode == 0 and "SCENARIO_OK" in output, output
+
+
+def test_bind_gcs_sync_methods_ignores_mocked_class_methods():
+    """Mocks patched onto the class must not be bound to the instance.
+
+    MagicMock auto-creates ``_is_gcs_sync_wrapped``; binding it would pass the
+    filesystem as an extra positional argument and break call assertions.
+    """
+    core.GCSFileSystem.clear_instance_cache()
+    with mock.patch.object(core.GCSFileSystem, "ls", return_value=["x"]) as mocked:
+        fs = core.GCSFileSystem(token="anon", skip_instance_cache=True)
+        assert "ls" not in fs.__dict__
+        assert fs.ls("bucket/path") == ["x"]
+        mocked.assert_called_once_with("bucket/path")
+    # Real telemetry wrappers are still bound per instance.
+    assert fs.__dict__["walk"].__self__ is fs
+
+
+def test_cached_only_filesystem_is_freed_by_gc_not_cache_clear():
+    """Sync methods are bound per instance, as fsspec's mirror_sync_methods does.
+
+    The bound methods keep the instance in a reference cycle, so clearing
+    ``cls._cache`` (as fsspec does in a forked child) does not tear it down
+    immediately; only the cyclic garbage collector frees it.
+    """
+    core.GCSFileSystem.clear_instance_cache()
+    fs = core.GCSFileSystem(token="anon")
+    assert fs.__dict__["ls"].__self__ is fs
+    assert fs.__dict__["walk"].__self__ is fs
+    fs_ref = weakref.ref(fs)
+    del fs
+
+    gc.disable()
+    try:
+        core.GCSFileSystem.clear_instance_cache()
+        assert fs_ref() is not None
+    finally:
+        gc.enable()
+    gc.collect()
+    assert fs_ref() is None

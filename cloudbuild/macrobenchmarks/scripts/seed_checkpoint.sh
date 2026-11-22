@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# seed-checkpoint: when _SEED_CHECKPOINT=true and no external _CHECKPOINT_LOAD_PATH
+# is supplied, run the real workload once (1 step) to write a single,
+# format-exact checkpoint into the per-run checkpoint bucket, then export its
+# path for run-workload to restore from. The seed runs under its own helm
+# release (${RUN_ID}-seed) so its logs never enter the benchmark's metrics
+# (the scraper filters by the benchmark RUN_ID). Skips entirely when seeding is
+# disabled or an external checkpoint is supplied (that path takes precedence).
+set -e
+source "$(dirname "$0")/lib.sh"
+trap 'record_failure seed-checkpoint' ERR
+skip_if_failed
+source "${BUILD_VARS_FILE}"
+
+if [ "${_SEED_CHECKPOINT}" != "true" ] || [ -n "${_CHECKPOINT_LOAD_PATH}" ]; then
+  echo "Seeding disabled or external checkpoint supplied; skipping seed-checkpoint."
+  exit 0
+fi
+
+SEED_RUN_ID="${RUN_ID}-seed"
+SEED_CKPT_DIR="gs://$CHECKPOINT_BUCKET/seed"
+install_helm
+gcloud container clusters get-credentials "$CLUSTER_NAME" --zone="${CLUSTER_LOCATION:-${_ZONE}}" --project="${PROJECT_ID}"
+CHART="gcsfs/tests/perf/macrobenchmarks/workloads/${_WORKLOAD}/helm_chart"
+
+# One optimizer step (gradient accumulation is fixed at 1 in launcher.sh) with
+# ckptWriterInterval=1 writes exactly one checkpoint at global_step 1. The
+# checkpoint is full-size regardless of step count: the frozen ~16 GB model plus
+# eagerly-materialized AdamW state are serialized the same as in a long run.
+# simulatedStepComputeSeconds=0 makes the single step instant.
+# RCU writes default to STANDARD over HTTP (wanted for *_rcu_warm and
+# *_rcu_cold); shared_workload_helm_args sets gcsfs.rcuRapidWrite=true for
+# *_rcu_z so the seed checkpoint is written as RAPID objects over gRPC.
+echo "Installing seed release $SEED_RUN_ID to write one checkpoint to $SEED_CKPT_DIR ..."
+shared_workload_helm_args
+helm install "$SEED_RUN_ID" "$CHART" -f "$CHART/values_base.yaml" \
+  "${SHARED_HELM_ARGS[@]}" \
+  --set gcsfs.ckptWritePath="$SEED_CKPT_DIR" \
+  --set-string gcsfs.ckptLoadPath="" \
+  --set workload.steps="1" \
+  --set workload.ckptWriterInterval="1" \
+  --set workload.simulatedStepComputeSeconds="0"
+
+if ! wait_for_jobset "$SEED_RUN_ID" seed-checkpoint; then
+  helm uninstall "$SEED_RUN_ID" || true
+  exit 1
+fi
+
+# The workload writes to ${ckptWritePath}/${RUN_ID}/...; RUN_ID inside the seed
+# pod is the seed release name. Select the single checkpoint entry: a *.ckpt
+# object for DDP, a *.ckpt/ prefix for FSDP. Strip any trailing slash.
+SEED_PREFIX="${SEED_CKPT_DIR}/${SEED_RUN_ID}/"
+LS_OUTPUT=$(gcloud storage ls "$SEED_PREFIX" || true)
+SEEDED_CKPT_PATH=$(printf '%s\n' "$LS_OUTPUT" | grep -E '\.ckpt/?$' | sed 's#/$##')
+if [ -z "$SEEDED_CKPT_PATH" ]; then
+  echo "ERROR: no seed checkpoint found under $SEED_PREFIX."
+  helm uninstall "$SEED_RUN_ID" || true
+  record_failure seed-checkpoint
+  exit 1
+fi
+
+valid_seed_ckpt_path() {
+  local LC_ALL=C path="$1" rel line pat='^[A-Za-z0-9._=/-]+\.ckpt$'
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == "${SEED_CKPT_DIR}/${SEED_RUN_ID}" || "$line" == "${SEED_PREFIX}"* ]] || return 1
+  done <<< "$LS_OUTPUT"
+  [[ "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" == "${SEED_PREFIX}"* ]] || return 1
+  rel="${path#"${SEED_PREFIX}"}"
+  [[ "$rel" != /* && "$rel" != *//* && "/$rel/" != */../* && "$rel" =~ $pat ]]
+}
+
+if ! valid_seed_ckpt_path "$SEEDED_CKPT_PATH"; then
+  printf 'ERROR: invalid seed checkpoint path %q (expected under %s).\n' "$SEEDED_CKPT_PATH" "$SEED_PREFIX"
+  helm uninstall "$SEED_RUN_ID" || true
+  record_failure seed-checkpoint
+  exit 1
+fi
+echo "Seed checkpoint: $SEEDED_CKPT_PATH"
+printf 'export SEEDED_CKPT_PATH=%q\n' "$SEEDED_CKPT_PATH" >> "${BUILD_VARS_FILE}"
+
+# Free the node pool so the benchmark run can schedule on all $_NODES nodes.
+helm uninstall --wait "$SEED_RUN_ID" || true

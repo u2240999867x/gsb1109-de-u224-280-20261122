@@ -1,0 +1,2085 @@
+"""Unit tests for ExtendedGcsFileSystem with mocked backends.
+Focuses on Zonal bucket logic, MRD pool caching, and parameter validation.
+"""
+
+import asyncio
+import io
+import logging
+from unittest import mock
+
+import aiohttp
+import pytest
+from google.cloud.storage.asyncio.async_multi_range_downloader import (
+    AsyncMultiRangeDownloader,
+)
+from google.cloud.storage.exceptions import DataCorruption
+
+import gcsfs.core
+from gcsfs.checkers import ConsistencyChecker, MD5Checker, SizeChecker
+from gcsfs.core import GCSFile
+from gcsfs.extended_gcsfs import (
+    BucketLayout,
+    ExtendedGcsFileSystem,
+    _close_pool,
+    initiate_upload,
+    simple_upload,
+    upload_chunk,
+)
+from gcsfs.tests import layouts
+from gcsfs.tests.conftest import csv_files, files, requires_rapid
+from gcsfs.tests.settings import TEST_BUCKET, TEST_ZONAL_BUCKET
+from gcsfs.tests.test_zonal import gcs_bucket_mocks  # noqa: F401
+from gcsfs.tests.utils import is_real_gcs, tmpfile
+from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPoolCache
+from gcsfs.zonal_file import ZonalFile
+
+file = "test/accounts.1.json"
+file_path = f"{TEST_ZONAL_BUCKET}/{file}"
+json_data = files[file]
+lines = io.BytesIO(json_data).readlines()
+file_size = len(json_data)
+
+a = TEST_ZONAL_BUCKET + "/zonal/test/a"
+b = TEST_ZONAL_BUCKET + "/zonal/test/b"
+c = TEST_ZONAL_BUCKET + "/zonal/test/c"
+
+pytestmark = [
+    requires_rapid,
+    pytest.mark.skipif(
+        is_real_gcs(),
+        reason="Contains Unit tests using mocks, does not require testing on real GCS.",
+    ),
+]
+
+GRPC_READ_LAYOUTS = [
+    layouts.ZONAL_HIERARCHICAL,
+    layouts.STANDARD_RCU,
+    layouts.HIERARCHICAL_RCU,
+]
+
+
+@pytest.mark.parametrize("bucket_type_val", layouts.ALL_BUCKET_LAYOUTS)
+def test_open_uses_default_blocksize_and_consistency_from_fs(
+    extended_gcsfs, gcs_bucket_mocks, bucket_type_val
+):
+    csv_file = "2014-01-01.csv"
+    csv_file_path = f"{TEST_ZONAL_BUCKET}/{csv_file}"
+    csv_data = csv_files[csv_file]
+
+    with gcs_bucket_mocks(csv_data, bucket_type_val=bucket_type_val):
+        with extended_gcsfs.open(csv_file_path, "rb") as f:
+            assert isinstance(f, GCSFile)
+            assert isinstance(f, ZonalFile) is bucket_type_val.uses_grpc_data_path
+            assert f.blocksize == extended_gcsfs.default_block_size
+            assert f.cache_type == "adaptive"
+            assert type(f.checker) is ConsistencyChecker
+
+
+@pytest.mark.parametrize("bucket_type_val", layouts.ALL_BUCKET_LAYOUTS)
+def test_open_uses_correct_blocksize_and_consistency_for_all_bucket_types(
+    extended_gcs_factory, gcs_bucket_mocks, bucket_type_val
+):
+    csv_file = "2014-01-01.csv"
+    csv_file_path = f"{TEST_ZONAL_BUCKET}/{csv_file}"
+    csv_data = csv_files[csv_file]
+
+    custom_filesystem_block_size = 100 * 1024 * 1024
+    extended_gcsfs = extended_gcs_factory(
+        block_size=custom_filesystem_block_size,
+        consistency="md5",
+        cache_type="readahead",
+    )
+
+    with gcs_bucket_mocks(csv_data, bucket_type_val=bucket_type_val):
+        with extended_gcsfs.open(csv_file_path, "rb") as f:
+            assert f.blocksize == custom_filesystem_block_size
+            assert f.cache_type == "readahead"
+            assert f.cache_source == "explicit"
+            assert isinstance(f.checker, MD5Checker)
+
+        file_block_size = 1024 * 1024
+        with extended_gcsfs.open(
+            csv_file_path,
+            "rb",
+            block_size=file_block_size,
+            consistency="size",
+            cache_type="none",
+        ) as f:
+            assert f.blocksize == file_block_size
+            assert f.cache_type == "none"
+            assert isinstance(f.checker, SizeChecker)
+
+
+@pytest.mark.parametrize(
+    "bucket_layout",
+    [layouts.STANDARD_RCU, layouts.HIERARCHICAL_RCU],
+)
+@pytest.mark.parametrize("mode", ["r+", "rb+"])
+def test_open_plus_mode_does_not_check_out_mrd_pool(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout, mode
+):
+    """Read-write modes are rejected before an MRD pool is taken from the cache."""
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        with pytest.raises(NotImplementedError):
+            extended_gcsfs.open(file_path, mode)
+        mocks["pool_cache_get"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "start, end, exp_offset, exp_length",
+    [
+        # --- Standard Slicing ---
+        (None, None, 0, file_size),  # Full file: data[:]
+        (10, 20, 10, 10),  # Middle slice: data[10:20]
+        (None, 10, 0, 10),  # Prefix: data[:10]
+        (10, None, 10, file_size - 10),  # Suffix: data[10:]
+        # --- Negative Indices ---
+        (-10, None, file_size - 10, 10),  # Last N bytes: data[-10:]
+        (None, -10, 0, file_size - 10),  # All except last N: data[:-10]
+        (10, -10, 10, file_size - 20),  # Positive start, Negative end: data[10:-10]
+        # --- Zero Length & Empty Reads ---
+        (20, 20, 20, 0),  # Zero-length (Start == End): data[20:20]
+        (50, 40, 50, 0),  # Crossover (Start > End): data[50:40] -> Empty
+        (
+            file_size + 10,
+            None,
+            file_size + 10,
+            0,
+        ),  # Start past EOF: data[110:] -> Empty
+        # --- Overshoot & Clamping ---
+        (
+            -file_size * 2,
+            None,
+            0,
+            file_size,
+        ),  # Start Overshoot: data[-200:] -> Whole file
+        (
+            file_size - 10,
+            file_size + 100,
+            file_size - 10,
+            10,
+        ),  # End Overshoot: data[90:200] -> Last 10 bytes
+    ],
+)
+def test_process_limits_parametrized(
+    extended_gcsfs, start, end, exp_offset, exp_length
+):
+    """
+    Verifies that start/end limits are correctly converted to offset/length
+    """
+    offset, length = extended_gcsfs.sync_process_limits_to_offset_and_length(
+        file_path, start, end
+    )
+
+    assert offset == exp_offset
+    assert length == exp_length
+
+
+def test_process_limits_when_file_size_passed(extended_gcsfs):
+    """
+    Tests that process_limits works correctly when file_size is provided,
+    without calling _info().
+    """
+    with mock.patch.object(
+        extended_gcsfs, "_info", new_callable=mock.AsyncMock
+    ) as mock_info:
+        test_file_size = 1000
+
+        # Case: start and end provided
+        offset, length = extended_gcsfs.sync_process_limits_to_offset_and_length(
+            file_path, start=100, end=200, file_size=test_file_size
+        )
+        assert offset == 100
+        assert length == 100
+
+        # Case: only end provided
+        offset, length = extended_gcsfs.sync_process_limits_to_offset_and_length(
+            file_path, start=None, end=50, file_size=test_file_size
+        )
+        assert offset == 0
+        assert length == 50
+
+        # Case: only start provided
+        offset, length = extended_gcsfs.sync_process_limits_to_offset_and_length(
+            file_path, start=950, end=None, file_size=test_file_size
+        )
+        assert offset == 950
+        assert length == 50
+
+        mock_info.assert_not_called()
+
+
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+@pytest.mark.parametrize(
+    "exception_to_raise",
+    [ValueError, DataCorruption, Exception],
+)
+def test_mrd_exception_handling(
+    extended_gcsfs, gcs_bucket_mocks, exception_to_raise, bucket_layout
+):
+    """
+    Tests that _cat_file correctly propagates exceptions from mrd.download_ranges.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        # Configure the mock to raise a specified exception
+        if exception_to_raise is DataCorruption:
+            # The first argument is 'response', the message is in '*args'
+            mocks["downloader"].download_ranges.side_effect = exception_to_raise(
+                None, "Test exception raised"
+            )
+        else:
+            mocks["downloader"].download_ranges.side_effect = exception_to_raise(
+                "Test exception raised"
+            )
+
+        with pytest.raises(exception_to_raise, match="Test exception raised"):
+            extended_gcsfs.read_block(file_path, 0, 10)
+
+        assert mocks["downloader"].download_ranges.call_count == 1
+
+
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+def test_mrd_created_once_for_zonal_file(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """
+    Tests that the AsyncMultiRangeDownloader (MRD) is created only once when a
+    ZonalFile is opened, and not for each subsequent read operation.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        with extended_gcsfs.open(file_path, "rb") as f:
+            # The MRDPoolCache.get should be called upon opening the file.
+            mocks["pool_cache_get"].assert_called_once()
+
+            f.read(10)
+            f.read(20)
+            f.seek(5)
+            f.read(5)
+
+        # Verify that pool_cache_get was not called again.
+        mocks["pool_cache_get"].assert_called_once()
+
+
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+def test_zonal_file_warning_on_missing_persisted_size(
+    extended_gcsfs, gcs_bucket_mocks, caplog, bucket_layout
+):
+    """
+    Tests that a warning is logged when MRD has no 'persisted_size' attribute when opening ZonalFile.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        # Force persisted_size to None to trigger the warning
+        mocks["pool"].persisted_size = None
+        with caplog.at_level(logging.WARNING, logger="gcsfs"):
+            with extended_gcsfs.open(file_path, "rb"):
+                pass
+            assert "has no 'persisted_size'" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_file_warning_on_missing_persisted_size(
+    extended_gcsfs, gcs_bucket_mocks, caplog, bucket_layout
+):
+    """
+    Tests that a warning is logged in cat_file when MRD has no 'persisted_size' attribute.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        # 'persisted_size' is set to None in the mock downloader
+        with (
+            caplog.at_level(logging.WARNING, logger="gcsfs"),
+            mock.patch.object(
+                extended_gcsfs, "_info", new_callable=mock.AsyncMock
+            ) as mock_info,
+        ):
+            mock_info.return_value = {"size": len(json_data)}
+            result = await extended_gcsfs._cat_file(file_path, start=0, end=10)
+            assert "Falling back to _info() to get the file size" in caplog.text
+            assert result == json_data[:10]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_file_passes_cache_type(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """
+    Tests that cache_type and cache_source are propagated to _mrd_pool_cache.get.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        with mock.patch.object(
+            extended_gcsfs._mrd_pool_cache, "get", new_callable=mock.AsyncMock
+        ) as mock_get:
+            from gcsfs.zb_hns_utils import MRDPool
+
+            mock_mrd = mock.AsyncMock(spec=MRDPool)
+            mock_mrd.get_mrd.return_value.__aenter__.return_value.persisted_size = len(
+                json_data
+            )
+            mock_get.return_value = mock_mrd
+
+            with mock.patch.object(
+                extended_gcsfs, "_concurrent_mrd_fetch", new_callable=mock.AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = json_data[:10]
+                await extended_gcsfs._cat_file(
+                    file_path,
+                    start=0,
+                    end=10,
+                    cache_type="readahead",
+                )
+
+            mock_get.assert_awaited_once_with(
+                TEST_ZONAL_BUCKET,
+                file,
+                mock.ANY,
+                pool_size=mock.ANY,
+                cache_type="readahead",
+                cache_source="explicit",
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_file_zonal_default_concurrency(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """Tests that cat_file defaults to pool_size=1 on zonal/RCU buckets."""
+    # Arrange
+    from gcsfs.zb_hns_utils import MRDPool
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        with mock.patch.object(
+            extended_gcsfs._mrd_pool_cache, "get", new_callable=mock.AsyncMock
+        ) as mock_get:
+            mock_mrd = mock.AsyncMock(spec=MRDPool)
+            mock_mrd.get_mrd.return_value.__aenter__.return_value.persisted_size = len(
+                json_data
+            )
+            mock_get.return_value = mock_mrd
+
+            with mock.patch.object(
+                extended_gcsfs, "_concurrent_mrd_fetch", new_callable=mock.AsyncMock
+            ):
+                # Act
+                await extended_gcsfs._cat_file(file_path, start=0, end=10)
+
+                # Assert
+                assert mock_get.call_args.kwargs["pool_size"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_file_zonal_explicit_concurrency(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """Tests that cat_file propagates explicit concurrency to pool_size on zonal/RCU buckets."""
+    # Arrange
+    from gcsfs.zb_hns_utils import MRDPool
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        with mock.patch.object(
+            extended_gcsfs._mrd_pool_cache, "get", new_callable=mock.AsyncMock
+        ) as mock_get:
+            mock_mrd = mock.AsyncMock(spec=MRDPool)
+            mock_mrd.get_mrd.return_value.__aenter__.return_value.persisted_size = len(
+                json_data
+            )
+            mock_get.return_value = mock_mrd
+
+            with mock.patch.object(
+                extended_gcsfs, "_concurrent_mrd_fetch", new_callable=mock.AsyncMock
+            ):
+                # Act
+                await extended_gcsfs._cat_file(
+                    file_path, start=0, end=10, concurrency=3
+                )
+
+                # Assert
+                assert mock_get.call_args.kwargs["pool_size"] == 3
+
+
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+def test_zonal_prefetcher_default_concurrency(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """Tests that ZonalFile streaming prefetcher defaults to concurrency=4 and pool_size=4."""
+    # Arrange
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        # Act
+        with extended_gcsfs.open(file_path, "rb") as f:
+            # Assert
+            assert f.pool_size == 4
+            assert f.concurrency == 4
+            cache_concurrency = getattr(
+                getattr(f.cache, "_prefetcher", None), "concurrency", None
+            )
+            assert cache_concurrency == 4
+
+
+def test_split_ranges_across_streams_balances_bytes():
+    reqs = [(0, 0, 16), (1, 100, 1), (2, 200, 1), (3, 300, 16), (4, 400, 2)]
+    groups = ExtendedGcsFileSystem._split_ranges_across_streams(reqs, 2)
+    assert len(groups) == 2
+    assert sorted(r for g in groups for r in g) == sorted(reqs)
+    loads = sorted(sum(r[2] for r in g) for g in groups)
+    assert loads == [18, 18]
+    for g in groups:
+        assert [r[1] for r in g] == sorted(r[1] for r in g)
+
+
+def test_split_ranges_across_streams_edge_cases():
+    split = ExtendedGcsFileSystem._split_ranges_across_streams
+    assert split([], 4) == []
+    assert split([(0, 5, 1), (1, 0, 1)], 1) == [[(1, 0, 1), (0, 5, 1)]]
+    # Never more groups than requests.
+    assert len(split([(0, 0, 1), (1, 1, 1)], 64)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_uses_one_pool_and_splits_across_mrds(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    starts = [0, 10, 20, 30, 40, 50, file_size - 5, 5]
+    ends = [5, 15, 25, 35, 45, 55, file_size + 100, 5]
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        res = await extended_gcsfs._cat_ranges(
+            [file_path] * len(starts), starts, ends, batch_size=3
+        )
+
+        assert res == [json_data[s:e] for s, e in zip(starts, ends)]
+        mocks["pool_cache_get"].assert_awaited_once()
+        # 7 non-empty ranges across 3 streams -> 3 multi-range calls.
+        assert mocks["pool_cache_get"].call_args.kwargs["pool_size"] == 3
+        assert mocks["downloader"].download_ranges.await_count == 3
+        n_sent = sum(
+            len(c.args[0]) for c in mocks["downloader"].download_ranges.await_args_list
+        )
+        assert n_sent == 7
+        mocks["pool"].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_multi_file_shares_stream_budget(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    other = f"{TEST_ZONAL_BUCKET}/test/accounts.2.json"
+    paths = [file_path, other] * 4
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        res = await extended_gcsfs._cat_ranges(paths, 0, 10, batch_size=4)
+
+        assert res == [json_data[:10]] * len(paths)
+        assert mocks["pool_cache_get"].await_count == 2
+        sizes = [c.kwargs["pool_size"] for c in mocks["pool_cache_get"].await_args_list]
+        assert sizes == [2, 2]
+
+
+def test_allocate_streams_stays_within_budget():
+    alloc = ExtendedGcsFileSystem._allocate_streams
+    # 5 objects x 40 ranges, budget 64, cap 16 -> sums to exactly 64.
+    a = alloc([40] * 5, 64, 16)
+    assert sum(a) == 64 and max(a) <= 16 and min(a) >= 1
+    # Streams follow range counts (D'Hondt), ties to the earlier object.
+    assert alloc([30, 10], 8, 16) == [6, 2]
+    assert alloc([4, 4, 4], 5, 16) == [2, 2, 1]
+    # Caps bind: 2 objects cannot use more than 2 x 16 streams.
+    assert alloc([100, 100], 64, 16) == [16, 16]
+    # Few ranges on an object never get more streams than ranges.
+    assert alloc([1, 99], 64, 16) == [1, 16]
+    # Skewed counts with the at-least-one floor stay within budget.
+    a = alloc([1, 1, 1, 197], 8, 16)
+    assert sum(a) == 8 and a[:3] == [1, 1, 1]
+    # As many or more objects than streams -> one each (caller bounds concurrency).
+    assert alloc([5, 5], 2, 16) == [1, 1]
+    assert alloc([3] * 10, 4, 16) == [1] * 10
+    # Many objects under the default budget use the whole budget.
+    a = alloc([2] * 1000, 1280, 16)
+    assert sum(a) == 1280 and max(a) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_many_objects_bounded_by_batch_size(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    paths = [f"{TEST_ZONAL_BUCKET}/obj{i}" for i in range(10)]
+    in_flight = 0
+    peak = 0
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        pool = mocks["pool"]
+
+        async def tracking_get(*args, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            return pool
+
+        async def tracking_close():
+            nonlocal in_flight
+            in_flight -= 1
+
+        mocks["pool_cache_get"].side_effect = tracking_get
+        pool.close.side_effect = tracking_close
+
+        res = await extended_gcsfs._cat_ranges(paths, 0, 10, batch_size=4)
+
+        assert res == [json_data[:10]] * len(paths)
+        assert mocks["pool_cache_get"].await_count == 10
+        assert peak <= 4
+        assert all(
+            c.kwargs["pool_size"] == 1 for c in mocks["pool_cache_get"].await_args_list
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_returns_group_exceptions(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = ValueError("boom")
+        res = await extended_gcsfs._cat_ranges([file_path] * 2, [0, 10], [5, 15])
+        assert all(isinstance(r, ValueError) for r in res)
+        mocks["pool"].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket_layout",
+    [
+        layouts.STANDARD,
+        layouts.STANDARD_HIERARCHICAL,
+        layouts.STANDARD_RAPID_CACHE,
+        layouts.HIERARCHICAL_RAPID_CACHE,
+        BucketLayout.UNKNOWN,
+    ],
+)
+async def test_cat_ranges_non_zonal_delegates_to_fsspec(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        with mock.patch(
+            "fsspec.asyn.AsyncFileSystem._cat_ranges", new_callable=mock.AsyncMock
+        ) as mock_super:
+            mock_super.return_value = [b"x"]
+            res = await extended_gcsfs._cat_ranges([file_path], [0], [1])
+            assert res == [b"x"]
+            mock_super.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_with_max_gap_delegates_to_fsspec(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        with pytest.raises(NotImplementedError):
+            await extended_gcsfs._cat_ranges([file_path], [0], [1], max_gap=0)
+        mocks["pool_cache_get"].assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_on_error_raise(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = ValueError("boom")
+        with pytest.raises(ValueError, match="boom"):
+            await extended_gcsfs._cat_ranges(
+                [file_path] * 2, [0, 10], [5, 15], on_error="raise"
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_respects_concurrency_kwarg(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        res = await extended_gcsfs._cat_ranges(
+            [file_path] * 20, 0, 5, batch_size=64, concurrency=3
+        )
+        assert res == [json_data[:5]] * 20
+        assert mocks["pool_cache_get"].call_args.kwargs["pool_size"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_batch_size_minus_one_is_unbounded(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        res = await extended_gcsfs._cat_ranges([file_path] * 20, 0, 5, batch_size=-1)
+        assert res == [json_data[:5]] * 20
+        # fsspec's -1 means "no limit": only the per-object cap applies.
+        assert (
+            mocks["pool_cache_get"].call_args.kwargs["pool_size"]
+            == ExtendedGcsFileSystem.MAX_ZONAL_STREAMS_PER_OBJECT
+        )
+        with pytest.raises(ValueError, match="batch_size"):
+            await extended_gcsfs._cat_ranges([file_path] * 2, 0, 5, batch_size=-2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_mixed_zonal_and_regional_paths(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    regional = f"{TEST_BUCKET}/regional.json"
+    paths = [file_path, regional, file_path, regional]
+
+    async def lookup_layout(bucket):
+        return bucket_layout if bucket == TEST_ZONAL_BUCKET else layouts.STANDARD
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        pool = mocks["pool"]
+
+        async def slow_pool_get(*args, **kwargs):
+            await asyncio.sleep(0)
+            return pool
+
+        mocks["pool_cache_get"].side_effect = slow_pool_get
+        err = RuntimeError("regional fail")
+        with (
+            mock.patch.object(
+                extended_gcsfs, "_lookup_bucket_layout", side_effect=lookup_layout
+            ),
+            mock.patch.object(
+                extended_gcsfs,
+                "_cat_file",
+                new_callable=mock.AsyncMock,
+                side_effect=[b"r1", err],
+            ) as mock_cat_file,
+        ):
+            res = await extended_gcsfs._cat_ranges(
+                paths, [0, 1, 5, 3], [5, 2, 10, 4], concurrency=2
+            )
+        assert res == [json_data[:5], b"r1", json_data[5:10], err]
+        assert [c.args for c in mock_cat_file.await_args_list] == [
+            (regional,),
+            (regional,),
+        ]
+        assert [c.kwargs for c in mock_cat_file.await_args_list] == [
+            {"start": 1, "end": 2, "concurrency": 2},
+            {"start": 3, "end": 4, "concurrency": 2},
+        ]
+        mocks["pool_cache_get"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_init_fallbacks_and_errors(
+    extended_gcsfs, gcs_bucket_mocks, caplog, bucket_layout
+):
+    with pytest.raises(TypeError):
+        await extended_gcsfs._cat_ranges(file_path, [0], [5])
+    with pytest.raises(ValueError):
+        await extended_gcsfs._cat_ranges([file_path], [0, 1], [5])
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["pool"].persisted_size = None
+        mocks["downloader"].persisted_size = None
+
+        with (
+            caplog.at_level(logging.WARNING, logger="gcsfs"),
+            mock.patch.object(
+                extended_gcsfs,
+                "_info",
+                new_callable=mock.AsyncMock,
+                return_value={"size": len(json_data)},
+            ) as mock_info,
+        ):
+            res = await extended_gcsfs._cat_ranges([file_path], [0], [5])
+            assert res == [json_data[:5]]
+            mock_info.assert_awaited_once_with(file_path)
+            assert "Falling back to _info() to get the file size" in caplog.text
+
+        mocks["pool"].close.reset_mock()
+        with mock.patch.object(
+            extended_gcsfs,
+            "_info",
+            new_callable=mock.AsyncMock,
+            side_effect=RuntimeError("info boom"),
+        ):
+            res = await extended_gcsfs._cat_ranges([file_path] * 2, [0, 5], [5, 10])
+            assert len(res) == 2
+            assert all(isinstance(r, RuntimeError) for r in res)
+            mocks["pool"].close.assert_awaited_once()
+
+        mocks["pool"].close.reset_mock()
+        with (
+            mock.patch.object(
+                extended_gcsfs,
+                "_info",
+                new_callable=mock.AsyncMock,
+                side_effect=asyncio.CancelledError(),
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await extended_gcsfs._cat_ranges([file_path], [0], [5])
+        mocks["pool"].close.assert_awaited_once()
+
+
+async def _cancel_once(started, coro):
+    """Run ``coro`` as a task, cancel it once ``started`` is set, and return the
+    tasks it left behind."""
+    before = set(asyncio.all_tasks())
+    task = asyncio.ensure_future(coro)
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    return asyncio.all_tasks() - before - {task}
+
+
+@pytest.fixture
+def close_pool_cancels():
+    """Count the cancellations that reach a stream while it is closing its
+    pool, i.e. any cancel after the one that stopped the stream. A regression
+    to supervising the streams with a plain ``asyncio.gather`` shows up here."""
+    counts = {"n": 0}
+
+    async def counting_close_pool(pool):
+        try:
+            return await _close_pool(pool)
+        except asyncio.CancelledError:
+            counts["n"] += 1
+            raise
+
+    with mock.patch("gcsfs.extended_gcsfs._close_pool", counting_close_pool):
+        yield counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_cancel_closes_pool_and_tasks(
+    extended_gcsfs, gcs_bucket_mocks, close_pool_cancels, bucket_layout
+):
+    started = asyncio.Event()
+    calls = {"downloads": 0, "cancelled": 0, "close_completed": 0}
+
+    async def blocking_download(read_requests, metadata=None):
+        calls["downloads"] += 1
+        if calls["downloads"] == 4:
+            started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            calls["cancelled"] += 1
+            raise
+
+    async def slow_close():
+        # Span multiple ticks so a second cancel of the closing stream would
+        # arrive while _close_pool is still waiting for this to finish.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        calls["close_completed"] += 1
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = blocking_download
+        mocks["pool"].close.side_effect = slow_close
+
+        leftover = await _cancel_once(
+            started,
+            extended_gcsfs._cat_ranges(
+                [file_path] * 4, [0, 10, 20, 30], [5, 15, 25, 35], batch_size=4
+            ),
+        )
+        assert calls["cancelled"] == 4
+        assert calls["close_completed"] == 1
+        mocks["pool"].close.assert_awaited_once()
+        assert close_pool_cancels["n"] == 0
+        assert not leftover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_cancel_while_closing_pool(
+    extended_gcsfs, gcs_bucket_mocks, close_pool_cancels, bucket_layout
+):
+    paths = [f"{TEST_ZONAL_BUCKET}/done", f"{TEST_ZONAL_BUCKET}/in_flight"]
+    closing = asyncio.Event()
+    close_completed = 0
+
+    async def download_ranges(read_requests, metadata=None):
+        if read_requests[0][0] == 0:
+            for offset, length, view in read_requests:
+                view.write(json_data[offset : offset + length])
+            return
+        await asyncio.Event().wait()
+
+    async def slow_close():
+        nonlocal close_completed
+        closing.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        close_completed += 1
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = download_ranges
+        mocks["pool"].close.side_effect = slow_close
+
+        leftover = await _cancel_once(
+            closing,
+            extended_gcsfs._cat_ranges(paths, [0, 10], [5, 15], batch_size=2),
+        )
+        # Both objects opened a pool; even the stream cancelled while already
+        # inside pool.close() ran close() to completion.
+        assert mocks["pool"].close.await_count == 2
+        assert close_completed == 2
+        # Only the stream that was already closing saw its (single) cancel
+        # there; the in-flight stream was not cancelled again while closing.
+        assert close_pool_cancels["n"] == 1
+        assert not leftover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_cancel_many_objects_closes_open_pools(
+    extended_gcsfs, gcs_bucket_mocks, close_pool_cancels, bucket_layout
+):
+    paths = [f"{TEST_ZONAL_BUCKET}/obj{i}" for i in range(10)]
+    started = asyncio.Event()
+    downloads = 0
+
+    async def blocking_download(read_requests, metadata=None):
+        nonlocal downloads
+        downloads += 1
+        if downloads == 4:
+            started.set()
+        await asyncio.Event().wait()
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = blocking_download
+
+        leftover = await _cancel_once(
+            started, extended_gcsfs._cat_ranges(paths, 0, 10, batch_size=4)
+        )
+        # The 4 objects in flight opened a pool each; all 4 were closed and
+        # the 6 objects still waiting for the batch never opened one.
+        assert mocks["pool_cache_get"].await_count == 4
+        assert mocks["pool"].close.await_count == 4
+        assert close_pool_cancels["n"] == 0
+        assert not leftover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_pool_close_error_raised_after_streams_finish(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    paths = [f"{TEST_ZONAL_BUCKET}/done", f"{TEST_ZONAL_BUCKET}/slow"]
+    release = asyncio.Event()
+    close_failed = asyncio.Event()
+    state = {"closes": 0, "slow_finished": False}
+
+    async def download_ranges(read_requests, metadata=None):
+        if read_requests[0][0] != 0:
+            await release.wait()
+            state["slow_finished"] = True
+        for offset, length, view in read_requests:
+            view.write(json_data[offset : offset + length])
+
+    async def close():
+        state["closes"] += 1
+        if state["closes"] == 1:
+            close_failed.set()
+            raise RuntimeError("close boom")
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = download_ranges
+        mocks["pool"].close.side_effect = close
+
+        task = asyncio.ensure_future(
+            extended_gcsfs._cat_ranges(paths, [0, 10], [5, 15], batch_size=2)
+        )
+        await asyncio.wait_for(close_failed.wait(), 5)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        # The first object's pool failed to close; the call keeps waiting for
+        # the other object's stream rather than cancelling it.
+        assert not task.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="close boom"):
+            await task
+        assert state["slow_finished"]
+        assert state["closes"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_cancel_while_opening_pool(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    started = asyncio.Event()
+
+    async def blocking_get(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["pool_cache_get"].side_effect = blocking_get
+
+        leftover = await _cancel_once(
+            started,
+            extended_gcsfs._cat_ranges(
+                [file_path] * 4, [0, 10, 20, 30], [5, 15, 25, 35], batch_size=4
+            ),
+        )
+        mocks["pool_cache_get"].assert_awaited_once()
+        mocks["pool"].close.assert_not_awaited()
+        assert not leftover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_chunks_download_ranges_at_mrd_max_ranges(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    starts = list(range(0, 70, 10))
+    ends = [s + 5 for s in starts]
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        with mock.patch("gcsfs.extended_gcsfs.MRD_MAX_RANGES", 3):
+            res = await extended_gcsfs._cat_ranges(
+                [file_path] * len(starts), starts, ends, batch_size=1
+            )
+        assert res == [json_data[s:e] for s, e in zip(starts, ends)]
+        calls = mocks["downloader"].download_ranges.await_args_list
+        assert [len(c.args[0]) for c in calls] == [3, 3, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_short_read_is_an_error(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    async def short_read(read_requests, metadata=None):
+        for offset, length, view in read_requests:
+            view.write(json_data[offset : offset + length - 1])
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        mocks["downloader"].download_ranges.side_effect = short_read
+        res = await extended_gcsfs._cat_ranges(
+            [file_path] * 2, [0, 10], [5, 15], batch_size=1
+        )
+        assert all(isinstance(r, BufferError) for r in res)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_cat_ranges_zonal_closes_all_buffers_when_close_raises(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    created = []
+    real_buf = DirectMemmoveBuffer
+
+    def make_buf(length, executor):
+        buf = real_buf(length, executor)
+        idx = len(created)
+        created.append(buf)
+        orig_close = buf.close
+
+        def close():
+            orig_close()
+            if idx == 0:
+                raise RuntimeError("buf0 close failed")
+            if idx == 1:
+                raise RuntimeError("buf1 close failed")
+
+        buf.close = mock.Mock(side_effect=close)
+        return buf
+
+    with (
+        gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout),
+        mock.patch("gcsfs.extended_gcsfs.DirectMemmoveBuffer", side_effect=make_buf),
+        pytest.raises(RuntimeError, match="buf0 close failed"),
+    ):
+        await extended_gcsfs._cat_ranges(
+            [file_path] * 3,
+            [0, 5, 10],
+            [5, 10, 15],
+            batch_size=1,
+            on_error="raise",
+        )
+    assert len(created) == 3
+    assert all(b.close.call_count == 1 for b in created)
+
+
+def test_resolve_cache_config(monkeypatch):
+    """Tests _resolve_cache_config logic under various kwargs configurations."""
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+    # 1. Both cache_type and cache_source already present
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(
+        {"cache_type": "custom", "cache_source": "explicit"}
+    )
+    assert c_type == "custom"
+    assert c_source == "explicit"
+
+    # 2. Only cache_type provided (cache_source missing)
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(
+        {"cache_type": "readahead"}
+    )
+    assert c_type == "readahead"
+    assert c_source == "explicit"
+
+    # 3. Neither provided (defaults resolved via _get_prefetcher_and_cache_config)
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config({})
+    assert c_type == "adaptive"
+    assert c_source == "default"
+
+    # 4. kwargs is None
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(None)
+    assert c_type == "adaptive"
+    assert c_source == "default"
+
+    # 5. Disabled via kwarg
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config(
+        {"use_experimental_adaptive_prefetching": False}
+    )
+    assert c_type == "readahead"
+    assert c_source == "default"
+
+    # 6. Disabled via env var
+    monkeypatch.setenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", "false")
+    c_type, c_source = ExtendedGcsFileSystem._resolve_cache_config({})
+    assert c_type == "readahead"
+    assert c_source == "default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_kwarg",
+    [
+        {"metadatain": {"key": "value"}},
+        {"fixed_key_metadata": {"key": "value"}},
+        {"kms_key_name": "key_name"},
+        {"consistency": "md5"},
+        {"content_type": "text/plain"},
+    ],
+)
+async def test_simple_upload_zonal_unsupported_params(
+    async_gcs, zonal_write_mocks, unsupported_kwarg, caplog, file_path
+):
+    """Test simple_upload for Zonal buckets warns on unsupported parameters."""
+    bucket, object_name, _ = async_gcs.split_path(file_path)
+    # Ensure caplog captures the warning by setting the level
+    with caplog.at_level(logging.WARNING, logger="gcsfs"):
+        await simple_upload(
+            async_gcs,
+            bucket=bucket,
+            key=object_name,
+            datain=b"",
+            **unsupported_kwarg,
+        )
+
+    assert any(
+        "will be ignored" in r.message and r.levelname == "WARNING"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_kwarg",
+    [
+        {"metadata": {"key": "value"}},
+        {"fixed_key_metadata": {"key": "value"}},
+        {"kms_key_name": "key_name"},
+        {"content_type": "text/plain"},
+    ],
+)
+async def test_initiate_upload_zonal_unsupported_params(
+    async_gcs, zonal_write_mocks, unsupported_kwarg, caplog, file_path
+):
+    """Test initiate_upload for Zonal buckets warns on unsupported parameters."""
+    bucket, object_name, _ = async_gcs.split_path(file_path)
+    with caplog.at_level(logging.WARNING, logger="gcsfs"):
+        await initiate_upload(
+            fs=async_gcs,
+            bucket=bucket,
+            key=object_name,
+            **unsupported_kwarg,
+        )
+    assert any(
+        "will be ignored" in r.message and r.levelname == "WARNING"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_chunk_zonal_exception_cleanup(
+    async_gcs, zonal_write_mocks, file_path
+):
+    """
+    Tests that upload_chunk correctly closes the stream when an
+    exception occurs during append, without finalizing the object.
+    """
+    bucket, object_name, _ = async_gcs.split_path(file_path)
+    writer = await initiate_upload(fs=async_gcs, bucket=bucket, key=object_name)
+
+    error_message = "Simulated network failure"
+    writer.append.side_effect = Exception(error_message)
+
+    with pytest.raises(Exception, match=error_message):
+        await upload_chunk(
+            fs=async_gcs,
+            location=writer,
+            data=b"some data",
+            offset=0,
+            size=100,
+            content_type=None,
+        )
+
+    writer.close.assert_awaited_once_with(finalize_on_close=False)
+
+
+@pytest.mark.asyncio
+async def test_upload_chunk_zonal_wrong_type(async_gcs):
+    """Test upload_chunk raises TypeError for incorrect location type."""
+    with pytest.raises(TypeError, match="expects an AsyncAppendableObjectWriter"):
+        await upload_chunk(
+            fs=async_gcs,
+            location=AsyncMultiRangeDownloader,
+            data=b"",
+            offset=0,
+            size=0,
+            content_type=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_kwarg",
+    [
+        {"metadata": {"key": "value"}},
+        {"fixed_key_metadata": {"key": "value"}},
+        {"consistency": "md5"},
+        {"content_type": "text/plain"},
+    ],
+)
+async def test_put_file_zonal_unsupported_params(
+    async_gcs, zonal_write_mocks, unsupported_kwarg, caplog, file_path
+):
+    """Test _put_file for Zonal buckets warns on unsupported parameters."""
+    with tmpfile() as lpath:
+        with open(lpath, "wb") as f:
+            f.write(b"data")
+
+        with caplog.at_level(logging.WARNING, logger="gcsfs"):
+            await async_gcs._put_file(lpath, file_path, **unsupported_kwarg)
+
+    assert any(
+        "will be ignored" in r.message and r.levelname == "WARNING"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_kwarg",
+    [
+        {"metadata": {"key": "value"}},
+        {"fixed_key_metadata": {"key": "value"}},
+        {"content_type": "text/plain"},
+    ],
+)
+async def test_pipe_file_zonal_unsupported_params(
+    async_gcs, zonal_write_mocks, unsupported_kwarg, caplog, file_path
+):
+    """Test _pipe_file for Zonal buckets warns on unsupported parameters."""
+    data = b"data"
+
+    with caplog.at_level(logging.WARNING, logger="gcsfs"):
+        await async_gcs._pipe_file(file_path, data, **unsupported_kwarg)
+
+    assert any(
+        "will be ignored" in r.message and r.levelname == "WARNING"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_simple_upload_delegates_to_core_for_non_zonal(async_gcs):
+    """
+    Tests that simple_upload delegates to core.simple_upload
+    when the bucket is not zonal.
+    """
+    key = "test-key"
+    data = b"test data"
+
+    with (
+        mock.patch.object(
+            async_gcs, "_lookup_bucket_layout", return_value=layouts.STANDARD
+        ),
+        mock.patch(
+            "gcsfs.core.simple_upload", new_callable=mock.AsyncMock
+        ) as mock_core_simple,
+    ):
+        mock_core_simple.return_value = {"generation": "123"}
+        result = await simple_upload(
+            fs=async_gcs,
+            bucket=TEST_BUCKET,
+            key=key,
+            datain=data,
+            metadatain=None,
+            consistency=None,
+            content_type="application/octet-stream",
+            fixed_key_metadata=None,
+            mode="overwrite",
+            kms_key_name=None,
+        )
+
+        # Verify core.simple_upload was called with correct arguments
+        mock_core_simple.assert_awaited_once_with(
+            async_gcs,
+            TEST_BUCKET,
+            key,
+            data,
+            None,
+            None,
+            "application/octet-stream",
+            None,
+            "overwrite",
+            None,
+            if_generation_match=None,
+        )
+        assert result == {"generation": "123"}
+
+
+@pytest.mark.asyncio
+async def test_initiate_upload_delegates_to_core_for_non_zonal(async_gcs):
+    """
+    Tests that initiate_upload delegates to core.initiate_upload
+    when the bucket is not zonal.
+    """
+    key = "test-key"
+
+    with (
+        mock.patch.object(
+            async_gcs, "_lookup_bucket_layout", return_value=layouts.STANDARD
+        ),
+        mock.patch(
+            "gcsfs.core.initiate_upload", new_callable=mock.AsyncMock
+        ) as mock_core_initiate,
+    ):
+        mock_core_initiate.return_value = "http://mock-resumable-url"
+        result = await initiate_upload(
+            fs=async_gcs,
+            bucket=TEST_BUCKET,
+            key=key,
+            content_type="application/octet-stream",
+            metadata=None,
+            fixed_key_metadata=None,
+            mode="overwrite",
+            kms_key_name=None,
+        )
+
+        # Verify core.initiate_upload was called with correct arguments
+        mock_core_initiate.assert_awaited_once_with(
+            async_gcs,
+            TEST_BUCKET,
+            key,
+            "application/octet-stream",
+            None,
+            None,
+            "overwrite",
+            None,
+            if_generation_match=None,
+        )
+        assert result == "http://mock-resumable-url"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "http_location",
+    [
+        pytest.param(
+            "https://www.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=resumable&upload_id=abc123",
+            id="string_url",
+        ),
+        pytest.param(
+            b"https://www.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=resumable&upload_id=abc123",
+            id="bytes_url",
+        ),
+    ],
+)
+async def test_upload_chunk_delegates_to_core_for_http_url(async_gcs, http_location):
+    """
+    Tests that upload_chunk delegates to core.upload_chunk
+    when location is an HTTP resumable-upload URL (string or bytes).
+    """
+    data = b"chunk data"
+    offset = 0
+    size = 1024
+    content_type = "application/octet-stream"
+
+    with mock.patch(
+        "gcsfs.core.upload_chunk", new_callable=mock.AsyncMock
+    ) as mock_core_upload:
+        mock_core_upload.return_value = {"kind": "storage#object"}
+        result = await upload_chunk(
+            fs=async_gcs,
+            location=http_location,
+            data=data,
+            offset=offset,
+            size=size,
+            content_type=content_type,
+        )
+
+        # Verify core.upload_chunk was called with correct arguments
+        mock_core_upload.assert_awaited_once_with(
+            async_gcs,
+            http_location,
+            data,
+            offset,
+            size,
+            content_type,
+        )
+        assert result == {"kind": "storage#object"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_get_file_warning_on_missing_persisted_size(
+    async_gcs, gcs_bucket_mocks, caplog, tmp_path, file_path, bucket_layout
+):
+    """
+    Tests that a warning is logged in _get_file when MRD has no 'persisted_size' attribute.
+    """
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        lpath = tmp_path / "output.txt"
+        with (
+            caplog.at_level(logging.WARNING, logger="gcsfs"),
+            mock.patch.object(
+                async_gcs, "_info", new_callable=mock.AsyncMock
+            ) as mock_info,
+        ):
+            mock_info.return_value = {"size": len(json_data)}
+            await async_gcs._get_file(file_path, str(lpath))
+            assert "Falling back to _info() to get the file size" in caplog.text
+            assert lpath.read_bytes() == json_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_get_file_incomplete_download(
+    async_gcs, gcs_bucket_mocks, tmp_path, file_path, bucket_layout
+):
+    """
+    Tests that _get_file raises ClientError and correctly removes the local file
+    when the downloaded bytes are less than the expected size.
+    """
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        lpath = tmp_path / "output.txt"
+
+        # Simulate download_range returning a shorter byte string than expected:
+        # every attempt gets some data for the first chunk, then empty bytes (EOF).
+        # This ensures the download terminates early and raises ClientError, even if
+        # the expected size happens to be a multiple of the chunk size.
+        async def mock_download_range(offset, length, mrd):
+            return b"short" if offset == 0 else b""
+
+        with (
+            mock.patch(
+                "gcsfs.zb_hns_utils.download_range",
+                side_effect=mock_download_range,
+            ),
+            mock.patch.object(
+                async_gcs, "_info", new_callable=mock.AsyncMock
+            ) as mock_info,
+            # _get_file_concurrent retries the ClientError; skip the real backoff.
+            mock.patch("gcsfs.retry.asyncio.sleep", new_callable=mock.AsyncMock),
+        ):
+            mock_info.return_value = {"size": len(json_data)}
+            with pytest.raises(
+                aiohttp.ClientError,
+                match=f"Expected {len(json_data)} bytes, but only received 5 bytes",
+            ):
+                await async_gcs._get_file(file_path, str(lpath))
+
+            # The local file should not exist after the failed download
+            assert not lpath.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_get_file_exception_cleanup(
+    async_gcs, gcs_bucket_mocks, tmp_path, file_path, bucket_layout
+):
+    """
+    Tests that _get_file correctly removes the local file when an
+    exception occurs during download.
+    """
+
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout):
+        lpath = tmp_path / "output.txt"
+        error_message = "Simulated network failure during download"
+        with (
+            mock.patch(
+                "gcsfs.zb_hns_utils.download_range",
+                side_effect=Exception(error_message),
+            ),
+            mock.patch.object(
+                async_gcs, "_info", new_callable=mock.AsyncMock
+            ) as mock_info,
+        ):
+            mock_info.return_value = {"size": len(json_data)}
+            with pytest.raises(Exception, match=error_message):
+                await async_gcs._get_file(file_path, str(lpath))
+
+            # The local file should not exist after the failed download
+            assert not lpath.exists()
+
+
+@pytest.mark.asyncio
+async def test_merge_zonal_not_supported(async_gcs, zonal_write_mocks):
+    """Test _merge for Zonal buckets raises NotImplementedError."""
+    path = f"{TEST_ZONAL_BUCKET}/merged_file"
+    paths = [f"{TEST_ZONAL_BUCKET}/file1", f"{TEST_ZONAL_BUCKET}/file2"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Server-side compose/merge is not supported for Zonal buckets.",
+    ):
+        await async_gcs._merge(path, paths)
+
+
+@pytest.mark.asyncio
+async def test_merge_delegates_to_core_for_non_zonal(async_gcs):
+    """Test _merge delegates to core._merge when the bucket is not zonal."""
+    path = f"{TEST_BUCKET}/merged_file"
+    paths = [f"{TEST_BUCKET}/file1", f"{TEST_BUCKET}/file2"]
+
+    with (
+        mock.patch.object(async_gcs, "_is_zonal_bucket", return_value=False),
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._merge", new_callable=mock.AsyncMock
+        ) as mock_core_merge,
+    ):
+        await async_gcs._merge(path, paths, acl="public-read")
+        mock_core_merge.assert_awaited_once_with(path, paths, acl="public-read")
+
+
+@pytest.mark.parametrize(
+    "requester_pays, expected_quota_project",
+    [
+        ("requester-project", "requester-project"),  # Case 1: string
+        (True, "dummy-billing-project"),  # Case 2: True (fallback)
+    ],
+)
+@pytest.mark.asyncio
+async def test_async_grpc_client_init_quota_project(
+    requester_pays, expected_quota_project
+):
+    """
+    Verifies that ExtendedGcsFileSystem initializes AsyncGrpcClient
+    with the correct quota_project_id in ClientOptions derived from requester_pays.
+    """
+    project = "dummy-billing-project"
+
+    fs = ExtendedGcsFileSystem(project=project, requester_pays=requester_pays)
+
+    with mock.patch("gcsfs.extended_gcsfs.AsyncGrpcClient") as mock_grpc_client:
+        # Trigger client initialization
+        await fs._get_grpc_client()
+
+        mock_grpc_client.assert_called_once()
+        _, kwargs = mock_grpc_client.call_args
+        client_options = kwargs.get("client_options")
+        assert client_options is not None
+        assert client_options.quota_project_id == expected_quota_project
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path, prefix, expected_start_dir",
+    [
+        ("bucket", "folder", ""),  # Case: bucket root with prefix
+        ("bucket/parent", "folder", "parent/"),  # Case: subfolder with prefix
+        ("bucket/a/b", "c", "a/b/"),  # Case: deep subfolder
+        ("bucket", "a/b", "a/"),  # Case: root path with slash-contained prefix
+        (
+            "bucket/folder/",
+            "",
+            "folder/",
+        ),  # Case: subfolder with trailing slash, no prefix
+        ("bucket", "", ""),  # Case: empty everything
+    ],
+)
+async def test_get_all_folders_start_dir_calculation(
+    extended_gcsfs, path, prefix, expected_start_dir
+):
+    """
+    Verifies that _get_all_folders correctly calculates start_dir for various
+    combinations of path and prefix.
+    """
+    fs = extended_gcsfs
+
+    with mock.patch.object(
+        fs, "_get_control_plane_client", new_callable=mock.AsyncMock
+    ) as mock_client_getter:
+        mock_client = mock_client_getter.return_value
+        mock_client.list_folders = mock.AsyncMock()
+
+        # Mock async for loop in _get_all_folders to return empty results
+        mock_client.list_folders.return_value = mock.MagicMock()
+        mock_client.list_folders.return_value.__aiter__.return_value = []
+
+        await fs._get_all_folders(path, "bucket", prefix=prefix)
+
+        # Check the prefix passed to ListFoldersRequest
+        _, kwargs = mock_client.list_folders.call_args
+        request = kwargs["request"]
+        assert request.prefix == expected_start_dir
+
+
+@pytest.mark.asyncio
+async def test_process_limits_to_offset_and_length_info_calls():
+    extended_gcsfs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    path = "bucket/file"
+    with mock.patch.object(
+        extended_gcsfs, "_info", new_callable=mock.AsyncMock
+    ) as mock_info:
+        mock_info.return_value = {"size": 100}
+
+        # Test case where size is fetched
+        await extended_gcsfs._process_limits_to_offset_and_length(
+            path, start=-10, end=-5
+        )
+        mock_info.assert_awaited_once_with(path)
+
+        mock_info.reset_mock()
+
+        # Test case where size is fetched (None, None)
+        await extended_gcsfs._process_limits_to_offset_and_length(
+            path, start=None, end=None
+        )
+        mock_info.assert_awaited_once_with(path)
+
+        mock_info.reset_mock()
+
+        # Test case where size is not fetched because start and end are positive and end <= start
+        # When end <= start, the function returns early without needing size.
+        await extended_gcsfs._process_limits_to_offset_and_length(path, start=10, end=5)
+        mock_info.assert_not_called()
+
+        mock_info.reset_mock()
+
+        # Test case where size is provided
+        await extended_gcsfs._process_limits_to_offset_and_length(
+            path, start=-10, end=-5, file_size=100
+        )
+        mock_info.assert_not_called()
+
+
+def test_extended_gcsfs_constructs_mrd_pool_cache(monkeypatch):
+    # Avoid creating real gRPC clients
+    monkeypatch.setattr(
+        "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._get_grpc_client",
+        mock.AsyncMock(),
+    )
+
+    fs = ExtendedGcsFileSystem(token="anon", mrd_pool_cache_size=64)
+    assert isinstance(fs._mrd_pool_cache, MRDPoolCache)
+    assert fs._mrd_pool_cache._max_idle_pools == 64
+
+    # Default applies when kwarg omitted
+    fs2 = ExtendedGcsFileSystem(token="anon")
+    assert fs2._mrd_pool_cache._max_idle_pools == 16
+
+
+def test_finalize_mrd_pool_cache_closed_loop(monkeypatch, caplog):
+    """
+    Tests that _finalize_mrd_pool_cache does nothing when no event loop is running.
+    """
+
+    mock_pool = mock.MagicMock(spec=MRDPoolCache)
+    mock_pool._closed = False
+
+    # Mock asyncio.get_running_loop to raise RuntimeError
+    monkeypatch.setattr(
+        asyncio, "get_running_loop", mock.Mock(side_effect=RuntimeError)
+    )
+
+    # Mock asyn.loop to be [None]
+    monkeypatch.setattr("fsspec.asyn.loop", [None])
+
+    mock_loop = mock.MagicMock()
+    mock_loop.is_running.return_value = False
+
+    with caplog.at_level(logging.WARNING, logger="gcsfs"):
+        ExtendedGcsFileSystem._finalize_mrd_pool_cache(mock_loop, mock_pool)
+
+    # Verify that close was not called (since no loop was running)
+    mock_pool.close.assert_not_called()
+    # Verify no warnings were logged
+    assert len(caplog.records) == 0
+
+
+def test_finalize_mrd_pool_cache_current_loop_running(monkeypatch):
+    """
+    Tests that _finalize_mrd_pool_cache uses asyncio.run_coroutine_threadsafe
+    when current_loop is running.
+    """
+    mock_pool = mock.MagicMock(spec=MRDPoolCache)
+    mock_pool._closed = False
+
+    # Mock asyncio.get_running_loop to return a running loop
+    mock_current_loop = mock.MagicMock()
+    mock_current_loop.is_running.return_value = True
+    monkeypatch.setattr(
+        asyncio, "get_running_loop", mock.Mock(return_value=mock_current_loop)
+    )
+
+    # Mock asyncio.run_coroutine_threadsafe
+    mock_run_coroutine_threadsafe = mock.Mock()
+    monkeypatch.setattr(
+        asyncio, "run_coroutine_threadsafe", mock_run_coroutine_threadsafe
+    )
+
+    mock_loop = mock.MagicMock()
+    mock_loop.is_running.return_value = False
+
+    ExtendedGcsFileSystem._finalize_mrd_pool_cache(mock_loop, mock_pool)
+
+    # Verify that run_coroutine_threadsafe was called
+    assert mock_run_coroutine_threadsafe.call_count >= 1
+    assert any(
+        args[1] == mock_current_loop
+        for args, kwargs in mock_run_coroutine_threadsafe.call_args_list
+    )
+
+
+def test_finalize_mrd_pool_cache_asyn_loop_running(monkeypatch):
+    """
+    Tests that _finalize_mrd_pool_cache uses asyn.sync when asyn.loop[0] is running.
+    """
+    mock_pool = mock.MagicMock(spec=MRDPoolCache)
+    mock_pool._closed = False
+
+    # Mock asyncio.get_running_loop to raise RuntimeError
+    monkeypatch.setattr(
+        asyncio, "get_running_loop", mock.Mock(side_effect=RuntimeError)
+    )
+
+    # Mock asyn.loop to be [mock_loop]
+    mock_asyn_loop = mock.MagicMock()
+    mock_asyn_loop.is_running.return_value = True
+    monkeypatch.setattr("fsspec.asyn.loop", [mock_asyn_loop])
+
+    # Mock asyn.sync
+    mock_sync = mock.Mock()
+    monkeypatch.setattr("fsspec.asyn.sync", mock_sync)
+
+    mock_loop = mock.MagicMock()
+    mock_loop.is_running.return_value = False
+
+    ExtendedGcsFileSystem._finalize_mrd_pool_cache(mock_loop, mock_pool)
+
+    # Verify that asyn.sync was called
+    mock_sync.assert_called_once_with(mock_asyn_loop, mock_pool.close, timeout=5.0)
+
+
+def test_finalize_mrd_pool_cache_asyn_loop_running_timeout(monkeypatch):
+    """
+    Tests that _finalize_mrd_pool_cache ignores FSTimeoutError from asyn.sync.
+    """
+    import fsspec
+
+    mock_pool = mock.MagicMock(spec=MRDPoolCache)
+    mock_pool._closed = False
+
+    # Mock asyncio.get_running_loop to raise RuntimeError
+    monkeypatch.setattr(
+        asyncio, "get_running_loop", mock.Mock(side_effect=RuntimeError)
+    )
+
+    # Mock asyn.loop to be [mock_loop]
+    mock_asyn_loop = mock.MagicMock()
+    mock_asyn_loop.is_running.return_value = True
+    monkeypatch.setattr("fsspec.asyn.loop", [mock_asyn_loop])
+
+    # Mock asyn.sync to raise FSTimeoutError
+    mock_sync = mock.Mock(side_effect=fsspec.FSTimeoutError)
+    monkeypatch.setattr("fsspec.asyn.sync", mock_sync)
+
+    mock_loop = mock.MagicMock()
+    mock_loop.is_running.return_value = False
+
+    # Should not raise exception
+    ExtendedGcsFileSystem._finalize_mrd_pool_cache(mock_loop, mock_pool)
+
+    mock_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_close_resources_with_exceptions(caplog):
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    # Mock grpc_client
+    mock_grpc = mock.Mock()
+    mock_grpc.grpc_client.transport.close = mock.AsyncMock(
+        side_effect=Exception("grpc fail")
+    )
+    fs._grpc_client = mock_grpc
+
+    # Mock storage_control_client
+    mock_storage_control = mock.Mock()
+    mock_storage_control.transport.close = mock.AsyncMock(
+        side_effect=Exception("storage control fail")
+    )
+    fs._storage_control_client = mock_storage_control
+
+    # Mock mrd_pool_cache
+    mock_cache = mock.Mock()
+    mock_cache.close = mock.AsyncMock(side_effect=Exception("cache fail"))
+    fs._mrd_pool_cache = mock_cache
+
+    with caplog.at_level(logging.WARNING, logger="gcsfs"):
+        await fs._close_resources()
+
+    assert "Failed to close grpc_client: grpc fail" in caplog.text
+    assert "Failed to close storage_control_client: storage control fail" in caplog.text
+    assert "Failed to close MRDPoolCache: cache fail" in caplog.text
+
+    assert fs._grpc_client is None
+    assert fs._storage_control_client is None
+
+
+def _crc32c_b64(payload: bytes) -> str:
+    import base64
+
+    import google_crc32c
+
+    return base64.b64encode(google_crc32c.Checksum(payload).digest()).decode()
+
+
+def _make_fake_mrd_pool(persisted_size: int | None, details: dict):
+    import contextlib
+    from types import SimpleNamespace
+
+    from gcsfs.zb_hns_utils import MRDPool
+
+    class _FakeMRDPool(MRDPool):
+        def __init__(self):
+            self.persisted_size = persisted_size
+            self.details = details
+            self.closed = False
+
+        @contextlib.asynccontextmanager
+        async def get_mrd(self):
+            yield SimpleNamespace(persisted_size=self.persisted_size)
+
+        async def close(self):
+            self.closed = True
+
+    return _FakeMRDPool()
+
+
+def _enable_crc32c_checker(monkeypatch):
+    from types import SimpleNamespace
+
+    import google_crc32c
+
+    import gcsfs.checkers
+
+    if gcsfs.checkers.crcmod is None:
+        monkeypatch.setattr(
+            gcsfs.checkers,
+            "crcmod",
+            SimpleNamespace(Crc=lambda *a, **kw: google_crc32c.Checksum()),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+@pytest.mark.parametrize(
+    "consistency,persisted_size,details_size,crc_payload",
+    [
+        pytest.param("none", 6 * 1024 * 1024, 0, None, id="unfinalized_size_zero"),
+        pytest.param(
+            "none", None, 6 * 1024 * 1024, None, id="missing_persisted_size_fallback"
+        ),
+        pytest.param(
+            "crc32c",
+            6 * 1024 * 1024,
+            6 * 1024 * 1024,
+            b"x" * (6 * 1024 * 1024),
+            id="valid_crc32c",
+        ),
+        pytest.param(
+            "crc32c",
+            6 * 1024 * 1024,
+            1024 * 1024,
+            b"x" * (1024 * 1024),
+            id="stale_prefix_crc32c",
+        ),
+    ],
+)
+async def test_get_file_concurrent_downloads_persisted_size(
+    tmp_path,
+    monkeypatch,
+    consistency,
+    persisted_size,
+    details_size,
+    crc_payload,
+    bucket_layout,
+):
+    """Test _get_file_concurrent downloads persisted_size bytes without calling _info."""
+    from types import SimpleNamespace
+
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+    # Arrange
+    _enable_crc32c_checker(monkeypatch)
+    data = b"x" * (6 * 1024 * 1024)
+    lpath = tmp_path / "out.bin"
+    details = {"size": details_size, "generation": "123"}
+    if crc_payload is not None:
+        details["crc32c"] = _crc32c_b64(crc_payload)
+
+    pool = _make_fake_mrd_pool(persisted_size=persisted_size, details=details)
+    fs = ExtendedGcsFileSystem(
+        token="anon",
+        consistency=consistency,
+        loop=asyncio.get_running_loop(),
+        skip_instance_cache=True,
+    )
+    fs._mrd_pool_cache = SimpleNamespace(get=mock.AsyncMock(return_value=pool))
+    mock_info = mock.AsyncMock(return_value=details)
+
+    async def fake_cat_file(rpath, start=None, end=None, **kwargs):
+        return data[start:end]
+
+    # Act
+    with (
+        mock.patch.object(
+            fs, "_lookup_bucket_layout", new=mock.AsyncMock(return_value=bucket_layout)
+        ),
+        mock.patch.object(fs, "_info", new=mock_info),
+        mock.patch.object(fs, "_cat_file", side_effect=fake_cat_file),
+    ):
+        await fs._get_file_concurrent(
+            "zonal-bucket/obj.bin",
+            str(lpath),
+            concurrency=2,
+            chunk_size=3 * 1024 * 1024,
+            max_prefetch_size=6 * 1024 * 1024,
+        )
+
+    # Assert
+    mock_info.assert_not_awaited()
+    assert lpath.stat().st_size == len(data)
+    assert lpath.read_bytes() == data
+    assert pool.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_get_file_concurrent_crc32c_mismatch_raises(
+    tmp_path, monkeypatch, bucket_layout
+):
+    """Test _get_file_concurrent raises ChecksumError when crc32c does not match."""
+    from types import SimpleNamespace
+
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+    from gcsfs.retry import ChecksumError
+
+    # Arrange
+    _enable_crc32c_checker(monkeypatch)
+    data = b"x" * (6 * 1024 * 1024)
+    lpath = tmp_path / "corrupt.bin"
+    details = {
+        "size": len(data),
+        "generation": "123",
+        "crc32c": _crc32c_b64(b"wrong"),
+    }
+    pool = _make_fake_mrd_pool(persisted_size=len(data), details=details)
+    fs = ExtendedGcsFileSystem(
+        token="anon",
+        consistency="crc32c",
+        loop=asyncio.get_running_loop(),
+        skip_instance_cache=True,
+    )
+    fs._mrd_pool_cache = SimpleNamespace(get=mock.AsyncMock(return_value=pool))
+
+    async def fake_cat_file(rpath, start=None, end=None, **kwargs):
+        return data[start:end]
+
+    # Act & Assert
+    with (
+        mock.patch.object(
+            fs, "_lookup_bucket_layout", new=mock.AsyncMock(return_value=bucket_layout)
+        ),
+        mock.patch.object(fs, "_cat_file", side_effect=fake_cat_file),
+        mock.patch("gcsfs.retry.asyncio.sleep", new=mock.AsyncMock()),
+        pytest.raises(ChecksumError),
+    ):
+        await fs._get_file_concurrent(
+            "zonal-bucket/obj.bin",
+            str(lpath),
+            concurrency=2,
+            chunk_size=3 * 1024 * 1024,
+            max_prefetch_size=6 * 1024 * 1024,
+        )
+
+    assert pool.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_layout", GRPC_READ_LAYOUTS)
+async def test_get_threshold_for_disk_reads_grpc_buckets(bucket_layout):
+    """Test _get_threshold_for_disk_reads returns 5 MiB for Zonal and RCU buckets."""
+    fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    with mock.patch.object(
+        fs, "_lookup_bucket_layout", new=mock.AsyncMock(return_value=bucket_layout)
+    ):
+        threshold = await fs._get_threshold_for_disk_reads("test-bucket")
+        assert threshold == 5 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket_layout",
+    [
+        layouts.STANDARD,
+        layouts.STANDARD_HIERARCHICAL,
+        layouts.STANDARD_RAPID_CACHE,
+        layouts.HIERARCHICAL_RAPID_CACHE,
+        BucketLayout.UNKNOWN,
+    ],
+)
+async def test_get_threshold_for_disk_reads_http_buckets_delegates_to_super(
+    bucket_layout,
+):
+    """Test _get_threshold_for_disk_reads delegates to super for HTTP buckets."""
+    fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    with (
+        mock.patch.object(
+            fs, "_lookup_bucket_layout", new=mock.AsyncMock(return_value=bucket_layout)
+        ),
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._get_threshold_for_disk_reads",
+            new=mock.AsyncMock(return_value=12345),
+        ) as mock_super,
+    ):
+        threshold = await fs._get_threshold_for_disk_reads("test-bucket")
+        assert threshold == 12345
+        mock_super.assert_awaited_once_with("test-bucket")
+
+
+@pytest.mark.parametrize(
+    "bucket_layout", [layouts.STANDARD_RCU, layouts.HIERARCHICAL_RCU]
+)
+def test_open_rcu_bucket_read_uses_zonal_file(
+    extended_gcsfs, gcs_bucket_mocks, bucket_layout
+):
+    """Test _open returns ZonalFile for 'rb' on RCU buckets."""
+    with gcs_bucket_mocks(json_data, bucket_type_val=bucket_layout) as mocks:
+        with extended_gcsfs.open(file_path, "rb") as rf:
+            assert type(rf) is ZonalFile
+            assert rf.read(10) == json_data[:10]
+        mocks["pool_cache_get"].assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket_layout", [layouts.STANDARD_RCU, layouts.HIERARCHICAL_RCU]
+)
+async def test_cp_file_and_merge_on_rcu_bucket_delegate_to_core(
+    async_gcs, bucket_layout
+):
+    """cp_file and merge on RCU buckets keep using the HTTP implementation."""
+    with (
+        mock.patch.object(
+            async_gcs,
+            "_lookup_bucket_layout",
+            new_callable=mock.AsyncMock,
+            return_value=bucket_layout,
+        ),
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._cp_file", new_callable=mock.AsyncMock
+        ) as mock_core_cp_file,
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._merge", new_callable=mock.AsyncMock
+        ) as mock_core_merge,
+    ):
+        await async_gcs._cp_file(f"{TEST_BUCKET}/a", f"{TEST_BUCKET}/b")
+        await async_gcs._merge(
+            f"{TEST_BUCKET}/m", [f"{TEST_BUCKET}/a", f"{TEST_BUCKET}/b"]
+        )
+
+    mock_core_cp_file.assert_awaited_once()
+    mock_core_merge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_anywhere_cache_bucket_writes_stay_on_http(extended_gcsfs, async_gcs):
+    """Anywhere Cache (RAPID_CACHE) buckets keep writing over HTTP."""
+    layout = layouts.STANDARD_RAPID_CACHE
+    path = f"{TEST_BUCKET}/anywhere-cache-file"
+    with (
+        mock.patch(
+            "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._lookup_bucket_layout",
+            new_callable=mock.AsyncMock,
+            return_value=layout,
+        ),
+        mock.patch(
+            "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._sync_lookup_bucket_layout",
+            return_value=layout,
+        ),
+        mock.patch("gcsfs.extended_gcsfs.GCSFile") as mock_gcs_file,
+        mock.patch("gcsfs.extended_gcsfs.ZonalFile") as mock_zonal_file,
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._pipe_file", new_callable=mock.AsyncMock
+        ) as mock_core_pipe_file,
+        mock.patch(
+            "gcsfs.zb_hns_utils.init_aaow", new_callable=mock.AsyncMock
+        ) as mock_init_aaow,
+    ):
+        extended_gcsfs._open(path, "wb")
+        await async_gcs._pipe_file(path, b"data")
+
+    mock_gcs_file.assert_called_once()
+    mock_zonal_file.assert_not_called()
+    mock_core_pipe_file.assert_awaited_once()
+    mock_init_aaow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket_layout", [layouts.STANDARD_RCU, layouts.HIERARCHICAL_RCU]
+)
+async def test_core_upload_helpers_route_rcu_to_extended_with_rcu_rapid_write(
+    async_gcs, bucket_layout
+):
+    """With rcu_rapid_write, core.simple_upload and core.initiate_upload hand RCU buckets to gRPC."""
+    with (
+        mock.patch.object(async_gcs, "rcu_rapid_write", True),
+        mock.patch.object(
+            async_gcs,
+            "_lookup_bucket_layout",
+            new_callable=mock.AsyncMock,
+            return_value=bucket_layout,
+        ),
+        mock.patch(
+            "gcsfs.extended_gcsfs.simple_upload", new_callable=mock.AsyncMock
+        ) as mock_ext_simple_upload,
+        mock.patch(
+            "gcsfs.extended_gcsfs.initiate_upload", new_callable=mock.AsyncMock
+        ) as mock_ext_initiate_upload,
+    ):
+        await gcsfs.core.simple_upload(async_gcs, TEST_BUCKET, "key", b"data")
+        await gcsfs.core.initiate_upload(async_gcs, TEST_BUCKET, "key")
+
+    mock_ext_simple_upload.assert_awaited_once()
+    mock_ext_initiate_upload.assert_awaited_once()

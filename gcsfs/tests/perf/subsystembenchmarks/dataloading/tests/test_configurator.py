@@ -1,0 +1,110 @@
+from dataclasses import dataclass
+
+import pytest
+
+from gcsfs.tests.perf.subsystembenchmarks.dataloading.configurator import (
+    OneFactorReadConfigurator,
+    ReadParameters,
+)
+
+
+@dataclass
+class _FakeParams(ReadParameters):
+    LOADER_TAG = "fk"
+    FMT_TAGS = {"pretok_parquet": "ptpq"}
+
+
+class _FakeConfigurator(OneFactorReadConfigurator):
+    FRAMEWORK = "fake"
+    PARAMS_CLASS = _FakeParams
+
+
+_YAML = """
+common:
+  rounds: 3
+  batch_size: 64
+  baseline:
+    fmt: "pretok_parquet"
+    file_count: 8
+    rows_per_file: 4096
+    access: "sequential"
+    num_workers: 8
+    prefetch_factor: 2
+    split_by_node: false
+    world_size: 1
+scenarios:
+  - name: "read"
+    scenario: "read"
+    variants:
+      - {axis: "workers", num_workers: 1}
+      - {axis: "bucket_type", bucket_type: "hns"}   # run-level key -> must reject
+"""
+
+
+def _write(tmp_path, text):
+    (tmp_path / "configs.yaml").write_text(text)
+    return _FakeConfigurator(str(tmp_path / "configs.py"))
+
+
+def test_baseline_and_variant_expand_with_stable_ids(tmp_path):
+    text = _YAML.replace(
+        '      - {axis: "bucket_type", bucket_type: "hns"}   # run-level key -> must reject\n',
+        "",
+    )
+    cases = _write(tmp_path, text).generate_cases()
+    assert [c.name for c in cases] == [
+        "read-fk-ptpq-seq-nw8-fc8x4096-reg",
+        "read-fk-ptpq-seq-nw1-fc8x4096-reg",
+    ]
+    assert all(c.framework == "fake" for c in cases)
+    assert [c.sweep_axis for c in cases] == ["baseline", "workers"]
+
+
+def test_variant_setting_run_level_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="run-level"):
+        _write(tmp_path, _YAML).generate_cases()
+
+
+def test_zero_rounds_is_rejected(tmp_path):
+    text = _YAML.replace(
+        '      - {axis: "bucket_type", bucket_type: "hns"}   # run-level key -> must reject\n',
+        '      - {axis: "smoke", rounds: 0}\n',
+    )
+    with pytest.raises(ValueError, match="rounds must be >= 1"):
+        _write(tmp_path, text).generate_cases()
+
+
+def test_extra_columns_and_id_hooks_default_empty(tmp_path):
+    text = _YAML.replace(
+        '      - {axis: "bucket_type", bucket_type: "hns"}   # run-level key -> must reject\n',
+        "",
+    )
+    cases = _write(tmp_path, text).generate_cases()
+    assert cases[0].extra_columns() == {}
+    assert cases[0]._id_extra_tokens() == []
+
+
+@pytest.mark.parametrize(
+    ("bucket_type", "token"),
+    [
+        ("rapid_cache_cold", "rccold"),
+        ("rapid_cache_warm", "rcwarm"),
+        ("standard_rcu_z", "rcuz"),
+        ("standard_rcu_warm", "rcuwarm"),
+        ("standard_rcu_cold", "rcucold"),
+        ("hns_rcu_z", "hnsrcuz"),
+        ("hns_rcu_warm", "hnsrcuwarm"),
+        ("hns_rcu_cold", "hnsrcucold"),
+    ],
+)
+def test_rapid_cache_bucket_types_produce_expected_id_tokens(
+    tmp_path, monkeypatch, bucket_type, token
+):
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_BUCKET_TYPE", bucket_type)
+    text = _YAML.replace(
+        '      - {axis: "bucket_type", bucket_type: "hns"}   # run-level key -> must reject\n',
+        "",
+    )
+    cases = _write(tmp_path, text).generate_cases()
+    assert cases[0].name == f"read-fk-ptpq-seq-nw8-fc8x4096-{token}"
+    assert cases[0].rounds == 3

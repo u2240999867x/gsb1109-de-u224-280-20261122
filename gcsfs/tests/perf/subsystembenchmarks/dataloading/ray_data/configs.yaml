@@ -1,0 +1,49 @@
+common:
+  rounds: 3
+  seq_len: 2048
+  batch_size: 8
+  baseline:
+    fmt: "pretok_parquet"
+    file_count: 64
+    rows_per_file: 10920
+    # Keeps uncompressed pretokenized Parquet row groups below about 30 MB.
+    row_group_size: 1800
+    access: "shuffled"
+    file_shuffle: true
+    shuffle_buffer_size: 0
+    num_workers: 0
+    prefetch_factor: 2
+    split_by_node: true
+    world_size: 8
+
+scenarios:
+  - name: "read"
+    scenario: "read"
+    variants:
+      - { axis: "format", fmt: "text_parquet" }
+
+      - { axis: "concurrency", num_workers: 4 }
+      - { axis: "concurrency", num_workers: 16 }
+
+      - { axis: "shuffle", shuffle_buffer_size: 10000 }
+
+      - { axis: "scale", file_count: 512, rows_per_file: 1365 }
+
+      - { axis: "prefetch", prefetch_factor: 4 }
+
+      - { axis: "workers", world_size: 4 }
+
+      # Wide table: 1,134 extra binary feature columns, read with a projection of 286
+      # (scattered, in blocks of 16 adjacent columns, or all together). Every projected
+      # column chunk becomes its own small range read unless its neighbours are projected too. Read throughput and amplification for these
+      # rows are relative to the whole table, so compare them with each other.
+      - { axis: "features", feature_column_count: 1134, projected_feature_count: 286 }
+      - { axis: "features", feature_column_count: 1134, projected_feature_count: 286, projection_run_length: 16 }
+      # Recommended layout: the same table and projection, with the 286 projected columns
+      # stored next to each other, so each row group is read with one large contiguous range.
+      - { axis: "features", feature_column_count: 1134, projected_feature_count: 286, projection_run_length: 286 }
+      - { axis: "features", feature_column_count: 1134, enabled: false }
+
+      # gcsfs cache for the projected read; compare with the first features row.
+      - { axis: "gcsfs_cache", feature_column_count: 1134, projected_feature_count: 286, cache_type: "readahead", block_size: 5242880 }
+      - { axis: "gcsfs_cache", feature_column_count: 1134, projected_feature_count: 286, cache_type: "readahead", block_size: 8388608 }

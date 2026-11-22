@@ -1,0 +1,10 @@
+fsspec
+gcsfs
+numpy
+packaging
+psutil
+py-spy
+pyarrow
+ray[data,train]==2.60.0
+safetensors
+transformers==5.22.2

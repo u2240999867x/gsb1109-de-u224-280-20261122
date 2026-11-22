@@ -1,0 +1,5040 @@
+import array
+import asyncio
+import base64
+import builtins
+import io
+import json
+import os
+import ssl
+import uuid
+from builtins import FileNotFoundError
+from datetime import datetime, timedelta, timezone
+from itertools import chain
+from unittest import mock
+from urllib.parse import parse_qs, unquote, urlparse
+from uuid import uuid4
+
+import aiohttp
+import fsspec.asyn
+import fsspec.core
+import google.auth.compute_engine
+import pytest
+import requests
+from fsspec.asyn import sync
+from fsspec.utils import seek_delimiter
+
+import gcsfs.checkers
+import gcsfs.tests.settings
+from gcsfs import GCSFileSystem
+from gcsfs import __version__ as version
+from gcsfs.core import GCSFile
+from gcsfs.credentials import GoogleCredentials
+from gcsfs.retry import GenerationMismatchError, HttpError
+from gcsfs.tests.conftest import (
+    a,
+    allfiles,
+    b,
+    csv_files,
+    files,
+    requires_real_gcs,
+    text_files,
+)
+from gcsfs.tests.utils import tempdir, tmpfile
+from gcsfs.zb_hns_utils import MAX_PREFETCH_SIZE
+
+TEST_BUCKET = gcsfs.tests.settings.TEST_BUCKET
+TEST_PROJECT = gcsfs.tests.settings.TEST_PROJECT
+TEST_REQUESTER_PAYS_BUCKET = gcsfs.tests.settings.TEST_REQUESTER_PAYS_BUCKET
+TEST_KMS_KEY = gcsfs.tests.settings.TEST_KMS_KEY
+
+# Test placement: keep common behavior and standard-bucket coverage in this
+# file. HNS-specific filesystem behavior belongs in test_hns_unit.py
+# or test_hns.py; zonal-specific behavior belongs in
+# test_zonal.py or test_zonal_file.py.
+
+
+def test_simple(gcs, monkeypatch):
+    monkeypatch.setattr(GoogleCredentials, "tokens", None)
+    gcs.ls(TEST_BUCKET)  # no error
+    gcs.ls("/" + TEST_BUCKET)  # OK to lead with '/'
+
+
+def test_gcs_init_invalid_access():
+    with pytest.raises(ValueError) as excinfo:
+        GCSFileSystem(access="invalid_access_value", token="anon")
+    msg = str(excinfo.value)
+    assert msg.startswith("access must be one of {")
+    assert msg.endswith("}")
+    for scope in GCSFileSystem.scopes:
+        assert f"'{scope}'" in msg or f'"{scope}"' in msg
+
+
+def test_exists(gcs):
+    # Existing file
+    fn = TEST_BUCKET + "/nested/file1"
+    assert gcs.exists(fn)
+
+    # Existing directory
+    dn = TEST_BUCKET + "/nested"
+    assert gcs.exists(dn)
+
+    # Bucket
+    assert gcs.exists(TEST_BUCKET)
+
+    # Non-existing path
+    assert not gcs.exists(TEST_BUCKET + "/non-existing")
+
+    # Path within non-existing directory
+    assert not gcs.exists(TEST_BUCKET + "/non-existing/file")
+
+    # Prefix cases
+    # file 'nested/file1' exists. Check if 'nested/file' exists.
+    assert not gcs.exists(TEST_BUCKET + "/nested/file")
+
+    # nested/nested2/file1 exists, so nested/nested2 should be a directory
+    assert gcs.exists(TEST_BUCKET + "/nested/nested2")
+
+    # Trailing slash
+    assert gcs.exists(dn + "/")
+
+    # Non-existent bucket
+    nb = "gcsfs-test-non-existent-" + str(uuid4())
+    assert not gcs.exists(nb)
+
+
+def test_isdir(gcs):
+    # Existing file
+    fn = TEST_BUCKET + "/nested/file1"
+    assert not gcs.isdir(fn)
+
+    # Existing directory
+    dn = TEST_BUCKET + "/nested"
+    assert gcs.isdir(dn)
+
+    # Bucket
+    assert gcs.isdir(TEST_BUCKET)
+
+    # Non-existing path
+    assert not gcs.isdir(TEST_BUCKET + "/non-existing")
+
+    # nested/nested2/file1 exists, so nested/nested2 should be a directory
+    assert gcs.isdir(TEST_BUCKET + "/nested/nested2")
+
+    # Trailing slash
+    assert gcs.isdir(dn + "/")
+
+    # Non-existent bucket
+    nb = "gcsfs-test-non-existent-" + str(uuid4())
+    assert not gcs.isdir(nb)
+
+
+def test_isfile(gcs):
+    # Existing file
+    fn = TEST_BUCKET + "/nested/file1"
+    assert gcs.isfile(fn)
+
+    # Existing directory
+    dn = TEST_BUCKET + "/nested"
+    assert not gcs.isfile(dn)
+
+    # Bucket
+    assert not gcs.isfile(TEST_BUCKET)
+
+    # Non-existing path
+    assert not gcs.isfile(TEST_BUCKET + "/non-existing")
+
+    # Path within non-existing directory
+    assert not gcs.isfile(TEST_BUCKET + "/non-existing/file")
+
+    # nested/nested2/file1 exists, so nested/nested2 is not a file
+    assert not gcs.isfile(TEST_BUCKET + "/nested/nested2")
+
+    # Trailing slash
+    assert not gcs.isfile(dn + "/")
+
+    # Non-existent bucket
+    nb = "gcsfs-test-non-existent-" + str(uuid4())
+    assert not gcs.isfile(nb)
+
+    # Generation
+    info = gcs.info(fn)
+    gen = info.get("generation")
+    if gen:
+        original_version_aware = gcs.version_aware
+        gcs.version_aware = True
+        try:
+            assert gcs.isfile(f"{fn}#{gen}")
+        finally:
+            gcs.version_aware = original_version_aware
+
+
+def test_dircache_filled(gcs):
+    assert not dict(gcs.dircache)
+    gcs.ls(TEST_BUCKET)
+    assert len(gcs.dircache) == 1
+    gcs.dircache[TEST_BUCKET][0]["CHECK"] = True
+    out = gcs.ls(TEST_BUCKET, detail=True)
+    assert [o for o in out if o.get("CHECK", None)]
+
+    gcs.invalidate_cache()
+    assert not dict(gcs.dircache)
+
+    gcs.find(TEST_BUCKET)
+    assert len(gcs.dircache)
+
+
+def test_many_connect(gcs_factory):
+    from multiprocessing.pool import ThreadPool
+
+    gcs_factory()
+
+    def task(i):
+        gcs_factory().ls("")
+        return True
+
+    pool = ThreadPool(processes=20)
+    out = pool.map(task, range(40))
+    assert all(out)
+    pool.close()
+    pool.join()
+
+
+def test_many_connect_new(gcs_factory):
+    from multiprocessing.pool import ThreadPool
+
+    def task(i):
+        # first instance is made within thread - creating loop
+        gcs_factory().ls("")
+        return True
+
+    pool = ThreadPool(processes=20)
+    out = pool.map(task, range(40))
+    assert all(out)
+    pool.close()
+    pool.join()
+
+
+def test_simple_upload(gcs):
+    fn = TEST_BUCKET + "/test"
+    with gcs.open(fn, "wb", content_type="text/plain") as f:
+        f.write(b"zz")
+    with gcs.open(fn, "wb") as f:
+        f.write(b"zz")
+    assert gcs.cat(fn) == b"zz"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"before\r\n--==0==--\r\nafter",
+        b"before\n--==0==--\nafter",
+    ],
+    ids=["crlf_boundary", "lf_boundary"],
+)
+def test_simple_upload_payload_with_multipart_boundary(gcs, payload):
+    fn = f"{TEST_BUCKET}/multipart_boundary_payload"
+    assert gcs.consistency == "none"
+    gcs.pipe_file(fn, payload)
+    assert gcs.cat_file(fn) == payload
+
+
+def test_simple_upload_memoryview(gcs):
+    key = "simple_upload_mv_typed"
+    fn = f"{TEST_BUCKET}/{key}"
+    mv = memoryview(array.array("H", [1, 2, 3]))
+    sync(
+        gcs.loop,
+        gcsfs.core.simple_upload,
+        gcs,
+        TEST_BUCKET,
+        key,
+        mv,
+        consistency="size",
+    )
+    assert gcs.cat_file(fn) == bytes(mv)
+
+
+@pytest.mark.parametrize(
+    "bad_content_type",
+    [
+        "text/plain\r\nX-Injected: 1",
+        "text/plain\n\nmalicious-body",
+        "text/plain\rX-Injected: 1",
+    ],
+    ids=["crlf_header", "lf_body", "cr_header"],
+)
+def test_simple_upload_rejects_crlf_in_content_type(
+    gcs, skip_if_zonal, bad_content_type
+):
+    fn = f"{TEST_BUCKET}/bad_content_type"
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        with pytest.raises(ValueError, match="content_type"):
+            gcs.pipe_file(fn, b"hello", content_type=bad_content_type)
+        mock_call.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"hello", b"x" * (2**18)],
+    ids=["below_chunksize", "at_chunksize"],
+)
+def test_pipe_file_none_content_type(gcs, skip_if_zonal, payload):
+    fn = f"{TEST_BUCKET}/none_content_type"
+    gcs.pipe_file(fn, payload, content_type=None, chunksize=2**18)
+    assert gcs.cat_file(fn) == payload
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_simple_upload_with_kms(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+    fn = TEST_BUCKET + "/test"
+    with gcs.open(fn, "wb", content_type="text/plain", kms_key_name=TEST_KMS_KEY) as f:
+        f.write(b"zz")
+    assert gcs.cat(fn) == b"zz"
+    assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
+
+
+def test_large_upload(gcs):
+    import gcsfs.core
+
+    orig = gcsfs.core.GCS_MAX_BLOCK_SIZE
+    gcsfs.core.GCS_MAX_BLOCK_SIZE = 262144  # minimum block size
+    try:
+        fn = TEST_BUCKET + "/test"
+        d = b"7123" * 262144
+        with gcs.open(fn, "wb", content_type="application/octet-stream") as f:
+            f.write(d)
+        assert gcs.cat(fn) == d
+    finally:
+        gcsfs.core.GCS_MAX_BLOCK_SIZE = orig
+
+
+def test_large_upload_with_kms(gcs):
+    import gcsfs.core
+
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+    orig = gcsfs.core.GCS_MAX_BLOCK_SIZE
+    gcsfs.core.GCS_MAX_BLOCK_SIZE = 262144  # minimum block size
+    try:
+        fn = TEST_BUCKET + "/test"
+        d = b"7123" * 262144
+        with gcs.open(
+            fn, "wb", content_type="application/octet-stream", kms_key_name=TEST_KMS_KEY
+        ) as f:
+            f.write(d)
+        assert gcs.cat(fn) == d
+        assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
+    finally:
+        gcsfs.core.GCS_MAX_BLOCK_SIZE = orig
+
+
+def test_multi_upload(gcs):
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", content_type="text/plain", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "text/plain"
+    # empty buffer on close
+    with gcs.open(fn, "wb", content_type="text/plain", block_size=2**19) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "text/plain"
+
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+    # empty buffer on close
+    with gcs.open(fn, "wb", block_size=2**19) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_streaming_upload_aligns_non_final_chunk():
+    class MockGCSFileSystem:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, location, headers=None, data=None):
+            assert method == "POST"
+            assert location == "mock-location"
+            length = int(headers["Content-Length"])
+            content_range = headers["Content-Range"]
+            self.calls.append((headers, data))
+            assert length % gcsfs.core.GCS_MIN_BLOCK_SIZE == 0
+            assert content_range == f"bytes 0-{length - 1}/*"
+            return {"Range": f"bytes=0-{length - 1}"}, None
+
+    # Reproduces https://github.com/fsspec/gcsfs/issues/886:
+    # the reported failing request was 5,250,002 bytes. The default block size
+    # is 5 MiB (5,242,880 bytes), leaving a 7,122-byte unaligned overflow.
+    overflow = 7122
+    fs = MockGCSFileSystem()
+    f = gcsfs.core.GCSFile.__new__(gcsfs.core.GCSFile)
+    f.path = "mock-bucket/mock-key"
+    f.buffer = io.BytesIO(b"x" * (gcsfs.core.DEFAULT_BLOCK_SIZE + overflow))
+    f.offset = 0
+    f.autocommit = True
+    f.content_type = "application/octet-stream"
+    f.location = "mock-location"
+    f.if_generation_match = None
+    f.gcsfs = fs
+    f.checker = gcsfs.checkers.get_consistency_checker(None)
+
+    assert f._upload_chunk(final=False) is False
+    assert len(fs.calls) == 1
+    assert len(fs.calls[0][1]) == gcsfs.core.DEFAULT_BLOCK_SIZE
+    assert f.buffer.getvalue() == b"x" * overflow
+    assert f.buffer.tell() == overflow
+    assert f.offset == gcsfs.core.DEFAULT_BLOCK_SIZE
+
+
+@requires_real_gcs
+def test_streaming_upload_unaligned_flush_real_gcs(gcs):
+    # Keep this in sync with test_streaming_upload_aligns_non_final_chunk. This
+    # is the same overflow reported in https://github.com/fsspec/gcsfs/issues/886.
+    overflow = 7122
+    first = b"x" * (gcsfs.core.DEFAULT_BLOCK_SIZE - 10)
+    second = b"y" * (overflow + 10)
+    path = f"{TEST_BUCKET}/streaming_unaligned_flush_{uuid.uuid4().hex}"
+
+    try:
+        with gcs.open(path, "wb") as f:
+            f.write(first)
+            f.write(second)
+
+        assert gcs.info(path)["size"] == len(first) + len(second)
+        assert gcs.cat(path) == first + second
+    finally:
+        try:
+            gcs.rm(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_multi_upload_with_kms(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support kmsKeyName")
+
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", content_type="text/plain", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "text/plain"
+    # empty buffer on close
+    with gcs.open(
+        fn,
+        "wb",
+        content_type="text/plain",
+        block_size=2**19,
+        kms_key_name=TEST_KMS_KEY,
+    ) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "text/plain"
+    assert TEST_KMS_KEY in gcs.info(fn)["kmsKeyName"]
+
+    fn = TEST_BUCKET + "/test"
+    d = b"01234567" * 2**15
+
+    # something to write on close
+    with gcs.open(fn, "wb", block_size=2**18) as f:
+        f.write(d)
+        f.write(b"xx")
+    assert gcs.cat(fn) == d + b"xx"
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+    assert "kmsKeyName" not in gcs.info(fn)
+    # empty buffer on close
+    with gcs.open(fn, "wb", block_size=2**19) as f:
+        f.write(d)
+        f.write(b"xx")
+        f.write(d)
+    assert gcs.cat(fn) == d + b"xx" + d
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_info(gcs):
+    gcs.touch(a)
+    assert gcs.info(a) == gcs.ls(a, detail=True)[0]
+
+    today = datetime.utcnow().date().isoformat()
+    assert gcs.created(a).isoformat().startswith(today)
+    assert gcs.modified(a).isoformat().startswith(today)
+    # Check conformance with expected info attribute names.
+    assert gcs.info(a)["ctime"] == gcs.created(a)
+    assert gcs.info(a)["mtime"] == gcs.modified(a)
+
+
+def test_size(gcs):
+    gcs.touch(a)
+    assert gcs.size(a) == 0
+    with gcs.open(a, "wb") as f:
+        f.write(b"123")
+    assert gcs.size(a) == 3
+
+
+def test_size_nonexistent(gcs):
+    with pytest.raises(FileNotFoundError):
+        gcs.size(TEST_BUCKET + "/nonexistent_" + str(uuid.uuid4()))
+
+
+def test_size_directory(gcs):
+    path = f"{TEST_BUCKET}/test_size_dir/file.txt"
+    gcs.touch(path)
+    dir_path = f"{TEST_BUCKET}/test_size_dir"
+    assert gcs.size(dir_path) == 0
+
+
+def test_info_on_directory_with_only_subdirectories(gcs):
+    """Test info() on a path that contains no direct files but has subdirectories."""
+    # Setup: create a file inside a nested directory
+    path = f"{TEST_BUCKET}/dir_with_only_subdirs/subdir1/file.txt"
+    gcs.touch(path)
+    path = f"{TEST_BUCKET}/dir_with_only_subdirs/subdir2/file.txt"
+    gcs.touch(path)
+    path = f"{TEST_BUCKET}/dir_with_only_subdirs/subdir3/file.txt"
+    gcs.touch(path)
+    path = f"{TEST_BUCKET}/dir_with_only_subdirs/subdir4/file.txt"
+    gcs.touch(path)
+
+    # The path to test with info()
+    dir_path = f"{TEST_BUCKET}/dir_with_only_subdirs"
+
+    # Mock the _call method to count invocations
+    with mock.patch.object(gcs, "_call", wraps=gcs._call) as mock_call:
+        # Get info for the directory
+        info = gcs.info(dir_path)
+
+        # Assertions
+        assert info["type"] == "directory"
+        assert info["name"] == dir_path
+        # Standard bucket: one call is for exact file check and one call for directory
+        # Zonal buckets use Storage Control API for directory lookup, which bypasses _call.
+        assert (
+            mock_call.call_count <= 2
+        ), "info() should not make more than two calls to GCS for a directory."
+
+
+def test_ls2(gcs):
+    assert TEST_BUCKET + "/" in gcs.ls("")
+    with pytest.raises((OSError, IOError)):
+        gcs.ls("nonexistent")
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+    gcs.touch(fn)
+    assert fn in gcs.ls(TEST_BUCKET + "/test")
+
+
+def test_pickle(gcs):
+    import pickle
+
+    # Write data to distinct filename
+    fn = TEST_BUCKET + "/nested/abcdefg"
+    with gcs.open(fn, "wb") as f:
+        f.write(b"1234567")
+
+    # verify that that filename is not in the serialized form
+    b = pickle.dumps(gcs)
+    assert b"abcdefg" not in b
+    assert b"1234567" not in b
+    assert b"listing_cache" not in b
+
+    gcs2 = pickle.loads(b)
+
+    # since https://github.com/fsspec/filesystem_spec/pull/155
+    assert gcs.session is gcs2.session
+    gcs.touch(a)
+    assert gcs.ls(TEST_BUCKET) == gcs2.ls(TEST_BUCKET)
+
+
+def test_ls_touch(gcs):
+    path = TEST_BUCKET + "/tmp/test"
+    if gcs.exists(path):
+        try:
+            gcs.rm(path, recursive=True)
+        except Exception:
+            pass
+
+    gcs.touch(a)
+    gcs.touch(b)
+
+    L = gcs.ls(TEST_BUCKET + "/tmp/test", False)
+    assert set(L) == {a, b}
+
+    L_d = gcs.ls(TEST_BUCKET + "/tmp/test", True)
+    assert {d["name"] for d in L_d} == {a, b}
+
+
+def test_rm(gcs):
+    assert not gcs.exists(a)
+    gcs.touch(a)
+    assert gcs.exists(a)
+    gcs.rm(a)
+    assert not gcs.exists(a)
+    with pytest.raises((OSError, IOError)):
+        gcs.rm(TEST_BUCKET + "/nonexistent")
+    with pytest.raises((OSError, IOError)):
+        gcs.rm("nonexistent")
+
+
+def test_rm_batch(gcs):
+    gcs.touch(a)
+    gcs.touch(b)
+    assert a in gcs.find(TEST_BUCKET)
+    assert b in gcs.find(TEST_BUCKET)
+    gcs.rm([a, b])
+    assert a not in gcs.find(TEST_BUCKET)
+    assert b not in gcs.find(TEST_BUCKET)
+
+
+@pytest.mark.asyncio
+async def test_rm_batch_error(gcs):
+    path = TEST_BUCKET + "/test_error_file"
+    boundary = "==========7330845974216740156=="
+    mock_response_content = (
+        f"\n--{boundary}\n"
+        "Content-Type: application/http\n"
+        "\n"
+        "HTTP/1.1 400 Bad Request\n"
+        "Content-Type: text/plain\n"
+        "\n"
+        "Error without braces\n"
+        f"--{boundary}--\n"
+    ).encode()
+    mock_headers = {"Content-Type": f"multipart/mixed; boundary={boundary}"}
+
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.return_value = (mock_headers, mock_response_content)
+
+        out = await gcs._rm_files([path])
+
+        assert len(out) == 1
+        assert isinstance(out[0], OSError)
+        assert f"{path}: 400" in str(out[0])
+
+
+@pytest.mark.asyncio
+async def test_rm_batch_not_found_invalidates_stale_cache(gcs):
+    parent = TEST_BUCKET + "/cached"
+    path = parent + "/already_gone"
+    gcs.dircache[parent] = [{"name": path, "type": "file"}]
+    is_hns = (
+        await gcs._is_bucket_hns_enabled(TEST_BUCKET)
+        if hasattr(gcs, "_is_bucket_hns_enabled")
+        else False
+    )
+
+    boundary = "==========7330845974216740156=="
+    mock_response_content = (
+        f"\n--{boundary}\n"
+        "Content-Type: application/http\n"
+        "\n"
+        "HTTP/1.1 404 Not Found\n"
+        "Content-Type: application/json\n"
+        "\n"
+        '{"error": {"code": 404, "message": "No such object"}}\n'
+        f"--{boundary}--\n"
+    ).encode()
+    mock_headers = {"Content-Type": f"multipart/mixed; boundary={boundary}"}
+
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.return_value = (mock_headers, mock_response_content)
+
+        out = await gcs._rm_files([path])
+
+        assert len(out) == 1
+        assert isinstance(out[0], OSError)
+        assert "No such object" in str(out[0])
+        if is_hns:
+            assert parent in gcs.dircache
+            assert path not in [entry["name"] for entry in gcs.dircache[parent]]
+        else:
+            assert parent not in gcs.dircache
+
+
+def test_rm_recursive(gcs):
+    files = ["/a", "/a/b", "/a/c"]
+    for fn in files:
+        gcs.touch(TEST_BUCKET + fn)
+    gcs.rm(TEST_BUCKET + files[0], True)
+    assert not gcs.exists(TEST_BUCKET + files[-1])
+
+
+def test_rm_chunked_batch(gcs):
+    files = [f"{TEST_BUCKET}/t{i}" for i in range(303)]
+    gcs.pipe({fn: b"" for fn in files})
+
+    files_created = gcs.find(TEST_BUCKET)
+    for fn in files:
+        assert fn in files_created
+
+    gcs.rm(files)
+
+    files_removed = gcs.find(TEST_BUCKET)
+    for fn in files:
+        assert fn not in files_removed
+
+
+@pytest.mark.asyncio
+async def test_delete_files_with_exception(gcs):
+    # Arrange
+    files = [f"{TEST_BUCKET}/file_{i}" for i in range(3)]
+    exc = RuntimeError("batch failed")
+
+    async def mock_rm_files(batch):
+        if files[2] in batch:
+            raise exc
+        return [True] * len(batch)
+
+    with (
+        mock.patch.object(
+            type(gcs),
+            "on_google",
+            new_callable=mock.PropertyMock(return_value=True),
+        ),
+        mock.patch.object(gcs, "_rm_files", side_effect=mock_rm_files),
+    ):
+        # Act
+        result = await gcs._delete_files(files, batchsize=2, concurrency=5)
+
+        # Assert
+        assert result == [True, True, exc]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 5, 8])
+async def test_delete_files_bounds_concurrency(gcs, concurrency):
+    # Arrange
+    files = [f"{TEST_BUCKET}/file_{i}" for i in range(50)]
+    in_flight = 0
+    max_in_flight = 0
+
+    async def mock_rm_files(batch):
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        # Yield to the event loop so the other scheduled batch requests start
+        # before this one finishes. Without an await, each mock would complete
+        # immediately and at most one would ever be in flight. sleep(0) yields
+        # without adding wall-clock delay.
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return list(batch)
+
+    with (
+        mock.patch.object(
+            type(gcs),
+            "on_google",
+            new_callable=mock.PropertyMock(return_value=True),
+        ),
+        mock.patch.object(gcs, "_rm_files", side_effect=mock_rm_files),
+    ):
+        # Act
+        result = await gcs._delete_files(files, batchsize=2, concurrency=concurrency)
+
+    # Assert
+    assert result == files
+    # 25 batches are available, so the cap is what limits in-flight requests.
+    assert max_in_flight == concurrency
+
+
+def test_rm_passes_concurrency_to_delete_files(gcs):
+    # Arrange
+    path = f"{TEST_BUCKET}/test_rm_concurrency_{uuid.uuid4().hex}"
+    files = [f"{path}/file_{i}" for i in range(3)]
+    # Call the flat-bucket implementation directly: on HNS/zonal test buckets
+    # ExtendedGcsFileSystem._rm would route to the HNS path instead. Run it on
+    # the filesystem's own loop, as the sync API does.
+    core_rm = gcsfs.core.GCSFileSystem._rm
+
+    with (
+        mock.patch.object(gcs, "_expand_path", new=mock.AsyncMock(return_value=files)),
+        mock.patch.object(
+            gcs, "_delete_files", new=mock.AsyncMock(return_value=files)
+        ) as mock_delete_files,
+    ):
+        # Act
+        sync(gcs.loop, core_rm, gcs, path, recursive=True)
+        sync(gcs.loop, core_rm, gcs, path, recursive=True, batchsize=10, concurrency=2)
+
+    # Assert
+    assert mock_delete_files.await_args_list == [
+        mock.call(files, 100, concurrency=4),
+        mock.call(files, 10, concurrency=2),
+    ]
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, True, 2.5, "4"])
+def test_rm_rejects_invalid_concurrency(gcs, concurrency):
+    # Goes through the public rm(), so it covers GCSFileSystem and, when the
+    # suite runs with ExtendedGcsFileSystem (standard, HNS and zonal buckets),
+    # its HNS-aware _rm as well.
+    path = f"{TEST_BUCKET}/test_rm_invalid_concurrency_{uuid.uuid4().hex}"
+
+    with mock.patch.object(
+        gcs, "_delete_files", new=mock.AsyncMock()
+    ) as mock_delete_files:
+        with pytest.raises(ValueError, match="positive integer"):
+            gcs.rm(path, recursive=True, concurrency=concurrency)
+
+        mock_delete_files.assert_not_called()
+
+
+def test_rm_wildcards_in_directory(gcs):
+    base_dir = f"{TEST_BUCKET}/test_rm_complex_{uuid.uuid4().hex}"
+    files = [
+        f"{base_dir}/file1.txt",
+        f"{base_dir}/file2.txt",
+        f"{base_dir}/other.txt",
+        f"{base_dir}/a1.dat",
+        f"{base_dir}/b1.dat",
+        f"{base_dir}/subdir/nested.txt",
+    ]
+    gcs.pipe({f: b"" for f in files})
+
+    # 1. Test '?' wildcard (non-recursive)
+    gcs.rm(f"{base_dir}/file?.txt")
+    assert not gcs.exists(files[0])
+    assert not gcs.exists(files[1])
+    assert gcs.exists(files[2])
+    assert gcs.exists(files[5])
+
+    # 2. Test list of patterns with '*' wildcards (non-recursive)
+    gcs.rm([f"{base_dir}/a*", f"{base_dir}/b*"])
+    assert not gcs.exists(files[3])
+    assert not gcs.exists(files[4])
+    assert gcs.exists(files[2])
+    assert gcs.exists(files[5])  # subdir file still exists
+
+    # 3. Test non-matching pattern
+    with pytest.raises(FileNotFoundError):
+        gcs.rm(f"{base_dir}/non_existent*")
+
+    # 4. Test recursive wildcard cleanup
+    gcs.rm(f"{base_dir}/**", recursive=True)
+    assert not gcs.exists(base_dir)
+
+
+def test_rm_wildcard_bucket_non_recursive(gcs):
+    """Tests non-recursive rm with a wildcard at the bucket root."""
+    # Test 'bucket/*' (non-recursive)
+    new_bucket = f"gcsfs-test-rm-{uuid.uuid4().hex}"
+    gcs.mkdir(new_bucket)
+    try:
+        gcs.touch(f"{new_bucket}/file1")
+        gcs.touch(f"{new_bucket}/subdir/file2")
+        gcs.rm(f"{new_bucket}/*")
+        assert not gcs.exists(f"{new_bucket}/file1")
+        assert gcs.exists(f"{new_bucket}/subdir/file2")
+    finally:
+        gcs.rm(new_bucket, recursive=True)
+
+
+def test_rm_wildcard_bucket_recursive(gcs):
+    """Tests recursive rm with a wildcard at the bucket root."""
+    # Test 'bucket/*' (recursive)
+    new_bucket = f"gcsfs-test-rm-recursive-{uuid.uuid4().hex}"
+    gcs.mkdir(new_bucket)
+    try:
+        gcs.touch(f"{new_bucket}/file1")
+        gcs.touch(f"{new_bucket}/subdir/file2")
+        gcs.rm(f"{new_bucket}/*", recursive=True)
+        assert not gcs.exists(f"{new_bucket}/file1")
+        assert not gcs.exists(f"{new_bucket}/subdir/file2")
+    finally:
+        if gcs.exists(new_bucket):
+            gcs.rm(new_bucket, recursive=True)
+
+
+def test_rm_wildcards_non_recursive(gcs):
+    base_dir = f"{TEST_BUCKET}/test_rm_asterisk_{uuid.uuid4().hex}"
+    files = [
+        f"{base_dir}/other.txt",
+        f"{base_dir}/subdir/nested.txt",
+    ]
+    for f in files:
+        gcs.touch(f)
+
+    gcs.rm(f"{base_dir}/*")
+    assert not gcs.exists(files[0])
+    assert gcs.exists(files[1])  # subdir file still exists
+
+
+def test_file_access(gcs):
+    fn = TEST_BUCKET + "/nested/file1"
+    data = b"hello\n"
+    with gcs.open(fn, "wb") as f:
+        f.write(data)
+    assert gcs.cat(fn) == data
+    assert gcs.head(fn, 3) == data[:3]
+    assert gcs.tail(fn, 3) == data[-3:]
+    assert gcs.tail(fn, 10000) == data
+
+
+def test_file_info(gcs):
+    fn = TEST_BUCKET + "/nested/file1"
+    data = b"hello\n"
+    with gcs.open(fn, "wb") as f:
+        f.write(data)
+    assert fn in gcs.find(TEST_BUCKET)
+    assert gcs.exists(fn)
+    assert not gcs.exists(fn + "another")
+    assert gcs.info(fn)["size"] == len(data)
+    with pytest.raises((OSError, IOError)):
+        gcs.info(fn + "another")
+
+
+def test_du(gcs):
+    d = gcs.du(TEST_BUCKET, total=False)
+    assert all(isinstance(v, int) and v >= 0 for v in d.values())
+    assert TEST_BUCKET + "/nested/file1" in d
+
+    assert gcs.du(TEST_BUCKET + "/test/", total=True) == sum(map(len, files.values()))
+
+
+def test_ls(gcs):
+    fn = TEST_BUCKET + "/nested/file1"
+    gcs.touch(fn)
+
+    assert fn not in gcs.ls(TEST_BUCKET + "/")
+    assert fn in gcs.ls(TEST_BUCKET + "/nested/")
+    assert fn in gcs.ls(TEST_BUCKET + "/nested")
+
+
+def test_ls_detail(gcs):
+    L = gcs.ls(TEST_BUCKET + "/nested", detail=True)
+    assert all(isinstance(item, dict) for item in L)
+
+
+@pytest.mark.parametrize("refresh", (False, True))
+def test_ls_refresh(gcs, refresh):
+    with mock.patch.object(gcs, "invalidate_cache") as mock_invalidate_cache:
+        gcs.ls(TEST_BUCKET, refresh=refresh)
+    assert mock_invalidate_cache.called is refresh
+
+
+def test_gcs_glob(gcs):
+    fn = TEST_BUCKET + "/nested/file1"
+    assert fn not in gcs.glob(TEST_BUCKET + "/")
+    assert fn not in gcs.glob(TEST_BUCKET + "/*")
+    assert fn not in gcs.glob(TEST_BUCKET + "/nested/")
+    assert fn in gcs.glob(TEST_BUCKET + "/nested/*")
+    assert fn in gcs.glob(TEST_BUCKET + "/nested/file*")
+    assert fn in gcs.glob(TEST_BUCKET + "/*/*")
+    assert fn in gcs.glob(TEST_BUCKET + "/**")
+    assert fn in gcs.glob(TEST_BUCKET + "/**/*1")
+    assert all(
+        f in gcs.find(TEST_BUCKET)
+        for f in gcs.glob(TEST_BUCKET + "/nested/*")
+        if gcs.isfile(f)
+    )
+    # the following is no longer true since the glob method list the root path
+    # Ensure the glob only fetches prefixed folders
+    # gcs.dircache.clear()
+    # gcs.glob(TEST_BUCKET + "/nested**1")
+    # assert all(d.startswith(TEST_BUCKET + "/nested") for d in gcs.dircache)
+    # the following is no longer true as of #437
+    # gcs.glob(TEST_BUCKET + "/test*")
+    # assert TEST_BUCKET + "/test" in gcs.dircache
+
+
+def test_read_keys_from_bucket(gcs):
+    for k, data in files.items():
+        file_contents = gcs.cat("/".join([TEST_BUCKET, k]))
+        assert file_contents == data
+
+    assert all(
+        gcs.cat("/".join([TEST_BUCKET, k]))
+        == gcs.cat("gcs://" + "/".join([TEST_BUCKET, k]))
+        for k in files
+    )
+
+
+def test_url(gcs):
+    from gcsfs.core import quote
+
+    fn = TEST_BUCKET + "/nested/file1"
+    url = gcs.url(fn)
+    assert "http" in url
+    assert quote("nested/file1") in url
+    with gcs.open(fn) as f:
+        assert "http" in f.url()
+
+
+def test_seek(gcs):
+    with gcs.open(a, "wb") as f:
+        f.write(b"123")
+
+    with gcs.open(a) as f:
+        f.seek(1000)
+        with pytest.raises(ValueError):
+            f.seek(-1)
+        with pytest.raises(ValueError):
+            f.seek(-5, 2)
+        with pytest.raises(ValueError):
+            f.seek(0, 10)
+        f.seek(0)
+        assert f.read(1) == b"1"
+        f.seek(0)
+        assert f.read(1) == b"1"
+        f.seek(3)
+        assert f.read(1) == b""
+        f.seek(-1, 2)
+        assert f.read(1) == b"3"
+        f.seek(-1, 1)
+        f.seek(-1, 1)
+        assert f.read(1) == b"2"
+        for i in range(4):
+            assert f.seek(i) == i
+
+
+def test_tell(gcs):
+    fn = TEST_BUCKET + "/test_tell"
+    data = b"abcdefghij"
+    with gcs.open(fn, "wb") as f:
+        f.write(data)
+
+    with gcs.open(fn, "rb") as f:
+        assert f.tell() == 0
+        f.read(2)
+        assert f.tell() == 2
+        f.seek(5)
+        assert f.tell() == 5
+        assert f.read(1) == b"f"
+        assert f.tell() == 6
+        f.seek(0, 2)
+        assert f.tell() == 10
+        f.seek(-2, 2)
+        assert f.tell() == 8
+        assert f.read(1) == b"i"
+        assert f.tell() == 9
+        f.seek(-1, 1)
+        assert f.tell() == 8
+        assert f.read(1) == b"i"
+        assert f.tell() == 9
+
+        # Seek beyond EOF
+        f.seek(100)
+        assert f.tell() == 100
+        assert f.read(1) == b""
+        assert f.tell() == 100
+
+    # fsspec does not currently raise on closed files for tell()
+    # but we can test other error cases for seek
+    with gcs.open(fn, "rb") as f:
+        with pytest.raises(ValueError):
+            f.seek(-1)
+        with pytest.raises(ValueError):
+            f.seek(0, 5)  # Invalid whence
+
+
+def test_tell_write(gcs):
+    fn = TEST_BUCKET + "/test_tell_write"
+    with gcs.open(fn, "wb") as f:
+        assert f.tell() == 0
+        f.write(b"abc")
+        assert f.tell() == 3
+        f.write(b"def")
+        assert f.tell() == 6
+
+        # seek is not allowed in write mode
+        with pytest.raises(OSError):
+            f.seek(0)
+
+
+def test_bad_open(gcs):
+    with pytest.raises((IOError, OSError)):
+        gcs.open("")
+
+
+def test_copy(gcs):
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+    gcs.copy(fn, fn + "2")
+    assert gcs.cat(fn) == gcs.cat(fn + "2")
+
+
+def test_copy_recursive(gcs):
+    src = TEST_BUCKET + "/nested"
+    dest = TEST_BUCKET + "/dest"
+    gcs.copy(src, dest, recursive=True)
+    for fn in gcs.ls(dest):
+        if not gcs.isdir(fn):
+            assert gcs.cat(fn) == gcs.cat(fn.replace("dest", "nested"))
+
+
+def test_copy_errors(gcs):
+    src = TEST_BUCKET + "/test/"
+    file1 = TEST_BUCKET + "/test/accounts.1.json"
+    file2 = TEST_BUCKET + "/test/accounts.2.json"
+    dne = TEST_BUCKET + "/test/notafile"
+    dest1 = TEST_BUCKET + "/dest1/"
+    dest2 = TEST_BUCKET + "/dest2/"
+
+    # Non recursive should raise an error unless we specify ignore
+    with pytest.raises(FileNotFoundError):
+        gcs.copy([file1, file2, dne], dest1)
+
+    gcs.copy([file1, file2, dne], dest1, on_error="ignore")
+    assert gcs.ls(dest1) == [dest1 + "accounts.1.json", dest1 + "accounts.2.json"]
+
+    # Recursive should raise an error only if we specify raise
+    # the patch simulates the filesystem finding a file that does not exist in the directory
+    current_files = gcs.expand_path(src, recursive=True)
+    with mock.patch.object(gcs, "expand_path", return_value=current_files + [dne]):
+        with pytest.raises(FileNotFoundError):
+            gcs.copy(src, dest2, recursive=True, on_error="raise")
+
+        gcs.copy(src, dest2, recursive=True)
+        assert gcs.ls(dest2) == [
+            dest2 + "accounts.1.json",
+            dest2 + "accounts.2.json",
+        ]
+
+
+def test_move_src_dst_equal(gcs):
+    path = TEST_BUCKET + "/file1"
+    with mock.patch.object(
+        gcs, "_mv_file", new_callable=mock.AsyncMock
+    ) as mock_mv_file:
+        gcs.mv(path, path)
+        mock_mv_file.assert_not_awaited()
+
+
+def test_move(gcs):
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+
+    if gcs.on_google:
+        data = gcs.cat(fn)
+        gcs.mv(fn, fn + "2")
+        assert gcs.cat(fn + "2") == data
+        assert not gcs.exists(fn)
+    else:
+        with (
+            mock.patch.object(
+                gcs, "_expand_path", new_callable=mock.AsyncMock
+            ) as mock_expand,
+            mock.patch.object(
+                gcs, "_mv_file", new_callable=mock.AsyncMock
+            ) as mock_mv_file,
+        ):
+            mock_expand.return_value = [fn]
+            gcs.mv(fn, fn + "2")
+            mock_mv_file.assert_awaited_once_with(fn, fn + "2")
+
+
+def test_move_recursive_no_slash(gcs):
+    # See issue #489
+    dir_from = TEST_BUCKET + "/nested"
+    dir_to = TEST_BUCKET + "/new_name"
+
+    if gcs.on_google:
+        gcs.mv(dir_from, dir_to, recursive=True)
+        assert not gcs.exists(dir_from)
+        assert gcs.ls(dir_to) == [
+            dir_to + "/file1",
+            dir_to + "/file2",
+            dir_to + "/nested2",
+        ]
+    else:
+        with (
+            mock.patch.object(
+                gcs, "_expand_path", new_callable=mock.AsyncMock
+            ) as mock_expand,
+            mock.patch.object(gcs, "_isdir", new_callable=mock.AsyncMock) as mock_isdir,
+            mock.patch.object(
+                gcs, "_mv_file", new_callable=mock.AsyncMock
+            ) as mock_mv_file,
+        ):
+            mock_expand.return_value = [dir_from + "/file1", dir_from + "/file2"]
+            mock_isdir.return_value = False
+
+            gcs.mv(dir_from, dir_to, recursive=True)
+
+            assert mock_mv_file.call_count == 2
+            mock_mv_file.assert_any_await(dir_from + "/file1", dir_to + "/file1")
+            mock_mv_file.assert_any_await(dir_from + "/file2", dir_to + "/file2")
+
+
+def test_move_recursive_with_slash(gcs):
+    # See issue #489
+    dir_from = TEST_BUCKET + "/nested/"
+    dir_to = TEST_BUCKET + "/new_name_with_slash"
+
+    if gcs.on_google:
+        gcs.mv(dir_from, dir_to, recursive=True)
+        assert not gcs.exists(dir_from.rstrip("/"))
+        assert gcs.ls(dir_to) == [
+            dir_to + "/file1",
+            dir_to + "/file2",
+            dir_to + "/nested2",
+        ]
+    else:
+        with (
+            mock.patch.object(
+                gcs, "_expand_path", new_callable=mock.AsyncMock
+            ) as mock_expand,
+            mock.patch.object(gcs, "_isdir", new_callable=mock.AsyncMock) as mock_isdir,
+            mock.patch.object(
+                gcs, "_mv_file", new_callable=mock.AsyncMock
+            ) as mock_mv_file,
+        ):
+            mock_expand.return_value = [dir_from + "file1", dir_from + "file2"]
+            mock_isdir.return_value = False
+
+            gcs.mv(dir_from, dir_to, recursive=True)
+
+            assert mock_mv_file.call_count == 2
+            mock_mv_file.assert_any_await(dir_from + "file1", dir_to + "/file1")
+            mock_mv_file.assert_any_await(dir_from + "file2", dir_to + "/file2")
+
+
+def test_move_with_glob_pattern(gcs):
+    path1 = TEST_BUCKET + "/test/*.json"
+    path2 = TEST_BUCKET + "/dest_glob/"
+
+    if gcs.on_google:
+        data1 = gcs.cat(TEST_BUCKET + "/test/accounts.1.json")
+        data2 = gcs.cat(TEST_BUCKET + "/test/accounts.2.json")
+
+        gcs.mv(path1, path2)
+
+        assert gcs.cat(path2 + "accounts.1.json") == data1
+        assert gcs.cat(path2 + "accounts.2.json") == data2
+        assert not gcs.exists(TEST_BUCKET + "/test/accounts.1.json")
+        assert not gcs.exists(TEST_BUCKET + "/test/accounts.2.json")
+    else:
+        fn = TEST_BUCKET + "/test/accounts.1.json"
+        with (
+            mock.patch.object(
+                gcs, "_expand_path", new_callable=mock.AsyncMock
+            ) as mock_expand,
+            mock.patch.object(gcs, "_isdir", new_callable=mock.AsyncMock) as mock_isdir,
+            mock.patch.object(
+                gcs, "_mv_file", new_callable=mock.AsyncMock
+            ) as mock_mv_file,
+        ):
+            mock_expand.return_value = [fn]
+            mock_isdir.return_value = False
+
+            gcs.mv(TEST_BUCKET + "/test/*.json", TEST_BUCKET + "/dest/")
+
+            mock_mv_file.assert_awaited_once_with(
+                fn, TEST_BUCKET + "/dest/accounts.1.json"
+            )
+
+
+def test_move_list_to_dir(gcs):
+    fn1 = TEST_BUCKET + "/test/accounts.1.json"
+    fn2 = TEST_BUCKET + "/test/accounts.2.json"
+
+    if gcs.on_google:
+        data1 = gcs.cat(fn1)
+        data2 = gcs.cat(fn2)
+
+        gcs.mv([fn1, fn2], TEST_BUCKET + "/test2/")
+
+        assert gcs.cat(TEST_BUCKET + "/test2/accounts.1.json") == data1
+        assert gcs.cat(TEST_BUCKET + "/test2/accounts.2.json") == data2
+        assert not gcs.exists(fn1)
+        assert not gcs.exists(fn2)
+    else:
+        with mock.patch.object(
+            gcs, "_mv_file", new_callable=mock.AsyncMock
+        ) as mock_mv_file:
+            gcs.mv([fn1, fn2], TEST_BUCKET + "/test2/")
+
+            assert mock_mv_file.call_count == 2
+            mock_mv_file.assert_any_await(fn1, TEST_BUCKET + "/test2/accounts.1.json")
+            mock_mv_file.assert_any_await(fn2, TEST_BUCKET + "/test2/accounts.2.json")
+
+
+def test_move_list_to_list(gcs):
+    fn1 = TEST_BUCKET + "/test/accounts.1.json"
+    fn2 = TEST_BUCKET + "/test/accounts.2.json"
+
+    if gcs.on_google:
+        data1 = gcs.cat(fn1)
+        data2 = gcs.cat(fn2)
+
+        gcs.mv([fn1, fn2], [fn1 + "2", fn2 + "2"])
+
+        assert gcs.cat(fn1 + "2") == data1
+        assert gcs.cat(fn2 + "2") == data2
+        assert not gcs.exists(fn1)
+        assert not gcs.exists(fn2)
+    else:
+        with mock.patch.object(
+            gcs, "_mv_file", new_callable=mock.AsyncMock
+        ) as mock_mv_file:
+            gcs.mv([fn1, fn2], [fn1 + "2", fn2 + "2"])
+
+            assert mock_mv_file.call_count == 2
+            mock_mv_file.assert_any_await(fn1, fn1 + "2")
+            mock_mv_file.assert_any_await(fn2, fn2 + "2")
+
+
+def test_move_raises_filenotfound(gcs):
+    paths1 = [TEST_BUCKET + "/file1"]
+    paths2 = [TEST_BUCKET + "/dest/file1"]
+
+    with mock.patch.object(
+        gcs, "_mv_file", new_callable=mock.AsyncMock
+    ) as mock_mv_file:
+        mock_mv_file.side_effect = FileNotFoundError("not found")
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            gcs.mv(paths1, paths2, recursive=False)
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            gcs.mv(paths1, paths2, recursive=True)
+
+
+def test_move_implicit_directories_ignore_filenotfound(gcs):
+    paths1 = [TEST_BUCKET + "/dir/", TEST_BUCKET + "/dir/file1"]
+    paths2 = [TEST_BUCKET + "/dest/", TEST_BUCKET + "/dest/file1"]
+
+    with mock.patch.object(
+        gcs, "_mv_file", new_callable=mock.AsyncMock
+    ) as mock_mv_file:
+        mock_mv_file.side_effect = [FileNotFoundError("dir not found"), None]
+        gcs.mv(paths1, paths2, recursive=True)
+        assert mock_mv_file.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_move_non_recursive_empty_after_filter(gcs):
+    path1 = TEST_BUCKET + "/dir"
+    path2 = TEST_BUCKET + "/dest"
+
+    with (
+        mock.patch.object(
+            gcs, "_expand_path", new_callable=mock.AsyncMock
+        ) as mock_expand,
+        mock.patch.object(gcs, "_isdir", new_callable=mock.AsyncMock) as mock_isdir,
+        mock.patch.object(gcs, "_mv_file", new_callable=mock.AsyncMock) as mock_mv_file,
+    ):
+        mock_expand.return_value = [TEST_BUCKET + "/dir/"]
+        mock_isdir.return_value = True
+
+        await gcs._mv(path1, path2, recursive=False)
+
+        mock_mv_file.assert_not_awaited()
+
+
+def test_mv_file(gcs):
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+
+    if gcs.on_google:
+        data = gcs.cat(fn)
+        gcs.mv_file(fn, fn + "2")
+        assert gcs.cat(fn + "2") == data
+        assert not gcs.exists(fn)
+    else:
+        with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+            mock_call.return_value = {
+                "kind": "storage#object",
+                "bucket": TEST_BUCKET,
+                "name": "test/accounts.1.json2",
+            }
+            gcs.mv_file(fn, fn + "2")
+            mock_call.assert_awaited_once()
+
+
+def test_mv_file_cache(gcs):
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+    fn2 = TEST_BUCKET + "/nested/accounts.1.json"
+    parent = TEST_BUCKET + "/test"
+    parent2 = TEST_BUCKET + "/nested"
+    gcs.ls(parent)
+    gcs.ls(parent2)
+    assert parent in gcs.dircache
+    assert parent2 in gcs.dircache
+
+    if gcs.on_google:
+        gcs.mv_file(fn, fn2)
+
+        assert parent not in gcs.dircache
+        assert parent2 not in gcs.dircache
+        assert fn2 in gcs.ls(parent2)
+    else:
+        with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+            mock_call.return_value = {
+                "kind": "storage#object",
+                "bucket": TEST_BUCKET,
+                "name": "nested/accounts.1.json",
+            }
+            gcs.mv_file(fn, fn2)
+
+        assert parent not in gcs.dircache
+        assert parent2 not in gcs.dircache
+
+
+def test_mv_file_calls_move_to(gcs):
+    path1 = TEST_BUCKET + "/file1.txt"
+    path2 = TEST_BUCKET + "/file2.txt"
+
+    # Mock _call to return a dummy object resource
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.return_value = {
+            "kind": "storage#object",
+            "bucket": TEST_BUCKET,
+            "name": "file2.txt",
+        }
+
+        gcs.mv_file(path1, path2)
+
+        mock_call.assert_awaited_once()
+        args, kwargs = mock_call.await_args
+        assert args[0] == "POST"
+        assert "moveTo" in args[1]
+        headers = kwargs["headers"]
+        assert headers["Content-Type"] == "application/json"
+        assert "X-Goog-GCS-Idempotency-Token" in headers
+        assert uuid.UUID(headers["X-Goog-GCS-Idempotency-Token"])
+
+
+def test_mv_file_fallback(gcs):
+    # Case 1: Cross bucket
+    path1 = "bucket1/file1.txt"
+    path2 = "bucket2/file2.txt"
+
+    with (
+        mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        mock.patch(
+            "fsspec.asyn.AsyncFileSystem._mv_file", new_callable=mock.AsyncMock
+        ) as mock_super_mv_file,
+    ):
+        gcs.mv_file(path1, path2)
+
+        mock_call.assert_not_awaited()
+        mock_super_mv_file.assert_awaited_once_with(path1, path2)
+
+    # Case 2: Missing key
+    path1 = "bucket1/file1.txt"
+    path2 = "bucket1/"
+
+    with (
+        mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        mock.patch(
+            "fsspec.asyn.AsyncFileSystem._mv_file", new_callable=mock.AsyncMock
+        ) as mock_super_mv_file,
+    ):
+        gcs.mv_file(path1, path2)
+
+        mock_call.assert_not_awaited()
+        mock_super_mv_file.assert_awaited_once_with(path1, path2)
+
+    # Case 3: API Error
+    path1 = "bucket1/file1.txt"
+    path2 = "bucket1/file2.txt"
+
+    with (
+        mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        mock.patch(
+            "fsspec.asyn.AsyncFileSystem._mv_file", new_callable=mock.AsyncMock
+        ) as mock_super_mv_file,
+    ):
+        mock_call.side_effect = Exception("moveTo failed")
+        gcs.mv_file(path1, path2)
+
+        mock_call.assert_awaited_once()
+        mock_super_mv_file.assert_awaited_once_with(path1, path2)
+
+
+def test_mv_file_raises_filenotfound_from_moveto(gcs):
+    path1 = TEST_BUCKET + "/file1.txt"
+    path2 = TEST_BUCKET + "/file2.txt"
+
+    with (
+        mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        mock.patch(
+            "fsspec.asyn.AsyncFileSystem._mv_file", new_callable=mock.AsyncMock
+        ) as mock_super_mv_file,
+    ):
+        mock_call.side_effect = FileNotFoundError("not found")
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            gcs.mv_file(path1, path2)
+
+        mock_super_mv_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mv_file_idempotency_retries(gcs):
+    path1 = TEST_BUCKET + "/file1.txt"
+    path2 = TEST_BUCKET + "/file2.txt"
+
+    # Ensure session is initialized
+    await gcs._set_session()
+
+    # Mock responses
+    fail_response = mock.Mock()
+    fail_response.status = 503
+    fail_response.headers = {}
+    fail_response.read = mock.AsyncMock(
+        return_value=b'{"error": "Service Unavailable"}'
+    )
+    fail_response.request_info = mock.Mock()
+
+    success_response = mock.Mock()
+    success_response.status = 200
+    success_response.headers = {}
+    success_response.read = mock.AsyncMock(return_value=b'{"kind": "storage#object"}')
+    success_response.request_info = mock.Mock()
+
+    # Patch the session.request method
+    with mock.patch.object(
+        gcs.session,
+        "request",
+        side_effect=[
+            mock.AsyncMock(__aenter__=mock.AsyncMock(return_value=fail_response)),
+            mock.AsyncMock(__aenter__=mock.AsyncMock(return_value=success_response)),
+        ],
+    ) as mock_request:
+        await gcs._mv_file(path1, path2)
+
+        assert mock_request.call_count == 2
+
+        # Verify both calls had the same idempotency token
+        call1_kwargs = mock_request.call_args_list[0].kwargs
+        call2_kwargs = mock_request.call_args_list[1].kwargs
+
+        # Check URL to ensure we intercepted the right call
+        assert "moveTo" in call1_kwargs["url"]
+
+        headers1 = call1_kwargs["headers"]
+        headers2 = call2_kwargs["headers"]
+
+        token1 = headers1.get("X-Goog-GCS-Idempotency-Token")
+        token2 = headers2.get("X-Goog-GCS-Idempotency-Token")
+
+        assert token1 is not None
+        assert token1 == token2
+
+
+def test_cat_file(gcs):
+    fn = TEST_BUCKET + "/test/accounts.1.json"
+    data = gcs.cat_file(fn)
+    assert data[1:10] == gcs.cat_file(fn, start=1, end=10)
+    assert data[1:] == gcs.cat_file(fn, start=1)
+    assert data[:1] == gcs.cat_file(fn, end=1)
+
+
+@pytest.mark.parametrize("consistency", [None, "size", "md5", "crc32c"])
+def test_get_put(consistency, gcs):
+    if consistency == "crc32c" and gcsfs.checkers.crcmod is None:
+        pytest.skip("No CRC")
+    if consistency == "size" and not gcs.on_google:
+        pytest.skip("emulator does not return size")
+    gcs.consistency = consistency
+    with tmpfile() as fn:
+        gcs.get(TEST_BUCKET + "/test/accounts.1.json", fn)
+        data = files["test/accounts.1.json"]
+        assert open(fn, "rb").read() == data
+        gcs.put(fn, TEST_BUCKET + "/temp")
+        assert gcs.du(TEST_BUCKET + "/temp") == len(data)
+        assert gcs.cat(TEST_BUCKET + "/temp") == data
+
+
+def test_get_put_list(gcs):
+    with tmpfile() as fn:
+        gcs.get([TEST_BUCKET + "/test/accounts.1.json"], [fn])
+        data = files["test/accounts.1.json"]
+        assert open(fn, "rb").read() == data
+        gcs.put([fn], [TEST_BUCKET + "/temp"])
+        assert gcs.du(TEST_BUCKET + "/temp") == len(data)
+        assert gcs.cat(TEST_BUCKET + "/temp") == data
+
+
+@pytest.mark.parametrize("protocol", ["", "gs://", "gcs://"])
+def test_get_put_recursive(protocol, gcs):
+    with tempdir() as dn:
+        gcs.get(protocol + TEST_BUCKET + "/test/", dn + "/temp_dir", recursive=True)
+        # there is now in local directory:
+        # dn+'/temp_dir/accounts.1.json'
+        # dn+'/temp_dir/accounts.2.json'
+        data1 = files["test/accounts.1.json"]
+        data2 = files["test/accounts.2.json"]
+        assert open(dn + "/temp_dir/accounts.1.json", "rb").read() == data1
+        assert open(dn + "/temp_dir/accounts.2.json", "rb").read() == data2
+        gcs.put(dn + "/temp_dir", protocol + TEST_BUCKET + "/temp_dir", recursive=True)
+        # there is now in remote directory:
+        # protocol+TEST_BUCKET+'/temp_dir/accounts.1.json'
+        # protocol+TEST_BUCKET+'/temp_dir/accounts.2.json'
+        assert gcs.du(protocol + TEST_BUCKET + "/temp_dir/accounts.1.json") == len(
+            data1
+        )
+        assert gcs.cat(protocol + TEST_BUCKET + "/temp_dir/accounts.1.json") == data1
+        assert gcs.du(protocol + TEST_BUCKET + "/temp_dir/accounts.2.json") == len(
+            data2
+        )
+        assert gcs.cat(protocol + TEST_BUCKET + "/temp_dir/accounts.2.json") == data2
+
+
+@pytest.mark.parametrize("protocol", ["", "gs://", "gcs://"])
+def test_get_put_file_in_dir(protocol, gcs):
+    with tempdir() as dn:
+        gcs.get(protocol + TEST_BUCKET + "/test/", dn + "/temp_dir", recursive=True)
+        # there is now in local directory:
+        # dn+'/temp_dir/accounts.1.json'
+        # dn+'/temp_dir/accounts.2.json'
+        data1 = files["test/accounts.1.json"]
+        assert open(dn + "/temp_dir/accounts.1.json", "rb").read() == data1
+        gcs.put(
+            dn + "/temp_dir/accounts.1.json",
+            protocol + TEST_BUCKET + "/temp_dir/",
+            recursive=True,
+        )
+        # there is now in remote directory:
+        # protocol+TEST_BUCKET+'/temp_dir/accounts.1.json'
+        assert gcs.du(protocol + TEST_BUCKET + "/temp_dir/accounts.1.json") == len(
+            data1
+        )
+        assert gcs.cat(protocol + TEST_BUCKET + "/temp_dir/accounts.1.json") == data1
+
+
+@pytest.mark.asyncio
+async def test_upload_chunk_shortfall():
+    from gcsfs.core import upload_chunk
+
+    fs_mock = mock.AsyncMock()
+
+    data = b"0123456789"
+    location = "http://mock-location"
+    offset = 0
+    size = 10
+    content_type = "application/octet-stream"
+
+    call_count = 0
+
+    async def mock_call(method, loc, headers=None, data=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {"Range": "bytes=0-4"}, None
+        else:
+            return {}, '{"generation": "12345"}'
+
+    fs_mock._call.side_effect = mock_call
+
+    result = await upload_chunk(fs_mock, location, data, offset, size, content_type)
+
+    assert result == {"generation": "12345"}
+    assert call_count == 2
+
+    call_args_list = fs_mock._call.call_args_list
+
+    args1, kwargs1 = call_args_list[0]
+    assert kwargs1["headers"]["Content-Range"] == "bytes 0-9/10"
+
+    args2, kwargs2 = call_args_list[1]
+    assert kwargs2["headers"]["Content-Range"] == "bytes 5-9/10"
+
+    sent_data = kwargs2["data"]
+    if hasattr(sent_data, "getvalue"):
+        sent_data = sent_data.getvalue()
+    assert sent_data == b"56789"
+
+
+@pytest.mark.parametrize("protocol", ["", "gs://", "gcs://"])
+def test_put_file_resumable_upload_cleanup_on_chunk_failure(protocol, gcs):
+    rpath = protocol + TEST_BUCKET + "/resumable_cleanup_test"
+    location = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        f"{TEST_BUCKET}/o?uploadType=resumable&upload_id=abc123"
+        "&ifGenerationMatch=0"
+    )
+    expected_cleanup_url = location.replace("&ifGenerationMatch=0", "")
+    chunk_error = RuntimeError("chunk upload exploded")
+    payload = b"x" * (5 * 2**20)
+
+    with tmpfile() as lpath:
+        with open(lpath, "wb") as f:
+            f.write(payload)
+
+        with (
+            mock.patch(
+                "gcsfs.core.initiate_upload",
+                new_callable=mock.AsyncMock,
+                return_value=location,
+            ) as mock_init,
+            mock.patch(
+                "gcsfs.core.upload_chunk",
+                new_callable=mock.AsyncMock,
+                side_effect=chunk_error,
+            ) as mock_chunk,
+            mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        ):
+            with pytest.raises(RuntimeError, match="chunk upload exploded"):
+                gcs.put_file(lpath, rpath)
+
+            mock_init.assert_awaited_once()
+            mock_chunk.assert_awaited()
+            mock_call.assert_awaited_once_with("DELETE", expected_cleanup_url)
+
+
+def _upload_call_params(mock_call):
+    """ifGenerationMatch sent on the upload POST(s) recorded by a mocked _call."""
+    out = []
+    for call in mock_call.call_args_list:
+        method = call.args[0] if call.args else call.kwargs.get("method")
+        path = call.args[1] if len(call.args) > 1 else call.kwargs.get("path", "")
+        if method == "POST" and "upload/storage" in path:
+            out.append(call.kwargs.get("ifGenerationMatch"))
+    return out
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, None),
+        ({"mode": "create"}, "0"),
+        ({"if_generation_match": 0}, "0"),
+        ({"if_generation_match": 123}, "123"),
+        ({"mode": "create", "if_generation_match": 0}, "0"),
+    ],
+)
+def test_pipe_file_if_generation_match_simple(gcs, skip_if_zonal, kwargs, expected):
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.return_value = {"size": "3", "md5Hash": "", "crc32c": ""}
+        gcs.pipe_file(TEST_BUCKET + "/cas", b"abc", consistency="none", **kwargs)
+    assert _upload_call_params(mock_call) == [expected]
+
+
+def test_pipe_file_if_generation_match_resumable(gcs, skip_if_zonal):
+    location = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        f"{TEST_BUCKET}/o?uploadType=resumable&upload_id=abc123&ifGenerationMatch=123"
+    )
+    with (
+        mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+        mock.patch(
+            "gcsfs.core.upload_chunk",
+            new_callable=mock.AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        mock_call.return_value = ({"Location": location}, None)
+        with pytest.raises(RuntimeError):
+            gcs.pipe_file(
+                TEST_BUCKET + "/cas",
+                b"x" * 2**20,
+                chunksize=2**19,
+                if_generation_match=123,
+            )
+    assert _upload_call_params(mock_call) == ["123"]
+    mock_call.assert_awaited_with(
+        "DELETE", location.replace("&ifGenerationMatch=123", "")
+    )
+
+
+def test_put_file_if_generation_match(gcs, skip_if_zonal):
+    with tmpfile() as lpath:
+        with open(lpath, "wb") as f:
+            f.write(b"abc")
+        with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+            mock_call.return_value = {"size": "3", "md5Hash": "", "crc32c": ""}
+            gcs.put_file(
+                lpath, TEST_BUCKET + "/cas", consistency="none", if_generation_match=7
+            )
+    assert _upload_call_params(mock_call) == ["7"]
+
+
+def test_put_file_if_generation_match_resumable(gcs, skip_if_zonal):
+    location = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        f"{TEST_BUCKET}/o?uploadType=resumable&upload_id=abc123&ifGenerationMatch=7"
+    )
+    with tmpfile() as lpath:
+        with open(lpath, "wb") as f:
+            f.write(b"x" * (5 * 2**20))
+        with (
+            mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call,
+            mock.patch(
+                "gcsfs.core.upload_chunk", new_callable=mock.AsyncMock, return_value={}
+            ) as mock_chunk,
+        ):
+            mock_call.return_value = ({"Location": location}, None)
+            gcs.put_file(
+                lpath,
+                TEST_BUCKET + "/cas",
+                chunksize=2**20,
+                consistency="none",
+                if_generation_match=7,
+            )
+    assert _upload_call_params(mock_call) == ["7"]
+    assert mock_chunk.await_count == 5
+    assert all(c.args[1] == location for c in mock_chunk.await_args_list)
+
+
+def test_open_if_generation_match(gcs, skip_if_zonal):
+    location = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        f"{TEST_BUCKET}/o?uploadType=resumable&upload_id=abc123&ifGenerationMatch=7"
+    )
+    with (
+        mock.patch(
+            "gcsfs.core._http_initiate_upload",
+            new_callable=mock.AsyncMock,
+            return_value=location,
+        ) as mock_init,
+        mock.patch.object(gcs, "call") as mock_call,
+    ):
+        mock_call.return_value = ({}, '{"generation": "8", "size": "3"}')
+        with gcs.open(
+            TEST_BUCKET + "/cas", "wb", consistency="none", if_generation_match=7
+        ) as f:
+            f.write(b"abc")
+    assert mock_init.call_args.kwargs["if_generation_match"] == 7
+    assert mock_init.call_args.kwargs["mode"] == "overwrite"
+    mock_call.assert_called_once()
+    assert mock_call.call_args.args[:2] == ("POST", location)
+    # call_args holds a memoryview of the upload buffer; release it so the
+    # BytesIO can be finalized without a BufferError during a later test.
+    mock_call.reset_mock()
+
+
+def test_pipe_file_create_conflicts_with_if_generation_match(gcs):
+    with pytest.raises(ValueError):
+        gcs.pipe_file(
+            TEST_BUCKET + "/cas", b"abc", mode="create", if_generation_match=5
+        )
+
+
+@pytest.mark.parametrize(
+    "mode, value, expected",
+    [
+        ("overwrite", None, None),
+        ("overwrite", "7", 7),
+        ("create", "0", 0),
+        ("create", None, 0),
+        ("overwrite", True, ValueError),
+        ("overwrite", -1, ValueError),
+        ("create", 5, ValueError),
+    ],
+)
+def test_resolve_generation_match(mode, value, expected):
+    from gcsfs.core import _resolve_generation_match
+
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            _resolve_generation_match(mode, value)
+    else:
+        assert _resolve_generation_match(mode, value) == expected
+
+
+@pytest.mark.parametrize("exists", [True, False], ids=["existing", "missing"])
+@pytest.mark.parametrize(
+    "mode, kwargs",
+    [("rb", {"if_generation_match": 5}), ("xb", {"if_generation_match": 5})],
+)
+def test_open_rejects_invalid_if_generation_match(gcs, mode, kwargs, exists):
+    fn = TEST_BUCKET + "/cas"
+    if exists:
+        gcs.pipe_file(fn, b"abc")
+    assert gcs.exists(fn) is exists
+    with pytest.raises(ValueError):
+        gcs.open(fn, mode, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"if_generation_match": 7}, GenerationMismatchError),
+        ({"mode": "create"}, FileExistsError),
+    ],
+)
+def test_pipe_file_precondition_error(gcs, skip_if_zonal, kwargs, expected):
+    with mock.patch.object(gcs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        mock_call.side_effect = FileExistsError("412")
+        with pytest.raises(expected) as info:
+            gcs.pipe_file(TEST_BUCKET + "/cas", b"abc", **kwargs)
+    if expected is GenerationMismatchError:
+        assert info.value.generation == 7
+
+
+def test_write_if_generation_match(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support condition")
+    fn = TEST_BUCKET + "/cas.file"
+    if gcs.exists(fn):
+        gcs.rm(fn)
+    gcs.pipe_file(fn, b"v1", if_generation_match=0)
+    with pytest.raises(FileExistsError):
+        gcs.pipe_file(fn, b"v1", if_generation_match=0)
+    gen = gcs.info(fn)["generation"]
+    try:
+        gcs.pipe_file(fn, b"v2", if_generation_match=gen)
+    except NotImplementedError:
+        pytest.skip("zonal CAS needs a google-cloud-storage release with Preconditions")
+    assert gcs.cat(fn) == b"v2"
+    with pytest.raises(GenerationMismatchError):
+        gcs.pipe_file(fn, b"v3", if_generation_match=gen)
+    assert gcs.cat(fn) == b"v2"
+
+
+@pytest.mark.parametrize("protocol", ["", "gs://", "gcs://"])
+def test_get_file_to_current_working_directory(monkeypatch, protocol, gcs):
+    fn = protocol + TEST_BUCKET + "/temp"
+    gcs.pipe(fn, b"hello world")
+
+    with tempdir() as dn:
+        os.makedirs(dn)
+        monkeypatch.chdir(dn)
+        gcs.get_file(fn, "temp")
+        with open("temp", mode="rb") as f:
+            assert f.read() == b"hello world"
+
+
+def test_special_characters_filename(gcs: GCSFileSystem):
+    special_filename = """'!"`#$%&'()+,-.<=>?@[]^_{}~/'"""
+    full_path = TEST_BUCKET + "/" + special_filename
+    gcs.touch(full_path)
+    info = gcs.info(full_path)
+    assert info["name"] == full_path
+    # Normal cat currently doesn't work with special characters,
+    # because it invokes expand_path (and in turn glob) without escaping the characters.
+    # This would need to be fixed in fsspec.
+    assert gcs.cat_file(full_path) == b""
+
+
+def test_slash_filename(gcs: GCSFileSystem):
+    slash_filename = """abc/def"""
+    full_path = TEST_BUCKET + "/" + slash_filename
+    gcs.touch(full_path)
+    info = gcs.info(full_path)
+    assert info["name"] == full_path
+    assert gcs.cat_file(full_path) == b""
+
+
+def test_hash_filename(gcs: GCSFileSystem):
+    slash_filename = """a#b#c"""
+    full_path = TEST_BUCKET + "/" + slash_filename
+    gcs.touch(full_path)
+    info = gcs.info(full_path)
+    assert info["name"] == full_path
+    assert gcs.cat_file(full_path) == b""
+
+
+def test_errors(gcs):
+    with pytest.raises((IOError, OSError)):
+        gcs.open(TEST_BUCKET + "/tmp/test/shfoshf", "rb")
+
+    ## This is fine, no need for interleving directories on gcs
+    # with pytest.raises((IOError, OSError)):
+    #    gcs.touch('tmp/test/shfoshf/x')
+
+    # silently ignoed for now
+    # with pytest.raises((IOError, OSError)):
+    #    gcs.rm(TEST_BUCKET + "/tmp/test/shfoshf/x")
+
+    with pytest.raises((IOError, OSError)):
+        gcs.mv(TEST_BUCKET + "/tmp/test/shfoshf/x", "tmp/test/shfoshf/y")
+
+    with pytest.raises((IOError, OSError)):
+        gcs.open("x", "rb")
+
+    with pytest.raises((IOError, OSError)):
+        gcs.rm("unknown")
+
+    with pytest.raises(ValueError):
+        with gcs.open(TEST_BUCKET + "/temp", "wb") as f:
+            f.read()
+
+    gcs.touch(TEST_BUCKET + "/temp")
+    with pytest.raises(ValueError):
+        f = gcs.open(TEST_BUCKET + "/temp", "rb")
+        f.close()
+        f.read()
+
+    with pytest.raises(ValueError) as e:
+        gcs.mkdir("/")
+        assert "bucket" in str(e)
+
+
+def test_read_small(gcs):
+    fn = TEST_BUCKET + "/2014-01-01.csv"
+    with gcs.open(fn, "rb", block_size=10, cache_type="readahead") as f:
+        out = []
+        while True:
+            data = f.read(3)
+            if data == b"":
+                break
+            out.append(data)
+        assert gcs.cat(fn) == b"".join(out)
+        # cache drop
+        assert len(f.cache.cache) < len(out)
+
+
+def test_seek_delimiter(gcs):
+    fn = "test/accounts.1.json"
+    data = files[fn]
+    with gcs.open("/".join([TEST_BUCKET, fn])) as f:
+        seek_delimiter(f, b"}", 0)
+        assert f.tell() == 0
+        f.seek(1)
+        seek_delimiter(f, b"}", 5)
+        assert f.tell() == data.index(b"}") + 1
+        seek_delimiter(f, b"\n", 5)
+        assert f.tell() == data.index(b"\n") + 1
+        f.seek(1, 1)
+        ind = data.index(b"\n") + data[data.index(b"\n") + 1 :].index(b"\n") + 1
+        seek_delimiter(f, b"\n", 5)
+        assert f.tell() == ind + 1
+
+
+def test_read_block(gcs):
+    data = files["test/accounts.1.json"]
+    lines = io.BytesIO(data).readlines()
+    path = TEST_BUCKET + "/test/accounts.1.json"
+    assert gcs.read_block(path, 1, 35, b"\n") == lines[1]
+    assert gcs.read_block(path, 0, 30, b"\n") == lines[0]
+    assert gcs.read_block(path, 0, 35, b"\n") == lines[0] + lines[1]
+    gcs.read_block(path, 0, 5000, b"\n")
+    assert gcs.read_block(path, 0, 5000, b"\n") == data
+    assert len(gcs.read_block(path, 0, 5)) == 5
+    assert len(gcs.read_block(path, 4, 5000)) == len(data) - 4
+    assert gcs.read_block(path, 5000, 5010) == b""
+
+    assert gcs.read_block(path, 5, None) == gcs.read_block(path, 5, 1000)
+
+
+def test_flush(gcs):
+    gcs.touch(a)
+    with gcs.open(a, "rb") as ro:
+        with pytest.raises(ValueError):
+            ro.write(b"abc")
+
+        ro.flush()
+
+    with gcs.open(b, "wb") as wo:
+        wo.write(b"abc")
+        wo.flush()
+        assert not gcs.exists(b)
+
+    assert gcs.exists(b)
+    with pytest.raises(ValueError):
+        wo.write(b"abc")
+
+
+def test_write_fails(gcs):
+    with pytest.raises(ValueError):
+        gcs.touch(TEST_BUCKET + "/temp")
+        gcs.open(TEST_BUCKET + "/temp", "rb").write(b"hello")
+
+        with gcs.open(TEST_BUCKET + "/temp", "wb") as f:
+            f.write(b"hello")
+            f.flush(force=True)
+        with pytest.raises(ValueError):
+            f.write(b"world")
+
+    f = gcs.open(TEST_BUCKET + "/temp", "wb")
+    f.close()
+    with pytest.raises(ValueError):
+        f.write(b"hello")
+    with pytest.raises((OSError, IOError)):
+        gcs.open("nonexistentbucket/temp", "wb").close()
+
+
+def text_mode(gcs):
+    text = "Hello µ"
+    with gcs.open(TEST_BUCKET + "/temp", "w") as f:
+        f.write(text)
+    with gcs.open(TEST_BUCKET + "/temp", "r") as f:
+        assert f.read() == text
+
+
+def test_write_blocks(gcs):
+    with gcs.open(TEST_BUCKET + "/temp", "wb", block_size=2**18) as f:
+        f.write(b"a" * 100000)
+        assert f.buffer.tell() == 100000
+        assert not (f.offset)
+        f.write(b"a" * 100000)
+        f.write(b"a" * 100000)
+        assert f.offset
+    assert gcs.info(TEST_BUCKET + "/temp")["size"] == 300000
+
+
+def test_write_blocks2(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator always accepts whole request")
+    with gcs.open(TEST_BUCKET + "/temp1", "wb", block_size=2**18) as f:
+        f.write(b"a" * (2**18 + 1))
+        # leftover bytes: GCS accepts blocks in multiples of 2**18 bytes
+        assert f.buffer.tell() == 1
+    assert gcs.info(TEST_BUCKET + "/temp1")["size"] == 2**18 + 1
+
+
+def test_readline(gcs):
+    all_items = chain.from_iterable(
+        [files.items(), csv_files.items(), text_files.items()]
+    )
+    for k, data in all_items:
+        with gcs.open("/".join([TEST_BUCKET, k]), "rb") as f:
+            result = f.readline()
+            expected = data.split(b"\n")[0] + (b"\n" if data.count(b"\n") else b"")
+        assert result == expected
+
+
+def test_readline_from_cache(gcs):
+    data = b"a,b\n11,22\n3,4"
+    with gcs.open(a, "wb") as f:
+        f.write(data)
+
+    with gcs.open(a, "rb", cache_type="readahead") as f:
+        result = f.readline()
+        assert result == b"a,b\n"
+        assert f.loc == 4
+        assert f.cache.cache == data
+
+        result = f.readline()
+        assert result == b"11,22\n"
+        assert f.loc == 10
+        assert f.cache.cache == data
+
+        result = f.readline()
+        assert result == b"3,4"
+        assert f.loc == 13
+        assert f.cache.cache == data
+
+
+def test_readline_empty(gcs):
+    data = b""
+    with gcs.open(a, "wb") as f:
+        f.write(data)
+    with gcs.open(a, "rb") as f:
+        result = f.readline()
+        assert result == data
+
+
+def test_readline_blocksize(gcs):
+    data = b"ab\n" + b"a" * (2**18) + b"\nab"
+    with gcs.open(a, "wb") as f:
+        f.write(data)
+    with gcs.open(a, "rb", block_size=2**18) as f:
+        result = f.readline()
+        expected = b"ab\n"
+        assert result == expected
+
+        result = f.readline()
+        expected = b"a" * (2**18) + b"\n"
+        assert result == expected
+
+        result = f.readline()
+        expected = b"ab"
+        assert result == expected
+
+
+def test_next(gcs):
+    expected = csv_files["2014-01-01.csv"].split(b"\n")[0] + b"\n"
+    with gcs.open(TEST_BUCKET + "/2014-01-01.csv") as f:
+        result = next(f)
+        assert result == expected
+
+
+def test_iterable(gcs):
+    data = b"abc\n123"
+    with gcs.open(a, "wb") as f:
+        f.write(data)
+    with gcs.open(a) as f, io.BytesIO(data) as g:
+        for fromgcs, fromio in zip(f, g):
+            assert fromgcs == fromio
+        f.seek(0)
+        assert f.readline() == b"abc\n"
+        assert f.readline() == b"123"
+        f.seek(1)
+        assert f.readline() == b"bc\n"
+
+
+@pytest.mark.parametrize(
+    "metadata_attribute, value, result_attribute",
+    [
+        ("custom_time", "2021-10-21T17:00:00Z", "customTime"),
+        ("cache_control", "public, max-age=3600", "cacheControl"),
+        ("content_encoding", "gzip", "contentEncoding"),
+        ("content_language", "en", "contentLanguage"),
+        (
+            "content_disposition",
+            "Attachment; filename=sample.empty",
+            "contentDisposition",
+        ),
+    ],
+)
+def test_fixed_key_metadata(metadata_attribute, value, result_attribute, gcs):
+    if not gcs.on_google:
+        # might be added in the future
+        # follow https://github.com/fsouza/fake-gcs-server/issues/477
+        pytest.skip("no google metadata support on emulation")
+
+    # open
+    gcs.touch(a)
+    assert metadata_attribute not in gcs.info(a)
+    gcs.touch(a, fixed_key_metadata={metadata_attribute: value})
+    file_info = gcs.info(a)
+    assert result_attribute in file_info
+    assert file_info[result_attribute] == value
+
+    # setxattrs
+    gcs.touch(b)
+    assert metadata_attribute not in gcs.info(b)
+    gcs.setxattrs(b, fixed_key_metadata={metadata_attribute: value})
+    file_info = gcs.info(b)
+    assert result_attribute in file_info
+    assert file_info[result_attribute] == value
+
+
+def test_readable(gcs):
+    with gcs.open(a, "wb") as f:
+        assert not f.readable()
+
+    with gcs.open(a, "rb") as f:
+        assert f.readable()
+
+
+def test_seekable(gcs):
+    with gcs.open(a, "wb") as f:
+        assert not f.seekable()
+
+    with gcs.open(a, "rb") as f:
+        assert f.seekable()
+
+
+def test_writable(gcs):
+    with gcs.open(a, "wb") as f:
+        assert f.writable()
+
+    with gcs.open(a, "rb") as f:
+        assert not f.writable()
+
+
+def test_merge(gcs):
+    with gcs.open(a, "wb") as f:
+        f.write(b"a" * 10)
+
+    with gcs.open(b, "wb") as f:
+        f.write(b"a" * 10)
+    gcs.merge(TEST_BUCKET + "/joined", [a, b])
+    assert gcs.info(TEST_BUCKET + "/joined")["size"] == 20
+
+
+def test_bigger_than_block_read(gcs):
+    with gcs.open(TEST_BUCKET + "/2014-01-01.csv", "rb", block_size=3) as f:
+        out = []
+        while True:
+            data = f.read(20)
+            out.append(data)
+            if len(data) == 0:
+                break
+    assert b"".join(out) == csv_files["2014-01-01.csv"]
+
+
+def test_current(gcs):
+    from gcsfs.tests import conftest
+
+    assert GCSFileSystem.current() is gcs
+    gcs2 = GCSFileSystem(**conftest.params)
+    assert gcs2.session is gcs.session
+
+
+def test_array(gcs):
+    from array import array
+
+    data = array("B", [65] * 1000)
+
+    with gcs.open(a, "wb") as f:
+        f.write(data)
+
+    with gcs.open(a, "rb") as f:
+        out = f.read()
+        assert out == b"A" * 1000
+
+
+def test_content_type_set(gcs):
+    fn = TEST_BUCKET + "/content_type"
+    with gcs.open(fn, "wb", content_type="text/html") as f:
+        f.write(b"<html>")
+    assert gcs.info(fn)["contentType"] == "text/html"
+
+
+def test_content_type_guess(gcs):
+    fn = TEST_BUCKET + "/content_type.txt"
+    with gcs.open(fn, "wb") as f:
+        f.write(b"zz")
+    assert gcs.info(fn)["contentType"] == "text/plain"
+
+
+def test_content_type_default(gcs):
+    fn = TEST_BUCKET + "/content_type.abcdef"
+    with gcs.open(fn, "wb") as f:
+        f.write(b"zz")
+    assert gcs.info(fn)["contentType"] == "application/octet-stream"
+
+
+def test_content_type_put_guess(gcs):
+    dst = TEST_BUCKET + "/content_type_put_guess"
+    with tmpfile(extension="txt") as fn:
+        with open(fn, "w") as f:
+            f.write("zz")
+        gcs.put(fn, f"gs://{dst}", b"")
+    assert gcs.info(dst)["contentType"] == "text/plain"
+
+
+def test_content_type_lazy_evaluation(fake_fs):
+    from gcsfs.core import GCSFile
+
+    fake_fs.split_path.return_value = ("test-bucket", "test-key.txt", None)
+    fake_fs.info.return_value = {
+        "name": "test-bucket/test-key.txt",
+        "size": 10,
+        "contentType": "application/json",
+        "type": "file",
+    }
+    with mock.patch("mimetypes.guess_type") as mock_guess:
+        f = GCSFile(
+            fake_fs, "test-bucket/test-key.txt", mode="rb", cache_type="readahead"
+        )
+        assert f.content_type == "application/json"
+        mock_guess.assert_not_called()
+
+
+def test_content_type_lazy_evaluation_fallback(fake_fs):
+    from gcsfs.core import GCSFile
+
+    fake_fs.split_path.return_value = ("test-bucket", "test-key.txt", None)
+    fake_fs.info.return_value = {
+        "name": "test-bucket/test-key.txt",
+        "size": 10,
+        "type": "file",
+    }
+    with mock.patch(
+        "mimetypes.guess_type", return_value=("text/plain", None)
+    ) as mock_guess:
+        f = GCSFile(
+            fake_fs, "test-bucket/test-key.txt", mode="rb", cache_type="readahead"
+        )
+        assert f.content_type == "text/plain"
+        mock_guess.assert_called_once()
+
+
+def test_attrs(gcs):
+    if not gcs.on_google:
+        # https://github.com/fsspec/gcsfs/pull/479
+        pytest.skip("fake-gcs-server:latest only supports PUT for metadata, not PATCH")
+    gcs.touch(a)
+    assert "metadata" not in gcs.info(a)
+    with pytest.raises(KeyError):
+        gcs.getxattr(a, "foo")
+
+    gcs.touch(a, metadata={"foo": "blob"})
+    assert gcs.getxattr(a, "foo") == "blob"
+
+    gcs.setxattrs(a, foo="blah")
+    assert gcs.getxattr(a, "foo") == "blah"
+
+    with gcs.open(a, "wb") as f:
+        f.metadata = {"something": "not"}
+
+    with pytest.raises(KeyError):
+        gcs.getxattr(a, "foo")
+    assert gcs.getxattr(a, "something") == "not"
+
+
+@pytest.mark.usefixtures("gcs")
+def test_request_user_project(gcs_factory):
+    gcs = gcs_factory(requester_pays=True, project=TEST_PROJECT)
+    # test directly against `_call` to inspect the result
+    r = gcs.call(
+        "GET",
+        "b/{}/o",
+        TEST_BUCKET,
+        delimiter="/",
+        prefix="test",
+        maxResults=100,
+        info_out=True,
+    )
+    qs = urlparse(r.url.human_repr()).query
+    result = parse_qs(qs)
+    assert result["userProject"] == [TEST_PROJECT]
+
+
+@pytest.mark.usefixtures("gcs")
+def test_request_user_project_string(gcs_factory):
+    gcs = gcs_factory(requester_pays=TEST_PROJECT)
+    assert gcs.requester_pays == TEST_PROJECT
+    # test directly against `_call` to inspect the result
+    r = gcs.call(
+        "GET",
+        "b/{}/o",
+        TEST_BUCKET,
+        delimiter="/",
+        prefix="",
+        maxResults=100,
+        info_out=True,
+    )
+    qs = urlparse(r.url.human_repr()).query
+    result = parse_qs(qs)
+    assert result["userProject"] == [TEST_PROJECT]
+
+
+@pytest.mark.usefixtures("gcs")
+def test_request_header(gcs_factory):
+    gcs = gcs_factory(requester_pays=True)
+    # test directly against `_call` to inspect the result
+    r = gcs.call(
+        "GET",
+        "b/{}/o",
+        TEST_BUCKET,
+        delimiter="/",
+        prefix="test",
+        maxResults=100,
+        info_out=True,
+    )
+    assert r.headers["User-Agent"] == "python-gcsfs/" + version
+
+
+def test_user_project_fallback_google_default(monkeypatch):
+    monkeypatch.setattr(gcsfs.core, "DEFAULT_PROJECT", "my_default_project")
+    monkeypatch.setattr(fsspec.config, "conf", {})
+    monkeypatch.setattr(
+        gcsfs.credentials.gauth,
+        "default",
+        lambda *__, **_: (requests.Session(), "my_default_project"),
+    )
+    fs = GCSFileSystem(skip_instance_cache=True)
+    assert fs.project == "my_default_project"
+
+
+@pytest.mark.parametrize("requester_pays", [True, TEST_PROJECT])
+def test_requester_pays_cat(gcs_factory, requester_pays_bucket, requester_pays):
+    gcs = gcs_factory(requester_pays=requester_pays)
+    file_path = f"{requester_pays_bucket}/test_file.txt"
+    data = b"test data requester pays"
+
+    gcs.pipe(file_path, data)
+    assert gcs.cat(file_path) == data
+
+
+def test_requester_pays_fails_without_user_project(requester_pays_bucket, gcs_factory):
+    """Test that operations on a requester-pays bucket fail if the flag is not set."""
+    fs = gcs_factory(requester_pays=False)
+    with pytest.raises(ValueError, match="Bucket is requester pays"):
+        fs.ls(requester_pays_bucket)
+
+
+def test_fs_requester_pays_on_bucket_without_requester_pays(gcs, gcs_factory):
+    """Test that metadata and data operations work when fs has requester_pays=True
+    but the bucket does not have requester-pays enabled."""
+    # The gcs fixture creates TEST_BUCKET.
+    fs = gcs_factory(requester_pays=True)
+    file_path = f"{TEST_BUCKET}/test_req_pays_data_{uuid.uuid4().hex}"
+    data = b"test data"
+
+    # Metadata operations
+    assert fs.exists(TEST_BUCKET)
+    assert isinstance(fs.ls(TEST_BUCKET), list)
+
+    # Data operations
+    fs.pipe(file_path, data)
+    assert fs.cat(file_path) == data
+
+
+@mock.patch("gcsfs.credentials.gauth")
+def test_raise_on_project_mismatch(mock_auth):
+    mock_auth.default.return_value = (requests.Session(), "my_other_project")
+    match = "'my_project' does not match the google default project 'my_other_project'"
+    with pytest.raises(ValueError, match=match):
+        GCSFileSystem(project="my_project", token="google_default")
+
+    result = GCSFileSystem(project="my_other_project", token="google_default")
+    assert result.project == "my_other_project"
+
+
+def test_ls_prefix_cache(gcs):
+    gcs.touch(f"gs://{TEST_BUCKET}/a/file1")
+    gcs.touch(f"gs://{TEST_BUCKET}/a/file2")
+
+    gcs.ls(f"gs://{TEST_BUCKET}/", prefix="a/file")
+    gcs.info(f"gs://{TEST_BUCKET}/a/file1")
+
+
+def test_placeholder_dir_cache_validity(gcs):
+    gcs.touch(f"gs://{TEST_BUCKET}/a/")
+    gcs.touch(f"gs://{TEST_BUCKET}/a/file")
+    gcs.touch(f"gs://{TEST_BUCKET}/b")
+
+    gcs.find(f"gs://{TEST_BUCKET}/a/")
+    gcs.info(f"gs://{TEST_BUCKET}/b")
+
+
+def test_pipe_small_cache_validity(gcs):
+    folder = f"{TEST_BUCKET}/{str(uuid4())}"
+
+    gcs.pipe(f"gs://{folder}/a/file.txt", b"")
+
+    assert gcs.ls(f"gs://{folder}") == [f"{folder}/a"]
+
+    gcs.pipe(f"gs://{folder}/b/file.txt", b"")
+
+    ls_res = gcs.ls(f"gs://{folder}")
+    assert len(ls_res) == 2
+    assert f"{folder}/b" in ls_res
+
+
+def _numpy():
+    return pytest.importorskip("numpy")
+
+
+@pytest.mark.parametrize(
+    "make_data, kwargs",
+    [
+        # consistency="size" checks the uploaded size against the byte count:
+        # bytes + a typed buffer already sends every byte.
+        (lambda: array.array("d", [1.5, 2.5]), {"consistency": "size"}),
+        (lambda: _numpy().arange(5, dtype="int32"), {}),
+        (lambda: _numpy().arange(6, dtype="int32").reshape(2, 3), {}),
+        (lambda: _numpy().zeros((0, 3), dtype="int32"), {}),
+        # Large enough in bytes, and in elements, for a resumable upload.
+        (
+            lambda: array.array("d", bytes(4 * 2**20)),
+            {"chunksize": 2**18, "consistency": "size"},
+        ),
+    ],
+    ids=["typed_array", "numpy", "numpy_2d", "numpy_empty_2d", "typed_array_resumable"],
+)
+def test_pipe_file_accepts_any_bytes_like_object(gcs, make_data, kwargs):
+    """pipe_file uploads the bytes of any bytes-like object: len() of a typed
+    buffer counts elements, and a numpy array added to bytes broadcasts."""
+    data = make_data()
+    path = f"{TEST_BUCKET}/{uuid4()}"
+
+    gcs.pipe_file(path, data, **kwargs)
+
+    assert gcs.cat_file(path) == bytes(memoryview(data))
+
+
+def test_put_small_cache_validity(gcs):
+    folder = f"{TEST_BUCKET}/{str(uuid4())}"
+
+    gcs.pipe(f"gs://{folder}/a/file.txt", b"")
+
+    assert gcs.ls(f"gs://{folder}") == [f"{folder}/a"]
+
+    with tmpfile() as fn:
+        with open(fn, "w") as f:
+            f.write("")
+
+        gcs.put(fn, f"gs://{folder}/b/file.txt", b"")
+
+    ls_res = gcs.ls(f"gs://{folder}")
+    assert len(ls_res) == 2
+    assert f"{folder}/b" in ls_res
+
+
+def test_pseudo_dir_find(gcs):
+    gcs.rm(f"{TEST_BUCKET}/*", recursive=True)
+    gcs.touch(f"{TEST_BUCKET}/a/b/file")
+
+    c = gcs.glob(f"{TEST_BUCKET}/a/b/*")
+    assert c == [f"{TEST_BUCKET}/a/b/file"]
+
+    b = set(gcs.glob(f"{TEST_BUCKET}/a/*"))
+    assert b == {f"{TEST_BUCKET}/a/b"}
+
+    a = set(gcs.glob(f"{TEST_BUCKET}/*"))
+    assert a == {f"{TEST_BUCKET}/a"}
+
+    assert gcs.find(TEST_BUCKET) == [f"{TEST_BUCKET}/a/b/file"]
+    assert gcs.find(f"{TEST_BUCKET}/a", withdirs=True) == [
+        f"{TEST_BUCKET}/a",
+        f"{TEST_BUCKET}/a/b",
+        f"{TEST_BUCKET}/a/b/file",
+    ]
+
+
+def test_zero_cache_timeout(gcs):
+    gcs.dircache.listings_expiry_time = 0
+    gcs.touch(f"gs://{TEST_BUCKET}/a/file")
+    gcs.find(f"gs://{TEST_BUCKET}/a/")
+    gcs.info(f"gs://{TEST_BUCKET}/a/file")
+    gcs.ls(f"gs://{TEST_BUCKET}/a/")
+
+    # The _times entry and exception below should only be present after
+    # https://github.com/fsspec/filesystem_spec/pull/513.
+    if f"{TEST_BUCKET}/a" not in gcs.dircache._times:
+        pytest.skip("fsspec version too early")
+
+    with pytest.raises(KeyError):
+        gcs.dircache[f"{TEST_BUCKET}/a"]
+
+
+@pytest.mark.parametrize("with_cache", (False, True))
+def test_find_with_prefix_partial_cache(gcs, with_cache):
+    base_dir = f"{TEST_BUCKET}/test_find_with_prefix"
+    gcs.touch(base_dir + "/test_1")
+    gcs.touch(base_dir + "/test_2")
+
+    gcs.invalidate_cache()
+    if with_cache:
+        gcs.ls(base_dir)
+    precache = dict(gcs.dircache)
+    assert gcs.find(base_dir, prefix="non_existent_") == []
+    assert gcs.find(base_dir, prefix="test_") == [
+        base_dir + "/test_1",
+        base_dir + "/test_2",
+    ]
+    assert dict(gcs.dircache) == precache  # find qwith prefix shouldn't touch cache
+    assert gcs.find(base_dir + "/test_1") == [base_dir + "/test_1"]
+    assert gcs.find(base_dir + "/non_existent") == []
+    assert gcs.find(base_dir + "/non_existent", prefix="more_non_existent") == []
+
+
+def test_find_withdirs_prefix(gcs):
+    base_dir = f"{TEST_BUCKET}/test_find_withdirs_prefix"
+    gcs.touch(base_dir + "/folder_1/file1.txt")
+    gcs.touch(base_dir + "/folder_2/file2.txt")
+    gcs.touch(base_dir + "/other/file3.txt")
+
+    # Find with prefix matching folders
+    results = gcs.find(base_dir, withdirs=True, prefix="folder_")
+    expected = [
+        base_dir + "/folder_1",
+        base_dir + "/folder_1/file1.txt",
+        base_dir + "/folder_2",
+        base_dir + "/folder_2/file2.txt",
+    ]
+    assert sorted(results) == sorted(expected)
+
+
+def test_find_dircache(gcs):
+    """Running `ls` after find should not corrupt the dir cache"""
+    assert set(gcs.find(TEST_BUCKET)) == {f"{TEST_BUCKET}/{path}" for path in allfiles}
+    assert set(gcs.ls(TEST_BUCKET)) == {
+        f"{TEST_BUCKET}/test",
+        f"{TEST_BUCKET}/nested",
+        f"{TEST_BUCKET}/2014-01-01.csv",
+        f"{TEST_BUCKET}/2014-01-02.csv",
+        f"{TEST_BUCKET}/2014-01-03.csv",
+        f"{TEST_BUCKET}/zonal",
+    }
+    assert set(gcs.ls(f"{TEST_BUCKET}/nested")) == {
+        f"{TEST_BUCKET}/nested/file1",
+        f"{TEST_BUCKET}/nested/file2",
+        f"{TEST_BUCKET}/nested/nested2",
+    }
+
+
+def test_find_dircache_trailing_slash(gcs):
+    path = f"{TEST_BUCKET}/trailing_slash"
+    gcs.touch(f"{path}/file")
+    gcs.invalidate_cache()
+
+    gcs.find(f"{path}/")
+
+    assert path in gcs.dircache
+    assert len(gcs.dircache[path]) == 1
+    assert gcs.dircache[path][0]["name"] == f"{path}/file"
+
+
+def test_percent_file_name(gcs):
+    parent = f"{TEST_BUCKET}/test/onefile"
+    fn = f"{parent}/a%25.txt"
+    data = b"zz"
+    with gcs.open(fn, "wb", content_type="text/plain") as f:
+        f.write(data)
+    assert gcs.cat(fn) == data
+    fn2 = unquote(fn)
+    gcs.touch(fn2)
+    assert gcs.cat(fn2) != data
+    assert set(gcs.ls(parent)) == {fn, fn2}
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        (None),
+        ("US"),
+        ("EUROPE-WEST3"),
+        ("europe-west3"),
+    ],
+)
+def test_bucket_location(gcs_factory, location):
+    gcs = gcs_factory(default_location=location)
+    if not gcs.on_google:
+        pytest.skip("emulator can only create buckets in the 'US-CENTRAL1' location.")
+    bucket_name = f"gcsfs-test-{uuid4()}"
+    try:
+        gcs.mkdir(bucket_name)
+        bucket = [
+            b
+            for b in sync(gcs.loop, gcs._list_buckets, timeout=gcs.timeout)
+            if b["name"] == bucket_name + "/"
+        ][0]
+        assert bucket["location"] == (location or "US").upper()
+    finally:
+        gcs.rm(bucket_name, recursive=True)
+
+
+def test_bucket_default_location_overwrite(gcs_factory):
+    gcs = gcs_factory(default_location="US")
+    if not gcs.on_google:
+        pytest.skip("emulator can only create buckets in the 'US-CENTRAL1' location.")
+    bucket_name = f"gcsfs-test-{uuid4()}"
+    try:
+        gcs.mkdir(bucket_name, location="EUROPE-WEST3")
+        bucket = [
+            b
+            for b in sync(gcs.loop, gcs._list_buckets, timeout=gcs.timeout)
+            if b["name"] == bucket_name + "/"
+        ][0]
+        assert bucket["location"] == "EUROPE-WEST3"
+    finally:
+        gcs.rm(bucket_name, recursive=True)
+
+
+def test_dir_marker(gcs):
+    gcs.touch(f"{TEST_BUCKET}/placeholder/")
+    gcs.touch(f"{TEST_BUCKET}/placeholder/inner")
+    out = gcs.find(TEST_BUCKET)
+    assert f"{TEST_BUCKET}/placeholder/" in out
+    gcs.invalidate_cache()
+    out2 = gcs.info(f"{TEST_BUCKET}/placeholder/")
+    out3 = gcs.info(f"{TEST_BUCKET}/placeholder/")
+    assert out2 == out3
+    assert out2["type"] == "directory"
+
+
+def test_dir_marker_directory_not_listed(gcs):
+    gcs.touch(f"{TEST_BUCKET}/psudodir/")
+    gcs.touch(f"{TEST_BUCKET}/psudodir/innerfolder/innerfile")
+    gcs.invalidate_cache()
+    info = gcs.info(f"{TEST_BUCKET}/psudodir")
+    assert info["type"] == "directory"
+
+
+def test_dir_marker_directory_listed(gcs):
+    gcs.touch(f"{TEST_BUCKET}/psudodir/")
+    gcs.touch(f"{TEST_BUCKET}/psudodir/innerfolder/innerfile")
+    gcs.invalidate_cache()
+    gcs.ls(f"{TEST_BUCKET}/psudodir")
+    info = gcs.info(f"{TEST_BUCKET}/psudodir")
+    assert info["type"] == "directory"
+
+
+def test_dir_marker_parent_directory_listed(gcs):
+    gcs.touch(f"{TEST_BUCKET}/parent_psudodir/psudodir/")
+    gcs.touch(f"{TEST_BUCKET}/parent_psudodir/psudodir/innerfolder/innerfile")
+    gcs.invalidate_cache()
+    gcs.ls(f"{TEST_BUCKET}/parent_psudodir")
+    info = gcs.info(f"{TEST_BUCKET}/parent_psudodir/psudodir")
+    assert info["type"] == "directory"
+
+
+def test_dir_marker_info_eq_ls(gcs):
+    gcs.touch(f"{TEST_BUCKET}/psudodir/")
+    gcs.invalidate_cache()
+    out1 = gcs.info(f"{TEST_BUCKET}/psudodir")
+    out2 = gcs.ls(f"{TEST_BUCKET}/psudodir", detail=True)[0]
+    assert out1["type"] == "directory"
+    assert {k: v for k, v in out1.items() if k in out2} == out2
+
+    gcs.invalidate_cache()
+    out3 = gcs.ls(f"{TEST_BUCKET}/psudodir", detail=True)[0]
+    out4 = gcs.info(f"{TEST_BUCKET}/psudodir")
+    assert out3["type"] == "directory"
+    assert {k: v for k, v in out4.items() if k in out3} == out3
+
+
+def test_mkdir_with_path(gcs):
+    with pytest.raises(FileNotFoundError):
+        gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=False)
+    assert not gcs.exists(f"{TEST_BUCKET + 'new'}")
+    gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=True)
+    assert gcs.exists(f"{TEST_BUCKET + 'new'}")
+
+    # these lines do nothing, but should not fail
+    gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=False)
+    gcs.mkdir(f"{TEST_BUCKET + 'new'}/path", create_parents=True)
+
+    gcs.rm(f"{TEST_BUCKET + 'new'}", recursive=True)
+
+
+def test_deep_find_wthdirs(gcs):
+    gcs.touch(f"{TEST_BUCKET}/deep/nested/dir")
+    assert gcs.find(f"{TEST_BUCKET}/deep/nested") == [f"{TEST_BUCKET}/deep/nested/dir"]
+    assert gcs.find(f"{TEST_BUCKET}/deep/nested", withdirs=True) == [
+        f"{TEST_BUCKET}/deep/nested",
+        f"{TEST_BUCKET}/deep/nested/dir",
+    ]
+
+
+def test_cp_directory_recursive(gcs):
+    src = TEST_BUCKET + "/src"
+    src_file = src + "/file"
+    gcs.mkdir(src)
+    gcs.touch(src_file)
+
+    target = TEST_BUCKET + "/target"
+
+    # cp without slash
+    assert not gcs.exists(target)
+    for loop in range(2):
+        gcs.cp(src, target, recursive=True)
+        assert gcs.isdir(target)
+
+        if loop == 0:
+            correct = [target + "/file"]
+            assert gcs.find(target) == correct
+        else:
+            correct = [target + "/file", target + "/src/file"]
+            assert sorted(gcs.find(target)) == correct
+
+    gcs.rm(target, recursive=True)
+
+    # cp with slash
+    assert not gcs.exists(target)
+    for loop in range(2):
+        gcs.cp(src + "/", target, recursive=True)
+        assert gcs.isdir(target)
+        correct = [target + "/file"]
+        assert gcs.find(target) == correct
+
+
+def test_get_directory_recursive(gcs):
+    src = TEST_BUCKET + "/src"
+    src_file = src + "/file"
+    gcs.mkdir(src)
+    gcs.touch(src_file)
+
+    with tempdir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        target_fs = fsspec.filesystem("file")
+
+        # get without slash
+        assert not target_fs.exists(target)
+        for loop in range(2):
+            gcs.get(src, target, recursive=True)
+            assert target_fs.isdir(target)
+
+            if loop == 0:
+                assert target_fs.find(target) == [os.path.join(target, "file")]
+            else:
+                assert sorted(target_fs.find(target)) == [
+                    os.path.join(target, "file"),
+                    os.path.join(target, "src", "file"),
+                ]
+
+        target_fs.rm(target, recursive=True)
+
+        # get with slash
+        assert not target_fs.exists(target)
+        for loop in range(2):
+            gcs.get(src + "/", target, recursive=True)
+            assert target_fs.isdir(target)
+            assert target_fs.find(target) == [os.path.join(target, "file")]
+
+
+def test_put_directory_recursive(gcs):
+    with tempdir() as tmpdir:
+        src = os.path.join(tmpdir, "src")
+        src_file = os.path.join(src, "file")
+
+        source_fs = fsspec.filesystem("file")
+        source_fs.mkdir(src)
+        source_fs.touch(src_file)
+
+        target = TEST_BUCKET + "/target"
+
+        # put without slash
+        assert not gcs.exists(target)
+        for loop in range(2):
+            gcs.put(src, target, recursive=True)
+            assert gcs.isdir(target)
+
+            if loop == 0:
+                assert gcs.find(target) == [target + "/file"]
+            else:
+                assert sorted(gcs.find(target)) == [
+                    target + "/file",
+                    target + "/src/file",
+                ]
+
+        gcs.rm(target, recursive=True)
+
+        # put with slash
+        assert not gcs.exists(target)
+        for loop in range(2):
+            gcs.put(src + "/", target, recursive=True)
+            assert gcs.isdir(target)
+            assert gcs.find(target) == [target + "/file"]
+
+
+def test_cp_two_files(gcs):
+    src = TEST_BUCKET + "/src"
+    file0 = src + "/file0"
+    file1 = src + "/file1"
+    gcs.mkdir(src)
+    gcs.touch(file0)
+    gcs.touch(file1)
+
+    target = TEST_BUCKET + "/target"
+    assert not gcs.exists(target)
+
+    gcs.cp([file0, file1], target)
+
+    assert gcs.isdir(target)
+    assert sorted(gcs.find(target)) == [
+        target + "/file0",
+        target + "/file1",
+    ]
+
+
+def test_multiglob(gcs):
+    # #530
+    root = TEST_BUCKET
+
+    ggparent = root + "/t1"
+    gparent = ggparent + "/t2"
+    parent = gparent + "/t3"
+    leaf1 = parent + "/foo.txt"
+    leaf2 = parent + "/bar.txt"
+    leaf3 = parent + "/baz.txt"
+
+    gcs.touch(leaf1)
+    gcs.touch(leaf2)
+    gcs.touch(leaf3)
+    gcs.invalidate_cache()
+
+    assert gcs.ls(gparent, detail=False) == [f"{root}/t1/t2/t3"]
+    gcs.glob(ggparent + "/")
+    assert gcs.ls(gparent, detail=False) == [f"{root}/t1/t2/t3"]
+
+
+def test_expiry_keyword():
+    gcs = GCSFileSystem(listings_expiry_time=1, token="anon")
+    assert gcs.dircache.listings_expiry_time == 1
+    gcs = GCSFileSystem(cache_timeout=1, token="anon")
+    assert gcs.dircache.listings_expiry_time == 1
+    gcs = GCSFileSystem(cache_timeout=0, token="anon")
+    assert gcs.dircache.listings_expiry_time == 0
+
+
+def test_copy_cache_invalidated(gcs):
+    # Issue https://github.com/fsspec/gcsfs/issues/562
+    source = TEST_BUCKET + "/source"
+    gcs.mkdir(source)
+    gcs.touch(source + "/file2")
+
+    target = TEST_BUCKET + "/target"
+    assert not gcs.exists(target)
+    gcs.touch(target + "/dummy")
+    assert gcs.isdir(target)
+
+    target_file2 = target + "/file2"
+    gcs.cp(source + "/file2", target)
+
+    # Explicitly check that target has been removed from DirCache
+    assert target not in gcs.dircache
+
+    # Prior to fix the following failed as cache stale
+    assert gcs.isfile(target_file2)
+
+
+def test_write_file_cache_invalidates_only_immediate_parent_standard(gcs, flat_bucket):
+    """Standard buckets use the write-cache shortcut when the parent is cached."""
+    base_dir = f"{flat_bucket}/write_cache_std_{uuid.uuid4().hex}"
+    parent_dir = f"{base_dir}/parent"
+    sibling_dir = f"{base_dir}/sibling"
+    new_file = f"{parent_dir}/new.txt"
+
+    gcs.touch(f"{parent_dir}/existing.txt")
+    gcs.touch(f"{sibling_dir}/sibling_file.txt")
+
+    gcs.ls(base_dir)
+    gcs.ls(parent_dir)
+    gcs.ls(sibling_dir)
+    assert base_dir in gcs.dircache
+    assert parent_dir in gcs.dircache
+    assert sibling_dir in gcs.dircache
+
+    gcs.pipe_file(new_file, b"hello world")
+
+    assert parent_dir not in gcs.dircache
+    assert base_dir in gcs.dircache
+    assert sibling_dir in gcs.dircache
+    assert new_file in gcs.ls(parent_dir, detail=False)
+
+
+def test_transaction(gcs):
+    # https://github.com/fsspec/gcsfs/issues/389
+    if not gcs.on_google:
+        pytest.skip()
+    try:
+        with gcs.transaction:
+            with gcs.open(f"{TEST_BUCKET}/foo", "wb") as f:
+                f.write(b"This is a test string")
+            f.discard()
+            assert not gcs.exists(f"{TEST_BUCKET}/foo")
+            raise ZeroDivisionError
+    except ZeroDivisionError:
+        ...
+    assert not gcs.exists(f"{TEST_BUCKET}/foo")
+
+    with gcs.transaction:
+        with gcs.open(f"{TEST_BUCKET}/foo", "wb") as f:
+            f.write(b"This is a test string")
+        assert not gcs.exists(f"{TEST_BUCKET}/foo")
+
+    assert gcs.cat(f"{TEST_BUCKET}/foo") == b"This is a test string"
+
+
+def test_find_maxdepth(gcs):
+    assert gcs.find(f"{TEST_BUCKET}/nested", maxdepth=None) == [
+        f"{TEST_BUCKET}/nested/file1",
+        f"{TEST_BUCKET}/nested/file2",
+        f"{TEST_BUCKET}/nested/nested2/file1",
+        f"{TEST_BUCKET}/nested/nested2/file2",
+    ]
+
+    assert gcs.find(f"{TEST_BUCKET}/nested", maxdepth=None, withdirs=True) == [
+        f"{TEST_BUCKET}/nested",
+        f"{TEST_BUCKET}/nested/file1",
+        f"{TEST_BUCKET}/nested/file2",
+        f"{TEST_BUCKET}/nested/nested2",
+        f"{TEST_BUCKET}/nested/nested2/file1",
+        f"{TEST_BUCKET}/nested/nested2/file2",
+    ]
+
+    assert gcs.find(f"{TEST_BUCKET}/nested", maxdepth=1) == [
+        f"{TEST_BUCKET}/nested/file1",
+        f"{TEST_BUCKET}/nested/file2",
+    ]
+
+    assert gcs.find(f"{TEST_BUCKET}/nested", maxdepth=1, withdirs=True) == [
+        f"{TEST_BUCKET}/nested",
+        f"{TEST_BUCKET}/nested/file1",
+        f"{TEST_BUCKET}/nested/file2",
+        f"{TEST_BUCKET}/nested/nested2",
+    ]
+
+    with pytest.raises(ValueError, match="maxdepth must be at least 1"):
+        gcs.find(f"{TEST_BUCKET}/nested", maxdepth=0)
+
+
+def test_sign(gcs, monkeypatch):
+    if not gcs.on_google:
+        pytest.skip("Emulator does not support signing")
+
+    file = TEST_BUCKET + "/test.jpg"
+    with gcs.open(file, "wb") as f:
+        f.write(b"This is a test string")
+    assert gcs.cat(file) == b"This is a test string"
+
+    current_ts_utc = int(datetime.now(tz=timezone.utc).timestamp())
+    result = gcs.sign(file)
+
+    params = parse_qs(urlparse(result).query)
+    assert int(params["Expires"][0]) >= current_ts_utc + 100
+
+    response = requests.get(result)
+    assert response.text == "This is a test string"
+
+
+FAKE_SERVICE_ACCOUNT_FILE = os.path.join(
+    os.path.dirname(__file__), "fake-service-account-credentials.json"
+)
+IAM_SIGN_EMAIL = "sa@project.iam.gserviceaccount.com"
+
+
+def _keyless_credentials():
+    """Credentials without a private key, as GCE or GKE Workload Identity provide.
+
+    Like real Compute Engine credentials before their first refresh, they have
+    no token and report the service account email as "default"; refreshing
+    resolves both, as the metadata server would.
+    """
+    creds = google.auth.compute_engine.Credentials(universe_domain="googleapis.com")
+    creds.token = None
+
+    def refresh(request):
+        creds._service_account_email = IAM_SIGN_EMAIL
+        creds.token = "access-token"
+
+    creds.refresh = mock.Mock(side_effect=refresh)
+    return creds
+
+
+def _fake_storage_client(monkeypatch):
+    """Replace google.cloud.storage.Client; returns the blob mock that records signing kwargs."""
+    blob = mock.Mock()
+    blob.generate_signed_url.return_value = "https://signed.example/key"
+    client = mock.Mock()
+    client.bucket.return_value.blob.return_value = blob
+    monkeypatch.setattr("google.cloud.storage.Client", mock.Mock(return_value=client))
+    return blob
+
+
+SIGNER = object()
+
+
+@pytest.mark.parametrize(
+    "token, sign_kwargs, expected",
+    [
+        pytest.param(
+            _keyless_credentials,
+            {},
+            {"service_account_email": IAM_SIGN_EMAIL, "access_token": "access-token"},
+            id="no-private-key-uses-iam",
+        ),
+        pytest.param(
+            lambda: FAKE_SERVICE_ACCOUNT_FILE,
+            {},
+            {"service_account_email": None, "access_token": None},
+            id="private-key-signs-locally",
+        ),
+        pytest.param(
+            _keyless_credentials,
+            {"service_account_email": "other@example.com", "access_token": "t"},
+            {"service_account_email": "other@example.com", "access_token": "t"},
+            id="explicit-iam-arguments-kept",
+        ),
+        pytest.param(
+            _keyless_credentials,
+            {"credentials": SIGNER},
+            {
+                "credentials": SIGNER,
+                "service_account_email": None,
+                "access_token": None,
+            },
+            id="explicit-credentials-kept",
+        ),
+    ],
+)
+def test_sign_credentials(monkeypatch, token, sign_kwargs, expected):
+    blob = _fake_storage_client(monkeypatch)
+    fs = GCSFileSystem(token=token(), skip_instance_cache=True)
+
+    assert fs.sign("bucket/key", expiration=300, **sign_kwargs) == (
+        "https://signed.example/key"
+    )
+    kwargs = blob.generate_signed_url.call_args.kwargs
+    assert kwargs["expiration"] == timedelta(seconds=300)
+    assert kwargs["generation"] is None
+    for key, value in expected.items():
+        assert kwargs.get(key) == value
+
+
+def test_sign_without_private_key_calls_signblob_api(monkeypatch):
+    fs = GCSFileSystem(token=_keyless_credentials(), skip_instance_cache=True)
+    signature = base64.b64encode(b"signature").decode()
+    calls = []
+
+    def fake_request():
+        def request(url, method, body, headers):
+            calls.append((url, method, body, headers))
+            return mock.Mock(
+                status=200, data=json.dumps({"signedBlob": signature}).encode()
+            )
+
+        return request
+
+    monkeypatch.setattr("google.cloud.storage._signing.requests.Request", fake_request)
+
+    url = fs.sign("bucket/key")
+
+    assert len(calls) == 1
+    sign_url, method, body, headers = calls[0]
+    assert sign_url == (
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        f"{IAM_SIGN_EMAIL}:signBlob?alt=json"
+    )
+    assert method == "POST"
+    assert headers["Authorization"] == "Bearer access-token"
+    assert "payload" in json.loads(body)
+    params = parse_qs(urlparse(url).query)
+    assert params["GoogleAccessId"] == [IAM_SIGN_EMAIL]
+    assert params["Signature"] == [signature]
+
+
+def test_write_x_mpu(gcs):
+    if not gcs.on_google:
+        pytest.skip("emulator does not support condition")
+    fn = TEST_BUCKET + "/test.file"
+    with gcs.open(fn, mode="xb", block_size=5 * 2**20) as f:
+        assert f.mode == "xb"
+        f.write(b"0" * 5 * 2**20)
+        f.write(b"done")
+    with pytest.raises(FileExistsError):
+        with gcs.open(fn, mode="xb", block_size=5 * 2**20) as f:
+            f.write(b"0" * 5 * 2**20)
+            f.write(b"done")
+
+
+def test_near_find(gcs):
+    gcs.touch(f"{TEST_BUCKET}/inner/aa/file")
+    out = gcs.find(f"{TEST_BUCKET}/inner/a")
+    assert not out
+
+
+def test_ls_with_max_results(gcs):
+    """
+    Test that ls with max_results returns the correct number of items,
+    especially when the listing includes both files and directories (prefixes)
+    and requires pagination.
+    """
+    if not gcs.on_google:
+        pytest.skip("emulator does not respect max_results")
+    parent_dir = f"{TEST_BUCKET}/max_results_test"
+    # Create directories/prefixes under parent directory.
+    dirs_to_create = {f"{parent_dir}/xdir{i}/subfile{i}": b"" for i in range(50)}
+    # Create many files to ensure pagination is triggered.
+    files_to_create = {f"{parent_dir}/file{i}": b"" for i in range(1000)}
+    all_files_to_create = {**dirs_to_create, **files_to_create}
+    gcs.pipe(all_files_to_create)
+
+    # Test for triggering pagination, default page_size is 1000
+    results = gcs.ls(parent_dir, max_results=1020)
+    assert len(results) == 1020
+
+    results = gcs.ls(parent_dir, max_results=5)
+    assert len(results) == 5
+
+
+def test_get_error(gcs):
+    with pytest.raises(FileNotFoundError):
+        gcs.get_file(f"{TEST_BUCKET}/doesnotexist", "other")
+
+
+def test_custom_gcp_universe(monkeypatch, mtls_env):
+    # Make sure we simulate a mock less connection
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
+
+    monkeypatch.setenv("GOOGLE_CLOUD_UNIVERSE_DOMAIN", "s3nsapis.fr")
+    fs = fsspec.filesystem("gcs", token="anon")
+    assert fs.base == "https://storage.s3nsapis.fr/storage/v1/"
+    assert fs.on_google is True
+    assert (
+        fs.url("/test/path")
+        == "https://storage.s3nsapis.fr/download/storage/v1/b/test/o/path?alt=media"
+    )
+    assert fs.batch_url_base == "https://storage.s3nsapis.fr/batch/storage/v1"
+
+
+def test_default_gcp_universe(monkeypatch, mtls_env):
+    # Make sure we simulate a mock less connection
+    monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_UNIVERSE_DOMAIN", raising=False)
+
+    fs = fsspec.filesystem("gcs", token="anon")
+    assert fs.base == "https://storage.googleapis.com/storage/v1/"
+    assert fs.on_google is True
+    assert (
+        fs.url("/test/path")
+        == "https://storage.googleapis.com/download/storage/v1/b/test/o/path?alt=media"
+    )
+    assert fs.batch_url_base == "https://storage.googleapis.com/batch/storage/v1"
+
+
+def _write_test_pki(directory):
+    """Write a throwaway CA plus server and client certs signed by it."""
+    import datetime as dt
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def issue(name, issuer=None, issuer_key=None, san=None, usage=None):
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer or subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(minutes=5))
+            .not_valid_after(now + dt.timedelta(hours=1))
+            .add_extension(
+                x509.BasicConstraints(ca=issuer is None, path_length=None),
+                critical=True,
+            )
+        )
+        # Key identifiers and CA key usage are required by the strict X.509
+        # checks that Python 3.13+ enables in ssl.create_default_context().
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
+        ).add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                (issuer_key or key).public_key()
+            ),
+            False,
+        )
+        if issuer is None:
+            builder = builder.add_extension(
+                x509.KeyUsage(
+                    digital_signature=False,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=True,
+                    crl_sign=True,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+        if san:
+            builder = builder.add_extension(x509.SubjectAlternativeName(san), False)
+        if usage:
+            builder = builder.add_extension(x509.ExtendedKeyUsage([usage]), False)
+        cert = builder.sign(issuer_key or key, hashes.SHA256())
+        return cert, key
+
+    def write(name, cert, key):
+        paths = os.path.join(directory, f"{name}.pem"), os.path.join(
+            directory, f"{name}-key.pem"
+        )
+        with open(paths[0], "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(paths[1], "wb") as f:
+            f.write(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+            )
+        return paths
+
+    ca, ca_key = issue("gcsfs test CA")
+    server = issue(
+        "localhost",
+        ca.subject,
+        ca_key,
+        san=[
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        ],
+        usage=ExtendedKeyUsageOID.SERVER_AUTH,
+    )
+    client = issue(
+        "gcsfs test client", ca.subject, ca_key, usage=ExtendedKeyUsageOID.CLIENT_AUTH
+    )
+    return {
+        "ca": write("ca", ca, ca_key)[0],
+        "server": write("server", *server),
+        "client": write("client", *client),
+    }
+
+
+@pytest.fixture
+def mtls_env(monkeypatch, tmp_path):
+    """Environment without an emulator or credentials; cert config not yet set."""
+    for var in (
+        "STORAGE_EMULATOR_HOST",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_UNIVERSE_DOMAIN",
+        "GOOGLE_API_USE_CLIENT_CERTIFICATE",
+        "GOOGLE_API_USE_MTLS_ENDPOINT",
+        "GOOGLE_API_CERTIFICATE_CONFIG",
+        "CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE",
+        "CLOUDSDK_CONTEXT_AWARE_CERTIFICATE_CONFIG_FILE_PATH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    # keep google-auth from finding a gcloud certificate_config.json
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path / "gcloud"))
+    GCSFileSystem.clear_instance_cache()
+    yield monkeypatch
+    GCSFileSystem.clear_instance_cache()
+
+
+@pytest.fixture
+def client_cert_config(mtls_env, tmp_path):
+    """Configure google-auth's default client cert source (workload config)."""
+    pki = _write_test_pki(str(tmp_path))
+    cert_path, key_path = pki["client"]
+    config = tmp_path / "certificate_config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "cert_configs": {
+                    "workload": {"cert_path": cert_path, "key_path": key_path}
+                }
+            }
+        )
+    )
+    mtls_env.setenv("GOOGLE_API_CERTIFICATE_CONFIG", str(config))
+    mtls_env.setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "true")
+    return pki
+
+
+def _session_kwargs(fs):
+    """Return the kwargs gcsfs passes to aiohttp.ClientSession."""
+    with mock.patch("gcsfs.core.get_client", mock.AsyncMock()) as get_client:
+        sync(fs.loop, fs._set_session)
+    fs._session = None
+    return get_client.call_args.kwargs
+
+
+def test_mtls_not_used_without_client_cert(mtls_env):
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "https://storage.googleapis.com/storage/v1/"
+    assert fs.on_google is True
+    assert "connector" not in _session_kwargs(fs)
+
+
+def test_mtls_not_used_when_client_cert_disabled(client_cert_config, mtls_env):
+    # a cert config exists, but the env var turns client certs off
+    mtls_env.setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "https://storage.googleapis.com/storage/v1/"
+    assert "connector" not in _session_kwargs(fs)
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "always", "ALWAYS"])
+def test_mtls_endpoint_with_client_cert(client_cert_config, mtls_env, mode):
+    if mode:
+        mtls_env.setenv("GOOGLE_API_USE_MTLS_ENDPOINT", mode)
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "https://storage.mtls.googleapis.com/storage/v1/"
+    assert fs.batch_url_base == "https://storage.mtls.googleapis.com/batch/storage/v1"
+    assert fs.on_google is True
+    connector = _session_kwargs(fs)["connector"]
+    assert isinstance(connector._ssl, ssl.SSLContext)
+
+
+def test_mtls_endpoint_never(client_cert_config, mtls_env):
+    # like google-cloud-storage: regular endpoint, but the cert is still used
+    mtls_env.setenv("GOOGLE_API_USE_MTLS_ENDPOINT", "never")
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "https://storage.googleapis.com/storage/v1/"
+    assert "connector" in _session_kwargs(fs)
+
+
+def test_mtls_concurrent_set_session(client_cert_config):
+    fs = GCSFileSystem(token="anon")
+
+    async def set_sessions():
+        return await asyncio.gather(*(fs._set_session() for _ in range(10)))
+
+    with mock.patch(
+        "gcsfs.core._client_cert_ssl_context",
+        wraps=gcsfs.core._client_cert_ssl_context,
+    ) as load:
+        sessions = sync(fs.loop, set_sessions)
+    try:
+        assert len({id(session) for session in sessions}) == 1
+        assert load.call_count == 1
+    finally:
+        sync(fs.loop, sessions[0].close)
+        fs._session = None
+
+
+def test_mtls_set_session_cancel_one_caller(client_cert_config):
+    """Cancelling one caller must not cancel the shared cert load."""
+    import time
+
+    fs = GCSFileSystem(token="anon")
+    real_load = gcsfs.core._client_cert_ssl_context
+
+    def slow_load():
+        time.sleep(0.2)
+        return real_load()
+
+    async def run():
+        tasks = [asyncio.ensure_future(fs._set_session()) for _ in range(3)]
+        await asyncio.sleep(0.05)
+        tasks[0].cancel()
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    with mock.patch(
+        "gcsfs.core._client_cert_ssl_context", side_effect=slow_load
+    ) as load:
+        results = sync(fs.loop, run)
+    try:
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert isinstance(results[1], aiohttp.ClientSession)
+        assert results[1] is results[2]
+        assert load.call_count == 1
+    finally:
+        sync(fs.loop, results[1].close)
+        fs._session = None
+
+
+def test_mtls_set_session_retries_after_failed_load(client_cert_config):
+    fs = GCSFileSystem(token="anon")
+    real_load = gcsfs.core._client_cert_ssl_context
+    with mock.patch(
+        "gcsfs.core._client_cert_ssl_context",
+        side_effect=[OSError("cert provider failed"), real_load()],
+    ):
+        with pytest.raises(OSError, match="cert provider failed"):
+            sync(fs.loop, fs._set_session)
+        session = sync(fs.loop, fs._set_session)
+    assert isinstance(session, aiohttp.ClientSession)
+    sync(fs.loop, session.close)
+    fs._session = None
+
+
+def test_mtls_empty_client_cert_source(client_cert_config):
+    from google.auth.exceptions import MutualTLSChannelError
+
+    with mock.patch(
+        "google.auth.transport.mtls.default_client_cert_source",
+        return_value=lambda: (None, None),
+    ):
+        with pytest.raises(MutualTLSChannelError, match="no certificate or key"):
+            gcsfs.core._client_cert_ssl_context()
+
+
+def test_mtls_endpoint_invalid(client_cert_config, mtls_env):
+    mtls_env.setenv("GOOGLE_API_USE_MTLS_ENDPOINT", "sometimes")
+    with pytest.raises(ValueError, match="GOOGLE_API_USE_MTLS_ENDPOINT"):
+        GCSFileSystem(token="anon")
+
+
+def test_mtls_explicit_endpoint_kept(client_cert_config):
+    fs = GCSFileSystem(token="anon", endpoint_url="https://example.com:8443")
+    assert fs.base == "https://example.com:8443/storage/v1/"
+    assert "connector" in _session_kwargs(fs)
+
+
+def test_mtls_emulator_kept(client_cert_config, mtls_env):
+    mtls_env.setenv("STORAGE_EMULATOR_HOST", "http://localhost:4443")
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "http://localhost:4443/storage/v1/"
+    assert "connector" not in _session_kwargs(fs)
+
+
+def test_mtls_custom_universe(client_cert_config, mtls_env):
+    mtls_env.setenv("GOOGLE_CLOUD_UNIVERSE_DOMAIN", "s3nsapis.fr")
+    fs = GCSFileSystem(token="anon")
+    assert fs.base == "https://storage.s3nsapis.fr/storage/v1/"
+    assert "connector" in _session_kwargs(fs)
+
+
+def test_mtls_user_connector_kept(client_cert_config):
+    connector = object()
+    fs = GCSFileSystem(token="anon", session_kwargs={"connector": connector})
+    assert _session_kwargs(fs)["connector"] is connector
+
+
+def test_mtls_session_presents_client_cert(client_cert_config, mtls_env):
+    """End to end: a server that requires a client cert accepts gcsfs."""
+    import http.server
+    import threading
+
+    peers = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            peers.append(self.connection.getpeercert())
+            body = json.dumps(
+                {"kind": "storage#object", "name": "obj", "bucket": "bkt", "size": "3"}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    server_ctx.load_cert_chain(*client_cert_config["server"])
+    server_ctx.load_verify_locations(client_cert_config["ca"])
+    server_ctx.verify_mode = ssl.CERT_REQUIRED
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    httpd.socket = server_ctx.wrap_socket(httpd.socket, server_side=True)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    # trust the test CA for server verification
+    mtls_env.setenv("SSL_CERT_FILE", client_cert_config["ca"])
+    try:
+        fs = GCSFileSystem(
+            token="anon", endpoint_url=f"https://localhost:{httpd.server_port}"
+        )
+        assert fs.info("bkt/obj")["size"] == 3
+        subject = dict(x[0] for x in peers[0]["subject"])
+        assert subject["commonName"] == "gcsfs test client"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_mv_file_raises_error_for_specific_generation(gcs):
+    original_version_aware = gcs.version_aware
+    gcs.version_aware = True
+    try:
+        src = f"{TEST_BUCKET}/source.txt"
+        dest = f"{TEST_BUCKET}/dest.txt#123456"
+        with pytest.raises(
+            ValueError, match="Cannot move to specific object generation"
+        ):
+            gcs.mv_file(src, dest)
+    finally:
+        gcs.version_aware = original_version_aware
+
+
+def test_cat_file_routing_and_thresholds(gcs, skip_if_grpc_read, monkeypatch):
+    monkeypatch.setattr(gcs, "MIN_CHUNK_SIZE_FOR_CONCURRENCY", 5)
+    fn = f"{TEST_BUCKET}/core_routing.txt"
+    data = b"0123456789abcdefghijk"
+    gcs.pipe(fn, data)
+
+    with mock.patch.object(
+        gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
+    ) as mock_seq:
+        with mock.patch.object(
+            gcs, "_cat_file_concurrent", wraps=gcs._cat_file_concurrent
+        ) as mock_conc:
+            res = fsspec.asyn.sync(
+                gcs.loop, gcs._cat_file, fn, start=0, end=1024, concurrency=1
+            )
+            assert res == data[:1024]
+            assert mock_seq.call_count == 1
+            assert mock_conc.call_count == 0
+
+    with mock.patch.object(
+        gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
+    ) as mock_seq:
+        with mock.patch.object(
+            gcs, "_cat_file_concurrent", wraps=gcs._cat_file_concurrent
+        ) as mock_conc:
+            res = fsspec.asyn.sync(
+                gcs.loop, gcs._cat_file, fn, start=0, end=4, concurrency=4
+            )
+            assert res == data[:4]
+            assert mock_conc.call_count == 1
+            assert mock_seq.call_count == 1
+
+    with mock.patch.object(
+        gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
+    ) as mock_seq:
+        res = fsspec.asyn.sync(
+            gcs.loop, gcs._cat_file, fn, start=0, end=len(data), concurrency=4
+        )
+        assert res == data
+        assert mock_seq.call_count == 4
+        assert [
+            (call.kwargs["start"], call.kwargs["end"])
+            for call in mock_seq.call_args_list
+        ] == [(0, 5), (5, 10), (10, 15), (15, 21)]
+
+
+def test_cat_file_concurrent_data_integrity(gcs):
+    fn = f"{TEST_BUCKET}/core_integrity.txt"
+    file_size = 20 * 1024 * 1024  # 20MB
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    res = fsspec.asyn.sync(
+        gcs.loop, gcs._cat_file, fn, start=0, end=file_size, concurrency=7
+    )
+    assert len(res) == file_size
+    assert res == data
+
+
+def test_cat_file_concurrent_caps_tasks(gcs, skip_if_zonal, monkeypatch):
+    monkeypatch.setattr(gcs, "MIN_CHUNK_SIZE_FOR_CONCURRENCY", 5)
+    fn = f"{TEST_BUCKET}/core_capped_concurrency.txt"
+    data = b"0123456789abcdefghij"
+    gcs.pipe(fn, data)
+
+    with mock.patch.object(
+        gcs, "_cat_file_sequential", wraps=gcs._cat_file_sequential
+    ) as mock_seq:
+        res = fsspec.asyn.sync(
+            gcs.loop,
+            gcs._cat_file_concurrent,
+            fn,
+            start=0,
+            end=len(data),
+            concurrency=1000,
+        )
+        assert res == data
+        assert mock_seq.call_count == 4
+        assert [
+            (call.kwargs["start"], call.kwargs["end"])
+            for call in mock_seq.call_args_list
+        ] == [(0, 5), (5, 10), (10, 15), (15, 20)]
+
+
+def test_cat_file_concurrent_exception_cancellation(gcs, skip_if_zonal):
+    fn = f"{TEST_BUCKET}/core_exception.txt"
+    data = b"0123456789" * 6000000  # ~6MB
+    gcs.pipe(fn, data)
+
+    original_seq = gcs._cat_file_sequential
+
+    async def mock_fail_seq(path, start, end, **kwargs):
+        if start > 0:  # Force failure on the 2nd chunk
+            raise OSError("Simulated HTTP Timeout")
+        return await original_seq(path, start, end, **kwargs)
+
+    with mock.patch.object(gcs, "_cat_file_sequential", side_effect=mock_fail_seq):
+        with pytest.raises(OSError, match="Simulated HTTP Timeout"):
+            fsspec.asyn.sync(
+                gcs.loop,
+                gcs._cat_file_concurrent,
+                fn,
+                start=0,
+                end=len(data),
+                concurrency=4,
+            )
+
+
+def test_gcsfile_prefetch_and_cache_type_rules(gcs, monkeypatch):
+    """Verify default adaptive cache, opt-out flags, filesystem default, and explicit overrides."""
+    import pickle
+
+    fn = f"{TEST_BUCKET}/cache_rules.txt"
+    gcs.pipe(fn, b"HelloWorld")
+
+    # 1. Default: cache_type is not set -> cache_type is "adaptive", cache_source is "default"
+    with gcs.open(fn, "rb") as f:
+        assert f.cache_type == "adaptive"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+
+    # 2. Opt-out via open() kwarg -> fallback to "readahead", cache_source is "default"
+    with gcs.open(fn, "rb", use_experimental_adaptive_prefetching=False) as f:
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+        with pickle.loads(pickle.dumps(f)) as f2:
+            assert f2.cache_type == "readahead"
+            assert f2.cache_source == "default"
+
+    # 3. Opt-out via env var -> fallback to "readahead", cache_source is "default"
+    monkeypatch.setenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", "false")
+    with gcs.open(fn, "rb") as f:
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+
+    # 4. Explicit open() kwarg True overrides env var "false"
+    with gcs.open(fn, "rb", use_experimental_adaptive_prefetching=True) as f:
+        assert f.cache_type == "adaptive"
+        assert f.cache_source == "default"
+        assert f.read() == b"HelloWorld"
+    monkeypatch.delenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING")
+
+    # 5. User sets cache_type="readahead" -> cache_type is "readahead", cache_source is "explicit"
+    with gcs.open(
+        fn, "rb", cache_type="readahead", use_experimental_adaptive_prefetching=True
+    ) as f:
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "explicit"
+        assert f.read() == b"HelloWorld"
+
+    # 6. User explicitly sets cache_type="none" -> cache_source is "explicit"
+    with gcs.open(fn, "rb", cache_type="none") as f:
+        assert f.cache_type == "none"
+        assert f.cache_source == "explicit"
+        assert f.read() == b"HelloWorld"
+
+    # 7. Filesystem-level default cache_type (including pickle and fsspec.open) and per-call override
+    base_opts = {
+        k: v for k, v in gcs.storage_options.items() if k != "skip_instance_cache"
+    }
+    fs_ra = pickle.loads(pickle.dumps(type(gcs)(**base_opts, cache_type="readahead")))
+    with fs_ra.open(fn, "rb", use_experimental_adaptive_prefetching=True) as f:
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "explicit"
+        assert f.read() == b"HelloWorld"
+    with fs_ra.open(fn, "rb", cache_type="none") as f:
+        assert f.cache_type == "none"
+    with fsspec.open(f"gs://{fn}", "rb", **base_opts, cache_type="readahead") as f:
+        assert f.cache_type == "readahead"
+
+
+def test_cat_file_default_concurrency(gcs, skip_if_grpc_read):
+    # Arrange
+    fn = f"{TEST_BUCKET}/test_cat_default_concurrency.txt"
+    gcs.pipe(fn, b"cat test data")
+
+    # Act
+    with mock.patch.object(
+        gcs, "_cat_file_concurrent", wraps=gcs._cat_file_concurrent
+    ) as mock_conc:
+        data = gcs.cat_file(fn)
+
+    # Assert
+    assert data == b"cat test data"
+    assert mock_conc.call_count == 0
+
+
+def test_cat_file_explicit_concurrency(gcs, skip_if_grpc_read):
+    # Arrange
+    fn = f"{TEST_BUCKET}/test_cat_explicit_concurrency.txt"
+    gcs.pipe(fn, b"cat test data")
+
+    # Act
+    with mock.patch.object(
+        gcs, "_cat_file_concurrent", wraps=gcs._cat_file_concurrent
+    ) as mock_conc:
+        data = gcs.cat_file(fn, concurrency=2)
+
+    # Assert
+    assert data == b"cat test data"
+    assert mock_conc.call_count == 1
+    assert mock_conc.call_args.kwargs["concurrency"] == 2
+
+
+def test_prefetcher_default_concurrency(gcs):
+    # Arrange
+    fn = f"{TEST_BUCKET}/test_prefetcher_concurrency.txt"
+    gcs.pipe(fn, b"prefetcher test data")
+
+    # Act
+    with gcs.open(fn, "rb") as f:
+        file_concurrency = f.concurrency
+        cache_concurrency = getattr(
+            getattr(f.cache, "_prefetcher", None), "concurrency", None
+        )
+
+    # Assert
+    assert file_concurrency == 4
+    assert cache_concurrency == 4
+
+
+@pytest.fixture
+def fake_fs():
+    fs = mock.MagicMock()
+    fs.split_path.return_value = ("bucket", "file.txt", None)
+    fs.info.return_value = {"size": 100}
+    fs.loop = fsspec.asyn.get_loop()
+    return fs
+
+
+@pytest.mark.parametrize(
+    "env_setting,open_kwarg,cache_type_arg,expected_cache,expected_source",
+    [
+        (None, None, None, "adaptive", "default"),
+        ("true", None, None, "adaptive", "default"),
+        ("1", None, None, "adaptive", "default"),
+        ("false", None, None, "readahead", "default"),
+        ("FALSE", None, None, "readahead", "default"),
+        ("0", None, None, "readahead", "default"),
+        (None, False, None, "readahead", "default"),
+        (None, "false", None, "readahead", "default"),
+        ("true", False, None, "readahead", "default"),
+        ("false", True, None, "adaptive", "default"),
+        ("false", "true", None, "adaptive", "default"),
+        ("false", None, "adaptive", "adaptive", "explicit"),
+        ("true", True, "none", "none", "explicit"),
+    ],
+)
+def test_adaptive_prefetching_flag_and_env(
+    fake_fs,
+    monkeypatch,
+    env_setting,
+    open_kwarg,
+    cache_type_arg,
+    expected_cache,
+    expected_source,
+):
+    if env_setting is None:
+        monkeypatch.delenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", raising=False)
+    else:
+        monkeypatch.setenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", env_setting)
+
+    extra_kwargs = {}
+    if open_kwarg is not None:
+        extra_kwargs["use_experimental_adaptive_prefetching"] = open_kwarg
+
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+        cache_type=cache_type_arg,
+        **extra_kwargs,
+    ) as f:
+        assert f.cache_type == expected_cache
+        assert f.cache_source == expected_source
+
+
+@pytest.mark.parametrize(
+    "env_setting,extra_kwargs",
+    [("false", {}), (None, {"use_experimental_adaptive_prefetching": False})],
+)
+def test_adaptive_opt_out_drops_adaptive_cache_options(
+    fake_fs, monkeypatch, env_setting, extra_kwargs
+):
+    if env_setting is None:
+        monkeypatch.delenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", raising=False)
+    else:
+        monkeypatch.setenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", env_setting)
+    caller_options = {"max_prefetch_size": 2**20, "concurrency": 8}
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+        cache_options=caller_options,
+        **extra_kwargs,
+    ) as f:
+        assert f.cache_type == "readahead"
+        assert f.cache_source == "default"
+        assert f._reopen_kwargs()["cache_options"] == caller_options
+
+    with pytest.raises(TypeError):
+        GCSFile(
+            fake_fs,
+            "bucket/file.txt",
+            mode="rb",
+            size=100,
+            cache_type="readahead",
+            cache_options={"max_prefetch_size": 2**20},
+        )
+
+
+def test_default_handle_reopens_across_opt_out_boundary(fake_fs, monkeypatch):
+    monkeypatch.delenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", raising=False)
+    with GCSFile(fake_fs, "bucket/file.txt", mode="rb", size=100) as f:
+        plain_reopen_kwargs = f._reopen_kwargs()
+        assert "cache_options" not in plain_reopen_kwargs
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+        cache_options={"max_prefetch_size": 2**20},
+    ) as f_tuned:
+        tuned_reopen_kwargs = f_tuned._reopen_kwargs()
+
+    monkeypatch.setenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", "false")
+    for reopen_kwargs in (plain_reopen_kwargs, tuned_reopen_kwargs):
+        with GCSFile(
+            fake_fs, "bucket/file.txt", mode="rb", size=100, **reopen_kwargs
+        ) as f2:
+            assert f2.cache_type == "readahead"
+            assert f2.cache_source == "default"
+
+    monkeypatch.delenv("USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING")
+    with GCSFile(
+        fake_fs, "bucket/file.txt", mode="rb", size=100, **tuned_reopen_kwargs
+    ) as f3:
+        assert f3.cache_type == "adaptive"
+        assert f3.cache._prefetcher.max_prefetch_size == 2**20
+
+
+def test_prefetcher_config_options(fake_fs):
+    # 1. Default without explicit max_prefetch_size -> MAX_PREFETCH_SIZE (256 MiB)
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+    ) as f:
+        assert (
+            getattr(getattr(f.cache, "_prefetcher", None), "max_prefetch_size", None)
+            == MAX_PREFETCH_SIZE
+        )
+
+    # 2. Explicit kwarg max_prefetch_size
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+        max_prefetch_size=1024 * 1024,
+    ) as f:
+        assert (
+            getattr(getattr(f.cache, "_prefetcher", None), "max_prefetch_size", None)
+            == 1024 * 1024
+        )
+
+    # 3. Explicit cache_options["max_prefetch_size"]
+    with GCSFile(
+        fake_fs,
+        "bucket/file.txt",
+        mode="rb",
+        size=100,
+        cache_options={"max_prefetch_size": 2048 * 1024},
+    ) as f:
+        assert (
+            getattr(getattr(f.cache, "_prefetcher", None), "max_prefetch_size", None)
+            == 2048 * 1024
+        )
+
+
+def test_gcsfile_prefetcher_producer_fetcher_integration(fake_fs):
+    with GCSFile(fake_fs, "bucket/file.txt", mode="rb", size=100) as f:
+        prefetcher = getattr(f.cache, "_prefetcher", None)
+        assert prefetcher is not None
+        assert prefetcher.producer.fetcher == f._async_fetch_range
+
+
+def test_gcsfile_prefetch_sequential_integrity(gcs):
+    fn = f"{TEST_BUCKET}/integrated_seq.txt"
+    file_size = 10 * 1024 * 1024
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with gcs.open(fn, "rb", block_size=2 * 1024 * 1024) as f:
+        chunks = []
+        while True:
+            chunk = f.read(1024 * 1024)  # Read 1MB at a time
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+        assert b"".join(chunks) == data
+
+
+def test_gcsfile_prefetch_random_seek_integrity(gcs):
+    fn = f"{TEST_BUCKET}/integrated_random.txt"
+    file_size = 5 * 1024 * 1024
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    import random
+
+    random.seed(42)
+
+    with gcs.open(fn, "rb", block_size=1024 * 1024) as f:
+        for _ in range(50):
+            start = random.randint(0, file_size - 1000)
+            length = random.randint(1, 1000)
+
+            f.seek(start)
+            chunk = f.read(length)
+
+            assert len(chunk) == length
+            assert chunk == data[start : start + length]
+
+
+def test_gcsfile_not_satisfiable_range(gcs):
+    fn = f"{TEST_BUCKET}/integrated_eof.txt"
+    gcs.pipe(fn, b"12345")
+
+    with gcs.open(fn, "rb") as f:
+        res = f.cache._fetch(100, 200)
+        assert res == b""
+
+        # Inverted range
+        assert f.cache._fetch(3, 1) == b""
+
+
+def test_gcsfile_fetch_range_error_handling(fake_fs):
+    fake_fs.cat_file.return_value = b"data"
+    f = GCSFile(fake_fs, "bucket/file.txt", mode="rb", cache_type="none", size=100)
+
+    # Boundary checks
+    assert f._fetch_range(100, 200) == b""
+    assert f._fetch_range(3, 1) == b""
+
+    # Negative end offset (e.g. read all except last byte)
+    assert f._fetch_range(0, -1) == b"data"
+    fake_fs.cat_file.assert_called_with(
+        "bucket/file.txt",
+        start=0,
+        end=-1,
+        concurrency=4,
+        cache_type="none",
+        cache_source="explicit",
+    )
+
+    # Exception handling
+    fake_fs.cat_file.side_effect = RuntimeError("Request range not satisfiable")
+    assert f._fetch_range(0, 5) == b""
+
+    fake_fs.cat_file.side_effect = HttpError({"code": 416, "message": "InvalidRange"})
+    assert f._fetch_range(0, 5) == b""
+
+    fake_fs.cat_file.side_effect = RuntimeError("Some other error")
+    with pytest.raises(RuntimeError, match="Some other error"):
+        f._fetch_range(0, 5)
+
+
+def test_tree(gcs):
+    unique_id = uuid.uuid4().hex
+    base_dir = f"{TEST_BUCKET}/test_tree_regional_{unique_id}"
+
+    gcs.mkdir(base_dir)
+    gcs.mkdir(f"{base_dir}/folder_A")
+    gcs.touch(f"{base_dir}/root_file.txt")
+    gcs.touch(f"{base_dir}/folder_A/file_A.txt")
+
+    # Deep nesting
+    gcs.touch(f"{base_dir}/folder_A/sub_B/sub_C/sub_D/deep_file.txt")
+
+    # Placeholder objects (Trailing slashes)
+    gcs.touch(f"{base_dir}/placeholder_P/")
+    gcs.touch(f"{base_dir}/placeholder_P/file_P.txt")
+    gcs.touch(f"{base_dir}/placeholder_Q/")
+
+    tree_str = gcs.tree(base_dir, recursion_limit=10)
+
+    expected_basenames = {
+        "root_file.txt",
+        "folder_A",
+        "file_A.txt",
+        "sub_B",
+        "sub_C",
+        "sub_D",
+        "deep_file.txt",
+        "placeholder_P",
+        "file_P.txt",
+        "placeholder_Q",
+    }
+
+    lines = tree_str.strip().split("\n")
+    # Extract basenames from tree lines (e.g., "├── folder_A" -> "folder_A")
+    found_names = {line.split("──")[-1].strip() for line in lines[1:]}
+
+    assert found_names == expected_basenames
+
+
+def test_glob(gcs):
+    base_dir = f"{TEST_BUCKET}/test_glob_regional_{uuid.uuid4().hex}"
+
+    files = [
+        f"{base_dir}/folder_with_files/file1.txt",
+        f"{base_dir}/folder_with_files/file2.txt",
+        f"{base_dir}/folder_with_files/subdir/file3.txt",
+        f"{base_dir}/folder_with_one_file/file4.dat",
+        f"{base_dir}/root_file.txt",
+    ]
+    placeholder = f"{base_dir}/folder_with_placeholder/"
+
+    for f in files:
+        gcs.touch(f)
+    gcs.touch(placeholder)
+
+    test_cases = [
+        {
+            "pattern": f"{base_dir}/*",
+            "expected": {
+                f"{base_dir}/folder_with_files",
+                f"{base_dir}/folder_with_one_file",
+                f"{base_dir}/root_file.txt",
+                f"{base_dir}/folder_with_placeholder",
+            },
+        },
+        {
+            "pattern": f"{base_dir}/folder_with_files/*",
+            "expected": {
+                f"{base_dir}/folder_with_files/file1.txt",
+                f"{base_dir}/folder_with_files/file2.txt",
+                f"{base_dir}/folder_with_files/subdir",
+            },
+        },
+        {
+            "pattern": f"{base_dir}/**",
+            "expected": {
+                base_dir,
+                f"{base_dir}/folder_with_files",
+                f"{base_dir}/folder_with_files/subdir",
+                f"{base_dir}/folder_with_one_file",
+                f"{base_dir}/folder_with_files/file1.txt",
+                f"{base_dir}/folder_with_files/file2.txt",
+                f"{base_dir}/folder_with_files/subdir/file3.txt",
+                f"{base_dir}/folder_with_one_file/file4.dat",
+                f"{base_dir}/root_file.txt",
+                f"{base_dir}/folder_with_placeholder",
+                f"{base_dir}/folder_with_placeholder/",
+            },
+        },
+    ]
+
+    for case in test_cases:
+        results = set(gcs.glob(case["pattern"]))
+        assert results == case["expected"]
+
+
+def test_expand_path_regional(gcs):
+    base_dir = f"{TEST_BUCKET}/test_expand_path_regional_{uuid.uuid4().hex}"
+
+    files = [
+        f"{base_dir}/folder/file1.txt",
+        f"{base_dir}/folder/file2.txt",
+        f"{base_dir}/folder/subdir/file3.txt",
+        f"{base_dir}/root_file.txt",
+    ]
+    for f in files:
+        gcs.touch(f)
+
+    # Empty folder (with placeholder)
+    empty_folder = f"{base_dir}/empty_folder/"
+    gcs.touch(empty_folder)
+
+    # Test case 1: No magic, recursive=True (invokes _find)
+    expanded = gcs.expand_path(base_dir, recursive=True)
+    expected = {
+        base_dir,
+        f"{base_dir}/folder",
+        f"{base_dir}/folder/file1.txt",
+        f"{base_dir}/folder/file2.txt",
+        f"{base_dir}/folder/subdir",
+        f"{base_dir}/folder/subdir/file3.txt",
+        f"{base_dir}/root_file.txt",
+        f"{base_dir}/empty_folder",
+        f"{base_dir}/empty_folder/",
+    }
+    assert set(expanded) == expected
+
+    # Test case 2: With magic * (invokes _glob)
+    expanded_magic = gcs.expand_path(f"{base_dir}/folder/*", recursive=True)
+    expected_magic = {
+        f"{base_dir}/folder/file1.txt",
+        f"{base_dir}/folder/file2.txt",
+        f"{base_dir}/folder/subdir",
+        f"{base_dir}/folder/subdir/file3.txt",
+    }
+    assert set(expanded_magic) == expected_magic
+
+    # Test case 3: Recursive glob **
+    expanded_glob_starstar = gcs.expand_path(f"{base_dir}/**/*.txt", recursive=True)
+    expected_glob_starstar = {
+        f"{base_dir}/folder/file1.txt",
+        f"{base_dir}/folder/file2.txt",
+        f"{base_dir}/folder/subdir/file3.txt",
+        f"{base_dir}/root_file.txt",
+    }
+    assert set(expanded_glob_starstar) == expected_glob_starstar
+
+    # Test case 4: Question mark magic
+    expanded_question = gcs.expand_path(f"{base_dir}/folder/file?.txt", recursive=True)
+    expected_question = {
+        f"{base_dir}/folder/file1.txt",
+        f"{base_dir}/folder/file2.txt",
+    }
+    assert set(expanded_question) == expected_question
+
+
+def test_walk(gcs):
+    base_dir = f"{TEST_BUCKET}/test_walk_regional_{uuid.uuid4().hex}"
+
+    folder_with_files = f"{base_dir}/folder_with_files"
+    subdir = f"{folder_with_files}/subdir"
+    folder_with_one_file = f"{base_dir}/folder_with_one_file"
+    folder_with_placeholder = f"{base_dir}/folder_with_placeholder"
+
+    gcs.touch(f"{subdir}/file1.txt")
+    gcs.touch(f"{folder_with_one_file}/file3.txt")
+    gcs.touch(f"{base_dir}/root_file.txt")
+    gcs.touch(f"{folder_with_placeholder}/")
+
+    walk_results = list(gcs.walk(base_dir))
+
+    # Expected structure for FLAT bucket
+    expected_structure = {
+        base_dir: (
+            {"folder_with_files", "folder_with_one_file", "folder_with_placeholder"},
+            {"root_file.txt"},
+        ),
+        folder_with_files: ({"subdir"}, set()),
+        subdir: (set(), {"file1.txt"}),
+        folder_with_one_file: (set(), {"file3.txt"}),
+        folder_with_placeholder: (set(), {""}),
+    }
+
+    assert len(walk_results) == len(expected_structure)
+    for root, d_list, f_list in walk_results:
+        root = root.rstrip("/")
+        assert root in expected_structure
+        exp_dirs, exp_files = expected_structure[root]
+        assert set(d_list) == exp_dirs
+        assert set(f_list) == exp_files
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "object_behavior, dir_behavior, expected",
+    [
+        (
+            {"return": {"name": TEST_BUCKET + "/file", "type": "file", "size": 100}},
+            {"exception": FileNotFoundError},
+            {"return": {"type": "file"}},
+        ),
+        (
+            {"exception": FileNotFoundError},
+            {"return": {"name": TEST_BUCKET + "/file", "type": "directory", "size": 0}},
+            {"return": {"type": "directory"}},
+        ),
+        (
+            {
+                "return": {
+                    "name": TEST_BUCKET + "/file/",
+                    "type": "directory",
+                    "size": 0,
+                }
+            },
+            {
+                "return": {
+                    "name": TEST_BUCKET + "/file",
+                    "type": "directory",
+                    "size": 0,
+                    "extra": "info",
+                }
+            },
+            {"return": {"type": "directory", "extra": "info"}},
+        ),
+        (
+            {"exception": Exception("Generic error")},
+            {"exception": FileNotFoundError},
+            {"exception": Exception, "match": "Generic error"},
+        ),
+        (
+            {"exception": FileNotFoundError},
+            {"exception": Exception("Directory error")},
+            {"exception": Exception, "match": "Directory error"},
+        ),
+        (
+            {"exception": FileNotFoundError},
+            {"exception": FileNotFoundError},
+            {"exception": FileNotFoundError},
+        ),
+    ],
+)
+async def test_info_parallel(gcs, object_behavior, dir_behavior, expected):
+    path = TEST_BUCKET + "/file"
+
+    with (
+        mock.patch.object(
+            gcs, "_get_object", new_callable=mock.AsyncMock
+        ) as mock_get_object,
+        mock.patch.object(
+            gcs, "_get_directory_info", new_callable=mock.AsyncMock
+        ) as mock_get_dir,
+    ):
+
+        if "return" in object_behavior:
+            mock_get_object.return_value = object_behavior["return"]
+        elif "exception" in object_behavior:
+            mock_get_object.side_effect = object_behavior["exception"]
+
+        if "return" in dir_behavior:
+            mock_get_dir.return_value = dir_behavior["return"]
+        elif "exception" in dir_behavior:
+            mock_get_dir.side_effect = dir_behavior["exception"]
+
+        if "exception" in expected:
+            with pytest.raises(expected["exception"], match=expected.get("match")):
+                await gcs._info(path)
+        else:
+            res = await gcs._info(path)
+            for k, v in expected["return"].items():
+                assert res[k] == v
+
+            assert mock_get_object.call_count == 1
+            assert mock_get_dir.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_info_parallel_dir_first(gcs):
+    import asyncio
+
+    path = TEST_BUCKET + "/dir"
+
+    with (
+        mock.patch.object(
+            gcs, "_get_object", new_callable=mock.AsyncMock
+        ) as mock_get_object,
+        mock.patch.object(
+            gcs, "_get_directory_info", new_callable=mock.AsyncMock
+        ) as mock_get_dir,
+    ):
+
+        # Make _get_object slower than _get_directory_info
+        async def slow_get_object(*args, **kwargs):
+            await asyncio.sleep(0.1)
+            return {"name": path, "type": "file", "size": 100}
+
+        mock_get_object.side_effect = slow_get_object
+        # Directory check finishes immediately and succeeds
+        mock_get_dir.return_value = {"name": path, "type": "directory", "size": 0}
+
+        res = await gcs._info(path)
+        assert res["type"] == "file"
+
+        assert mock_get_object.call_count == 1
+        assert mock_get_dir.call_count == 1
+
+
+def test_get_file_routing_and_thresholds(gcs):
+    """Test that get_file correctly routes to sequential or concurrent paths based on size thresholds."""
+    fn = f"{TEST_BUCKET}/get_routing.txt"
+    # Create an 8MB file
+    data = os.urandom(8 * 1024 * 1024)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out.txt")
+
+        with (
+            mock.patch.object(
+                gcs, "_get_file_request", wraps=gcs._get_file_request
+            ) as mock_req,
+            mock.patch.object(
+                gcs, "_get_file_concurrent", wraps=gcs._get_file_concurrent
+            ) as mock_conc,
+        ):
+
+            # 1. Concurrency = 1 (Should route directly to sequential)
+            gcs.get_file(fn, lpath, concurrency=1)
+            assert open(lpath, "rb").read() == data
+            assert mock_req.call_count == 1
+            assert mock_conc.call_count == 0
+
+            mock_req.reset_mock()
+            mock_conc.reset_mock()
+            os.remove(lpath)
+
+            # 2. Standard Bucket (100MB threshold)
+            # 8MB is < 100MB, so it should gracefully fall back to sequential internally
+            with mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=100 * 1024 * 1024,
+            ):
+                gcs.get_file(fn, lpath, concurrency=4)
+                assert open(lpath, "rb").read() == data
+                assert mock_conc.call_count == 1
+                assert mock_req.call_count == 1
+
+            mock_req.reset_mock()
+            mock_conc.reset_mock()
+            os.remove(lpath)
+
+            # 3. Zonal Bucket (5MB threshold)
+            # 8MB is >= 5MB, so it should fully execute via the concurrent prefetcher logic
+            with mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=5 * 1024 * 1024,
+            ):
+                gcs.get_file(fn, lpath, concurrency=4)
+                assert open(lpath, "rb").read() == data
+                assert mock_conc.call_count == 1
+                assert mock_req.call_count == 0
+
+
+def test_get_file_concurrent_data_integrity(gcs):
+    """Test that the concurrent file fetch stitches blocks together correctly."""
+    fn = f"{TEST_BUCKET}/get_integrity.txt"
+    file_size = 20 * 1024 * 1024  # 20MB (larger than 5MB default)
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_integrity.txt")
+
+        # Lower threshold to force true concurrency (no longer modifying MIN_CHUNK_SIZE_FOR_CONCURRENCY)
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=5 * 1024 * 1024,
+        ):
+            gcs.get_file(fn, lpath, concurrency=4, chunk_size=5 * 1024 * 1024)
+
+        assert os.path.getsize(lpath) == file_size
+        with open(lpath, "rb") as f:
+            assert f.read() == data
+
+
+def test_get_file_concurrent_exception_cancellation(gcs):
+    """Ensure that if a chunk fails during concurrent download, the exception is raised and file is cleaned up."""
+    fn = f"{TEST_BUCKET}/get_exception.txt"
+    file_size = 10 * 1024 * 1024  # 10MB (larger than 5MB default)
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_exception.txt")
+        original_cat = gcs._cat_file
+
+        async def mock_fail_cat(path, start, end, **kwargs):
+            if (
+                start > 0
+            ):  # Force failure on subsequent chunks, allowing the first chunk to write
+                raise OSError("Simulated Download Error")
+            return await original_cat(path, start, end, **kwargs)
+
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=2 * 1024 * 1024,
+        ):
+            with mock.patch.object(gcs, "_cat_file", side_effect=mock_fail_cat):
+                with pytest.raises(OSError, match="Simulated Download Error"):
+                    gcs.get_file(fn, lpath, concurrency=4, chunk_size=2 * 1024 * 1024)
+
+        # File should be removed by the clean-up block in _get_file
+        assert not os.path.exists(lpath)
+
+
+def test_get_file_concurrent_consistency(gcs):
+    """Ensure concurrent path appropriately invokes the file consistency checker."""
+    fn = f"{TEST_BUCKET}/get_consistency.txt"
+    data = b"consistency test data" * 300000  # ~6.3MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_consistency.txt")
+
+        # Mock the dynamic threshold lookup to 1 byte so it stays concurrent
+        with mock.patch.object(
+            gcs,
+            "_get_threshold_for_disk_reads",
+            new_callable=mock.AsyncMock,
+            return_value=1,
+        ):
+
+            # Mock the internal validate method of the checker
+            with mock.patch(
+                "gcsfs.checkers.MD5Checker.validate_json_response"
+            ) as mock_validate:
+                gcs.get_file(fn, lpath, concurrency=2, consistency="md5")
+                mock_validate.assert_called_once()
+
+
+def test_get_file_concurrent_no_pwrite(gcs):
+    """Coverage: `with open(lpath, "rb+") as f: f.seek(offset); f.write(chunk)`"""
+    fn = f"{TEST_BUCKET}/no_pwrite.txt"
+    data = b"fallback_test_data" * (1024 * 1024)  # ~18MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_no_pwrite.txt")
+
+        # Safely mock `hasattr(os, 'pwrite')` returning False
+        orig_hasattr = builtins.hasattr
+
+        def mock_hasattr(obj, name):
+            if obj is os and name == "pwrite":
+                return False
+            return orig_hasattr(obj, name)
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("builtins.hasattr", side_effect=mock_hasattr),
+        ):
+
+            gcs.get_file(fn, lpath, concurrency=2, chunk_size=10 * 1024 * 1024)
+
+        with open(lpath, "rb") as f:
+            assert f.read() == data
+
+
+def test_get_file_concurrent_early_eof(gcs):
+    """Coverage: integrity check raises ClientError after retries."""
+    fn = f"{TEST_BUCKET}/early_eof.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_early_eof.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch(
+                "fsspec.prefetcher.BackgroundPrefetcher.afetch",
+                new_callable=mock.AsyncMock,
+            ) as mock_afetch,
+        ):
+            # Define a function to simulate consistent truncation across retries
+            async def mock_afetch_truncated(start, end):
+                if start == 0:
+                    return b"12345"  # Only return the first 5 bytes
+                return b""  # Return EOF for any subsequent range
+
+            mock_afetch.side_effect = mock_afetch_truncated
+
+            # The function will retry several times, but always fail the integrity check.
+            # We assert that it eventually raises the ClientError.
+            with pytest.raises(
+                aiohttp.ClientError,
+                match="Expected 10485760 bytes, but only received 5 bytes",
+            ):
+                gcs.get_file(fn, lpath, concurrency=2, chunk_size=5)
+
+
+def test_get_file_concurrent_write_exception_in_loop(gcs):
+    """Coverage: `if exceptions: raise exceptions[0]` (Inside the pending loop)"""
+    fn = f"{TEST_BUCKET}/write_exc_loop.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_write_exc_loop.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("os.pwrite", side_effect=OSError("Disk Full Loop")),
+        ):
+            with pytest.raises(OSError, match="Disk Full Loop"):
+                # Chunk size small to produce many pending_writes and trigger the loop check
+                gcs.get_file(fn, lpath, concurrency=2, chunk_size=5 * 1024 * 1024)
+
+
+def test_get_file_concurrent_write_exception_in_finally(gcs):
+    """Coverage: `if exc: exceptions.append(exc)` (Inside the finally clean-up block)"""
+    fn = f"{TEST_BUCKET}/write_exc_finally.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_write_exc_finally.txt")
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("os.pwrite", side_effect=OSError("Disk Full Finally")),
+        ):
+            with pytest.raises(OSError, match="Disk Full Finally"):
+                gcs.get_file(fn, lpath, concurrency=3, chunk_size=20 * 1024 * 1024)
+
+
+def test_get_file_concurrent_cancelled_error(gcs):
+    """Coverage: `except asyncio.CancelledError: break/pass` inside the finally block"""
+    fn = f"{TEST_BUCKET}/cancelled.txt"
+    data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
+    gcs.pipe(fn, data)
+
+    with tempdir() as dn:
+        lpath = os.path.join(dn, "out_cancelled.txt")
+
+        # Create a mock that forces the exact exception we are trying to cover
+        async def mock_wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            mock.patch.object(
+                gcs,
+                "_get_threshold_for_disk_reads",
+                new_callable=mock.AsyncMock,
+                return_value=-1,
+            ),
+            mock.patch("gcsfs.core.asyncio.wait", side_effect=mock_wait),
+        ):
+            gcs.get_file(fn, lpath, concurrency=2, chunk_size=20 * 1024 * 1024)
+
+
+def test_init_local_file(gcs):
+    """Coverage: `if total_size == 0:` inside `_init_local_file`"""
+    with tempdir() as dn:
+        # Cover normal pre-allocation
+        lpath = os.path.join(dn, "prealloc.txt")
+        gcs._init_local_file(lpath, 1024)
+        assert os.path.exists(lpath)
+        assert os.path.getsize(lpath) == 1024
+
+        # Cover zero-size pre-allocation
+        lpath_zero = os.path.join(dn, "zero.txt")
+        gcs._init_local_file(lpath_zero, 0)
+        assert os.path.exists(lpath_zero)
+        assert os.path.getsize(lpath_zero) == 0
+
+
+def test_open_generation_forwarded():
+    fs = gcsfs.core.GCSFileSystem()
+    with mock.patch("gcsfs.core.GCSFile") as mock_gcs_file:
+        fs.open("test/key", "rb", generation="123")
+        mock_gcs_file.assert_called_once()
+        _, kwargs = mock_gcs_file.call_args
+        assert kwargs.get("generation") == "123"
+
+
+@pytest.mark.asyncio
+async def test_cat_file_generation():
+    fs = gcsfs.core.GCSFileSystem(token="anon")
+
+    with mock.patch.object(fs, "_call", new_callable=mock.AsyncMock) as mock_call:
+        with mock.patch.object(
+            fs, "_process_limits", new_callable=mock.AsyncMock
+        ) as mock_limits:
+            mock_limits.return_value = "bytes=0-10"
+            mock_call.return_value = ({}, b"data")
+
+            await fs._cat_file_sequential(
+                "bucket/file", start=0, end=10, generation="12345"
+            )
+
+            assert mock_call.call_count == 1
+            url = mock_call.call_args[0][1]
+            assert "generation=12345" in url
+
+
+def test_file_url_generation():
+    fs = gcsfs.core.GCSFileSystem(token="anon")
+    f = gcsfs.core.GCSFile(fs, "bucket/file", mode="wb")
+    f.generation = "12345"
+
+    try:
+        assert f.url() == fs.url("bucket/file", generation="12345")
+        assert "generation=12345" in f.url()
+    finally:
+        # Avoid flushing the unused write buffer (and a network call) on GC.
+        f.closed = True
+
+
+def test_get_cache_type_header_value():
+    from gcsfs.core import _get_cache_type_header_value
+
+    # Explicit source
+    assert _get_cache_type_header_value("none", "explicit") == "cache_type/none:e"
+    assert (
+        _get_cache_type_header_value("readahead", "explicit")
+        == "cache_type/readahead:e"
+    )
+    assert _get_cache_type_header_value("mmap", "explicit") == "cache_type/mmap:e"
+
+    # Default source
+    assert _get_cache_type_header_value("none", "default") == "cache_type/none:d"
+    assert (
+        _get_cache_type_header_value("readahead", "default") == "cache_type/readahead:d"
+    )
+
+    # Unspecified / None source (backward compatibility)
+    assert _get_cache_type_header_value("mmap", None) == "cache_type/mmap"
+
+    # None or empty cache_type
+    assert _get_cache_type_header_value(None, "explicit") == ""
+    assert _get_cache_type_header_value("", "explicit") == ""
+    assert _get_cache_type_header_value(None) == ""
+
+
+def test_get_headers_includes_cache_type(gcs):
+    # Test that _get_headers correctly appends cache_type to User-Agent
+    headers_explicit = gcs._get_headers(
+        None, cache_type="test_cache", cache_source="explicit"
+    )
+    assert "cache_type/test_cache:e" in headers_explicit["User-Agent"]
+    assert "python-gcsfs/" in headers_explicit["User-Agent"]
+
+    headers_default = gcs._get_headers(
+        None, cache_type="test_cache", cache_source="default"
+    )
+    assert "cache_type/test_cache:d" in headers_default["User-Agent"]
+
+    headers_plain = gcs._get_headers(None, cache_type="test_cache")
+    assert "cache_type/test_cache" in headers_plain["User-Agent"]
+    assert (
+        ":e" not in headers_plain["User-Agent"]
+        and ":d" not in headers_plain["User-Agent"]
+    )
+
+    # Test that it doesn't append if cache_type is None
+    headers_none = gcs._get_headers(None, cache_type=None)
+    assert "cache_type/" not in headers_none["User-Agent"]
+    assert headers_none["User-Agent"] == "python-gcsfs/" + version
+
+    # Test that it doesn't override if User-Agent is already present
+    headers_preset = gcs._get_headers(
+        {"User-Agent": "custom-ua"}, cache_type="test_cache", cache_source="explicit"
+    )
+    assert headers_preset["User-Agent"] == "custom-ua"
+
+
+def test_user_agent_includes_cache_type_and_source_in_read(gcs, skip_if_grpc_read):
+    # TODO(lankita): Remove this skip when User-Agent is updated to include cache_type for gRPC/rapid buckets.
+    # Zonal and RCU buckets currently read over gRPC, which does not use the HTTP client.
+    fn = TEST_BUCKET + "/2014-01-01.csv"
+
+    # 1. Explicit cache_type="mmap" -> User-Agent contains cache_type/mmap:e
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", block_size=10, cache_type="mmap") as f:
+            out = []
+            while True:
+                data = f.read(3)
+                if data == b"":
+                    break
+                out.append(data)
+            assert gcs.cat(fn) == b"".join(out)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent")
+            for call in mock_session_request.call_args_list
+        ]
+        expected_ua = f"python-gcsfs/{version} cache_type/mmap:e"
+        assert expected_ua in user_agents
+
+    # 2. Default open (adaptive cache active) -> User-Agent contains cache_type/adaptive:d
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb") as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/adaptive:d" in ua for ua in user_agents)
+
+    # 3. Explicit cache_type="none" -> User-Agent contains cache_type/none:e
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", cache_type="none") as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/none:e" in ua for ua in user_agents)
+
+    # 4. Explicit cache_type="readahead" -> User-Agent contains cache_type/readahead:e
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", cache_type="readahead") as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/readahead:e" in ua for ua in user_agents)
+
+    # 5. Adaptive prefetcher disabled fallback -> User-Agent contains cache_type/readahead:d
+    with mock.patch.object(
+        gcs.session, "request", wraps=gcs.session.request
+    ) as mock_session_request:
+        with gcs.open(fn, "rb", use_experimental_adaptive_prefetching=False) as f:
+            _ = f.read(10)
+
+        user_agents = [
+            call.kwargs.get("headers", {}).get("User-Agent", "")
+            for call in mock_session_request.call_args_list
+        ]
+        assert any("cache_type/readahead:d" in ua for ua in user_agents)
+
+
+@pytest.mark.parametrize(
+    "input_headers,cache_type,cache_source,framework,expected_in,expected_not_in",
+    [
+        (None, None, None, None, ["python-gcsfs/"], ["cache_type"]),
+        (
+            None,
+            "readahead",
+            "explicit",
+            None,
+            ["python-gcsfs/", "cache_type/readahead:e"],
+            [],
+        ),
+        (
+            None,
+            "none",
+            "default",
+            None,
+            ["python-gcsfs/", "cache_type/none:d"],
+            [],
+        ),
+        (None, None, None, "torch", ["python-gcsfs/", "fw/torch"], []),
+        (
+            {"User-Agent": "my-custom-agent"},
+            None,
+            None,
+            "pandas",
+            ["my-custom-agent"],
+            ["fw/pandas"],
+        ),
+    ],
+)
+def test_user_agent_telemetry_integration(
+    input_headers,
+    cache_type,
+    cache_source,
+    framework,
+    expected_in,
+    expected_not_in,
+):
+    """Verify that _get_headers builds User-Agent with cache/telemetry tokens and preserves overrides."""
+    import contextlib
+
+    from gcsfs.core import GCSFileSystem
+    from gcsfs.telemetry.context import Dimension
+    from gcsfs.telemetry.wrapper import _telemetry_context
+
+    # _get_headers needs no server, so avoid the heavier emulator-backed `gcs` fixture
+    gcs = GCSFileSystem(token="anon", skip_instance_cache=True)
+
+    ctx = (
+        _telemetry_context({Dimension.FRAMEWORK.value: framework})
+        if framework
+        else contextlib.nullcontext()
+    )
+    with ctx:
+        headers = gcs._get_headers(
+            input_headers, cache_type=cache_type, cache_source=cache_source
+        )
+
+    ua = headers["User-Agent"]
+    for token in expected_in:
+        assert token in ua
+    for token in expected_not_in:
+        assert token not in ua
+
+
+def test_init_does_not_evaluate_buckets(monkeypatch):
+    """
+    Verify that creating a (telemetry-mirrored) GCSFileSystem does not evaluate
+    properties such as `fs.buckets`, which would trigger network I/O.
+    """
+    from gcsfs.core import GCSFileSystem
+
+    buckets_called = False
+
+    async def mock_list_buckets(self, *args, **kwargs):
+        nonlocal buckets_called
+        buckets_called = True
+        return []
+
+    monkeypatch.setattr(GCSFileSystem, "_list_buckets", mock_list_buckets)
+
+    _ = GCSFileSystem(token="anon", project="test-project", skip_instance_cache=True)
+    assert not buckets_called, "GCSFileSystem.__init__ evaluated fs.buckets"
+
+
+def test_process_object_structure(gcs):
+    bucket = "my-bucket"
+    metadata = {
+        "kind": "storage#object",
+        "id": "my-bucket/nested/file.txt/12345",
+        "name": "nested/file.txt",
+        "bucket": "my-bucket",
+        "generation": "12345",
+        "metageneration": "2",
+        "contentType": "text/plain",
+        "timeCreated": "2024-01-15T10:30:00.000Z",
+        "updated": "2024-01-15T11:45:00.123456Z",
+        "storageClass": "STANDARD",
+        "size": "4096",
+        "md5Hash": "dummyHash==",
+    }
+
+    processed = gcs._process_object(bucket, metadata)
+
+    assert processed["name"] == "my-bucket/nested/file.txt"
+    assert processed["size"] == 4096
+    assert processed["type"] == "file"
+    assert processed["ctime"] == datetime(
+        2024, 1, 15, 10, 30, 0, 0, tzinfo=timezone.utc
+    )
+    assert processed["mtime"] == datetime(
+        2024, 1, 15, 11, 45, 0, 123456, tzinfo=timezone.utc
+    )
+    assert processed["generation"] == "12345"
+    assert processed["metageneration"] == "2"
+
+
+def test_process_object_leading_slash(gcs):
+    bucket = "my-bucket"
+    metadata = {
+        "name": "/leading_slash_file.txt",
+        "size": "100",
+    }
+
+    processed = gcs._process_object(bucket, metadata)
+    parsed_bucket, parsed_key, _ = gcs.split_path(processed["name"])
+
+    assert processed["name"] == "my-bucket//leading_slash_file.txt"
+    assert parsed_bucket == "my-bucket"
+    assert parsed_key == "/leading_slash_file.txt"
+
+
+def test_get_dirs_and_update_cache_nested(gcs):
+    bucket = "test-bucket"
+    objects = [
+        {"name": f"{bucket}/dir1/sub1/file1.txt", "size": 100, "type": "file"},
+        {"name": f"{bucket}/dir1/sub1/file2.txt", "size": 200, "type": "file"},
+        {"name": f"{bucket}/dir1/sub2/file3.txt", "size": 300, "type": "file"},
+        {"name": f"{bucket}/dir2/file4.txt", "size": 400, "type": "file"},
+    ]
+
+    gcs.dircache.clear()
+    dirs = gcs._get_dirs_and_update_cache(bucket, objects, prefix="", update_cache=True)
+
+    assert f"{bucket}/dir1" in dirs
+    assert f"{bucket}/dir1/sub1" in dirs
+    assert f"{bucket}/dir1/sub2" in dirs
+    assert f"{bucket}/dir2" in dirs
+    assert f"{bucket}" in gcs.dircache
+    assert f"{bucket}/dir1" in gcs.dircache
+    assert f"{bucket}/dir1/sub1" in gcs.dircache
+    assert f"{bucket}/dir1/sub2" in gcs.dircache
+    assert f"{bucket}/dir2" in gcs.dircache
+    root_children = [c["name"] for c in gcs.dircache[bucket]]
+    assert f"{bucket}/dir1" in root_children
+    assert f"{bucket}/dir2" in root_children
+    sub1_children = [c["name"] for c in gcs.dircache[f"{bucket}/dir1/sub1"]]
+    assert f"{bucket}/dir1/sub1/file1.txt" in sub1_children
+    assert f"{bucket}/dir1/sub1/file2.txt" in sub1_children
+
+
+def test_get_dirs_and_update_cache_with_directories_and_prefix(gcs):
+    bucket = "test-bucket"
+    objects = [
+        {"name": f"{bucket}/a/b/c/file1.txt", "size": 100, "type": "file"},
+        {"name": f"{bucket}/a/b/empty_folder", "size": 0, "type": "directory"},
+    ]
+
+    gcs.dircache.clear()
+    dirs = gcs._get_dirs_and_update_cache(
+        bucket, objects, prefix="a/b", update_cache=False
+    )
+
+    assert f"{bucket}/a/b" in dirs
+    assert f"{bucket}/a/b/c" in dirs
+    # Cache should remain empty because update_cache=False and prefix is used
+    assert len(gcs.dircache) == 0

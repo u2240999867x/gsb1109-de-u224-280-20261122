@@ -1,0 +1,199 @@
+"""Self-contained configs.yaml loader (vendored from microbenchmarks, no shared imports).
+
+Deliberately duplicates the microbenchmarks configurator instead of importing it (or the
+repo-wide test conftest/settings) so subsystembenchmarks can evolve without dragging the
+micro suite along.
+"""
+
+import logging
+import os
+
+import yaml
+
+
+def requested_sweep_axes():
+    value = os.environ.get("GCSFS_SUBSYSTEM_SWEEP_AXES", "")
+    return tuple(dict.fromkeys(value.split()))
+
+
+def filter_cases_by_sweep_axis(cases):
+    axes = requested_sweep_axes()
+    if not axes:
+        return cases
+    valid = {"baseline", *(case.sweep_axis for case in cases)}
+    unknown = sorted(set(axes) - valid)
+    if unknown:
+        raise ValueError(
+            "unknown sweep axis name(s) "
+            f"{', '.join(unknown)}; valid axes: {', '.join(sorted(valid))}"
+        )
+    selected = {"baseline", *axes}
+    return [case for case in cases if case.sweep_axis in selected]
+
+
+class BaseBenchmarkConfigurator:
+    def __init__(self, module_file):
+        # GCSFS_SUBSYSTEM_CONFIG names an alternate config file in the group directory,
+        # e.g. configs.ci.yaml for the per-PR suite (cloudbuild/subsystembenchmarks/
+        # scripts/run-ci.sh). A missing file raises instead of falling back.
+        config_name = os.environ.get("GCSFS_SUBSYSTEM_CONFIG") or "configs.yaml"
+        self.config_path = os.path.join(os.path.dirname(module_file), config_name)
+
+    def _load_config(self):
+        with open(self.config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        common = config["common"]
+        scenarios = config["scenarios"]
+
+        benchmark_filter = os.environ.get("GCSFS_BENCHMARK_FILTER", "")
+        if benchmark_filter:
+            filter_names = [
+                name.strip().lower() for name in benchmark_filter.split(",")
+            ]
+            scenarios = [s for s in scenarios if s["name"].lower() in filter_names]
+
+        return common, scenarios
+
+    def generate_cases(self, include_disabled=False):
+        """Build benchmark cases from configs.yaml.
+
+        Variants marked `enabled: false` are always built and validated, but are only
+        returned when include_disabled is True (e.g. for unit tests guarding them).
+        """
+        common_config, scenarios = self._load_config()
+        all_cases = []
+
+        for scenario in scenarios:
+            cases = self.build_cases(
+                scenario, common_config, include_disabled=include_disabled
+            )
+            all_cases.extend(cases)
+
+        all_cases = filter_cases_by_sweep_axis(all_cases)
+        if all_cases:
+            logging.info(
+                "Benchmark cases to be triggered: %s",
+                ", ".join(case.name for case in all_cases),
+            )
+        return all_cases
+
+    def build_cases(self, scenario, common_config, include_disabled=False):
+        """
+        Abstract method to be implemented by subclasses.
+        Should return a list of BenchmarkParameters objects.
+        """
+        raise NotImplementedError
+
+
+class OneFactorConfigurator(BaseBenchmarkConfigurator):
+    """Family-agnostic one-factor-at-a-time expansion: a baseline plus one variant per axis.
+
+    A benchmark family (read, later checkpoint) subclasses this once, pinning:
+      - FRAMEWORK / PARAMS_CLASS  -- per engine group, like before;
+      - RUN_LEVEL_KEYS            -- keys owned by the run env that yaml must never set;
+      - shared_keys()             -- the family's cross-case keys (rounds, batch sizes, ...);
+      - validate_case()           -- optional per-case semantic checks.
+
+    The mechanics that must not fork per family live here: baseline/shared clash rejection,
+    run-level and unknown-key rejection, the duplicate-id guard (the id is the
+    pytest-benchmark compare-by-name boundary), and the mandatory `axis:` per variant --
+    stamped on every case as `sweep_axis` ("baseline" for the implicit baseline case) so the
+    swept axis is a queryable column, not something reverse-engineered from the id.
+
+    A variant may also set `enabled: false` to park it without deleting it: it is still
+    built, validated, and checked for duplicate ids, but benchmark runs skip it.
+    """
+
+    FRAMEWORK = None  # subclass pins
+    PARAMS_CLASS = None  # subclass pins
+    RUN_LEVEL_KEYS = ()
+    # key -> env var. A variant that sets such a key is skipped while the env var
+    # is set, so a run-level override (e.g. --model-id) applies to every case.
+    ENV_OVERRIDE_KEYS = {}
+
+    def shared_keys(self, scenario, common_config):
+        """Family-shared keys merged into every case (may read the run env)."""
+        raise NotImplementedError
+
+    def validate_case(self, params):
+        """Optional family hook: raise ValueError for semantically invalid cases."""
+
+    def build_cases(self, scenario, common_config, include_disabled=False):
+        base = dict(common_config["baseline"])
+        shared = dict(self.shared_keys(scenario, common_config))
+        # A `baseline:` key colliding with a shared (common:/run-level) key would be
+        # silently discarded by the {**base, **shared, **over} merge -- the yaml would say
+        # one thing and the case run another. Reject instead of merging through it.
+        clash = sorted(set(base) & set(shared))
+        if clash:
+            raise ValueError(
+                f"configs.yaml baseline: sets key(s) {clash} that common: (or the run env) "
+                "also sets; set these under common:, not baseline:"
+            )
+        cases = [(self._make(base, {}, shared, sweep_axis="baseline"), True)]
+        for variant in scenario.get("variants", []):
+            if "axis" not in variant:
+                raise ValueError(
+                    f"variant {variant!r} has no axis: name; every variant must say which "
+                    "axis it perturbs (published as the sweep_axis column)"
+                )
+            # `enabled: false` parks a variant without deleting it. It is still built
+            # and validated below so it cannot rot while switched off.
+            enabled = variant.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValueError(
+                    f"variant {variant!r} enabled: must be true or false, got {enabled!r}"
+                )
+            over = {k: v for k, v in variant.items() if k not in ("axis", "enabled")}
+            overridden = [
+                k
+                for k, env in self.ENV_OVERRIDE_KEYS.items()
+                if k in over and os.environ.get(env)
+            ]
+            if overridden:
+                logging.info(
+                    "skipping variant %r: %s set by the run env", variant, overridden
+                )
+                continue
+            case = self._make(base, over, shared, sweep_axis=variant["axis"])
+            cases.append((case, enabled))
+
+        seen = set()
+        for c, _ in cases:
+            if c.name in seen:
+                raise ValueError(
+                    f"two cases share the benchmark id {c.name!r}; either the variant "
+                    "changes nothing, or it sweeps an axis benchmark_name() does not encode"
+                )
+            seen.add(c.name)
+        return [c for c, enabled in cases if enabled or include_disabled]
+
+    def _make(self, base, over, shared, sweep_axis):
+        import dataclasses
+
+        clash = sorted(set(over) & set(self.RUN_LEVEL_KEYS))
+        if clash:
+            raise ValueError(
+                f"variant overrides run-level key(s) {clash}; those come from the run env, "
+                "not from configs.yaml"
+            )
+        cfg = {
+            **base,
+            **shared,
+            **over,
+            "name": "",
+            "bucket_name": "",
+            "framework": self.FRAMEWORK,
+            "sweep_axis": sweep_axis,
+        }
+        valid = {f.name for f in dataclasses.fields(self.PARAMS_CLASS)}
+        unknown = sorted(set(cfg) - valid)
+        if unknown:
+            raise ValueError(
+                f"configs.yaml sets unknown key(s) {unknown} for {self.PARAMS_CLASS.__name__}"
+            )
+        p = self.PARAMS_CLASS(**cfg)
+        self.validate_case(p)
+        p.name = p.benchmark_name()
+        return p

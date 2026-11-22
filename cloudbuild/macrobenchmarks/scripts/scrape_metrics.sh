@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# scrape-metrics: scrape Cloud Logging into raw CSVs and aggregate them into one
+# summary row, retrying for Cloud Logging ingestion lag. calculate exits non-zero
+# until the required metrics are complete, gating the hand-off.
+#
+# Runs on a Python image (not the gcloud image, which ships no system python3),
+# so it must not call gcloud: it records the summary's local path and
+# destination in the build vars file, and the upload-summary step (gcloud
+# image) copies it to the results bucket.
+set -e
+source "$(dirname "$0")/lib.sh"
+trap 'record_failure scrape-metrics' ERR
+skip_if_failed
+source "${BUILD_VARS_FILE}"
+python3 -m pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore -r cloudbuild/macrobenchmarks/metrics/requirements.txt
+START_TIME=$(cat "${WORKSPACE_DIR}/start_time.txt")
+END_TIME=$(cat "${WORKSPACE_DIR}/end_time.txt")
+RAW_DIR="${WORKSPACE_DIR}/raw_metrics"
+cd cloudbuild/macrobenchmarks
+DATE_DIR=$(date +%Y%m%d)
+TS_DIR=$(date +%Y%m%d-%H%M%S)
+SUMMARY="${WORKSPACE_DIR}/${TS_DIR}.csv"
+MIN_WRITE_DATAPOINTS=$((${_STEPS} / ${_CHECKPOINT_INTERVAL}))
+if [ "$MIN_WRITE_DATAPOINTS" -lt 1 ]; then
+  MIN_WRITE_DATAPOINTS=1
+fi
+MIN_RESTORE_DATAPOINTS=0
+RESUME_ARGS=()
+# Restore is expected when an external checkpoint is supplied OR the per-run seed
+# was generated (_SEED_CHECKPOINT=true). Both make the measured run a resume, so
+# select calculate.py's resume-aware validation via --resume-run.
+if [ -n "${_CHECKPOINT_LOAD_PATH}" ] || [ "${_SEED_CHECKPOINT}" = "true" ]; then
+  MIN_RESTORE_DATAPOINTS=1
+  RESUME_ARGS=(--resume-run)
+fi
+case "${_WORKLOAD}" in
+  ray-data-ray-train-pytorch)
+    WORKLOAD_ID="${_WORKLOAD}"
+    PARSER_MODULE=metrics.parsers.ray_train
+    PROFILE_ARGS=(--require-ray-metrics)
+    # The strict profile derives exact write/restore sets from the observed
+    # schedule and topology. Disable the legacy approximate minimums so short
+    # and full-pass Ray runs are not forced to invent a checkpoint.
+    MIN_WRITE_DATAPOINTS=0
+    MIN_RESTORE_DATAPOINTS=0
+    ;;
+  *)
+    # Preserve 'hf-pytorch-lightning-cpu' as the stable workload_name ID in
+    # BigQuery so historical time-series queries remain contiguous across the
+    # directory rename to hf-datasets-pytorch-lightning.
+    WORKLOAD_ID="hf-pytorch-lightning-cpu"
+    PARSER_MODULE=metrics.parsers.hf
+    PROFILE_ARGS=(--require-data-loading-metrics --require-data-wait-metrics)
+    ;;
+esac
+# Run the calculator over the current raw metrics into the summary file $1.
+run_calculate() {
+  python3 -m metrics.calculate \
+      --run-id "$RUN_ID" --workload-name "$WORKLOAD_ID" \
+      --requirements "${_REQUIREMENTS}" --in-dir "$RAW_DIR" --out-file "$1" \
+      --expected-steps "${_STEPS}" \
+      --min-write-datapoints "$MIN_WRITE_DATAPOINTS" \
+      --min-restore-datapoints "$MIN_RESTORE_DATAPOINTS" \
+      "${RESUME_ARGS[@]}" \
+      "${PROFILE_ARGS[@]}" \
+      --bucket-type "${_BUCKET_TYPE}" --zone "${_ZONE}" --region "$REGION" \
+      --machine-type "${_MACHINE_TYPE}" \
+      --nodes "${_NODES}" --ranks-per-node "${_RANKS_PER_NODE}" \
+      --steps "${_STEPS}" --checkpoint-interval "${_CHECKPOINT_INTERVAL}" \
+      --checkpoints-to-keep "${_CKPT_TO_KEEP}" \
+      --dataset-path "${_DATASET_PATH}" --model-id "${_MODEL_ID}" \
+      --image "${_IMAGE}" \
+      --training-strategy "${_TRAINING_STRATEGY}" \
+      --tensor-parallel-size "${_TENSOR_PARALLEL_SIZE}" \
+      --data-parallel-size "${_DATA_PARALLEL_SIZE}" \
+      --simulated-step-compute-seconds "${_SIMULATED_STEP_COMPUTE_SECONDS}" \
+      --per-device-batch "${_PER_DEVICE_BATCH}" --grad-accum "${_GRAD_ACCUM}" \
+      --dataloader-workers "${_DATALOADER_WORKERS}" \
+      --epochs "${_EPOCHS}" \
+      --shuffle-buffer-size "${_SHUFFLE_BUFFER_SIZE}" \
+      --shuffle-max-buffer-input-shards "${_SHUFFLE_MAX_BUFFER_INPUT_SHARDS}" \
+      --dataloader-prefetch-factor "${_DATALOADER_PREFETCH_FACTOR}"
+}
+# Cloud Logging ingestion lags pod termination by seconds-to-minutes, and the
+# last logs emitted (the final checkpoint write and the profiler summary that
+# carries the data-loading metric) are the most likely to still be in flight
+# when the JobSet reports Completed. Settle once, then re-scrape every
+# SCRAPE_RETRY_SLEEP_SECONDS (default 90s) until the required metrics validate
+# (or SCRAPE_MAX_ATTEMPTS attempts are exhausted).
+# run_calculate exits non-zero when metrics are incomplete; running it as an
+# `if` condition keeps `set -e`/the ERR trap from aborting the step on a
+# not-yet-complete attempt.
+SCRAPE_MAX_ATTEMPTS="${SCRAPE_MAX_ATTEMPTS:-10}"
+SCRAPE_RETRY_SLEEP_SECONDS="${SCRAPE_RETRY_SLEEP_SECONDS:-90}"
+sleep 60
+SCRAPE_OK=false
+for ((attempt = 1; attempt <= SCRAPE_MAX_ATTEMPTS; attempt++)); do
+  echo "Scrape attempt $attempt of $SCRAPE_MAX_ATTEMPTS..."
+  rm -rf "$RAW_DIR"
+  # The parser hits the Cloud Logging API; a transient API error should fall
+  # through to the backoff like the ingestion-lag case, not abort the step via
+  # set -e / the ERR trap. Guard it in a condition so a failure retries.
+  if ! python3 -m "${PARSER_MODULE}" \
+      --run-id "$RUN_ID" --project "${PROJECT_ID}" \
+      --start-time "$START_TIME" --end-time "$END_TIME" \
+      --checkpoint-location "gs://$CHECKPOINT_BUCKET/checkpoints" \
+      --out-dir "$RAW_DIR"; then
+    echo "Scrape failed (transient?); waiting before retry..."
+    sleep "$SCRAPE_RETRY_SLEEP_SECONDS"
+    continue
+  fi
+  if run_calculate "$SUMMARY"; then
+    SCRAPE_OK=true
+    break
+  fi
+  echo "Required metrics incomplete; waiting for Cloud Logging ingestion..."
+  sleep "$SCRAPE_RETRY_SLEEP_SECONDS"
+done
+if [ "$SCRAPE_OK" != "true" ]; then
+  echo "Metrics still incomplete after retries."
+  # Record explicitly: bash's ERR trap does NOT fire on `exit`, so without this
+  # the allowFailure step leaves the FAILED ledger empty and check-failure would
+  # green a run that uploaded no summary.
+  record_failure scrape-metrics
+  exit 1
+fi
+# Best-effort system metrics: fetched once after the required metrics validate
+# (not per attempt, to avoid re-du'ing the dataset bucket). Settle for GCS
+# metric lag, then fold into the summary; a failure here must not lose the
+# metrics-complete summary already written above, so it's `|| true`/warn-only.
+sleep "${SYSTEM_METRICS_SETTLE_SECONDS:-900}"
+python3 -m metrics.monitoring \
+  --project "${PROJECT_ID}" --run-id "$RUN_ID" \
+  --start-time "$START_TIME" --end-time "$END_TIME" \
+  --checkpoint-bucket "$CHECKPOINT_BUCKET" --dataset-bucket "$DATASET_BUCKET" \
+  --cluster "$CLUSTER_NAME" \
+  --out-dir "$RAW_DIR" || true
+run_calculate "$SUMMARY" \
+  || echo "Warning: recompute with system metrics failed; uploading summary without them."
+echo "export SUMMARY_FILE=${SUMMARY}" >> "${BUILD_VARS_FILE}"
+echo "export SUMMARY_URI=gs://${RESULTS_BUCKET}/branch=${BRANCH_NAME}/${DATE_DIR}/${RUN_ID}/${TS_DIR}.csv" >> "${BUILD_VARS_FILE}"

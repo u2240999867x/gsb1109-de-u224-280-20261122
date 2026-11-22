@@ -1,0 +1,1026 @@
+import asyncio
+import contextlib
+import logging
+import os
+import shlex
+import shutil
+import subprocess
+import time
+import uuid
+from unittest import mock
+
+import fsspec
+import pytest
+import pytest_asyncio
+import requests
+from fsspec import asyn
+from google.cloud import storage
+from google.cloud.storage.asyncio.async_appendable_object_writer import (
+    AsyncAppendableObjectWriter,
+)
+
+from gcsfs import GCSFileSystem
+from gcsfs.extended_gcsfs import BucketLayout, CachingTier, ExtendedGcsFileSystem
+from gcsfs.tests import layouts
+from gcsfs.tests.lro_fakes import FakeLroFactory
+from gcsfs.tests.settings import (
+    TEST_BUCKET,
+    TEST_HNS_BUCKET,
+    TEST_HNS_RCU_BUCKET,
+    TEST_HNS_REQUESTER_PAYS_BUCKET,
+    TEST_PROJECT,
+    TEST_REGION,
+    TEST_REQUESTER_PAYS_BUCKET,
+    TEST_STANDARD_RCU_BUCKET,
+    TEST_VERSIONED_BUCKET,
+    TEST_ZONAL_BUCKET,
+)
+from gcsfs.tests.utils import is_real_gcs
+
+# Bucket type helpers
+is_real_gcs_bucket = is_real_gcs()
+is_hns_bucket = os.environ.get("GCSFS_RUN_HNS_TESTS", "false").lower() in ("true", "1")
+is_rapid_bucket = os.environ.get("GCSFS_RUN_RAPID_TESTS", "false").lower() in (
+    "true",
+    "1",
+)
+
+# Skip markers for test decoration
+requires_real_gcs = pytest.mark.skipif(
+    not is_real_gcs_bucket,
+    reason="Requires real GCS (STORAGE_EMULATOR_HOST must be https://storage.googleapis.com)",
+)
+is_extended_support = os.environ.get(
+    "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT", "true"
+).lower() in ("true", "1")
+
+requires_hns = pytest.mark.skipif(
+    not is_extended_support or (is_real_gcs_bucket and not is_hns_bucket),
+    reason="Requires HNS support and GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT to be enabled",
+)
+requires_rapid = pytest.mark.skipif(
+    not is_extended_support or (is_real_gcs_bucket and not is_rapid_bucket),
+    reason="Requires zonal support and GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT to be enabled",
+)
+
+files = {
+    "test/accounts.1.json": (
+        b'{"amount": 100, "name": "Alice"}\n'
+        b'{"amount": 200, "name": "Bob"}\n'
+        b'{"amount": 300, "name": "Charlie"}\n'
+        b'{"amount": 400, "name": "Dennis"}\n'
+    ),
+    "test/accounts.2.json": (
+        b'{"amount": 500, "name": "Alice"}\n'
+        b'{"amount": 600, "name": "Bob"}\n'
+        b'{"amount": 700, "name": "Charlie"}\n'
+        b'{"amount": 800, "name": "Dennis"}\n'
+    ),
+}
+
+csv_files = {
+    "2014-01-01.csv": (
+        b"name,amount,id\n" b"Alice,100,1\n" b"Bob,200,2\n" b"Charlie,300,3\n"
+    ),
+    "2014-01-02.csv": b"name,amount,id\n",
+    "2014-01-03.csv": (
+        b"name,amount,id\n" b"Dennis,400,4\n" b"Edith,500,5\n" b"Frank,600,6\n"
+    ),
+}
+text_files = {
+    "nested/file1": b"hello\n",
+    "nested/file2": b"world",
+    "nested/nested2/file1": b"hello\n",
+    "nested/nested2/file2": b"world",
+    "zonal/test/a": b"a,b\n11,22\n3,4",
+    "zonal/test/b": b"",
+    "zonal/test/c": b"ab\n" + b"a" * (2**18) + b"\nab",
+}
+
+allfiles = dict(**files, **csv_files, **text_files)
+a = TEST_BUCKET + "/tmp/test/a"
+b = TEST_BUCKET + "/tmp/test/b"
+c = TEST_BUCKET + "/tmp/test/c"
+d = TEST_BUCKET + "/tmp/test/d"
+
+params = dict()
+
+BUCKET_NAME_MAP = {
+    "regional": TEST_BUCKET,
+    "zonal": TEST_ZONAL_BUCKET,
+    "hns": TEST_HNS_BUCKET,
+    "standard_rcu_z": TEST_STANDARD_RCU_BUCKET,
+    "standard_rcu_warm": TEST_STANDARD_RCU_BUCKET,
+    "standard_rcu_cold": TEST_STANDARD_RCU_BUCKET,
+    "hns_rcu_z": TEST_HNS_RCU_BUCKET,
+    "hns_rcu_warm": TEST_HNS_RCU_BUCKET,
+    "hns_rcu_cold": TEST_HNS_RCU_BUCKET,
+}
+
+
+@pytest.fixture(autouse=True)
+def _avoid_adc_timeout(monkeypatch):
+    """Avoid slow ADC lookups and Metadata Server requests in tests."""
+    # Do not apply if tests are explicitly running against real GCS
+    if is_real_gcs():
+        yield
+        return
+
+    # Disable GCE metadata check in google-auth and gcsfs
+    monkeypatch.setenv("NO_GCE_CHECK", "true")
+
+    # Set a dummy project to avoid project ID lookup timeouts if not set
+    if "GOOGLE_CLOUD_PROJECT" not in os.environ:
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "dummy-project")
+
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _stub_environment_detection(request):
+    """Keep host-specific env/ tokens and metadata server probes out of tests."""
+    if request.config.getoption("--run-benchmarks"):
+        yield
+        return
+
+    from gcsfs.telemetry.detector import EnvironmentDetector
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(EnvironmentDetector, "detect", lambda self: None)
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _mock_get_bucket_layout_on_emulator():
+    """Mock _get_bucket_layout to return UNKNOWN instantly on emulator."""
+    from gcsfs.tests.utils import _patch_get_bucket_layout_for_emulator
+
+    patch = _patch_get_bucket_layout_for_emulator()
+    if patch:
+        with patch:
+            yield
+    else:
+        yield
+
+
+def stop_docker(container):
+    if not shutil.which("docker"):
+        return
+    cmd = shlex.split('docker ps -a -q --filter "name=%s"' % container)
+    cid = subprocess.check_output(cmd).strip().decode()
+    if cid:
+        subprocess.call(["docker", "rm", "-f", "-v", cid])
+
+
+@pytest.fixture(scope="session")
+def docker_gcs():
+    if not is_real_gcs():
+        params["token"] = "anon"
+
+    if "STORAGE_EMULATOR_HOST" in os.environ or is_real_gcs():
+        from gcsfs.core import _location
+
+        yield _location()
+        return
+
+    if not shutil.which("docker"):
+        pytest.skip(
+            "Docker is not available and STORAGE_EMULATOR_HOST is not set. "
+            "To run tests, set STORAGE_EMULATOR_HOST (e.g. "
+            "export STORAGE_EMULATOR_HOST=https://storage.googleapis.com) "
+            "or run a fake-gcs-server emulator."
+        )
+
+    container = "gcsfs_test"
+    cmd = (
+        "docker run -d -p 4443:4443 --name gcsfs_test fsouza/fake-gcs-server:latest -scheme "
+        "http -public-host 0.0.0.0:4443 -external-url http://localhost:4443 "
+        "-backend memory"
+    )
+    stop_docker(container)
+    subprocess.check_output(shlex.split(cmd))
+    url = "http://0.0.0.0:4443"
+    timeout = 10
+    while True:
+        try:
+            r = requests.get(url + "/storage/v1/b")
+            if r.ok:
+                yield url
+                break
+        except Exception as e:  # noqa: E722
+            timeout -= 1
+            if timeout < 0:
+                raise SystemError from e
+            time.sleep(1)
+    stop_docker(container)
+
+
+@pytest.fixture(scope="session")
+def _session_gcs_factory(docker_gcs):
+    params["endpoint_url"] = docker_gcs
+    if is_real_gcs():
+        params["default_location"] = TEST_REGION
+        params["project"] = TEST_PROJECT
+
+    def factory(**kwargs):
+        GCSFileSystem.clear_instance_cache()
+        combined_params = params.copy()
+        combined_params.update(kwargs)
+        return fsspec.filesystem("gcs", **combined_params)
+
+    return factory
+
+
+@pytest.fixture
+def gcs_factory(_session_gcs_factory):
+    created_instances = []
+
+    def factory(**kwargs):
+        fs = _session_gcs_factory(**kwargs)
+        created_instances.append(fs)
+        return fs
+
+    try:
+        yield factory
+    finally:
+        for fs in {id(fs): fs for fs in created_instances}.values():
+            _close_gcs(fs)
+
+
+@pytest.fixture(scope="session")
+def buckets_to_delete():
+    """
+    Provides a session-scoped set to track the names of GCS buckets that are
+    created by the test suite.
+
+    When tests run, they may create new GCS buckets. If these buckets are not
+    deleted, they will persist after the test run, leading to resource leakage.
+    This set acts as a registry of buckets that the `final_cleanup` fixture
+    should remove at the end of the entire test session.
+    """
+    return set()
+
+
+@pytest.fixture
+def requester_pays_bucket(gcs_factory, buckets_to_delete):
+    gcs = gcs_factory(requester_pays=True)
+
+    if not gcs.on_google:
+        pytest.skip("no requester-pays on emulation")
+
+    try:
+        if not gcs.exists(TEST_REQUESTER_PAYS_BUCKET):
+            gcs.mkdir(TEST_REQUESTER_PAYS_BUCKET)
+            gcs.make_bucket_requester_pays(TEST_REQUESTER_PAYS_BUCKET)
+            buckets_to_delete.add(TEST_REQUESTER_PAYS_BUCKET)
+        else:
+            _cleanup_gcs(gcs, bucket=TEST_REQUESTER_PAYS_BUCKET)
+
+        yield TEST_REQUESTER_PAYS_BUCKET
+    finally:
+        _cleanup_gcs(gcs, bucket=TEST_REQUESTER_PAYS_BUCKET)
+
+
+@pytest.fixture
+def hns_requester_pays_bucket(gcs_factory, buckets_to_delete):
+    gcs = gcs_factory(requester_pays=True)
+
+    if not gcs.on_google:
+        pytest.skip("no requester-pays on emulation")
+
+    try:
+        if not gcs.exists(TEST_HNS_REQUESTER_PAYS_BUCKET):
+            gcs.mkdir(
+                TEST_HNS_REQUESTER_PAYS_BUCKET, enable_hierarchical_namespace=True
+            )
+            gcs.make_bucket_requester_pays(TEST_HNS_REQUESTER_PAYS_BUCKET)
+            buckets_to_delete.add(TEST_HNS_REQUESTER_PAYS_BUCKET)
+        else:
+            _cleanup_gcs(gcs, bucket=TEST_HNS_REQUESTER_PAYS_BUCKET)
+
+        yield TEST_HNS_REQUESTER_PAYS_BUCKET
+    finally:
+        _cleanup_gcs(gcs, bucket=TEST_HNS_REQUESTER_PAYS_BUCKET)
+
+
+@pytest.fixture
+def populate_bucket():
+    return True
+
+
+@pytest.fixture
+def gcs(gcs_factory, buckets_to_delete, populate_bucket):
+    gcs = gcs_factory()
+    # Dynamically set `finalize_on_close` to True. This configures all upload
+    # methods (pipe, write etc.) to finalize objects for this fixture's duration without
+    # altering the fsspec cache key or the params which is also used by other fixtures.
+    gcs.finalize_on_close = True
+
+    try:  # ensure we're empty.
+        # Create the bucket if it doesn't exist, otherwise clean it.
+        if not gcs.exists(TEST_BUCKET):
+            gcs.mkdir(TEST_BUCKET)
+            # By adding the bucket name to this set, we are marking it for
+            # deletion at the end of the test session. This ensures that if
+            # the test suite creates the bucket, it will also be responsible
+            # for deleting it. If the bucket already existed, we assume it's
+            # managed externally and should not be deleted by the tests.
+            buckets_to_delete.add(TEST_BUCKET)
+        else:
+            _cleanup_gcs(gcs, bucket=TEST_BUCKET, bucket_populated=populate_bucket)
+
+        if populate_bucket:
+            gcs.pipe({TEST_BUCKET + "/" + k: v for k, v in allfiles.items()})
+        gcs.invalidate_cache()
+        yield gcs
+    finally:
+        _cleanup_gcs(gcs, bucket_populated=populate_bucket)
+        _close_gcs(gcs)
+        # Remove the dynamically added attribute. This prevents state leakage
+        # into subsequent tests that can share this cached fsspec instance.
+        if hasattr(gcs, "finalize_on_close"):
+            delattr(gcs, "finalize_on_close")
+
+
+@pytest.fixture
+def extended_gcs_factory(gcs_factory, buckets_to_delete, populate_bucket):
+    created_instances = []
+
+    def factory(**kwargs):
+        fs = _create_extended_gcsfs(
+            gcs_factory, buckets_to_delete, populate_bucket, **kwargs
+        )
+        created_instances.append(fs)
+        return fs
+
+    yield factory
+
+    for fs in created_instances:
+        _cleanup_gcs(fs, bucket_populated=populate_bucket)
+        _close_gcs(fs)
+
+
+@pytest.fixture
+def extended_gcsfs(gcs_factory, buckets_to_delete, populate_bucket):
+    extended_gcsfs = _create_extended_gcsfs(
+        gcs_factory, buckets_to_delete, populate_bucket
+    )
+    try:
+        yield extended_gcsfs
+    finally:
+        _cleanup_gcs(extended_gcsfs, bucket_populated=populate_bucket)
+        _close_gcs(extended_gcsfs)
+
+
+def _cleanup_gcs(gcs, bucket=TEST_BUCKET, bucket_populated=True):
+    """Clean the bucket contents, logging a warning on failure."""
+    try:
+        if bucket_populated and gcs.exists(bucket):
+            files_to_delete = gcs.find(bucket, withdirs=True)
+            if files_to_delete:
+                gcs.rm(files_to_delete)
+    except Exception as e:
+        logging.warning(f"Failed to clean up GCS bucket {bucket}: {e}")
+
+
+def _close_gcs(gcs):
+    """Close gcs instance resources for sync fixtures."""
+    if hasattr(gcs, "_close_resources"):
+        asyn.sync(gcs.loop, gcs._close_resources)
+    GCSFileSystem.close_session(gcs.loop, gcs._session, gcs.asynchronous)
+
+
+async def _close_gcs_async(gcs):
+    """Close gcs instance resources for async fixtures."""
+    if hasattr(gcs, "_close_resources"):
+        await gcs._close_resources()
+    GCSFileSystem.close_session(gcs.loop, gcs._session, gcs.asynchronous)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def final_cleanup(_session_gcs_factory, buckets_to_delete):
+    """
+    A session-scoped, auto-use fixture that deletes all buckets registered
+    in the `buckets_to_delete` set after the entire test session is complete.
+    """
+    yield
+    # This code runs after the entire test session finishes
+
+    gcs = _session_gcs_factory(requester_pays=True)
+    try:
+        for bucket in buckets_to_delete:
+            # The cleanup logic attempts to delete every bucket that was
+            # added to the set during the session. For real GCS, only delete if
+            # created by the test suite.
+            try:
+                if gcs.exists(bucket):
+                    gcs.rm(bucket, recursive=True)
+                    logging.info(f"Cleaned up bucket: {bucket}")
+            except Exception as e:
+                logging.error(
+                    f"Failed to perform final cleanup for bucket {bucket}: {e}"
+                )
+    finally:
+        _close_gcs(gcs)
+
+
+@pytest.fixture
+def gcs_versioned(gcs_factory, buckets_to_delete):
+    gcs = gcs_factory()
+    gcs.version_aware = True
+    try:  # ensure we're empty.
+        # The versioned bucket might be created by `is_versioning_enabled`
+        # in test_flat_versioned.py. We must register it for cleanup only if
+        # it was created by this test run.
+        try:
+            from gcsfs.tests.test_flat_versioned import (
+                _VERSIONED_BUCKET_CREATED_BY_TESTS,
+            )
+
+            if _VERSIONED_BUCKET_CREATED_BY_TESTS:
+                buckets_to_delete.add(TEST_VERSIONED_BUCKET)
+        except ImportError:
+            pass  # test_flat_versioned is not being run
+        if is_real_gcs():
+            cleanup_versioned_bucket(gcs, TEST_VERSIONED_BUCKET)
+        else:
+            # For emulators, we delete and recreate the bucket for a clean state
+            try:
+                gcs.rm(TEST_VERSIONED_BUCKET, recursive=True)
+            except FileNotFoundError:
+                pass
+            gcs.mkdir(TEST_VERSIONED_BUCKET, enable_versioning=True)
+            buckets_to_delete.add(TEST_VERSIONED_BUCKET)
+        gcs.invalidate_cache()
+        yield gcs
+    finally:
+        # Ensure the bucket is empty after the test.
+        try:
+            if is_real_gcs():
+                cleanup_versioned_bucket(gcs, TEST_VERSIONED_BUCKET)
+        except Exception as e:
+            logging.warning(
+                f"Failed to clean up versioned bucket {TEST_VERSIONED_BUCKET} after test: {e}"
+            )
+        _close_gcs(gcs)
+
+
+def cleanup_versioned_bucket(gcs, bucket_name, prefix=None):
+    """
+    Deletes all object versions in a bucket using the google-cloud-storage client,
+    ensuring it uses the same credentials as the gcsfs instance.
+    """
+    # Define a retry policy for API calls to handle rate limiting.
+    # This can retry on 429 Too Many Requests errors, which can happen
+    # when deleting many object versions quickly.
+    from google.api_core.retry import Retry
+
+    retry_policy = Retry(
+        initial=1.0,  # Initial delay in seconds
+        maximum=30.0,  # Maximum delay in seconds
+        multiplier=1.2,  # Backoff factor
+    )
+
+    client = storage.Client(
+        credentials=gcs.credentials.credentials, project=gcs.project
+    )
+
+    # List all blobs, including old versions
+    blobs_to_delete = list(client.list_blobs(bucket_name, versions=True, prefix=prefix))
+
+    if not blobs_to_delete:
+        logging.info("No object versions to delete in %s.", bucket_name)
+        return
+
+    logging.info(
+        "Deleting %d object versions from %s.", len(blobs_to_delete), bucket_name
+    )
+    time.sleep(2)
+    for blob in blobs_to_delete:
+        blob.delete(retry=retry_policy)
+
+    logging.info("Successfully deleted %d object versions.", len(blobs_to_delete))
+
+
+def _create_extended_gcsfs(gcs_factory, buckets_to_delete, populate_bucket, **kwargs):
+    extended_gcsfs = gcs_factory(**kwargs)
+    # Only create/delete/populate the bucket if we are NOT using the real GCS endpoint.
+    if not is_real_gcs():
+        if not extended_gcsfs.exists(TEST_ZONAL_BUCKET):
+            extended_gcsfs.mkdir(TEST_ZONAL_BUCKET)
+            buckets_to_delete.add(TEST_ZONAL_BUCKET)
+
+        if not extended_gcsfs.exists(TEST_BUCKET):
+            extended_gcsfs.mkdir(TEST_BUCKET)
+            buckets_to_delete.add(TEST_BUCKET)
+    try:
+        if populate_bucket:
+            # To avoid hitting object mutation limits, only pipe files if they
+            # don't exist or if their size has changed.
+            existing_files = extended_gcsfs.find(TEST_ZONAL_BUCKET, detail=True)
+            files_to_pipe = {}
+            for k, v in allfiles.items():
+                remote_path = f"{TEST_ZONAL_BUCKET}/{k}"
+                if remote_path not in existing_files or existing_files[remote_path][
+                    "size"
+                ] != len(v):
+                    files_to_pipe[remote_path] = v
+
+            if files_to_pipe:
+                extended_gcsfs.pipe(files_to_pipe, finalize_on_close=True)
+    except Exception as e:
+        logging.warning(f"Failed to populate Zonal bucket: {e}")
+
+    extended_gcsfs.invalidate_cache()
+    return extended_gcsfs
+
+
+@pytest.fixture
+def gcs_hns(gcs_factory, buckets_to_delete):
+    """
+    Provides a GCSFileSystem instance pointed at a HNS-enabled bucket.
+
+    - Creates the bucket if it doesn't exist.
+    - Cleans the bucket before the test.
+    - Yields the filesystem instance.
+    - Cleans the bucket after the test.
+    """
+    # TODO: Re-use _create_extended_gcsfs once cleanup for real_gcs is added to it
+    gcs = gcs_factory()
+
+    try:
+        if not gcs.exists(TEST_HNS_BUCKET):
+            # Note: Emulators may not fully support HNS features like real GCS.
+            gcs.mkdir(TEST_HNS_BUCKET, enable_hierarchical_namespace=True)
+            buckets_to_delete.add(TEST_HNS_BUCKET)
+        else:
+            _cleanup_gcs(gcs, bucket=TEST_HNS_BUCKET)
+        gcs.invalidate_cache()
+        yield gcs
+    finally:
+        _cleanup_gcs(gcs, bucket=TEST_HNS_BUCKET)
+        _close_gcs(gcs)
+
+
+@pytest.fixture(scope="session")
+def flat_bucket_name(_session_gcs_factory, buckets_to_delete):
+    """
+    Creates a dedicated standard (non-HNS) bucket once per test session.
+    """
+    gcs = _session_gcs_factory()
+    try:
+        bucket_name = f"gcsfs-test-flat-{uuid.uuid4().hex}"
+        gcs.mkdir(bucket_name)
+        buckets_to_delete.add(bucket_name)
+        yield bucket_name
+    finally:
+        _close_gcs(gcs)
+
+
+@pytest.fixture
+def flat_bucket(flat_bucket_name, gcs_factory):
+    """
+    Provides the name of a dedicated standard (non-HNS) bucket,
+    and cleans its contents before and after each test.
+    """
+    gcs = gcs_factory()
+    try:
+        _cleanup_gcs(gcs, bucket=flat_bucket_name)
+        gcs.invalidate_cache()
+        yield flat_bucket_name
+    finally:
+        _cleanup_gcs(gcs, bucket=flat_bucket_name)
+        _close_gcs(gcs)
+
+
+# Bucket layouts whose appendable writes use the gRPC writer (RCU layouts only
+# with ``rcu_rapid_write``); pass them to ``zonal_write_mocks`` as indirect params.
+RAPID_WRITE_LAYOUTS = [
+    layouts.ZONAL_HIERARCHICAL,
+    layouts.STANDARD_RCU,
+    layouts.HIERARCHICAL_RCU,
+]
+
+
+_live_bucket_layouts: dict[str, BucketLayout] = {}
+
+
+def _get_live_zonal_bucket_layout() -> BucketLayout:
+    cached = _live_bucket_layouts.get(TEST_ZONAL_BUCKET)
+    if cached is not None:
+        return cached
+    fs = ExtendedGcsFileSystem(project=TEST_PROJECT, skip_instance_cache=True)
+    try:
+        layout = fs._sync_lookup_bucket_layout(TEST_ZONAL_BUCKET)
+    finally:
+        _close_gcs(fs)
+    if layout != BucketLayout.UNKNOWN:
+        _live_bucket_layouts[TEST_ZONAL_BUCKET] = layout
+    return layout
+
+
+def _rapid_write_filesystems(request, layout):
+    """Return the test's filesystems that need rcu_rapid_write=True for RAPID writes."""
+    if not layout.is_rcu:
+        return []
+    fixturenames = getattr(request, "fixturenames", ())
+    return [
+        request.getfixturevalue(name)
+        for name in ("extended_gcsfs", "async_gcs")
+        if name in fixturenames
+    ]
+
+
+@pytest.fixture
+def zonal_write_mocks(request):
+    """A fixture for mocking Zonal and RCU bucket write functionality.
+
+    Accepts an optional indirect ``BucketLayout`` param (default ``ZONAL_HIERARCHICAL``).
+    On real GCS it yields ``None`` when the live bucket matches the requested
+    layout (or uses the gRPC data path when unparametrized) and skips otherwise.
+    For RCU layouts (live or mocked) it sets ``rcu_rapid_write`` on the test's
+    ``extended_gcsfs`` or ``async_gcs`` filesystem, so writes use the appendable writer.
+    """
+    has_param = hasattr(request, "param")
+    layout = getattr(request, "param", layouts.ZONAL_HIERARCHICAL)
+
+    if is_real_gcs():
+        live_layout = _get_live_zonal_bucket_layout()
+        if has_param:
+            if live_layout != layout:
+                pytest.skip(
+                    f"Live bucket {TEST_ZONAL_BUCKET} has layout {live_layout}, "
+                    f"skipping {layout} case"
+                )
+        elif not live_layout.uses_grpc_data_path:
+            pytest.skip(
+                f"Live write tests require a Zonal or RCU bucket, got {live_layout}"
+            )
+        with contextlib.ExitStack() as stack:
+            for fs in _rapid_write_filesystems(request, live_layout):
+                stack.enter_context(mock.patch.object(fs, "rcu_rapid_write", True))
+            yield None
+        return
+
+    rapid_write_filesystems = _rapid_write_filesystems(request, layout)
+
+    patch_target_get_bucket_layout = (
+        "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._get_bucket_layout"
+    )
+    patch_target_init_aaow = "gcsfs.zb_hns_utils.init_aaow"
+    patch_target_gcsfs_info = "gcsfs.core.GCSFileSystem._info"
+
+    mock_aaow = mock.AsyncMock(spec=AsyncAppendableObjectWriter)
+    mock_aaow.offset = 0
+    mock_aaow._is_stream_open = True
+
+    async def init_aaow_side_effect(grpc_client, bucket_name, object_name, *a, **k):
+        # Every open gets an open writer for its own object.
+        mock_aaow._is_stream_open = True
+        mock_aaow.offset = 0
+        mock_aaow.bucket_name = bucket_name
+        mock_aaow.object_name = object_name
+        return mock_aaow
+
+    mock_init_aaow = mock.AsyncMock(side_effect=init_aaow_side_effect)
+    mock_gcsfs_info = mock.AsyncMock(
+        return_value={"generation": "12345", "type": "file", "name": "mock_file"}
+    )
+
+    async def append_side_effect(data):
+        mock_aaow.offset += len(data)
+
+    mock_aaow.append.side_effect = append_side_effect
+
+    async def close_side_effect(finalize_on_close=False):
+        mock_aaow._is_stream_open = False
+
+    mock_aaow.close.side_effect = close_side_effect
+
+    # Finalize closes the stream as well
+    async def finalize_side_effect():
+        mock_aaow._is_stream_open = False
+
+    mock_aaow.finalize.side_effect = finalize_side_effect
+
+    with (
+        mock.patch(patch_target_get_bucket_layout, return_value=layout),
+        mock.patch(patch_target_gcsfs_info, mock_gcsfs_info),
+        mock.patch(patch_target_init_aaow, mock_init_aaow),
+        contextlib.ExitStack() as stack,
+    ):
+        for fs in rapid_write_filesystems:
+            stack.enter_context(mock.patch.object(fs, "rcu_rapid_write", True))
+        mocks = {
+            "aaow": mock_aaow,
+            "init_aaow": mock_init_aaow,
+            "_gcsfs_info": mock_gcsfs_info,
+            "storage_class": (
+                "RAPID"
+                if layout.caching_tier == CachingTier.RAPID_CACHE_ULTRA
+                else None
+            ),
+        }
+        yield mocks
+
+
+@pytest.fixture
+def fake_lro():
+    """Factory for LRO test doubles (see gcsfs/tests/lro_fakes.py)."""
+    return FakeLroFactory()
+
+
+class FakeClock:
+    """Virtual clock for ``gcsfs.poller``: sleeps return at once and advance ``now``."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+        # Yield like asyncio.sleep, so a pending cancel is delivered here.
+        await asyncio.sleep(0)
+
+    def patch(self, monkeypatch) -> "FakeClock":
+        monkeypatch.setattr("gcsfs.poller._monotonic", self.time)
+        monkeypatch.setattr("gcsfs.poller._sleep", self.sleep)
+        return self
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Virtual clock for gcsfs.poller's polling loop."""
+    return FakeClock().patch(monkeypatch)
+
+
+@pytest.fixture
+def file_path():
+    """Generates a unique test file path for every test."""
+    path = f"{TEST_ZONAL_BUCKET}/zonal-test-{uuid.uuid4()}"
+    yield path
+
+
+@pytest_asyncio.fixture
+async def async_gcs():
+    """Fixture to provide an asynchronous GCSFileSystem instance."""
+    token = "anon" if not os.getenv("STORAGE_EMULATOR_HOST") else None
+    GCSFileSystem.clear_instance_cache()
+    gcs = GCSFileSystem(asynchronous=True, token=token)
+    try:
+        yield gcs
+    finally:
+        await _close_gcs_async(gcs)
+
+
+@pytest.fixture
+def skip_if_zonal(gcs):
+    """Skips tests validating HTTP REST write mechanics when writes use gRPC."""
+    if (
+        hasattr(gcs, "_sync_lookup_bucket_layout")
+        and hasattr(gcs, "_uses_grpc_write_path")
+        and gcs._uses_grpc_write_path(gcs._sync_lookup_bucket_layout(TEST_BUCKET))
+    ):
+        pytest.skip(
+            "Test validates HTTP REST mechanics specific to non-gRPC regional writes"
+        )
+
+
+@pytest.fixture
+def skip_if_grpc_read(gcs):
+    """Skips tests of HTTP read mechanics; Zonal and RCU buckets read over gRPC."""
+    if (
+        hasattr(gcs, "_sync_lookup_bucket_layout")
+        and gcs._sync_lookup_bucket_layout(TEST_BUCKET).uses_grpc_data_path
+    ):
+        pytest.skip(
+            "Test validates HTTP read mechanics; Zonal and RCU buckets read over gRPC"
+        )
+
+
+@pytest.fixture
+def mock_gcs_harness(request, monkeypatch):
+    """
+    Harness that mocks GCSFileSystem HTTP transport and records the exact
+    User-Agent and feature headers sent on every outgoing GCS request.
+
+    Parametrize indirectly with "core" (default) or "extended" to select
+    `gcsfs.core.GCSFileSystem` or `ExtendedGcsFileSystem` (on a standard,
+    non-hierarchical bucket).
+    """
+    fs_kind = getattr(request, "param", "core")
+    captured_user_agents = []
+    captured_feature_headers = []
+    sample_pt_data = b"MOCK_PT_BINARY_DATA_FOR_TORCH_LOADER_TESTING_12345"
+    sample_csv_data = b"col1,col2,col3\n1,2,3\n4,5,6\n"
+
+    async def mock_call(self, method, path, *args, **kwargs):
+        from gcsfs.telemetry.context import HTTP_HEADER_KEY
+
+        if args:
+            path = path.format(*args)
+        headers = kwargs.get("headers") or {}
+        resolved = self._get_headers(
+            headers,
+            cache_type=kwargs.get("cache_type"),
+            cache_source=kwargs.get("cache_source"),
+        )
+        captured_user_agents.append(
+            next((v for k, v in resolved.items() if k.lower() == "user-agent"), "")
+            or ""
+        )
+        feature_key = HTTP_HEADER_KEY.lower()
+        captured_feature_headers.append(
+            next((v for k, v in resolved.items() if k.lower() == feature_key), "") or ""
+        )
+
+        # Mock initiate_upload (resumable upload session)
+        if kwargs.get("uploadType") == "resumable":
+            return {
+                "Location": "http://mock-gcs/upload/session-12345678901234567890"
+            }, b""
+
+        # Mock upload chunk / upload completion
+        if "http://mock-gcs/upload" in str(path):
+            return {}, b'{"generation": "1"}'
+
+        # Mock batch delete: one "204 No Content" part per object in the request
+        if str(path) == getattr(self, "batch_url_base", None):
+            n_parts = str(kwargs.get("data", "")).count("Content-ID")
+            boundary = "batch_mock_boundary"
+            body = "".join(
+                f"--{boundary}\nContent-Type: application/http\n\nHTTP/1.1 204 No Content\n\n"
+                for _ in range(n_parts)
+            )
+            return {
+                "Content-Type": f"multipart/mixed; boundary={boundary}"
+            }, f"{body}--{boundary}--".encode()
+
+        # Mock object metadata response (json_out=True returns dict directly)
+        if kwargs.get("json_out"):
+            if path in ["b", "b?"] or str(path).startswith("b?"):
+                return {"kind": "storage#buckets", "items": [{"name": "test-bucket"}]}
+            if str(path).startswith("b/") and "/o" not in str(path):
+                return {
+                    "kind": "storage#bucket",
+                    "name": "test-bucket",
+                    "items": [{"name": "test-bucket"}],
+                }
+            if str(path).endswith("/o") or "/o?" in str(path):
+                return {
+                    "items": [
+                        {
+                            "name": "model.pt" if "model" in str(path) else "file.txt",
+                            "bucket": "test-bucket",
+                            "size": str(len(sample_pt_data)),
+                            "generation": "1",
+                        }
+                    ]
+                }
+            obj_name = path.split("/o/")[-1] if "/o/" in path else path.split("/")[-1]
+            size = len(sample_csv_data) if "csv" in obj_name else len(sample_pt_data)
+            return {
+                "name": obj_name,
+                "bucket": "test-bucket",
+                "size": str(size),
+                "generation": "1",
+                "timeCreated": "2026-01-01T00:00:00.000Z",
+                "updated": "2026-01-01T00:00:00.000Z",
+            }
+
+        # Mock object data content
+        if "csv" in str(path):
+            return {}, sample_csv_data
+        return {}, sample_pt_data
+
+    from fsspec.registry import _registry
+
+    from gcsfs.core import GCSFileSystem as CoreGCSFileSystem
+    from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+    monkeypatch.setattr(CoreGCSFileSystem, "_call", mock_call)
+    # HTTP is fully mocked, so skip credential refresh: filesystems created internally by
+    # frameworks (e.g. Lightning, Pandas) use default credentials, which may be a fake
+    # service account (GOOGLE_APPLICATION_CREDENTIALS in CI) that cannot be refreshed.
+    from gcsfs.credentials import GoogleCredentials
+
+    monkeypatch.setattr(GoogleCredentials, "apply", lambda self, out: None)
+    if fs_kind == "extended":
+        fs_cls = ExtendedGcsFileSystem
+
+        async def mock_lookup_bucket_layout(self, bucket):
+            return layouts.STANDARD
+
+        monkeypatch.setattr(
+            ExtendedGcsFileSystem, "_lookup_bucket_layout", mock_lookup_bucket_layout
+        )
+    else:
+        fs_cls = CoreGCSFileSystem
+
+    protocols = ("gcs", "gs")
+    # fsspec exposes the registry read-only; use the private dict to restore it exactly
+    saved_registry = {proto: _registry.get(proto) for proto in protocols}
+    for proto in protocols:
+        fsspec.register_implementation(proto, fs_cls, clobber=True)
+
+    class Harness:
+        def __init__(self):
+            self.user_agents = captured_user_agents
+            self.feature_headers = captured_feature_headers
+            self.fs = fs_cls(
+                token="anon",
+                project="test-project",
+                consistency="none",
+                skip_instance_cache=True,
+            )
+
+        def clear(self):
+            self.user_agents.clear()
+            self.feature_headers.clear()
+
+        def last_user_agent(self) -> str:
+            assert len(self.user_agents) > 0, "No User-Agent was captured!"
+            return self.user_agents[-1]
+
+    try:
+        yield Harness()
+    finally:
+        # Drop filesystems created by frameworks via fsspec while the mocks were active
+        fs_cls.clear_instance_cache()
+        # Restore the registry exactly as it was (including "not registered")
+        for proto, cls in saved_registry.items():
+            if cls is None:
+                _registry.pop(proto, None)
+            else:
+                _registry[proto] = cls
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-benchmarks",
+        action="store_true",
+        default=False,
+        help="run only perf benchmark tests",
+    )
+    parser.addoption(
+        "--run-benchmarks-infra",
+        action="store_true",
+        default=False,
+        help="run only benchmark infrastructure tests",
+    )
+
+
+def pytest_ignore_collect(collection_path, config):
+    path_str = str(collection_path)
+
+    if "gcsfs/tests/perf" in path_str:
+        # If no benchmark flags are passed, ignore the entire directory immediately.
+        if not (
+            config.getoption("--run-benchmarks")
+            or config.getoption("--run-benchmarks-infra")
+        ):
+            return True
+
+        benchmark_subdirs = {
+            "cat",
+            "delete",
+            "listing",
+            "read",
+            "rename",
+            "write",
+            "info",
+            "pipe",
+            "open",
+            "glob",
+            "put",
+            "comparison",
+            "cat_ranges",
+        }
+
+        path_parts = set(path_str.replace(os.sep, "/").split("/"))
+        is_test_file = os.path.basename(path_str).startswith("test_")
+        is_benchmark_test = (
+            is_test_file
+            and bool(benchmark_subdirs.intersection(path_parts))
+            and os.path.basename(os.path.dirname(path_str)) in benchmark_subdirs
+        )
+
+        # If only --run-benchmarks-infra is passed, ignore live benchmark tests.
+        if config.getoption("--run-benchmarks-infra") and not config.getoption(
+            "--run-benchmarks"
+        ):
+            if is_benchmark_test:
+                return True
+
+        # If only --run-benchmarks is passed, ignore the unit tests.
+        if config.getoption("--run-benchmarks") and not config.getoption(
+            "--run-benchmarks-infra"
+        ):
+            if is_test_file and not is_benchmark_test:
+                return True
+
+    return None

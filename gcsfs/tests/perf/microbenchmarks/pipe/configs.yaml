@@ -1,0 +1,17 @@
+common:
+  bucket_types:
+    - "regional"
+    - "zonal"
+    - "standard_rcu_z"
+    - "hns_rcu_z"
+  file_sizes_mb:
+    - 4096 # 4 GB
+  chunk_sizes_mb:
+    - 50 # 50 MB Default chunk size
+  rounds: 3
+
+scenarios:
+  - name: "pipe_file"
+
+  - name: "pipe_file_multi_process"
+    processes: [4, 8]

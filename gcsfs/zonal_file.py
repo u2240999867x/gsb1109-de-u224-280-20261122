@@ -1,0 +1,591 @@
+import logging
+import threading
+
+from fsspec import asyn
+from fsspec.caching import caches
+from google.cloud.storage.asyncio.async_appendable_object_writer import (
+    _DEFAULT_FLUSH_INTERVAL_BYTES,
+)
+
+from gcsfs import zb_hns_utils
+from gcsfs.core import (
+    DEFAULT_BLOCK_SIZE,
+    GCSFile,
+    _coalesce_generation,
+    _get_prefetcher_and_cache_config,
+    _resolve_open_generation_match,
+)
+from gcsfs.retry import HttpError
+from gcsfs.telemetry.wrapper import wrap_file_methods
+from gcsfs.utils import as_byte_buffer, is_empty_range
+from gcsfs.zb_hns_utils import DEFAULT_TEARDOWN_TIMEOUT_SECONDS, sync_teardown
+
+from .caching import (  # noqa: F401 Unused import to register GCS-Specific caches, Please do not remove it.
+    ReadAheadChunked,
+)
+
+logger = logging.getLogger("gcsfs.zonal_file")
+
+
+class ZonalFile(GCSFile):
+    """
+    ZonalFile is subclass of GCSFile and handles data operations from
+    Zonal and RCU buckets using a high-performance gRPC path.
+    """
+
+    def __init__(
+        self,
+        gcsfs,
+        path,
+        mode="rb",
+        block_size=DEFAULT_BLOCK_SIZE,
+        autocommit=True,
+        cache_type=None,
+        cache_options=None,
+        acl=None,
+        consistency="md5",
+        metadata=None,
+        content_type=None,
+        timeout=None,
+        fixed_key_metadata=None,
+        generation=None,
+        kms_key_name=None,
+        if_generation_match=None,
+        pool_size=zb_hns_utils.DEFAULT_CONCURRENCY,
+        finalize_on_close=None,
+        flush_interval_bytes=_DEFAULT_FLUSH_INTERVAL_BYTES,
+        **kwargs,
+    ):
+        """
+        Initializes the ZonalFile object.
+
+        For Zonal buckets, `finalize_on_close` defaults to `False` to optimize
+        for write throughput and keep the file appendable. For RCU buckets,
+        which use ZonalFile for writes only with `rcu_rapid_write=True`,
+        `finalize_on_close` defaults to `True`. When `finalize_on_close` is
+        `False`, exiting a `with` block or closing the file will not
+        automatically finalize it; to finalize the write, `.commit()` must be
+        called explicitly or `finalize_on_close` must be set to `True`.
+        On Zonal and RCU buckets an overwrite replaces the existing object as
+        soon as the writer opens, so a failed append, flush or commit leaves
+        the partially written object in its place, unfinalized. When other
+        code raises inside `ZonalFile`'s own `with` block
+        (`with fs.open(path, "wb") as f:`), closing skips opening the writer
+        if it has not been opened yet (leaving any existing object intact),
+        and otherwise leaves the object unfinalized, still holding the data
+        already written, unless `.commit()` has already finalized it. A
+        wrapper that only calls `close()` when its block exits, such as a
+        text-mode file or `fsspec.open()`, does not pass the exception on: it
+        still runs the closing flush (opening the writer even if nothing was
+        written yet, regardless of `finalize_on_close`) and finalizes the
+        object when `finalize_on_close` is `True`.
+
+        For Zonal and RCU buckets, `flush_interval_bytes` controls the write buffer size before
+        persisting data to GCS (default: 16 MiB). This value must be a multiple
+        of `_MAX_CHUNK_SIZE_BYTES` (2 MiB). Note that this higher default value may
+        increase memory usage.
+        """
+        bucket, key, path_generation = gcsfs.split_path(path)
+        generation = _coalesce_generation(generation, path_generation)
+        if not key:
+            raise OSError("Attempt to open a bucket")
+        if mode not in ("rb", "wb", "ab", "xb"):
+            raise NotImplementedError(
+                "Only read, write and append operations are currently supported for Zonal and RCU buckets."
+            )
+        # GCSFile.__init__ resolves the precondition as well, but only after the
+        # MRD pool below has been opened; validate first so an invalid value
+        # fails without a lookup.
+        _resolve_open_generation_match(mode, if_generation_match)
+        if finalize_on_close is None:
+            from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
+
+            if isinstance(gcsfs, ExtendedGcsFileSystem):
+                finalize_on_close = gcsfs._resolve_finalize_on_close(
+                    gcsfs._sync_lookup_bucket_layout(bucket)
+                )
+            else:
+                finalize_on_close = False
+        self.aaow = None
+        self.mrd_pool = None
+        self.finalize_on_close = finalize_on_close
+        self.finalized = False
+        self.mode = mode
+        self.flush_interval_bytes = flush_interval_bytes
+        self.gcsfs = gcsfs
+        self.pool_size = pool_size
+        caller_size = kwargs.pop("size", None)
+        object_size = None
+        if self.mode == "rb":
+            resolved_cache_type, resolved_cache_source = (
+                _get_prefetcher_and_cache_config(cache_type, kwargs)
+            )
+            # Reject an unknown cache type before checking out a pool and stream.
+            if resolved_cache_type not in caches:
+                raise KeyError(resolved_cache_type)
+        elif (
+            metadata
+            or fixed_key_metadata
+            or kms_key_name
+            or (content_type and content_type != "application/octet-stream")
+        ):
+            logger.warning(
+                "Zonal and RCU buckets do not support content_type, metadata, fixed_key_metadata, "
+                "or kms_key_name during upload. These parameters will be ignored."
+            )
+
+        # asyn.sync() does not cancel the checkout when the caller is interrupted
+        # (e.g. by Ctrl-C), so whichever side sees the abort closes the pool.
+        handoff_lock = threading.Lock()
+        handoff = {"aborted": False, "pool": None}
+
+        async def _checkout_pool():
+            pool = await self.gcsfs._mrd_pool_cache.get(
+                bucket,
+                key,
+                generation,
+                pool_size=self.pool_size,
+                cache_type=resolved_cache_type,
+                cache_source=resolved_cache_source,
+            )
+            with handoff_lock:
+                if not handoff["aborted"]:
+                    handoff["pool"] = pool
+                    return pool
+            await pool.close()  # The caller already gave up.
+
+        # The pool checkout and everything after it run under the cleanup below.
+        try:
+            if self.mode == "rb":
+                self.mrd_pool = asyn.sync(self.gcsfs.loop, _checkout_pool)
+            if self.mrd_pool is not None:
+                if getattr(self.mrd_pool, "details", None) is not None:
+                    self._details = self.mrd_pool.details
+                object_size = self.mrd_pool.persisted_size
+
+                if object_size is None:
+                    logger.warning(
+                        "AsyncMultiRangeDownloader (MRD) exists but has no 'persisted_size'. "
+                        "This may result in incorrect behavior for unfinalized objects."
+                    )
+
+            super().__init__(
+                gcsfs,
+                path,
+                mode,
+                block_size,
+                autocommit,
+                cache_type,
+                cache_options,
+                acl,
+                consistency,
+                metadata,
+                content_type,
+                timeout,
+                fixed_key_metadata,
+                generation,
+                kms_key_name,
+                if_generation_match=if_generation_match,
+                # Zonal buckets support append; this prevents GCSFile from forcing 'w' mode
+                _supports_append="a" in mode,
+                # pass persisted_size here so that Cache is initialized with correct object size
+                size=object_size if object_size is not None else caller_size,
+                **kwargs,
+            )
+        except BaseException:
+            with handoff_lock:
+                handoff["aborted"] = True
+                if self.mrd_pool is None:
+                    self.mrd_pool = handoff["pool"]
+            self.closed = True
+            # GCSFile.__init__ leaves the prefetcher to _close_impl(), which a
+            # file marked closed never reaches, so stop it here. Like
+            # _close_impl(), rely on BackgroundPrefetcher.close() to log its
+            # own teardown errors.
+            cache = getattr(self, "cache", None)
+            prefetcher = getattr(cache, "_prefetcher", None)
+            if prefetcher is not None:
+                cache._prefetcher = None
+                prefetcher.close()
+            if self.mrd_pool is not None:
+                pool, self.mrd_pool = self.mrd_pool, None
+                try:
+                    sync_teardown(
+                        self.gcsfs.loop,
+                        pool.close,
+                        timeout=timeout or DEFAULT_TEARDOWN_TIMEOUT_SECONDS,
+                        description=f"closing mrd_pool for {path} after failed open",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to close MRD pool during failed initialization cleanup: %s",
+                        e,
+                    )
+            raise
+
+    def _reopen_kwargs(self):
+        return {**super()._reopen_kwargs(), "pool_size": self.pool_size}
+
+    async def _init_mrd(self, bucket_name, object_name, generation=None):
+        """
+        Initializes the AsyncMultiRangeDownloader.
+        """
+        await self.gcsfs._get_grpc_client()
+        return await zb_hns_utils.init_mrd(
+            self.gcsfs.grpc_client, bucket_name, object_name, generation
+        )
+
+    async def _init_aaow(
+        self, bucket_name, object_name, generation=None, flush_interval_bytes=None
+    ):
+        """
+        Initializes the AsyncAppendableObjectWriter.
+        """
+        # generation is needed while creating aaow to append to existing objects
+        if "a" in self.mode and generation is None:
+            try:
+                # self.path might not be set yet, so reconstruct full path
+                info = await self.gcsfs._info(f"{bucket_name}/{object_name}")
+                generation = info.get("generation")
+            except FileNotFoundError:
+                # if file doesn't exist, we don't need generation
+                pass
+        return await self.gcsfs._init_aaow(
+            bucket_name,
+            object_name,
+            generation,
+            flush_interval_bytes,
+            if_generation_match=self.if_generation_match,
+        )
+
+    def _ensure_aaow(self):
+        if self.aaow is None:
+            try:
+                self.aaow = asyn.sync(
+                    self.gcsfs.loop,
+                    self._init_aaow,
+                    self.bucket,
+                    self.key,
+                    self.generation,
+                    self.flush_interval_bytes,
+                )
+            except BaseException:
+                # Like fsspec's flush() when _initiate_upload() fails: mark the
+                # file closed so that close() does not open the writer again.
+                self.closed = True
+                raise
+
+    def _fetch_range(
+        self,
+        start: int | None = None,
+        end: int | None = None,
+        chunk_lengths: list[int] | None = None,
+    ):
+        """
+        Overrides the default _fetch_range to implement the gRPC read path.
+
+        Args:
+            start: The start offset for requested bytes (included).
+            end: The end offset for requested bytes (excluded).
+            chunk_lengths: A list of integers specifying the sizes of sequential chunks to read
+                starting from the start offset. This cannot be used at the same time as the end parameter.
+
+        Returns:
+            A single bytes object if chunk_lengths is None, or a list of bytes objects corresponding
+            to the requested chunk sizes. If the range cannot be satisfied, it returns empty bytes
+            or a list with empty bytes.
+
+        Raises:
+            ValueError: If both end and chunk_lengths are provided.
+            RuntimeError: If an underlying fetch operation fails for an unexpected reason.
+        """
+        if end is not None and chunk_lengths is not None:
+            raise ValueError(
+                "The end and chunk_lengths arguments are mutually exclusive and cannot be used together."
+            )
+
+        # Size can be stale for zonal buckets, hence not passing as part of is_empty_range check.
+        if is_empty_range(start, end):
+            return b"" if chunk_lengths is None else [b""]
+
+        async def _do_fetch():
+            if chunk_lengths is not None:
+                return await self.gcsfs._fetch_range_split(
+                    self.path,
+                    concurrency=self.concurrency,
+                    start=start,
+                    chunk_lengths=chunk_lengths,
+                    size=self.size,
+                    mrd=self.mrd_pool,
+                    cache_type=self.cache_type,
+                    cache_source=self.cache_source,
+                )
+
+            return await self.gcsfs._cat_file(
+                self.path,
+                start=start,
+                end=end,
+                concurrency=self.concurrency,
+                mrd=self.mrd_pool,
+                cache_type=self.cache_type,
+                cache_source=self.cache_source,
+            )
+
+        try:
+            return asyn.sync(self.fs.loop, _do_fetch)
+        except (RuntimeError, HttpError) as e:
+            if "not satisfiable" in str(e) or "InvalidRange" in str(e):
+                return b"" if chunk_lengths is None else [b""]
+            raise
+
+    async def _async_fetch_range(self, start_offset, total_size, split_factor=1):
+        """The native coroutine called by the BackgroundPrefetcher."""
+        return await self.gcsfs._concurrent_mrd_fetch(
+            start_offset, total_size, split_factor, self.mrd_pool
+        )
+
+    def write(self, data):
+        """
+        Writes data using AsyncAppendableObjectWriter.
+
+        Unlike standard GCSFile which buffers writes in an in-memory buffer before
+        uploading chunks, ZonalFile does not require an internal write buffer here.
+        The underlying AsyncAppendableObjectWriter manages its own internal buffering,
+        streaming, and chunk flushes. Data is passed directly to `self.aaow.append()`,
+        avoiding redundant memory copies.
+
+        For more details, see the documentation for AsyncAppendableObjectWriter:
+        https://github.com/googleapis/python-storage/blob/9e6fefdc24a12a9189f7119bc9119e84a061842f/google/cloud/storage/_experimental/asyncio/async_appendable_object_writer.py#L38
+        """
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+        if not self.writable():
+            raise ValueError("File not in write mode.")
+        if self.forced:
+            raise ValueError("This file has been force-flushed, can only close")
+
+        # Accept any bytes-like object, as a binary file does. The writer
+        # truth-tests and len()s its argument, which fails for a numpy array
+        # and counts elements, not bytes, for a typed buffer. bytes is passed
+        # through as is, so the writer's io.BytesIO shares it without a copy.
+        data = as_byte_buffer(data)
+
+        # Lazily initialize the AsyncAppendableObjectWriter on the first write to avoid
+        # unnecessary object creation for files that are opened but never written to.
+        self._ensure_aaow()
+        try:
+            asyn.sync(self.gcsfs.loop, self.aaow.append, data)
+        except BaseException:
+            self._abort_write()
+            raise
+        bytes_written = len(data)
+        self.loc += bytes_written
+        return bytes_written
+
+    def flush(self, force=False):
+        """
+        Flushes the AsyncAppendableObjectWriter, sending all buffered data
+        to the server.
+        """
+        if self.closed:
+            raise ValueError("Flush on closed file.")
+        if self.readable():
+            # no-op to flush on read-mode
+            return
+        if self.forced:
+            if force:
+                raise ValueError("Force flush cannot be called more than once.")
+            return
+        if self.finalized:
+            logger.warning("File is already finalized. Ignoring flush call.")
+            return
+        if force:
+            self.forced = True
+
+        # Case 1: Intermediate flush (force=False)
+        # If no data has been written (aaow is None), there is nothing to flush.
+        if self.aaow is None and not force:
+            return
+
+        # Case 2: Closing flush (force=True) or some data has been written (AAOW exists)
+        # We must ensure aaow exists so that the file is created even for empty writes,
+        # and to flush any buffered data if it exists.
+        self._ensure_aaow()
+
+        try:
+            asyn.sync(self.gcsfs.loop, self.aaow.flush)
+        except BaseException:
+            self._abort_write()
+            raise
+
+    def commit(self):
+        """
+        Commits the write by finalizing the AsyncAppendableObjectWriter.
+        """
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+        if not self.writable():  # No-op
+            logger.warning("File not in write mode. Ignoring commit call.")
+            return
+        if self.finalized:  # No-op
+            logger.warning(
+                "This file has already been finalized. Ignoring commit call."
+            )
+            return
+
+        self._ensure_aaow()
+        try:
+            asyn.sync(self.gcsfs.loop, self.aaow.finalize)
+        except BaseException:
+            self._abort_write()
+            raise
+        self.finalized = True
+        # File is already finalized, avoid finalizing again on close
+        self.finalize_on_close = False
+
+    def _abort_write(self):
+        """Makes the file close-only after a failed append, flush or finalize,
+        or after the `with` block raised.
+
+        The SDK may have closed the stream, so close() must not flush it again,
+        and the partially written object is not finalized.
+        """
+        if not self.finalized:
+            self.finalize_on_close = False
+        self.forced = True
+
+    def discard(self):
+        """Discard is not applicable for Zonal and RCU buckets. Log a warning instead."""
+        logger.warning(
+            "Discard is not applicable for Zonal and RCU buckets. \
+            Data is uploaded via streaming and cannot be cancelled."
+        )
+
+    def _initiate_upload(self):
+        """Initiates the upload for Zonal and RCU buckets using gRPC."""
+        from gcsfs.extended_gcsfs import initiate_upload
+
+        self.location = asyn.sync(
+            self.gcsfs.loop,
+            initiate_upload,
+            self.gcsfs,
+            self.bucket,
+            self.key,
+            self.content_type,
+            self.metadata,
+            self.fixed_key_metadata,
+            mode="create" if "x" in self.mode else "overwrite",
+            if_generation_match=self.if_generation_match,
+            kms_key_name=self.kms_key_name,
+            timeout=self.timeout,
+        )
+
+    def _simple_upload(self):
+        """Performs a simple upload for Zonal and RCU buckets using gRPC."""
+        from gcsfs.extended_gcsfs import simple_upload
+
+        self.buffer.seek(0)
+        data = self.buffer.read()
+        asyn.sync(
+            self.gcsfs.loop,
+            simple_upload,
+            self.gcsfs,
+            self.bucket,
+            self.key,
+            data,
+            self.metadata,
+            self.consistency,
+            self.content_type,
+            self.fixed_key_metadata,
+            mode="create" if "x" in self.mode else "overwrite",
+            if_generation_match=self.if_generation_match,
+            kms_key_name=self.kms_key_name,
+            timeout=self.timeout,
+            finalize_on_close=self.finalize_on_close,
+        )
+
+    def _upload_chunk(self, final=False):
+        raise NotImplementedError(
+            "_upload_chunk is not implemented yet for ZonalFile. Please use write() instead."
+        )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Code inside the `with` block raised: still close the file, but abort
+        # any uncommitted write (skipping the closing flush, not opening a
+        # writer if nothing has opened it yet, and leaving any partial object
+        # unfinalized) and keep close errors from masking the active exception.
+        # Bytes already written are not rolled back: closing the stream
+        # persists them without the flush.
+        if exc_type is not None:
+            if self.writable() and not self._close_deferred:
+                if self.aaow is None:
+                    self.finalize_on_close = False
+                    self.closed = True
+                else:
+                    self._abort_write()
+            try:
+                return super().__exit__(exc_type, exc_value, traceback)
+            except Exception as e:
+                if not self._close_deferred:
+                    self.closed = True
+                logger.warning(
+                    "Failed to close %s after with-block exception: %r",
+                    self.path,
+                    e,
+                )
+                return False
+        return super().__exit__(exc_type, exc_value, traceback)
+
+    def _close_impl(self):
+        errors = []
+
+        # A failed closing flush must not skip the teardown below, and the
+        # partially written object must not be finalized.
+        try:
+            super()._close_impl()
+        except Exception as e:
+            errors.append(e)
+            if not self.finalized:
+                self.finalize_on_close = False
+            if self.aaow is not None:
+                # fsspec skips its cache invalidation when the closing flush
+                # fails, but the open writer has already replaced the object.
+                self.fs.invalidate_cache(self.path)
+                self.fs.invalidate_cache(self.fs._parent(self.path))
+
+        timeout = self.timeout or DEFAULT_TEARDOWN_TIMEOUT_SECONDS
+
+        # Teardown the read-side MRD pool if initialized.
+        if hasattr(self, "mrd_pool") and self.mrd_pool:
+            try:
+                sync_teardown(
+                    self.gcsfs.loop,
+                    self.mrd_pool.close,
+                    timeout=timeout,
+                    description=f"closing mrd_pool for {self.path}",
+                )
+            except Exception as e:
+                errors.append(e)
+
+        # Finalize and close the write-side AAOW stream.
+        # Wrapped independently so a read pool failure does not abandon write finalization.
+        if self.aaow and self.aaow._is_stream_open:
+            try:
+                sync_teardown(
+                    self.gcsfs.loop,
+                    zb_hns_utils.close_aaow,
+                    self.aaow,
+                    timeout=timeout,
+                    finalize_on_close=self.finalize_on_close,
+                    description=f"finalizing AsyncAppendableObjectWriter for {self.path}",
+                )
+            except Exception as e:
+                errors.append(e)
+
+        if errors:
+            raise errors[0]
+
+
+# Wrap ZonalFile's own overrides (inherited GCSFile methods are already wrapped) so that
+# background fetches, writes and deferred close keep the opening framework context.
+wrap_file_methods(ZonalFile)

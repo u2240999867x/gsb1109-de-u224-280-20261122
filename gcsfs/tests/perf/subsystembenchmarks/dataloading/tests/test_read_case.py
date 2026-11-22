@@ -1,0 +1,312 @@
+import contextlib
+import statistics
+from dataclasses import dataclass
+
+import pytest
+
+from gcsfs.tests.perf.subsystembenchmarks.dataloading import read_case
+from gcsfs.tests.perf.subsystembenchmarks.dataloading.configurator import ReadParameters
+
+
+@pytest.fixture(autouse=True)
+def _bucket_env(monkeypatch):
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_BUCKET_PREFIX", "test-prefix")
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_PROJECT", "test-project")
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_LOCATION", "us-central1")
+
+
+_DEFAULT_MANIFEST = {
+    "file_count": 2,
+    "corpus_bytes": 1000,
+    "sample_count": 10,
+    "fmt": "pretok_parquet",
+    "rows_per_file": 5,
+}
+
+
+@dataclass
+class _P(ReadParameters):
+    LOADER_TAG = "fk"
+    FMT_TAGS = {"pretok_parquet": "ptpq"}
+
+    def ingest(self, prefix):
+        return self._manifest
+
+
+class _FakeDriver:
+    formats = ("pretok_parquet",)
+
+    def __init__(self, rows, build_seconds=0.5, extra_columns=None):
+        self._rows = rows
+        self._build = build_seconds
+        self._extra = extra_columns or {}
+
+    def run_read(self, prefix, params, manifest):
+        from gcsfs.tests.perf.subsystembenchmarks.dataloading.driver import ReadResult
+
+        return ReadResult(
+            durations=[1.0, 2.0],
+            rows_per_epoch=[self._rows, self._rows],
+            ttfb_seconds=0.25,
+            build_seconds=self._build,
+            extra_columns=self._extra,
+        )
+
+
+class _Bench:
+    def __init__(self):
+        self.extra_info = {}
+        self.group = None
+
+    def pedantic(self, fn, rounds, iterations, warmup_rounds):
+        fn()
+
+
+class _Monitor:
+    max_cpu = 1.0
+    max_mem = 2.0
+    net_recv = 100.0
+    net_sent = 50.0
+    duration = 2.0
+    vcpus = 4
+
+    def __call__(self):
+        return contextlib.nullcontext(self)
+
+
+def _params(manifest=None, **over):
+    kw = dict(
+        name="c",
+        bucket_name="",
+        bucket_type="regional",
+        rounds=2,
+        scenario="read",
+        framework="fake",
+        fmt="pretok_parquet",
+        file_count=2,
+        rows_per_file=5,
+        access="sequential",
+        num_workers=2,
+        batch_size=4,
+    )
+    kw.update(over)
+    p = _P(**kw)
+    p._manifest = manifest if manifest is not None else _DEFAULT_MANIFEST
+    return p
+
+
+def _local_bucket_ctx(tmp_path):
+    from gcsfs.tests.perf.subsystembenchmarks.dataloading.bucket import (
+        local_case_bucket,
+    )
+
+    return local_case_bucket(tmp_path)
+
+
+def test_run_read_case_publishes_throughput_and_passes_guard(tmp_path, monkeypatch):
+    monkeypatch.setenv("MACHINE_TYPE", "c4-standard-192")
+    monkeypatch.delenv("GCE_MACHINE_TYPE", raising=False)
+    monkeypatch.setenv("COMMIT_SHA", "source123")
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_REQUIREMENTS_OVERRIDE", "gcsfs==1.0")
+    monkeypatch.setenv(
+        "GCSFS_SUBSYSTEM_REQUIREMENTS_RESOLVED",
+        '[{"name":"gcsfs","version":"1.0"}]',
+    )
+    monkeypatch.setenv("GCSFS_SUBSYSTEM_SWEEP_AXES", "workers workers prefetch")
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+
+    bench = _Bench()
+    params = _params()
+    read_case.run_read_case(
+        bench,
+        _Monitor(),
+        params,
+        _FakeDriver(rows=10, extra_columns={"fake_driver_col": 7}),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+    assert bench.group == "read"
+    assert bench.extra_info["fake_driver_col"] == 7
+    assert bench.extra_info["dataset_sample_count"] == 10
+    assert bench.extra_info["workload_implementation"] == "fake"
+    assert bench.extra_info["config_sweep_axis"] == "baseline"
+    assert bench.extra_info["mean_samples_per_second"] == statistics.mean(
+        [10 / 1.0, 10 / 2.0]
+    )
+    assert bench.extra_info["dataloader_num_workers"] == 2
+    assert bench.extra_info["measurement_round_count"] == 2
+    assert bench.extra_info["machine_type"] == "c4-standard-192"
+    assert bench.extra_info["benchmark_source_commit_sha"] == "source123"
+    assert bench.extra_info["requirements_override"] == "gcsfs==1.0"
+    assert (
+        bench.extra_info["requirements_resolved"]
+        == '[{"name":"gcsfs","version":"1.0"}]'
+    )
+    assert bench.extra_info["config_sweep_axes_requested"] == "workers prefetch"
+    assert "gcsfs_commit_sha" not in bench.extra_info
+    assert {
+        "framework",
+        "sweep_axis",
+        "sample_count",
+        "dataset_read_throughput_mean_samples_per_second",
+        "data_loader_worker_count",
+        "rounds",
+    }.isdisjoint(bench.extra_info)
+
+
+def test_run_read_case_publishes_dataset_build_time(tmp_path, monkeypatch):
+    """Dataset initialization latency uses the macrobenchmark field name."""
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+
+    bench = _Bench()
+    read_case.run_read_case(
+        bench,
+        _Monitor(),
+        _params(),
+        _FakeDriver(rows=10, build_seconds=1.75),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+    assert bench.extra_info["dataset_build_time"] == 1.75
+
+
+def test_run_read_case_fails_partial_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+
+    man = {**_DEFAULT_MANIFEST, "sample_count": 99}
+
+    with pytest.raises(ValueError, match="partial read"):
+        read_case.run_read_case(
+            _Bench(),
+            _Monitor(),
+            _params(manifest=man),
+            _FakeDriver(rows=10),
+            bucket_ctx=_local_bucket_ctx(tmp_path),
+        )
+
+
+def test_run_read_case_rejects_unsupported_format(tmp_path):
+    class _JsonOnly(_FakeDriver):
+        formats = ("pretok_jsonl",)
+
+    with pytest.raises(ValueError, match="format"):
+        read_case.run_read_case(
+            _Bench(),
+            _Monitor(),
+            _params(fmt="pretok_parquet"),
+            _JsonOnly(rows=10),
+            bucket_ctx=_local_bucket_ctx(tmp_path),
+        )
+
+
+def test_run_read_case_invokes_warm_if_needed_before_timing(tmp_path, monkeypatch):
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+    order = []
+
+    def fake_warm(prefix, bucket_type):
+        order.append(("warm", bucket_type))
+        return 0
+
+    monkeypatch.setattr(read_case.rapid_cache, "warm_if_needed", fake_warm)
+
+    class _OrderDriver(_FakeDriver):
+        def run_read(self, prefix, params, manifest):
+            order.append(("run_read", params.bucket_type))
+            return super().run_read(prefix, params, manifest)
+
+    read_case.run_read_case(
+        _Bench(),
+        _Monitor(),
+        _params(bucket_type="rapid_cache_warm"),
+        _OrderDriver(rows=10),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+    assert order == [("warm", "rapid_cache_warm"), ("run_read", "rapid_cache_warm")]
+
+
+def test_run_read_case_forces_single_round_for_rapid_cache_cold(tmp_path, monkeypatch):
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+    monkeypatch.setattr(read_case.rapid_cache, "warm_if_needed", lambda *a, **kw: 0)
+    seen_rounds = []
+
+    class _RoundDriver(_FakeDriver):
+        def run_read(self, prefix, params, manifest):
+            from gcsfs.tests.perf.subsystembenchmarks.dataloading.driver import (
+                ReadResult,
+            )
+
+            seen_rounds.append((params.bucket_type, params.rounds))
+            return ReadResult(
+                durations=[1.0] * params.rounds,
+                rows_per_epoch=[self._rows] * params.rounds,
+                ttfb_seconds=0.25,
+                build_seconds=self._build,
+            )
+
+    cold_bench = _Bench()
+    read_case.run_read_case(
+        cold_bench,
+        _Monitor(),
+        _params(bucket_type="rapid_cache_cold", rounds=3),
+        _RoundDriver(rows=10),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+    warm_bench = _Bench()
+    read_case.run_read_case(
+        warm_bench,
+        _Monitor(),
+        _params(bucket_type="rapid_cache_warm", rounds=3),
+        _RoundDriver(rows=10),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+    assert seen_rounds == [("rapid_cache_cold", 1), ("rapid_cache_warm", 3)]
+    assert cold_bench.extra_info["measurement_round_count"] == 1
+    assert warm_bench.extra_info["measurement_round_count"] == 3
+
+
+@pytest.mark.parametrize(
+    "bucket_type",
+    ["standard_rcu_warm", "standard_rcu_cold", "hns_rcu_z"],
+)
+def test_run_read_case_stages_checks_and_warms_rcu_corpora_before_timing(
+    tmp_path, monkeypatch, bucket_type
+):
+    monkeypatch.setattr(read_case, "assert_fsspec_gcsfs", lambda prefix: None)
+    events = []
+    monkeypatch.setattr(
+        read_case.rcu,
+        "assert_storage_class",
+        lambda prefix, bt: events.append(("check", prefix, bt)),
+    )
+    monkeypatch.setattr(
+        read_case.rcu,
+        "warm_if_needed",
+        lambda prefix, bt: events.append(("warm", prefix, bt)),
+    )
+
+    def ingest(prefix):
+        events.append(("ingest", prefix))
+        return _DEFAULT_MANIFEST
+
+    params = _params(bucket_type=bucket_type, rounds=3)
+    params.ingest = ingest
+
+    class _RoundDriver(_FakeDriver):
+        def run_read(self, prefix, params, manifest):
+            events.append(("run_read", params.rounds))
+            return super().run_read(prefix, params, manifest)
+
+    read_case.run_read_case(
+        _Bench(),
+        _Monitor(),
+        params,
+        _RoundDriver(rows=10),
+        bucket_ctx=_local_bucket_ctx(tmp_path),
+    )
+
+    prefix = f"{tmp_path}/c/data/"
+    # Unlike rapid_cache_cold, rcu_cold keeps every configured round.
+    assert events == [
+        ("ingest", prefix),
+        ("check", prefix, bucket_type),
+        ("warm", prefix, bucket_type),
+        ("run_read", 3),
+    ]

@@ -1,0 +1,142 @@
+common:
+  bucket_types:
+    - "regional"
+    - "zonal"
+    - "hns"
+    - "standard_rcu_z"
+    - "standard_rcu_warm"
+    - "standard_rcu_cold"
+    - "hns_rcu_z"
+    - "hns_rcu_warm"
+    - "hns_rcu_cold"
+  file_sizes_mb:
+    - 1024 # 1 GB
+  num_ranges_list:
+    - 200
+  batch_sizes:
+    - 64
+  rounds: 3
+
+scenarios:
+  - name: "cat_ranges_seq"
+    pattern: "seq"
+    files: 1
+    chunk_sizes_mb:
+      - [1] # 1 MB uniform
+
+  - name: "cat_ranges_rand"
+    pattern: "rand"
+    files: 1
+    chunk_sizes_mb:
+      - [1] # 1 MB uniform
+
+  - name: "cat_ranges_mixed_sizes"
+    pattern: "rand"
+    files: 1
+    chunk_sizes_mb:
+      - [0.0625, 1, 4, 16] # 64KB, 1MB, 4MB, 16MB varied in one call
+
+  - name: "cat_ranges_multi_file"
+    pattern: "rand"
+    files: 5
+    chunk_sizes_mb:
+      - [1]
+
+  - name: "cat_ranges_batch_size_sweep"
+    pattern: "rand"
+    files: 1
+    num_ranges_list:
+      - 200
+    batch_sizes:
+      - 16
+      - 64
+      - 128
+    chunk_sizes_mb:
+      - [1]
+
+  - name: "cat_ranges_large_file_large_ranges"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 10240 # 10 GB
+    num_ranges_list:
+      - 1000
+    batch_sizes:
+      - 64
+    chunk_sizes_mb:
+      - [0.0625, 1, 4, 16]
+
+  # Range COUNT: 1000 / 2000 / 5000 uniform 1 MB ranges (1 / 2 / 5 GB per
+  # call) on a 10 GB object. Per-range and per-message overhead dominates
+  # here, so this is the case that catches client-side CPU regressions
+  # (request building, response parsing, buffer handling) rather than
+  # bandwidth. Throughput should stay flat as the count grows.
+  - name: "cat_ranges_many_ranges_sweep"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 10240 # 10 GB
+    num_ranges_list:
+      - 1000
+      - 2000
+      - 5000
+    chunk_sizes_mb:
+      - [1]
+
+  # Range count with a SIZE MIX: 64 KB / 1 MB / 4 MB ranges on a 50 GB
+  # object (~1.7 / 3.4 / 8.4 GB per call). Same per-range overhead as above,
+  # plus unequal ranges that must be balanced across concurrent streams and
+  # offsets well past 4 GB.
+  - name: "cat_ranges_many_mixed_ranges"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 51200 # 50 GB
+    num_ranges_list:
+      - 1000
+      - 2000
+      - 5000
+    chunk_sizes_mb:
+      - [0.0625, 1, 4]
+
+  # FEW LARGE ranges: 8 x 64 MB / 256 MB / 1 GB (0.5 / 2 / 8 GB per call).
+  # Per-range bandwidth dominates and there are fewer ranges than the
+  # default concurrency, so this shows whether large ranges are split across
+  # streams or each runs on a single stream.
+  - name: "cat_ranges_large_ranges_sweep"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 10240 # 10 GB
+    num_ranges_list:
+      - 8
+    chunk_sizes_mb:
+      - [64]
+      - [256]
+      - [1024]
+
+  # SINGLE 1 GB range: nothing to parallelize across ranges. Measures the
+  # one-range fast path and whether a lone large range is split across
+  # streams; this is where a one-stream-per-range implementation bottoms out.
+  - name: "cat_ranges_single_1gb_range"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 10240 # 10 GB
+    num_ranges_list:
+      - 1
+    chunk_sizes_mb:
+      - [1024]
+
+  # VERY LARGE object with extreme size skew: 32 ranges from 1 MB to 1 GB on
+  # a 50 GB object (~10 GB per call, the per-call memory ceiling). Checks
+  # that one 1 GB range does not serialize behind, or starve, the small ones.
+  - name: "cat_ranges_huge_file_mixed"
+    pattern: "rand"
+    files: 1
+    file_sizes_mb:
+      - 51200 # 50 GB
+    num_ranges_list:
+      - 32
+    chunk_sizes_mb:
+      - [1, 16, 256, 1024]
