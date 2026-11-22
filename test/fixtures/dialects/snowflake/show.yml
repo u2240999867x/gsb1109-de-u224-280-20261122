@@ -1,0 +1,151 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 8082d71277df6bcd722277539c66c325f0af77c23e5a96162a922129cbd31dc5
+file:
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: PASSWORD
+    - keyword: POLICIES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: CORTEX
+    - keyword: SEARCH
+    - keyword: SERVICES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: RESOURCE
+    - keyword: MONITORS
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: WORKSPACES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: EVENT
+    - keyword: TABLES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: EVENT
+    - keyword: TABLES
+    - keyword: LIKE
+    - quoted_literal: "'%sales%'"
+    - keyword: IN
+    - keyword: SCHEMA
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_schema
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: HYBRID
+    - keyword: TABLES
+    - keyword: IN
+    - keyword: DATABASE
+    - object_reference:
+        naked_identifier: my_db
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: ICEBERG
+    - keyword: TABLES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: TERSE
+    - keyword: EXTERNAL
+    - keyword: TABLES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: TABLES
+    - keyword: IN
+    - keyword: APPLICATION
+    - object_reference:
+        naked_identifier: my_app
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: TABLES
+    - keyword: IN
+    - keyword: APPLICATION
+    - keyword: PACKAGE
+    - object_reference:
+        naked_identifier: my_app_package
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: TERSE
+    - keyword: VIEWS
+    - keyword: LIKE
+    - quoted_literal: "'%sales%'"
+    - keyword: IN
+    - keyword: APPLICATION
+    - keyword: PACKAGE
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_app_package
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: SCHEMAS
+    - keyword: IN
+    - keyword: APPLICATION
+    - object_reference:
+        naked_identifier: my_app
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: DYNAMIC
+    - keyword: TABLES
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: DYNAMIC
+    - keyword: TABLES
+    - keyword: LIKE
+    - quoted_literal: "'product_%'"
+    - keyword: IN
+    - keyword: SCHEMA
+    - object_reference:
+      - naked_identifier: mydb
+      - dot: .
+      - naked_identifier: myschema
+- statement_terminator: ;
+- statement:
+    show_statement:
+    - keyword: SHOW
+    - keyword: DYNAMIC
+    - keyword: TABLES
+    - keyword: IN
+    - keyword: ACCOUNT
+    - keyword: STARTS
+    - keyword: WITH
+    - quoted_literal: "'p'"
+    - limit_clause:
+        keyword: LIMIT
+        numeric_literal: '10'
+- statement_terminator: ;

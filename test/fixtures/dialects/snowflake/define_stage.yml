@@ -1,0 +1,166 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: ae93fbf87337ed896625d8901d935db4d4df00e4730d94b515a9c4ec56ccaf32
+file:
+- statement:
+    define_stage_statement:
+    - keyword: DEFINE
+    - keyword: STAGE
+    - object_reference:
+      - naked_identifier: FINANCE_DB
+      - dot: .
+      - naked_identifier: RAW
+      - dot: .
+      - naked_identifier: TASTY_BYTES_ORDERS
+    - comment_equals_clause:
+        keyword: COMMENT
+        comparison_operator:
+          raw_comparison_operator: '='
+        quoted_literal: "'Internal stage for uploading files'"
+- statement_terminator: ;
+- statement:
+    define_stage_statement:
+    - keyword: DEFINE
+    - keyword: STAGE
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_schema
+      - dot: .
+      - naked_identifier: gcs_events_stage
+    - keyword: URL
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bucket_path: "'gcs://my-bucket/'"
+    - stage_parameters:
+        keyword: STORAGE_INTEGRATION
+        comparison_operator:
+          raw_comparison_operator: '='
+        object_reference:
+          naked_identifier: my_gcs_int
+    - keyword: FILE_FORMAT
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - file_format_segment:
+        bracketed:
+          start_bracket: (
+          keyword: FORMAT_NAME
+          comparison_operator:
+            raw_comparison_operator: '='
+          quoted_literal: "'my_db.my_schema.my_json_format'"
+          end_bracket: )
+    - comment_equals_clause:
+        keyword: COMMENT
+        comparison_operator:
+          raw_comparison_operator: '='
+        quoted_literal: "'events GCS stage'"
+- statement_terminator: ;
+- statement:
+    define_stage_statement:
+    - keyword: DEFINE
+    - keyword: STAGE
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_schema
+      - dot: .
+      - naked_identifier: s3_stage
+    - keyword: URL
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bucket_path: "'s3://my-bucket/files/'"
+    - stage_parameters:
+        keyword: STORAGE_INTEGRATION
+        comparison_operator:
+          raw_comparison_operator: '='
+        object_reference:
+          naked_identifier: my_s3_int
+    - keyword: DIRECTORY
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bracketed:
+      - start_bracket: (
+      - keyword: ENABLE
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - boolean_literal: 'TRUE'
+      - keyword: AUTO_REFRESH
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - boolean_literal: 'TRUE'
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    define_stage_statement:
+    - keyword: DEFINE
+    - keyword: STAGE
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_schema
+      - dot: .
+      - naked_identifier: azure_stage
+    - keyword: URL
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bucket_path: "'azure://myaccount.blob.core.windows.net/mycontainer/files/'"
+    - stage_parameters:
+        keyword: STORAGE_INTEGRATION
+        comparison_operator:
+          raw_comparison_operator: '='
+        object_reference:
+          naked_identifier: my_azure_int
+    - keyword: DIRECTORY
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bracketed:
+      - start_bracket: (
+      - keyword: ENABLE
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - boolean_literal: 'TRUE'
+      - keyword: NOTIFICATION_INTEGRATION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - naked_identifier: my_notification_int
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    define_stage_statement:
+    - keyword: DEFINE
+    - keyword: STAGE
+    - object_reference:
+      - naked_identifier: my_db
+      - dot: .
+      - naked_identifier: my_schema
+      - dot: .
+      - naked_identifier: var_url_stage
+    - keyword: URL
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - variable: $STAGE_URL
+    - stage_parameters:
+        keyword: STORAGE_INTEGRATION
+        comparison_operator:
+          raw_comparison_operator: '='
+        object_reference:
+          naked_identifier: my_gcs_int
+    - keyword: DIRECTORY
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - bracketed:
+        start_bracket: (
+        keyword: ENABLE
+        comparison_operator:
+          raw_comparison_operator: '='
+        boolean_literal: 'TRUE'
+        end_bracket: )
+    - comment_equals_clause:
+        keyword: COMMENT
+        comparison_operator:
+          raw_comparison_operator: '='
+        quoted_literal: "'external stage with variable URL'"
+- statement_terminator: ;

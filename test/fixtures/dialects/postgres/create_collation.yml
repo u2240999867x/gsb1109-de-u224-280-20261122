@@ -1,0 +1,105 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: b6d879c98645e8b5f63e7a0ad7b5cf0c0afdf78b916ee9ddd8f0ed5056b1a82b
+file:
+- statement:
+    create_collation_statement:
+    - keyword: CREATE
+    - keyword: COLLATION
+    - object_reference:
+        naked_identifier: numeric
+    - definition_parameters:
+        bracketed:
+        - start_bracket: (
+        - definition_parameter:
+          - properties_naked_identifier: provider
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - properties_naked_identifier: icu
+        - comma: ','
+        - definition_parameter:
+            properties_naked_identifier: locale
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "'en@colNumeric=yes'"
+        - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_collation_statement:
+    - keyword: CREATE
+    - keyword: COLLATION
+    - object_reference:
+        naked_identifier: french
+    - definition_parameters:
+        bracketed:
+          start_bracket: (
+          definition_parameter:
+            properties_naked_identifier: locale
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "'fr_FR.utf8'"
+          end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_collation_statement:
+    - keyword: CREATE
+    - keyword: COLLATION
+    - object_reference:
+        naked_identifier: german_phonebook
+    - definition_parameters:
+        bracketed:
+        - start_bracket: (
+        - definition_parameter:
+          - properties_naked_identifier: provider
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - properties_naked_identifier: icu
+        - comma: ','
+        - definition_parameter:
+            properties_naked_identifier: locale
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "'de-u-co-phonebk'"
+        - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_collation_statement:
+    - keyword: CREATE
+    - keyword: COLLATION
+    - object_reference:
+        naked_identifier: german
+    - keyword: FROM
+    - object_reference:
+        quoted_identifier: '"de_DE"'
+- statement_terminator: ;
+- statement:
+    create_collation_statement:
+    - keyword: CREATE
+    - keyword: COLLATION
+    - object_reference:
+        naked_identifier: c
+    - definition_parameters:
+        bracketed:
+        - start_bracket: (
+        - definition_parameter:
+          - properties_naked_identifier: provider
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - properties_naked_identifier: icu
+        - comma: ','
+        - definition_parameter:
+            properties_naked_identifier: locale
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "'und'"
+        - comma: ','
+        - definition_parameter:
+          - properties_naked_identifier: deterministic
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - properties_naked_identifier: 'off'
+        - end_bracket: )
+- statement_terminator: ;

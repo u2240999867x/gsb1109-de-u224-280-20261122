@@ -1,0 +1,226 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 719695d9f72ec148ced2393d7f4ea80e835d1a9f9c2dc617b1d001e7ae46effc
+file:
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: TEXT
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'FALSE'
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: OR
+    - keyword: REPLACE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: OR
+    - keyword: REPLACE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: OR
+    - keyword: REPLACE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+    - comment_equals_clause:
+        keyword: COMMENT
+        comparison_operator:
+          raw_comparison_operator: '='
+        quoted_literal: "'My Comment'"
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - object_reference:
+        naked_identifier: my_access_policy
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+    - comment_equals_clause:
+        keyword: COMMENT
+        comparison_operator:
+          raw_comparison_operator: '='
+        quoted_literal: "'My Comment'"
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - object_reference:
+        quoted_identifier: '"My-Access-Policy"'
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: val
+          data_type:
+            data_type_identifier: VARCHAR
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    create_row_access_policy_statement:
+    - keyword: CREATE
+    - keyword: ROW
+    - keyword: ACCESS
+    - keyword: POLICY
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - object_reference:
+      - naked_identifier: DUMMY_SCHEMA
+      - dot: .
+      - naked_identifier: DATA_FIREWALL
+    - keyword: AS
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          parameter: FOO
+          data_type:
+            data_type_identifier: VARCHAR
+            bracketed_arguments:
+              bracketed:
+                start_bracket: (
+                numeric_literal: '16777216'
+                end_bracket: )
+          end_bracket: )
+    - keyword: RETURNS
+    - keyword: BOOLEAN
+    - function_assigner: ->
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: FOO
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "'allowed'"
+          end_bracket: )
+- statement_terminator: ;

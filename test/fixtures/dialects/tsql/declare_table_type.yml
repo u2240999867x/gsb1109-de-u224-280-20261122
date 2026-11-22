@@ -1,0 +1,181 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 2abc4d8c8f9263d4f84374f3e9ec7ef3eb9dc8cf2258687af4258550a79b2106
+file:
+  batch:
+  - statement:
+      declare_segment:
+      - keyword: DECLARE
+      - parameter: '@MyTableVar'
+      - keyword: TABLE
+      - bracketed:
+        - start_bracket: (
+        - column_definition:
+            naked_identifier: EmpID
+            data_type:
+              keyword: INT
+            column_constraint_segment:
+            - keyword: NOT
+            - keyword: 'NULL'
+        - comma: ','
+        - column_definition:
+            naked_identifier: OldVacationHours
+            data_type:
+              keyword: INT
+        - comma: ','
+        - column_definition:
+            naked_identifier: NewVacationHours
+            data_type:
+              keyword: INT
+        - comma: ','
+        - column_definition:
+            naked_identifier: ModifiedDate
+            data_type:
+              keyword: DATETIME
+        - comma: ','
+        - table_constraint:
+          - keyword: PRIMARY
+          - keyword: KEY
+          - bracketed_index_column_list_grammar:
+              bracketed:
+                start_bracket: (
+                index_column_definition:
+                  naked_identifier: EmpID
+                end_bracket: )
+        - end_bracket: )
+  - statement_terminator: ;
+  - statement:
+      declare_segment:
+      - keyword: DECLARE
+      - parameter: '@myTable'
+      - keyword: TABLE
+      - bracketed:
+        - start_bracket: (
+        - column_definition:
+            naked_identifier: ID
+            data_type:
+              keyword: INT
+        - comma: ','
+        - column_definition:
+            naked_identifier: MyCol1
+            data_type:
+              keyword: BIT
+        - comma: ','
+        - column_definition:
+            naked_identifier: MyCol2
+            data_type:
+              keyword: BIT
+        - comma: ','
+        - computed_column_definition:
+            naked_identifier: MyComputedCol
+            keyword: AS
+            bracketed:
+              start_bracket: (
+              expression:
+                case_expression:
+                - keyword: CASE
+                - when_clause:
+                  - keyword: WHEN
+                  - expression:
+                    - column_reference:
+                        naked_identifier: MyCol1
+                    - binary_operator:
+                        ampersand: '&'
+                    - column_reference:
+                        naked_identifier: MyCol2
+                    - comparison_operator:
+                        raw_comparison_operator: '='
+                    - integer_literal: '0'
+                  - keyword: THEN
+                  - expression:
+                      integer_literal: '1'
+                - when_clause:
+                  - keyword: WHEN
+                  - expression:
+                      column_reference:
+                        naked_identifier: MyCol2
+                      comparison_operator:
+                        raw_comparison_operator: '='
+                      integer_literal: '0'
+                  - keyword: THEN
+                  - expression:
+                      integer_literal: '2'
+                - else_clause:
+                    keyword: ELSE
+                    expression:
+                      integer_literal: '3'
+                - keyword: END
+              end_bracket: )
+        - end_bracket: )
+  - statement_terminator: ;
+  - statement:
+      declare_segment:
+      - keyword: DECLARE
+      - parameter: '@TableVar'
+      - keyword: Table
+      - bracketed:
+        - start_bracket: (
+        - column_definition:
+          - naked_identifier: ID
+          - data_type:
+              keyword: int
+          - column_constraint_segment:
+            - keyword: NOT
+            - keyword: 'NULL'
+          - column_constraint_segment:
+            - keyword: primary
+            - keyword: key
+        - comma: ','
+        - column_definition:
+            naked_identifier: name
+            data_type:
+              keyword: varchar
+              bracketed_arguments:
+                bracketed:
+                  start_bracket: (
+                  expression:
+                    integer_literal: '128'
+                  end_bracket: )
+            column_constraint_segment:
+              keyword: 'NULL'
+            table_index_segment:
+              keyword: index
+              object_reference:
+                naked_identifier: _name
+              bracketed_index_column_list_grammar:
+                bracketed:
+                  start_bracket: (
+                  index_column_definition:
+                    naked_identifier: name
+                  end_bracket: )
+        - end_bracket: )
+  - statement_terminator: ;
+  - statement:
+      declare_segment:
+      - keyword: declare
+      - parameter: '@var'
+      - keyword: table
+      - bracketed:
+          start_bracket: (
+          column_definition:
+            naked_identifier: id
+            data_type:
+              keyword: int
+            column_constraint_segment:
+            - keyword: not
+            - keyword: 'null'
+          comma: ','
+          table_index_segment:
+            keyword: index
+            object_reference:
+              naked_identifier: idx
+            bracketed_index_column_list_grammar:
+              bracketed:
+                start_bracket: (
+                index_column_definition:
+                  naked_identifier: id
+                end_bracket: )
+          end_bracket: )

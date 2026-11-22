@@ -1,0 +1,88 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: c77c0136329c411640e7579e21a1f7f03ed3ae21b4943ba12ebb02d4b2bfcde7
+file:
+- statement:
+    create_aggregate_statement:
+    - keyword: CREATE
+    - keyword: AGGREGATE
+    - object_reference:
+        naked_identifier: agg_twocols
+    - bracketed:
+      - start_bracket: (
+      - word: numeric
+      - comma: ','
+      - word: numeric
+      - end_bracket: )
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            data_type_identifier: SFUNC
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - expression:
+            column_reference:
+              naked_identifier: mysfunc_accum
+        - comma: ','
+        - data_type:
+            data_type_identifier: STYPE
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - expression:
+            column_reference:
+              naked_identifier: numeric
+        - comma: ','
+        - data_type:
+            data_type_identifier: COMBINEFUNC
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - expression:
+            column_reference:
+              naked_identifier: mycombine_accum
+        - comma: ','
+        - data_type:
+            data_type_identifier: INITCOND
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - expression:
+            numeric_literal: '0'
+        - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_aggregate_statement:
+    - keyword: CREATE
+    - keyword: AGGREGATE
+    - object_reference:
+        naked_identifier: agg_array_stype
+    - bracketed:
+        start_bracket: (
+        word: numeric
+        start_square_bracket: '['
+        end_square_bracket: ']'
+        end_bracket: )
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            data_type_identifier: SFUNC
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - expression:
+            column_reference:
+              naked_identifier: mysfunc_accum
+        - comma: ','
+        - data_type:
+            data_type_identifier: STYPE
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - data_type:
+            keyword: numeric
+            array_type_suffix:
+              start_square_bracket: '['
+              end_square_bracket: ']'
+        - end_bracket: )
+- statement_terminator: ;

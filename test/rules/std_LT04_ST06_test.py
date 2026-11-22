@@ -1,0 +1,152 @@
+"""Tests the python routines within LT04 and ST06."""
+
+import pytest
+
+from sqlfluff.core import FluffConfig, Linter
+from sqlfluff.core.errors import SQLLintError, SQLParseError
+from sqlfluff.rules.structure.ST06 import Rule_ST06
+
+
+@pytest.mark.parametrize(
+    ["in_sql", "out_sql"],
+    [
+        (
+            """SELECT COALESCE(a, 0) AS b
+
+    , COALESCE(c, 0) AS d
+    , e
+FROM t""",
+            """SELECT e,
+
+    COALESCE(a, 0) AS b,
+    COALESCE(c, 0) AS d
+FROM t""",
+        ),
+        (
+            # ST06 does not reorder this one: the comment is not bound to the
+            # target it follows, so moving the targets would leave it behind
+            # annotating a different column. LT04 still rebreaks the commas,
+            # placing the comma before the comment.
+            """SELECT COALESCE(a, 0) AS b--comment
+
+    , COALESCE(c, 0) AS d
+    , e
+FROM t""",
+            """SELECT COALESCE(a, 0) AS b,--comment
+
+    COALESCE(c, 0) AS d,
+    e
+FROM t""",
+        ),
+        (
+            """with cte1 as (
+select "a"
+      ,"b"
+      ,coalesce("g1"
+               ,"g2"
+               ,"g3"
+       ) as "g_combined"
+
+      ,"i"
+      ,"j"
+  from test
+),
+
+cte2 as (
+select "col1"
+
+      ,'start: ' + "col2" as "new_col2"
+
+      ,'start2: ' + "col3" as "new_col3"
+
+      ,"col4"
+      ,"col5"
+from cte1
+)
+
+select * from cte2""",
+            """with cte1 as (
+select "a",
+      "b",
+      "i",
+
+      "j",
+      coalesce("g1",
+               "g2",
+               "g3"
+       ) as "g_combined"
+  from test
+),
+
+cte2 as (
+select "col1",
+
+      "col4",
+
+      "col5",
+
+      'start: ' + "col2" as "new_col2",
+      'start2: ' + "col3" as "new_col3"
+from cte1
+)
+
+select * from cte2""",
+        ),
+    ],
+)
+def test_rules_std_LT04_and_ST06_interaction_trailing(in_sql, out_sql) -> None:
+    """Test interaction between LT04 and ST06.
+
+    Test sql with two newlines with leading commas expecting trailing.
+    """
+    # Lint expected rules.
+    cfg = FluffConfig.from_string("""[sqlfluff]
+dialect = ansi
+rules = LT04, ST06
+""")
+    linter = Linter(config=cfg)
+
+    # Return linted/fixed file.
+    linted_file = linter.lint_string(in_sql, fix=True)
+
+    parse_errors = linted_file.get_violations(types=SQLParseError)
+    assert not parse_errors
+
+    # Check expected lint errors are raised.
+    assert {v.rule_code() for v in linted_file.get_violations(types=SQLLintError)} == {
+        "LT04",
+        "ST06",
+    }
+
+    # Check file is fixed.
+    assert linted_file.fix_string()[0] == out_sql
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "redshift", "snowflake"])
+def test_rule_st06_shorthand_casted_aggregates_are_complex(dialect: str) -> None:
+    """Test shorthand-casted aggregates remain in the complex target band."""
+    cfg = FluffConfig.from_string(
+        f"""[sqlfluff]
+dialect = {dialect}
+rules = ST06
+"""
+    )
+    linter = Linter(config=cfg)
+
+    pass_sql = "SELECT a, MIN(c)::DATE AS d FROM foo"
+    fail_sql = "SELECT MIN(c)::DATE AS d, a FROM foo"
+
+    assert not linter.lint_string(pass_sql).violations
+
+    linted_file = linter.lint_string(fail_sql, fix=True)
+    assert [v.rule.code for v in linted_file.violations] == ["ST06"]
+    assert linted_file.fix_string()[0] == pass_sql
+
+
+def test_rule_st06_simple_expression_helpers_reject_non_simple_segments() -> None:
+    """Test ST06 helper methods reject non-simple expression segments."""
+    parsed = Linter(dialect="ansi").parse_string("SELECT a + 1 AS sum FROM foo")
+    expression = next(parsed.tree.recursive_crawl("expression"))
+
+    assert not Rule_ST06._is_simple_cast_expression(expression)
+    assert not Rule_ST06._is_simple_expression_segment(expression)

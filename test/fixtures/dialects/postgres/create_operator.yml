@@ -1,0 +1,288 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: d20f5774a5d8f7a7260ffbc517797f9aa10a16f80c0e1fb952529f85718b7b25
+file:
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+      - operator: '>'
+      - operator: '='
+    - bracketed:
+      - start_bracket: (
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          data_type_identifier: semantic_version
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          data_type_identifier: semantic_version
+      - comma: ','
+      - keyword: PROCEDURE
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: semantic_version_ge
+      - comma: ','
+      - keyword: COMMUTATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - operator_name:
+        - operator: <
+        - operator: '='
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+      - operator: '='
+      - operator: '='
+      - operator: '='
+    - bracketed:
+      - start_bracket: (
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: box
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: box
+      - comma: ','
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: area_equal_function
+      - comma: ','
+      - keyword: COMMUTATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - operator_name:
+        - operator: '='
+        - operator: '='
+        - operator: '='
+      - comma: ','
+      - keyword: NEGATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - operator_name:
+        - operator: '!'
+        - operator: '='
+        - operator: '='
+      - comma: ','
+      - keyword: RESTRICT
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: area_restriction_function
+      - comma: ','
+      - keyword: JOIN
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: area_join_function
+      - comma: ','
+      - keyword: HASHES
+      - comma: ','
+      - keyword: MERGES
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+      - naked_identifier: app
+      - dot: .
+      - operator: '='
+      - operator: '='
+      - operator: '='
+    - bracketed:
+      - start_bracket: (
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          naked_identifier: app
+          dot: .
+          function_name_identifier: int_eq
+      - comma: ','
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: integer
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: integer
+      - comma: ','
+      - keyword: COMMUTATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - qualified_operator:
+          keyword: OPERATOR
+          bracketed:
+            start_bracket: (
+            operator_name:
+            - naked_identifier: app
+            - dot: .
+            - operator: '='
+            - operator: '='
+            - operator: '='
+            end_bracket: )
+      - comma: ','
+      - keyword: NEGATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - qualified_operator:
+          keyword: OPERATOR
+          bracketed:
+            start_bracket: (
+            operator_name:
+            - naked_identifier: app
+            - dot: .
+            - operator: '!'
+            - operator: '='
+            - operator: '='
+            end_bracket: )
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+        operator: <<->
+    - bracketed:
+      - start_bracket: (
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+        - keyword: double
+        - keyword: precision
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+        - keyword: double
+        - keyword: precision
+      - comma: ','
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: float8_distance
+      - comma: ','
+      - keyword: COMMUTATOR
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - operator_name:
+          operator: <<->
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+        operator: ~~~
+    - bracketed:
+      - start_bracket: (
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+        - keyword: character
+        - keyword: varying
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: text
+          array_type_suffix:
+            start_square_bracket: '['
+            end_square_bracket: ']'
+      - comma: ','
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: varchar_in_array
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+        naked_identifier: public
+        dot: .
+        operator: '@@'
+    - bracketed:
+      - start_bracket: (
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          datetime_type_identifier:
+          - keyword: timestamp
+          - keyword: with
+          - keyword: time
+          - keyword: zone
+      - comma: ','
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: age_of
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_operator_statement:
+    - keyword: CREATE
+    - keyword: OPERATOR
+    - operator_name:
+        naked_identifier: public
+        dot: .
+        operator: '##'
+    - bracketed:
+      - start_bracket: (
+      - keyword: LEFTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: point
+      - comma: ','
+      - keyword: RIGHTARG
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - data_type:
+          keyword: lseg
+      - comma: ','
+      - keyword: FUNCTION
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - function_name:
+          function_name_identifier: close_ps
+      - end_bracket: )
+- statement_terminator: ;

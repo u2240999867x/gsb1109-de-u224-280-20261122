@@ -1,0 +1,2754 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: d56aea98fd7d56e91d15cb18ef00e4525412263168c361e0812a1a488f5e4518
+file:
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: DROP
+    - keyword: COLUMN
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: DROP
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: DROP
+    - keyword: COLUMN
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: DROP
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: visits
+    - keyword: DROP
+    - keyword: COLUMN
+    - naked_identifier: browser
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: alter_test
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: Added1
+    - data_type:
+        data_type_identifier: UInt32
+    - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: alter_test
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: Added2
+    - data_type:
+        data_type_identifier: UInt32
+    - keyword: AFTER
+    - naked_identifier: NestedColumn
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: alter_test
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: Added3
+    - data_type:
+        data_type_identifier: UInt32
+    - keyword: AFTER
+    - naked_identifier: ToDrop
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: z
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: CODEC
+    - bracketed:
+        start_bracket: (
+        naked_identifier: ZSTD
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: z
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: AFTER
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: z
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: z
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '0'
+    - keyword: CODEC
+    - bracketed:
+        start_bracket: (
+        naked_identifier: ZSTD
+        end_bracket: )
+    - keyword: AFTER
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: RENAME
+    - keyword: COLUMN
+    - naked_identifier: old_name
+    - keyword: TO
+    - naked_identifier: new_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: RENAME
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: old_name
+    - keyword: TO
+    - naked_identifier: new_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: RENAME
+    - keyword: COLUMN
+    - naked_identifier: old_name
+    - keyword: TO
+    - naked_identifier: new_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: RENAME
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: old_name
+    - keyword: TO
+    - naked_identifier: new_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: visits
+    - keyword: RENAME
+    - keyword: COLUMN
+    - naked_identifier: webBrowser
+    - keyword: TO
+    - naked_identifier: browser
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: COMMENT
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - quoted_literal: "'This is a comment'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: COMMENT
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: col_name
+    - quoted_literal: "'Column description'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: COMMENT
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - quoted_literal: "'Cluster-wide comment'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: COMMENT
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: col_name
+    - quoted_literal: "'Cluster-wide description'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: visits
+    - keyword: COMMENT
+    - keyword: COLUMN
+    - naked_identifier: browser
+    - quoted_literal: "'This column shows the browser used for accessing the site.'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: COMMENT
+    - quoted_literal: "'This is a table comment'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: COMMENT
+    - quoted_literal: "'This is a table comment'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COMMENT
+    - quoted_literal: "''"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '0'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+    - keyword: CODEC
+    - bracketed:
+        start_bracket: (
+        naked_identifier: ZSTD
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+    - keyword: AFTER
+    - naked_identifier: other_col
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+    - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - data_type:
+        data_type_identifier: Int64
+    - keyword: DEFAULT
+    - expression:
+        numeric_literal: '0'
+    - keyword: CODEC
+    - bracketed:
+        start_bracket: (
+        naked_identifier: ZSTD
+        end_bracket: )
+    - keyword: AFTER
+    - naked_identifier: other_col
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: visits
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: browser
+    - data_type:
+        data_type_identifier: Array
+        bracketed_arguments:
+          bracketed:
+            start_bracket: (
+            data_type:
+              data_type_identifier: String
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: users
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: c2
+    - data_type:
+        data_type_identifier: String
+    - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: users
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: c2
+    - keyword: TYPE
+    - data_type:
+        data_type_identifier: String
+    - keyword: AFTER
+    - naked_identifier: c1
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: col_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - keyword: IN
+    - keyword: PARTITION
+    - naked_identifier: partition_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - keyword: IN
+    - keyword: PARTITION
+    - keyword: ID
+    - quoted_literal: "'partition_id'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: col_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: col_name
+    - keyword: IN
+    - keyword: PARTITION
+    - naked_identifier: partition_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: tmp
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: s
+    - data_type:
+        data_type_identifier: String
+    - keyword: MATERIALIZED
+    - expression:
+        function:
+          function_name:
+            function_name_identifier: toString
+          function_contents:
+            bracketed:
+              start_bracket: (
+              expression:
+                column_reference:
+                  naked_identifier: x
+              end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: tmp
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: s
+    - data_type:
+        data_type_identifier: String
+    - keyword: MATERIALIZED
+    - expression:
+        function:
+          function_name:
+            function_name_identifier: toString
+          function_contents:
+            bracketed:
+              start_bracket: (
+              expression:
+                function:
+                  function_name:
+                    function_name_identifier: round
+                  function_contents:
+                    bracketed:
+                      start_bracket: (
+                      expression:
+                        numeric_literal: '100'
+                        binary_operator: /
+                        column_reference:
+                          naked_identifier: x
+                      end_bracket: )
+              end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: tmp
+    - keyword: MATERIALIZE
+    - keyword: COLUMN
+    - naked_identifier: s
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: ALIAS
+    - naked_identifier: alias_name
+    - keyword: FOR
+    - naked_identifier: col_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: ALIAS
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: alias_name
+    - keyword: FOR
+    - naked_identifier: col_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: y
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: /
+        numeric_literal: '10'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: ALIAS
+    - naked_identifier: alias_name
+    - keyword: FOR
+    - naked_identifier: col_name
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: y
+    - keyword: REMOVE
+    - keyword: ALIAS
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Float32
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: '*'
+        numeric_literal: '100'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: table_with_ttl
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: column_ttl
+    - keyword: REMOVE
+    - keyword: TTL
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: table_with_ttl
+    - keyword: REMOVE
+    - keyword: TTL
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: table_with_ttl
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: REMOVE
+    - keyword: TTL
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: table_name
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: TTL
+    - expression:
+        column_reference:
+          naked_identifier: event_time
+        binary_operator: +
+        interval_expression:
+          keyword: INTERVAL
+          numeric_literal: '3'
+          date_part: MONTH
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: +
+        numeric_literal: '10'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: ADD
+    - keyword: COLUMN
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Float32
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: '*'
+        numeric_literal: '100'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: y
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: /
+        numeric_literal: '10'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: y
+    - keyword: REMOVE
+    - keyword: ALIAS
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+          keyword: SELECT
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: source_table
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+        - keyword: SELECT
+        - select_clause_element:
+            column_reference:
+              naked_identifier: id
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+              naked_identifier: name
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+              naked_identifier: value
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: source_table
+        where_clause:
+          keyword: WHERE
+          expression:
+            column_reference:
+              naked_identifier: value
+            comparison_operator:
+              raw_comparison_operator: '>'
+            numeric_literal: '0'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - naked_identifier: cluster1
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+          keyword: SELECT
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: source_table
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+        - keyword: SELECT
+        - select_clause_element:
+            column_reference:
+              naked_identifier: id
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+              naked_identifier: name
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+              naked_identifier: value
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: source_table
+        where_clause:
+          keyword: WHERE
+          expression:
+            column_reference:
+              naked_identifier: value
+            comparison_operator:
+              raw_comparison_operator: '>'
+            numeric_literal: '0'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+        - keyword: SELECT
+        - select_clause_element:
+            column_reference:
+              naked_identifier: id
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+              naked_identifier: name
+        - comma: ','
+        - select_clause_element:
+            function:
+              function_name:
+                function_name_identifier: sum
+              function_contents:
+                bracketed:
+                  start_bracket: (
+                  expression:
+                    column_reference:
+                      naked_identifier: value
+                  end_bracket: )
+            alias_expression:
+              alias_operator:
+                keyword: AS
+              naked_identifier: total_value
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: source_table
+        groupby_clause:
+        - keyword: GROUP
+        - keyword: BY
+        - column_reference:
+            naked_identifier: id
+        - comma: ','
+        - column_reference:
+            naked_identifier: name
+        having_clause:
+          keyword: HAVING
+          expression:
+            column_reference:
+              naked_identifier: total_value
+            comparison_operator:
+              raw_comparison_operator: '>'
+            numeric_literal: '100'
+        orderby_clause:
+        - keyword: ORDER
+        - keyword: BY
+        - column_reference:
+            naked_identifier: total_value
+        - keyword: DESC
+        limit_clause:
+          keyword: LIMIT
+          limit_clause_component:
+            numeric_literal: '10'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: mv
+    - keyword: MODIFY
+    - keyword: QUERY
+    - select_statement:
+        select_clause:
+        - keyword: SELECT
+        - select_clause_element:
+            column_reference:
+            - naked_identifier: t1
+            - dot: .
+            - naked_identifier: id
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+            - naked_identifier: t1
+            - dot: .
+            - naked_identifier: name
+        - comma: ','
+        - select_clause_element:
+            column_reference:
+            - naked_identifier: t2
+            - dot: .
+            - naked_identifier: value
+        from_clause:
+          keyword: FROM
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: table1
+              alias_expression:
+                alias_operator:
+                  keyword: AS
+                naked_identifier: t1
+            join_clause:
+              keyword: JOIN
+              from_expression_element:
+                table_expression:
+                  table_reference:
+                    naked_identifier: table2
+                alias_expression:
+                  alias_operator:
+                    keyword: AS
+                  naked_identifier: t2
+              join_on_condition:
+                keyword: 'ON'
+                expression:
+                - column_reference:
+                  - naked_identifier: t1
+                  - dot: .
+                  - naked_identifier: id
+                - comparison_operator:
+                    raw_comparison_operator: '='
+                - column_reference:
+                  - naked_identifier: t2
+                  - dot: .
+                  - naked_identifier: id
+        where_clause:
+          keyword: WHERE
+          expression:
+            column_reference:
+            - naked_identifier: t1
+            - dot: .
+            - naked_identifier: active
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: DROP
+    - keyword: PARTITION
+    - naked_identifier: y
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: DROP
+    - keyword: PARTITION
+    - quoted_identifier: "'y'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: DROP
+    - keyword: PART
+    - quoted_identifier: "'y'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: DROP
+    - keyword: PART
+    - quoted_identifier: "'y'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: REPLACE
+    - keyword: PARTITION
+    - quoted_identifier: "'y'"
+    - keyword: FROM
+    - table_reference:
+        naked_identifier: z
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: REPLACE
+    - keyword: PARTITION
+    - quoted_identifier: "'y'"
+    - keyword: FROM
+    - table_reference:
+        naked_identifier: z
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: x
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: y
+    - data_type:
+        data_type_identifier: Int32
+    - keyword: ALIAS
+    - expression:
+        column_reference:
+          naked_identifier: z
+        binary_operator: +
+        numeric_literal: '10'
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: abc
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_table
+    - keyword: UPDATE
+    - naked_identifier: column_name
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        quoted_literal: "'new_value'"
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: condition
+          comparison_operator:
+            raw_comparison_operator: '='
+          boolean_literal: 'true'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_table
+    - keyword: UPDATE
+    - naked_identifier: column_name
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        quoted_literal: "'new_value'"
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: condition
+          comparison_operator:
+            raw_comparison_operator: '='
+          boolean_literal: 'true'
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: mutations_sync
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: users
+    - keyword: UPDATE
+    - naked_identifier: age
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        column_reference:
+          naked_identifier: age
+        binary_operator: +
+        numeric_literal: '1'
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: id
+          comparison_operator:
+            raw_comparison_operator: '='
+          numeric_literal: '100'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: users
+    - keyword: UPDATE
+    - naked_identifier: status
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        quoted_literal: "'active'"
+    - comma: ','
+    - naked_identifier: last_login
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        function:
+          function_name:
+            function_name_identifier: now
+          function_contents:
+            bracketed:
+              start_bracket: (
+              end_bracket: )
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: user_id
+          keyword: IN
+          tuple:
+            bracketed:
+            - start_bracket: (
+            - numeric_literal: '1'
+            - comma: ','
+            - numeric_literal: '2'
+            - comma: ','
+            - numeric_literal: '3'
+            - end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: products
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: UPDATE
+    - naked_identifier: price
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        column_reference:
+          naked_identifier: price
+        binary_operator: '*'
+        numeric_literal: '1.1'
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: category
+          comparison_operator:
+            raw_comparison_operator: '='
+          quoted_literal: "'electronics'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: events
+    - keyword: UPDATE
+    - naked_identifier: event_count
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - expression:
+        column_reference:
+          naked_identifier: event_count
+        binary_operator: +
+        numeric_literal: '1'
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: event_date
+          comparison_operator:
+            raw_comparison_operator: '='
+          function:
+            function_name:
+              function_name_identifier: today
+            function_contents:
+              bracketed:
+                start_bracket: (
+                end_bracket: )
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: mutations_sync
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '2'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_table
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: condition
+          comparison_operator:
+            raw_comparison_operator: '='
+          boolean_literal: 'true'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_table
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: condition
+          comparison_operator:
+            raw_comparison_operator: '='
+          boolean_literal: 'true'
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: mutations_sync
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: logs
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: log_date
+          comparison_operator:
+            raw_comparison_operator: <
+          function:
+            function_name:
+              function_name_identifier: today
+            function_contents:
+              bracketed:
+                start_bracket: (
+                end_bracket: )
+          binary_operator: '-'
+          interval_expression:
+            keyword: INTERVAL
+            numeric_literal: '30'
+            date_part: DAY
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: users
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+        - column_reference:
+            naked_identifier: deleted
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - numeric_literal: '1'
+        - binary_operator: AND
+        - column_reference:
+            naked_identifier: last_activity
+        - comparison_operator:
+            raw_comparison_operator: <
+        - function:
+            function_name:
+              function_name_identifier: now
+            function_contents:
+              bracketed:
+                start_bracket: (
+                end_bracket: )
+        - binary_operator: '-'
+        - interval_expression:
+            keyword: INTERVAL
+            numeric_literal: '1'
+            date_part: YEAR
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: sessions
+    - on_cluster_clause:
+      - keyword: 'ON'
+      - keyword: CLUSTER
+      - quoted_identifier: "'{cluster}'"
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: session_id
+          keyword: IN
+          tuple:
+            bracketed:
+              start_bracket: (
+              expression:
+                select_statement:
+                  select_clause:
+                    keyword: SELECT
+                    select_clause_element:
+                      column_reference:
+                        naked_identifier: id
+                  from_clause:
+                    keyword: FROM
+                    from_expression:
+                      from_expression_element:
+                        table_expression:
+                          table_reference:
+                            naked_identifier: expired_sessions
+              end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: temp_data
+    - keyword: DELETE
+    - where_clause:
+        keyword: WHERE
+        expression:
+          column_reference:
+            naked_identifier: created_at
+          comparison_operator:
+            raw_comparison_operator: <
+          quoted_literal: "'2023-01-01'"
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: mutations_sync
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '2'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - naked_identifier: uid_proj
+      - projection_body:
+        - keyword: INDEX
+        - column_reference:
+            naked_identifier: user_id
+        - keyword: TYPE
+        - naked_identifier: basic
+      - keyword: WITH
+      - settings_clause:
+          keyword: SETTINGS
+          bracketed:
+          - start_bracket: (
+          - naked_identifier: index_granularity
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - numeric_literal: '4096'
+          - comma: ','
+          - naked_identifier: index_granularity_bytes
+          - comparison_operator:
+              raw_comparison_operator: '='
+          - numeric_literal: '1048576'
+          - end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - naked_identifier: region_proj
+      - projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                function:
+                  function_name:
+                    function_name_identifier: count
+                  function_contents:
+                    bracketed:
+                      start_bracket: (
+                      expression:
+                        column_reference:
+                          naked_identifier: user_id
+                      end_bracket: )
+            where_clause:
+              keyword: where
+              expression:
+                column_reference:
+                  naked_identifier: region
+                comparison_operator:
+                  raw_comparison_operator: '='
+                quoted_literal: "'JP'"
+            groupby_clause:
+            - keyword: group
+            - keyword: by
+            - column_reference:
+                naked_identifier: region
+            end_bracket: )
+      - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: user_proj
+      - projection_body:
+        - keyword: INDEX
+        - expression:
+            function:
+              function_name:
+                function_name_identifier: trim
+              function_contents:
+                bracketed:
+                  start_bracket: (
+                  expression:
+                    function:
+                      function_name:
+                        function_name_identifier: cast
+                      function_contents:
+                        bracketed:
+                          start_bracket: (
+                          expression:
+                            column_reference:
+                              naked_identifier: user_id
+                          keyword: as
+                          data_type:
+                            data_type_identifier: Nullable
+                            bracketed_arguments:
+                              bracketed:
+                                start_bracket: (
+                                data_type:
+                                  data_type_identifier: String
+                                end_bracket: )
+                          end_bracket: )
+                  end_bracket: )
+        - keyword: TYPE
+        - naked_identifier: basic
+      - keyword: WITH
+      - settings_clause:
+          keyword: SETTINGS
+          bracketed:
+            start_bracket: (
+            naked_identifier: index_granularity
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '4096'
+            end_bracket: )
+      - keyword: AFTER
+      - naked_identifier: region_proj
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - naked_identifier: region_proj_3
+      - projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+            where_clause:
+              keyword: where
+              expression:
+                column_reference:
+                  naked_identifier: region
+                comparison_operator:
+                  raw_comparison_operator: '='
+                quoted_literal: "'JP'"
+            orderby_clause:
+            - keyword: order
+            - keyword: by
+            - column_reference:
+                naked_identifier: user_id
+            end_bracket: )
+      - keyword: WITH
+      - settings_clause:
+          keyword: SETTINGS
+          bracketed:
+            start_bracket: (
+            naked_identifier: index_granularity
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '4096'
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: region_proj_4
+      - projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+            where_clause:
+              keyword: where
+              expression:
+                column_reference:
+                  naked_identifier: region
+                comparison_operator:
+                  raw_comparison_operator: '='
+                quoted_literal: "'JP'"
+            orderby_clause:
+            - keyword: order
+            - keyword: by
+            - column_reference:
+                naked_identifier: user_id
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: region_proj
+      - projection_body:
+          bracketed:
+          - start_bracket: (
+          - keyword: with
+          - expression:
+              quoted_literal: "'JP'"
+          - keyword: as
+          - naked_identifier: country
+          - select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                function:
+                  function_name:
+                    function_name_identifier: count
+                  function_contents:
+                    bracketed:
+                      start_bracket: (
+                      expression:
+                        column_reference:
+                          naked_identifier: user_id
+                      end_bracket: )
+          - where_clause:
+              keyword: where
+              expression:
+              - column_reference:
+                  naked_identifier: region
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                  naked_identifier: country
+          - groupby_clause:
+            - keyword: group
+            - keyword: by
+            - column_reference:
+                naked_identifier: region
+          - end_bracket: )
+      - keyword: FIRST
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: region_proj_3
+      - projection_body:
+          bracketed:
+          - start_bracket: (
+          - keyword: with
+          - expression:
+              bracketed:
+                start_bracket: (
+                expression:
+                - numeric_literal: '1'
+                - comparison_operator:
+                    raw_comparison_operator: '='
+                - numeric_literal: '1'
+                end_bracket: )
+          - keyword: as
+          - naked_identifier: f1
+          - comma: ','
+          - expression:
+              function:
+                function_name:
+                  function_name_identifier: cast
+                function_contents:
+                  bracketed:
+                    start_bracket: (
+                    expression:
+                      quoted_literal: "'JP'"
+                    keyword: as
+                    data_type:
+                      data_type_identifier: String
+                    end_bracket: )
+          - keyword: as
+          - naked_identifier: country
+          - select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+          - where_clause:
+              keyword: where
+              expression:
+              - column_reference:
+                  naked_identifier: region
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                  naked_identifier: country
+          - orderby_clause:
+            - keyword: order
+            - keyword: by
+            - column_reference:
+                naked_identifier: user_id
+          - end_bracket: )
+      - keyword: WITH
+      - settings_clause:
+          keyword: SETTINGS
+          bracketed:
+            start_bracket: (
+            naked_identifier: index_granularity
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '4096'
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: region_proj_4
+      - projection_body:
+          bracketed:
+          - start_bracket: (
+          - keyword: with
+          - expression:
+            - numeric_literal: '1'
+            - comparison_operator:
+                raw_comparison_operator: '='
+            - numeric_literal: '0'
+          - keyword: as
+          - naked_identifier: f1
+          - comma: ','
+          - expression:
+              function:
+                function_name:
+                  function_name_identifier: cast
+                function_contents:
+                  bracketed:
+                    start_bracket: (
+                    expression:
+                      quoted_literal: "'JP'"
+                    keyword: as
+                    data_type:
+                      data_type_identifier: String
+                    end_bracket: )
+          - keyword: as
+          - naked_identifier: country
+          - select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+          - where_clause:
+              keyword: where
+              expression:
+              - column_reference:
+                  naked_identifier: region
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                  naked_identifier: country
+          - orderby_clause:
+            - keyword: order
+            - keyword: by
+            - column_reference:
+                naked_identifier: user_id
+          - end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+        keyword: PROJECTION
+        naked_identifier: total_proj
+        projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+              keyword: select
+              select_clause_element:
+                function:
+                  function_name:
+                    function_name_identifier: sum
+                  function_contents:
+                    bracketed:
+                      start_bracket: (
+                      expression:
+                        column_reference:
+                          naked_identifier: user_id
+                      end_bracket: )
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: NOT
+      - keyword: EXISTS
+      - naked_identifier: region_proj_5
+      - projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+            where_clause:
+              keyword: where
+              expression:
+                column_reference:
+                  naked_identifier: region
+                comparison_operator:
+                  raw_comparison_operator: '='
+                quoted_literal: "'JP'"
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: ADD
+    - projection_definition:
+        keyword: PROJECTION
+        naked_identifier: region_proj_6
+        projection_body:
+          bracketed:
+          - start_bracket: (
+          - keyword: with
+          - expression:
+              quoted_literal: "'JP'"
+          - keyword: as
+          - naked_identifier: country
+          - select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: user_id
+          - where_clause:
+              keyword: where
+              expression:
+              - column_reference:
+                  naked_identifier: region
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                  naked_identifier: country
+          - end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MODIFY
+    - projection_definition:
+      - keyword: PROJECTION
+      - naked_identifier: uid_proj
+      - projection_body:
+        - keyword: INDEX
+        - column_reference:
+            naked_identifier: user_id
+        - keyword: TYPE
+        - naked_identifier: basic
+      - keyword: WITH
+      - settings_clause:
+          keyword: SETTINGS
+          bracketed:
+            start_bracket: (
+            naked_identifier: index_granularity
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '4096'
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MODIFY
+    - projection_definition:
+      - keyword: PROJECTION
+      - keyword: IF
+      - keyword: EXISTS
+      - naked_identifier: region_proj
+      - projection_body:
+          bracketed:
+            start_bracket: (
+            select_clause:
+            - keyword: select
+            - select_clause_element:
+                column_reference:
+                  naked_identifier: region
+            - comma: ','
+            - select_clause_element:
+                function:
+                  function_name:
+                    function_name_identifier: count
+                  function_contents:
+                    bracketed:
+                      start_bracket: (
+                      expression:
+                        column_reference:
+                          naked_identifier: user_id
+                      end_bracket: )
+            where_clause:
+              keyword: where
+              expression:
+                column_reference:
+                  naked_identifier: region
+                comparison_operator:
+                  raw_comparison_operator: '='
+                quoted_literal: "'JP'"
+            groupby_clause:
+            - keyword: group
+            - keyword: by
+            - column_reference:
+                naked_identifier: region
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: DROP
+    - keyword: PROJECTION
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: region_proj
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: uid_proj
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal:
+        sign_indicator: +
+        numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal:
+        sign_indicator: '-'
+        numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - keyword: ID
+    - quoted_identifier: "'201901'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - quoted_identifier: "'201901'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - function:
+        function_name:
+          function_name_identifier: tuple
+        function_contents:
+          bracketed:
+            start_bracket: (
+            expression:
+              function:
+                function_name:
+                  function_name_identifier: toYYYYMM
+                function_contents:
+                  bracketed:
+                    start_bracket: (
+                    expression:
+                      function:
+                        function_name:
+                          function_name_identifier: toDate
+                        function_contents:
+                          bracketed:
+                            start_bracket: (
+                            expression:
+                              quoted_literal: "'2019-01-25'"
+                            end_bracket: )
+                    end_bracket: )
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example2
+    - keyword: MATERIALIZE
+    - keyword: PROJECTION
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - tuple:
+        bracketed:
+          start_bracket: (
+          quoted_literal: "'JP'"
+          comma: ','
+          numeric_literal: '1'
+          end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_3
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal:
+        sign_indicator: +
+        numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: region_proj_4
+    - keyword: IN
+    - keyword: PARTITION
+    - numeric_literal:
+        sign_indicator: '-'
+        numeric_literal: '201901'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - keyword: ID
+    - quoted_identifier: "'201901'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - quoted_identifier: "'201901'"
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - boolean_literal: 'TRUE'
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - function:
+        function_name:
+          function_name_identifier: tuple
+        function_contents:
+          bracketed:
+            start_bracket: (
+            expression:
+              function:
+                function_name:
+                  function_name_identifier: toYYYYMM
+                function_contents:
+                  bracketed:
+                    start_bracket: (
+                    expression:
+                      function:
+                        function_name:
+                          function_name_identifier: toDate
+                        function_contents:
+                          bracketed:
+                            start_bracket: (
+                            expression:
+                              quoted_literal: "'2019-01-25'"
+                            end_bracket: )
+                    end_bracket: )
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: default
+      - dot: .
+      - naked_identifier: example2
+    - keyword: CLEAR
+    - keyword: PROJECTION
+    - keyword: IF
+    - keyword: EXISTS
+    - naked_identifier: user_proj
+    - keyword: IN
+    - keyword: PARTITION
+    - tuple:
+        bracketed:
+          start_bracket: (
+          quoted_literal: "'JP'"
+          comma: ','
+          numeric_literal: '1'
+          end_bracket: )
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: example
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: a
+    - data_type:
+        data_type_identifier: UInt8
+    - comma: ','
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: b
+    - data_type:
+        data_type_identifier: UInt8
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: example
+    - keyword: DROP
+    - keyword: COLUMN
+    - naked_identifier: a
+    - comma: ','
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: b
+    - data_type:
+        data_type_identifier: UInt8
+    - comma: ','
+    - keyword: MODIFY
+    - keyword: COLUMN
+    - naked_identifier: c
+    - data_type:
+        data_type_identifier: String
+- statement_terminator: ;
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: example
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: a
+    - data_type:
+        data_type_identifier: UInt8
+    - comma: ','
+    - keyword: ADD
+    - keyword: COLUMN
+    - naked_identifier: b
+    - data_type:
+        data_type_identifier: UInt8
+    - settings_clause:
+        keyword: SETTINGS
+        naked_identifier: max_execution_time
+        comparison_operator:
+          raw_comparison_operator: '='
+        numeric_literal: '10'
+- statement_terminator: ;

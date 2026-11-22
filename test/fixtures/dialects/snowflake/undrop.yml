@@ -1,0 +1,52 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 9528d3207cebb8c9eb221f0a5df73c5a1bd5c52979abd09dcd7dbefec538c447
+file:
+- statement:
+    undrop_statement:
+    - keyword: UNDROP
+    - keyword: database
+    - database_reference:
+        naked_identifier: mytestdb2
+- statement_terminator: ;
+- statement:
+    undrop_statement:
+    - keyword: undrop
+    - keyword: schema
+    - schema_reference:
+        naked_identifier: myschema
+- statement_terminator: ;
+- statement:
+    undrop_statement:
+    - keyword: undrop
+    - keyword: table
+    - table_reference:
+        naked_identifier: t2
+- statement_terminator: ;
+- statement:
+    undrop_statement:
+    - keyword: UNDROP
+    - keyword: EXTERNAL
+    - keyword: VOLUME
+    - external_volume_reference:
+        naked_identifier: my_external_volume
+- statement_terminator: ;
+- statement:
+    undrop_statement:
+    - keyword: UNDROP
+    - keyword: DYNAMIC
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_dynamic_table
+- statement_terminator: ;
+- statement:
+    undrop_statement:
+    - keyword: UNDROP
+    - keyword: ICEBERG
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: my_iceberg_table
+- statement_terminator: ;

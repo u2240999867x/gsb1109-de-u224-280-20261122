@@ -1,0 +1,318 @@
+rule: LT01
+
+test_pass_brackets:
+  # Test that we don't fail * operators in brackets
+  pass_str: "SELECT COUNT(*) FROM tbl\n\n"
+
+test_pass_expression:
+  # Github Bug #207
+  pass_str: |
+    select
+        field,
+        date(field_1) - date(field_2) as diff
+    from table
+
+test_fail_expression:
+  # Github Bug #207
+  fail_str: |
+    select
+        field,
+        date(field_1)-date(field_2) as diff
+    from table
+  fix_str: |
+    select
+        field,
+        date(field_1) - date(field_2) as diff
+    from table
+
+
+# Check we don't get false alarms with newlines, or sign indicators
+# -------------------
+
+test_pass_newline_1:
+  pass_str: |
+    SELECT 1
+
+    + 2
+
+test_pass_newline_2:
+  pass_str: |
+    SELECT 1
+    	+ 2
+
+test_pass_newline_£:
+  pass_str: |
+    SELECT 1
+        + 2
+
+test_pass_sign_indicators:
+  pass_str: SELECT 1, +2, -4
+
+test_pass_tilde:
+  pass_str: SELECT ~1
+
+# -------------------
+
+fail_simple:
+  fail_str: "SELECT 1+2"
+  fix_str: "SELECT 1 + 2"
+
+pass_bigquery_hyphen:
+  # hyphenated table reference should not fail
+  pass_str: SELECT col_foo FROM foo-bar.foo.bar
+  configs:
+    core:
+      dialect: bigquery
+
+
+pass_sparksql_ansi_interval_minus:
+  pass_str: SELECT INTERVAL -'20 15:40:32.99899999' DAY TO SECOND AS col;
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_sparksql_multi_units_interval_minus:
+  pass_str: SELECT INTERVAL -2 HOUR '3' MINUTE AS col;
+  configs:
+    core:
+      dialect: sparksql
+
+pass_tsql_assignment_operator:
+  # Test that we fix the outer whitespace but don't add any in between + and =.
+  fail_str: SET @param1+=1
+  fix_str: SET @param1 += 1
+  configs:
+    core:
+      dialect: tsql
+
+pass_oracle_execute_file_double_at_sign:
+  # Oracle SQL*Plus @@ execute-file prefixes should not be separated by LT01.
+  pass_str: |
+    @@ACS_DBLOGIN_FK.SQL
+    @@ACS_DPS_STRUKTURKLASSE_FK.SQL
+  configs:
+    core:
+      dialect: oracle
+
+pass_concat_string:
+  pass_str: SELECT 'barry' || 'pollard'
+
+test_pass_placeholder_spacing:
+  # Test for spacing issues around placeholders
+  # https://github.com/sqlfluff/sqlfluff/issues/4253
+  pass_str: |
+    {% set is_dev_environment = true %}
+
+    SELECT *
+    FROM table
+    WHERE
+        some_col IS TRUE
+        {% if is_dev_environment %}
+            AND created_at >= DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY)
+        {% else %}
+            AND created_at >= DATE_SUB(CURRENT_DATE, INTERVAL 30 DAY)
+        {% endif %}
+        AND TRUE
+    ;
+
+fail_bigquery_whitespaces_in_function_reference:
+  fail_str: SELECT dataset    .    AddFourAndDivide(5, 10)
+  fix_str: SELECT dataset.AddFourAndDivide(5, 10)
+  configs:
+    core:
+      dialect: bigquery
+
+pass_bigquery_safe_prefix_function:
+  # SAFE prefix to function calls should not fail
+  pass_str: SELECT SAFE.STRING(JSON '1')
+  configs:
+    core:
+      dialect: bigquery
+
+fail_bigquery_safe_prefix_function:
+  # Check that additional whitespaces introduced by
+  # https://github.com/sqlfluff/sqlfluff/issues/4645
+  # get fixed.
+  fail_str: SELECT SAFE . STRING(JSON '1')
+  fix_str: SELECT SAFE.STRING(JSON '1')
+  configs:
+    core:
+      dialect: bigquery
+
+pass_sparksql_file_literal:
+  pass_str: ADD JAR path/to/some.jar;
+  configs:
+    core:
+      dialect: sparksql
+
+pass_sqlite_column_path_operator:
+  pass_str: SELECT a -> 'b';
+  configs:
+    core:
+      dialect: sqlite
+
+pass_oracle_attribute_indicator:
+  # %TYPE / %ROWTYPE / cursor attributes should not be spaced like the modulo
+  # operator. https://github.com/sqlfluff/sqlfluff/issues/8070
+  pass_str: |
+    DECLARE
+      v_a ex_tab.a%TYPE;
+      v_r ex_tab%ROWTYPE;
+      CURSOR c1 IS SELECT 1 FROM dual;
+    BEGIN
+      IF c1%NOTFOUND THEN
+        NULL;
+      END IF;
+    END;
+  configs:
+    core:
+      dialect: oracle
+
+fail_oracle_modulo_still_spaced:
+  # Real modulo must still get spacing enforced.
+  fail_str: |
+    BEGIN
+      x := a%b;
+    END;
+  fix_str: |
+    BEGIN
+      x := a % b;
+    END;
+  configs:
+    core:
+      dialect: oracle
+
+pass_oracle_multiset_operators:
+  # MULTISET EXCEPT/INTERSECT/UNION are multi-keyword operators, so the spaces
+  # between the keywords must not be removed.
+  pass_str: |
+    SELECT
+        a MULTISET UNION b AS u,
+        a MULTISET UNION DISTINCT b AS ud,
+        a MULTISET EXCEPT ALL b AS ea,
+        a MULTISET INTERSECT b AS i
+    FROM t
+  configs:
+    core:
+      dialect: oracle
+
+fail_oracle_multiset_operators_extra_spaces:
+  # Extra spacing inside the operator is still normalized to a single space.
+  fail_str: |
+    SELECT a MULTISET   UNION  ALL b AS u FROM t
+  fix_str: |
+    SELECT a MULTISET UNION ALL b AS u FROM t
+  configs:
+    core:
+      dialect: oracle
+
+pass_mysql_word_delimiter:
+  # Removing the space before a word delimiter would join it to the
+  # statement, e.g. `DELETE FROM tgo`.
+  pass_str: |
+    DELIMITER go
+    DELETE FROM t go
+    SET @b = 2 go
+  configs:
+    core:
+      dialect: mysql
+
+pass_consecutive_sign_indicators:
+  # Touching these would produce "--" and comment out the rest of the line, so
+  # the gap is left alone rather than reported as an unsatisfiable violation.
+  pass_str: |
+    SELECT 1 * - -5
+
+fail_consecutive_sign_indicators_outer_spacing:
+  # Only the gap which would build the comment marker is exempt - the space
+  # between the last sign indicator and its operand is still removed.
+  fail_str: |
+    SELECT 1 * - - - 5
+  fix_str: |
+    SELECT 1 * - - -5
+
+fail_consecutive_sign_indicators_trailing_code:
+  # The code after the pair must survive the fix.
+  fail_str: |
+    SELECT 1 * - - 5 AS c, 2 AS d
+  fix_str: |
+    SELECT 1 * - -5 AS c, 2 AS d
+
+fail_consecutive_sign_indicators_across_a_newline:
+  # An `:inline` constraint strips line breaks before any whitespace check
+  # runs, so the line break itself has to be exempt too - otherwise the two
+  # sign indicators end up adjacent and comment out the rest of the line.
+  fail_str: |
+    SELECT 1 * -
+    - 5 AS c, 2 AS d
+  fix_str: |
+    SELECT 1 * -
+    -5 AS c, 2 AS d
+  configs:
+    core:
+      dialect: ansi
+    layout:
+      type:
+        sign_indicator:
+          spacing_after: touch:inline
+
+fail_sign_indicator_across_a_newline_without_a_marker:
+  # The exemption is only for the marker. A single sign indicator still has
+  # its line break stripped as the config asks.
+  fail_str: |
+    SELECT 1 * -
+    5 AS c, 2 AS d
+  fix_str: |
+    SELECT 1 * -5 AS c, 2 AS d
+  configs:
+    core:
+      dialect: ansi
+    layout:
+      type:
+        sign_indicator:
+          spacing_after: touch:inline
+
+pass_consecutive_tildes:
+  # Touching these would produce "~~", which is the LIKE operator in Postgres
+  # and DuckDB, so the fixed query would no longer run.
+  pass_str: |
+    SELECT 8 | ~ ~4
+  configs:
+    core:
+      dialect: postgres
+
+fail_consecutive_tildes_outer_spacing:
+  # Only the gap between the two operators is exempt - the space between the
+  # last tilde and its operand is still removed.
+  fail_str: |
+    SELECT 8 | ~ ~ 4 AS c, 2 AS d
+  fix_str: |
+    SELECT 8 | ~ ~4 AS c, 2 AS d
+  configs:
+    core:
+      dialect: postgres
+
+fail_consecutive_tildes_across_a_newline:
+  # As with sign indicators, the line break is the only thing keeping the two
+  # tildes apart, so it isn't stripped.
+  fail_str: |
+    SELECT 8 | ~
+    ~ 4 AS c, 2 AS d
+  fix_str: |
+    SELECT 8 | ~
+    ~4 AS c, 2 AS d
+  configs:
+    core:
+      dialect: postgres
+    layout:
+      type:
+        tilde:
+          spacing_after: touch:inline
+
+fail_sign_indicator_before_other_prefix_operators:
+  # A prefix operator is never glued onto another operator, whichever of
+  # them comes first.
+  fail_str: |
+    SELECT 1 * - ~ 5, 1 * ~ - 5, 1 * + + 5
+  fix_str: |
+    SELECT 1 * - ~5, 1 * ~ -5, 1 * + +5

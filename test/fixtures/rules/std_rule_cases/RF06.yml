@@ -1,0 +1,917 @@
+rule: RF06
+
+test_pass_default:
+  # NOTE: The ANSI dialect casefolds to UPPERCASE.
+  pass_str: |
+    select
+      unquoted_identifier,
+      another as unquoted_alias,
+      1 + 2 as expression_alias,
+      "case_specific_reference",
+      "REFERENCE WITH SPACE",
+      "I-c@nn0t-be~un-quoted",
+      "1_starts_with_digit",
+      "SELECT",  -- Keyword as identifier
+      another as "Case_Specific_Alias"
+    from my_schema.my_table
+
+test_fail_default_uppercase:
+  # Snowflake is a dialect which casefolds to UPPERCASE
+  fail_str: |
+    SELECT
+      "COLUMN_REFERENCE",
+      foo AS "COLUMN_ALIAS",
+      "Case_Specific_Reference"
+    FROM "SCHEMA_REFERENCE"."TABLE_REFERENCE" AS "TABLE_ALIAS"
+  fix_str: |
+    SELECT
+      COLUMN_REFERENCE,
+      foo AS COLUMN_ALIAS,
+      "Case_Specific_Reference"
+    FROM SCHEMA_REFERENCE.TABLE_REFERENCE AS TABLE_ALIAS
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_default_lowercase:
+  # Postgres is a dialect which casefolds to lowercase
+  fail_str: |
+    SELECT
+      "column_reference",
+      foo AS "column_alias",
+      "Case_Specific_Reference"
+    FROM "schema_reference"."table_reference" AS "table_alias"
+  fix_str: |
+    SELECT
+      column_reference,
+      foo AS column_alias,
+      "Case_Specific_Reference"
+    FROM schema_reference.table_reference AS table_alias
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_default_insensitive:
+  # DuckDB is a dialect which compares insensitively, which means
+  # as long as the identifier is *valid* without quotes, we should
+  # remove the quotes.
+  fail_str: |
+    SELECT
+      "lowercase_reference",
+      "UPPERCASE_REFERENCE",
+      foo AS "column_alias",
+      "Case_Specific_Reference",
+      "SELECT"
+    FROM "schema_reference"."TABLE_REFERENCE" AS "table_alias"
+  fix_str: |
+    SELECT
+      lowercase_reference,
+      UPPERCASE_REFERENCE,
+      foo AS column_alias,
+      Case_Specific_Reference,
+      "SELECT"
+    FROM schema_reference.TABLE_REFERENCE AS table_alias
+  configs:
+    core:
+      dialect: duckdb
+
+test_pass_postgres_bare_function_names_remain_quoted:
+  # Unquoted, these are calls to PostgreSQL's bare functions, not column
+  # references.
+  pass_str: |
+    SELECT "user", "current_user", "system_user", "session_user"
+    FROM events
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_ansi_bare_function_name_remains_quoted:
+  pass_str: SELECT "current_date" FROM events
+
+test_fail_postgres_ordinary_identifier_unquoted:
+  fail_str: SELECT "events" FROM "events"
+  fix_str: SELECT events FROM events
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_keyword_type_names_remain_quoted:
+  # Unquoted, these are the SQL syntax for built-in types, which can be
+  # different types: `"char"` is a one-byte type, but `char` is `character(1)`.
+  pass_str: |
+    CREATE TABLE events (flag "char", bits "bit", flags "char"[]);
+
+    SELECT flag::"char", CAST(bits AS "bit") FROM events;
+
+    CREATE FUNCTION first_flag(flags "char"[]) RETURNS "char"
+    LANGUAGE sql AS $$ SELECT flags[1] $$;
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_postgres_qualified_keyword_type_name_unquoted:
+  # After a schema, the type name is an ordinary name.
+  fail_str: CREATE TABLE events (flag pg_catalog."char")
+  fix_str: CREATE TABLE events (flag pg_catalog.char)
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_postgres_keyword_column_name_unquoted:
+  # Outside a data type, `char` is an ordinary column name, and `text` isn't a
+  # keyword, so the quotes can go.
+  fail_str: SELECT "char", "text"::"text" FROM events
+  fix_str: SELECT char, text::text FROM events
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_reference_tsql:
+  # Tests the TSQL bracket quotes.
+  # TSQL casefolds UPPERCASE.
+  pass_str: |
+    SELECT
+        123 as [I cannot be unquoted],  -- Because spaces
+        [I-c@nn0t-be~un-quoted],  -- Because special characters
+        [SELECT]  -- Because keyword
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_reference_tsql:
+  # Tests the TSQL bracket quotes.
+  # TSQL casefolds UPPERCASE.
+  fail_str: |
+    SELECT
+        [FOO] AS [BAR]
+    FROM [SCH].[TBL];
+  fix_str: |
+    SELECT
+        FOO AS BAR
+    FROM SCH.TBL;
+  configs:
+    core:
+      dialect: tsql
+
+
+test_pass_column_reference_prefer_quoted_ansi:
+  pass_str: |
+    SELECT 123 AS "foo";
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_column_reference_prefer_quoted_tsql:
+  pass_str: |
+    SELECT 123 AS [foo];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_column_reference_prefer_quoted_ansi:
+  fail_str: |
+    SELECT 123 AS foo;
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_table_reference_prefer_quoted_ansi:
+  pass_str: |
+    SELECT "foo"
+    FROM "bar";
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_table_reference_prefer_quoted_tsql:
+  pass_str: |
+    SELECT [foo]
+    FROM [bar];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_table_reference_prefer_quoted_ansi:
+  fail_str: |
+    SELECT "foo"
+    FROM bar;
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_table_reference_prefer_quoted_tsql:
+  fail_str: |
+    SELECT [foo]
+    FROM bar;
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_multiple_references_prefer_quoted_ansi:
+  pass_str: |
+    SELECT "foo"
+    FROM "bar"."baz";
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_multiple_references_prefer_quoted_tsql:
+  pass_str: |
+    SELECT [foo]
+    FROM [bar].[baz];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_multiple_references_prefer_quoted_ansi:
+  fail_str: |
+    SELECT "foo"
+    FROM bar.baz;
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_multiple_references_prefer_quoted_tsql:
+  fail_str: |
+    SELECT [foo]
+    FROM bar.baz;
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_whitespace_prefer_quoted_ansi:
+  pass_str: |
+    SELECT 123 AS "I cannot be unquoted"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_whitespace_prefer_quoted_tsql:
+  pass_str: |
+    SELECT 123 AS [I cannot be unquoted]
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_special_symbols_prefer_quoted_ansi:
+  pass_str: |
+    SELECT 123 AS "I-c@nn0t-be~un-quoted"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_special_symbols_prefer_quoted_tsql:
+  pass_str: |
+    SELECT 123 AS [I-c@nn0t-be~un-quoted]
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_reserved_keyword_prefer_quoted_ansi:
+  pass_str: |
+    SELECT 123 AS "SELECT"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_reserved_keyword_prefer_quoted_tsql:
+  pass_str: |
+    SELECT 123 AS [SELECT]
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_column_reference_prefer_quoted_backticks:
+  pass_str: |
+    SELECT 123 AS `foo`;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_column_reference_prefer_quoted_backticks:
+  fail_str: |
+    SELECT 123 AS foo;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_table_reference_prefer_quoted_backticks:
+  pass_str: |
+    SELECT `foo`
+    FROM `bar`;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_table_reference_prefer_quoted_backticks:
+  fail_str: |
+    SELECT `foo`
+    FROM bar;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_multiple_references_prefer_quoted_backticks:
+  pass_str: |
+    SELECT `foo`
+    FROM `bar`.`baz`;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_multiple_references_prefer_quoted_backticks:
+  fail_str: |
+    SELECT `foo`
+    FROM bar.baz;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_whitespace_prefer_quoted_backticks:
+  pass_str: |
+    SELECT 123 AS `I cannot be unquoted`
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_special_symbols_prefer_quoted_backticks:
+  pass_str: |
+    SELECT 123 AS `I-c@nn0t-be~un-quoted`
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_reserved_keyword_prefer_quoted_backticks:
+  pass_str: |
+    SELECT 123 AS `SELECT`
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_datetime_redshift:
+  pass_str: |
+    SELECT "datetime"
+  configs:
+    core:
+      dialect: redshift
+
+test_pass_uppivot_bigquery:
+  pass_str: |
+    SELECT
+        *
+    FROM model
+    UNPIVOT(
+        (A, B)
+        FOR year
+        IN ((C, D) AS 'year_2011', (E, F) AS 'year_2012'));
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_quoted_identifier_keyword_tsql:
+  pass_str: |
+    SET QUOTED_IDENTIFIER ON
+    GO
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_create_user_quoted_password_exasol:
+  pass_str: |
+    CREATE USER user_1 IDENTIFIED BY "h12_xhz";
+  configs:
+    core:
+      dialect: exasol
+
+test_fail_create_quoted_user_exasol:
+  fail_str: |
+    CREATE USER "USER1" IDENTIFIED BY "h12_xhz";
+  fix_str: |
+    CREATE USER USER1 IDENTIFIED BY "h12_xhz";
+  configs:
+    core:
+      dialect: exasol
+
+test_pass_ignore_lists:
+  pass_str:
+    SELECT 123 AS "foo";
+  configs:
+    rules:
+      references.quoting:
+        ignore_words: foo
+
+test_pass_ignore_lists_tsql:
+  pass_str:
+    SELECT 123 AS [foo];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        ignore_words: foo
+
+test_pass_ignore_lists_mixed_case:
+  pass_str:
+    SELECT 123 AS "Foo";
+  configs:
+    rules:
+      references.quoting:
+        ignore_words: foo
+
+test_pass_ignore_lists_mixed_case_tsql:
+  pass_str:
+    SELECT 123 AS [Foo];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        ignore_words: foo
+
+test_pass_ignore_words_regex:
+  pass_str:
+    SELECT 123 AS "foo";
+  configs:
+    rules:
+      references.quoting:
+        ignore_words_regex: ^fo
+
+test_pass_ignore_words_regex_tsql:
+  pass_str:
+    SELECT 123 AS [foo];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        ignore_words_regex: ^fo
+
+test_pass_ignore_words_regex_mixed_case:
+  pass_str:
+    SELECT 123 AS "Foo";
+  configs:
+    rules:
+      references.quoting:
+        ignore_words_regex: ^Fo
+
+test_pass_ignore_words_regex_mixed_case_tsql:
+  pass_str:
+    SELECT 123 AS [Foo];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        ignore_words_regex: ^Fo
+
+test_pass_ignore_if:
+  pass_str:
+    DROP TABLE IF EXISTS "example";
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_pass_ignore_if_tsql:
+  pass_str:
+    DROP TABLE IF EXISTS [example];
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+
+test_fail_insert_overwrite_directory:
+  # NOTE: SparkSQL is case insensitive
+  fail_str: |
+    INSERT OVERWRITE DIRECTORY '/tmp/destination'
+    USING PARQUET
+    OPTIONS ("col1" = "1", "col2" = "2", "col3" = 'test', "user" = "a person")
+    SELECT a FROM test_table;
+  fix_str: |
+    INSERT OVERWRITE DIRECTORY '/tmp/destination'
+    USING PARQUET
+    OPTIONS (col1 = "1", col2 = "2", col3 = 'test', "user" = "a person")
+    SELECT a FROM test_table;
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_insert_overwrite_directory:
+  pass_str: |
+    INSERT OVERWRITE DIRECTORY '/tmp/destination'
+    USING PARQUET
+    OPTIONS (col1 = "1", col2 = "2", col3 = 'test', "user" = "a person")
+    SELECT a FROM test_table;
+  configs:
+    core:
+      dialect: sparksql
+
+test_fail_quoted_column_ansi:
+  # NOTE: ANSI is UPPERCASE
+  fail_str: |
+    SELECT d."DATE"
+    FROM d
+  fix_str: |
+    SELECT d.DATE
+    FROM d
+
+test_fail_quoted_column_tsql:
+  # NOTE: TSQL is UPPERCASE
+  fail_str: |
+    SELECT d.[DATE]
+    FROM d
+  fix_str: |
+    SELECT d.DATE
+    FROM d
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_quoted_column_tsql_case_insensitive:
+  fail_str: |
+    SELECT d.[date]
+    FROM d
+  fix_str: |
+    SELECT d.date
+    FROM d
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.quoting:
+        case_sensitive: false
+
+test_pass_quoted_column_snowflake:
+  # The rule is disabled by default in Snowflake.
+  pass_str: |
+    SELECT d."date"
+    FROM d
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_quoted_column_snowflake_case_insensitive:
+  fail_str: |
+    SELECT d."date"
+    FROM d
+  fix_str: |
+    SELECT d.date
+    FROM d
+  configs:
+    core:
+      dialect: snowflake
+    rules:
+      references.quoting:
+        case_sensitive: false
+
+test_fail_quoted_column_postgres_case_sensitive:
+  fail_str: |
+    SELECT d."foo", d."FOO"
+    FROM d
+  fix_str: |
+    SELECT d.foo, d."FOO"
+    FROM d
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.quoting:
+        case_sensitive: true
+
+test_fail_quoted_column_postgres_case_insensitive:
+  fail_str: |
+    SELECT d."foo", d."FOO"
+    FROM d
+  fix_str: |
+    SELECT d.foo, d.FOO
+    FROM d
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.quoting:
+        case_sensitive: false
+
+test_pass_prefer_quoted_keywords_athena:
+  pass_str: SELECT 1 AS "metadata"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+    core:
+      dialect: athena
+
+test_fail_prefer_quoted_keywords_athena:
+  fail_str: SELECT 1 AS metadata
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+    core:
+      dialect: athena
+
+test_pass_prefer_quoted_keywords_sqlite_double_quotes:
+  pass_str: SELECT 1 AS "date"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+    core:
+      dialect: sqlite
+
+test_pass_prefer_quoted_keywords_sqlite_backticks:
+  pass_str: SELECT 1 AS `date`
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+        prefer_quoted_keyword_style: backticks
+    core:
+      dialect: sqlite
+
+test_fail_prefer_quoted_keywords_sqlite_double_quotes:
+  fail_str: SELECT 1 AS date
+  fix_str: SELECT 1 AS "date"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+    core:
+      dialect: sqlite
+
+test_fail_prefer_quoted_keywords_sqlite_backticks:
+  fail_str: SELECT 1 AS date
+  fix_str: SELECT 1 AS `date`
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+        prefer_quoted_keyword_style: backticks
+    core:
+      dialect: sqlite
+
+test_fail_prefer_quoted_keywords_sqlite_backticks_to_double_quotes:
+  fail_str: SELECT 1 AS `date`
+  fix_str: SELECT 1 AS "date"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+    core:
+      dialect: sqlite
+
+test_fail_prefer_quoted_keywords_sqlite_double_quotes_to_backticks:
+  fail_str: SELECT 1 AS "date"
+  fix_str: SELECT 1 AS `date`
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_keywords: true
+        prefer_quoted_keyword_style: backticks
+    core:
+      dialect: sqlite
+
+test_fail_prefer_quoted_identifiers_sqlite_no_fix:
+  fail_str: SELECT 1 AS foo
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+    core:
+      dialect: sqlite
+
+test_pass_prefer_quoted_identifiers_sqlite_existing_quotes:
+  pass_str: SELECT 1 AS "foo"
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: true
+    core:
+      dialect: sqlite
+
+test_pass_tsql_execute_as:
+  # 'login_test' should remain quoted.
+  pass_str: |
+    CREATE TRIGGER connection_limit_trigger
+    ON ALL SERVER WITH EXECUTE AS 'login_test'
+    FOR LOGON
+    AS
+        PRINT 'Database Created.'
+        SELECT 1
+    GO
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: false
+    core:
+      dialect: tsql
+
+test_pass_exasol_password_literals:
+  # password literals should remain quoted.
+  pass_str: |
+    ALTER USER user_1 IDENTIFIED BY "h22_xhz" REPLACE "h12_xhz";
+  configs:
+    rules:
+      references.quoting:
+        prefer_quoted_identifiers: false
+    core:
+      dialect: exasol
+
+test_snowflake_default_keyword:
+  pass_str: |
+    SELECT
+      foo,
+      "DEFAULT"
+    FROM my_table;
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_mysql_account_quotes:
+  # Account names are not ordinary identifiers; preserve their quoting.
+  pass_str: |
+    CREATE USER 'jeffrey'@'localhost' IDENTIFIED BY 'password';
+    CREATE USER `jeffrey`@`localhost` IDENTIFIED BY 'password';
+    CREATE USER 'jeffrey' IDENTIFIED BY 'password';
+    GRANT ALL PRIVILEGES ON *.* TO 'prj_svc'@'localhost';
+    GRANT 'reader'@'localhost' TO 'jeffrey'@'localhost';
+    DROP USER 'jeffrey'@'localhost';
+    DROP USER `prj_svc`@`localhost`;
+    SET DEFAULT ROLE 'reader'@'localhost' TO 'jeffrey'@'localhost';
+    CREATE DEFINER = `admin`@`localhost` SQL SECURITY INVOKER
+    VIEW v5 AS SELECT 1;
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_mariadb_account_quotes:
+  pass_str: |
+    CREATE USER 'jeffrey'@'localhost' IDENTIFIED BY 'password';
+    CREATE USER `jeffrey`@`localhost` IDENTIFIED BY 'password';
+    CREATE USER 'jeffrey' IDENTIFIED BY 'password';
+    GRANT ALL PRIVILEGES ON *.* TO 'prj_svc'@'localhost';
+    DROP USER 'jeffrey'@'localhost';
+    DROP USER `prj_svc`@`localhost`;
+    CREATE DEFINER = `admin`@`localhost` SQL SECURITY INVOKER
+    VIEW IF NOT EXISTS v5 AS SELECT 1;
+  configs:
+    core:
+      dialect: mariadb
+
+test_fail_mysql_quoted_table_with_account:
+  fail_str: |
+    GRANT SELECT ON `app`.`records` TO 'prj_svc'@'localhost';
+  fix_str: |
+    GRANT SELECT ON app.records TO 'prj_svc'@'localhost';
+  configs:
+    core:
+      dialect: mysql
+
+test_fail_mariadb_quoted_table_with_account:
+  fail_str: |
+    GRANT SELECT ON `app`.`records` TO 'prj_svc'@'localhost';
+  fix_str: |
+    GRANT SELECT ON app.records TO 'prj_svc'@'localhost';
+  configs:
+    core:
+      dialect: mariadb
+
+test_fail_postgres_quoted_role:
+  # Other dialects still permit unquoting ordinary role identifiers.
+  fail_str: |
+    GRANT SELECT ON app.records TO "reader";
+  fix_str: |
+    GRANT SELECT ON app.records TO reader;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_oracle_case_sensitive_quoted_alias:
+  # Oracle casefolds to UPPERCASE, so a quoted alias which is not already
+  # uppercase cannot be unquoted without changing the identifier.
+  pass_str: |
+    SELECT
+      col AS "renamedCol",
+      col AS "renamed_col"
+    FROM my_table
+  configs:
+    core:
+      dialect: oracle
+
+test_fail_oracle_redundant_quoted_alias:
+  # An alias which already matches the casefolded form is redundantly quoted.
+  fail_str: |
+    SELECT col AS "RENAMEDCOL"
+    FROM my_table
+  fix_str: |
+    SELECT col AS RENAMEDCOL
+    FROM my_table
+  configs:
+    core:
+      dialect: oracle
+
+test_fix_mysql_quoted_qualified_function_name:
+  fail_str: |
+    SELECT `app`.`my_func`(1) FROM t;
+  fix_str: |
+    SELECT app.my_func(1) FROM t;
+  configs:
+    core:
+      dialect: mysql
+
+test_fix_mariadb_quoted_qualified_function_name:
+  fail_str: |
+    SELECT `app`.`my_func`(1) FROM t;
+  fix_str: |
+    SELECT app.my_func(1) FROM t;
+  configs:
+    core:
+      dialect: mariadb
+
+test_fail_mysql_number_like_names_remain_quoted:
+  # Unquoted, `1e5`, `0x1F` and `0b101` are numbers in MySQL. `1a` is a name.
+  fail_str: |
+    SELECT `1e5`, `0x1F`, `0b101`, `1a`, `col` FROM t;
+  fix_str: |
+    SELECT `1e5`, `0x1F`, `0b101`, 1a, col FROM t;
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_sqlite_number_like_names_remain_quoted:
+  # Unquoted, `1E5` and `0X1F` are numbers in SQLite.
+  pass_str: |
+    SELECT "1E5", [0X1F], `1E5` FROM t;
+  configs:
+    core:
+      dialect: sqlite
+
+test_pass_sparksql_typed_number_like_names_remain_quoted:
+  # Unquoted, `1L`, `1D` and `1BD` are typed numbers in Spark SQL.
+  pass_str: |
+    SELECT `1L`, `1D`, `1BD`, `1e5` FROM t;
+  configs:
+    core:
+      dialect: sparksql

@@ -1,0 +1,129 @@
+"""Tests for the SQLFluff integration with the "diff-quality" tool."""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from sqlfluff import diff_quality_plugin
+from sqlfluff.cli.commands import lint
+from sqlfluff.utils.testing.cli import invoke_assert_code
+
+
+@pytest.mark.parametrize(
+    "sql_paths,expected_violations_lines",
+    [
+        (("linter/indentation_errors.sql",), list(range(2, 7))),
+        (("linter/parse_error.sql",), {1}),
+        # NB: This version of the file is in a directory configured
+        # to ignore parsing errors.
+        (("linter/diffquality/parse_error.sql",), []),
+        (tuple(), []),
+        (("linter/indentation_errors.sql", "linter/deleted.sql"), list(range(2, 7))),
+    ],
+)
+def test_diff_quality_plugin(sql_paths, expected_violations_lines, monkeypatch):
+    """Test the plugin at least finds errors on the expected lines."""
+
+    def execute(command, exit_codes):
+        printable_command_parts = [
+            c.decode(sys.getfilesystemencoding()) if isinstance(c, bytes) else c
+            for c in command
+        ]
+
+        result = invoke_assert_code(
+            ret_code=1 if expected_violations_lines else 0,
+            args=[
+                lint,
+                printable_command_parts[2:],
+            ],
+        )
+        return result.output, ""
+
+    # Mock the execute function -- this is an attempt to prevent the CircleCI
+    # coverage check from hanging. (We've seen issues in the past where using
+    # subprocesses caused things to occasionally hang.)
+    monkeypatch.setattr(diff_quality_plugin, "execute", execute)
+    monkeypatch.chdir("test/fixtures/")
+    violation_reporter = diff_quality_plugin.diff_cover_report_quality(
+        options="--processes=1"
+    )
+    sql_paths = [str(Path(sql_path)) for sql_path in sql_paths]
+
+    violations_dict = violation_reporter.violations_batch(sql_paths)
+    assert isinstance(violations_dict, dict)
+    if expected_violations_lines:
+        assert len(violations_dict[sql_paths[0]]) > 0
+        violations_lines = {v.line for v in violations_dict[sql_paths[0]]}
+        for expected_line in expected_violations_lines:
+            assert expected_line in violations_lines
+    else:
+        assert (
+            len(violations_dict[sql_paths[0]]) == 0
+            if sql_paths
+            else len(violations_dict) == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "src_paths",
+    [["deleted.sql"], ["README.md"], ["deleted.sql", "README.md"], ["directory.sql"]],
+)
+def test_diff_quality_skips_missing_or_non_sql_files(src_paths, monkeypatch, tmp_path):
+    """Do not accidentally lint the working directory when no SQL files remain."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "README.md").write_text("Modified non-SQL file")
+    (tmp_path / "directory.sql").mkdir()
+
+    def unexpected_execute(*args, **kwargs):
+        pytest.fail("SQLFluff must not run without an eligible SQL path")
+
+    monkeypatch.setattr(diff_quality_plugin, "execute", unexpected_execute)
+    reporter = diff_quality_plugin.diff_cover_report_quality()
+    reporter.driver_tool_installed = True
+    assert not reporter.violations_batch(src_paths)
+
+
+@pytest.mark.parametrize(
+    "options,configured_rules,expected_violations",
+    [
+        (None, "CP01", [(1, "Keywords must be upper case.")]),
+        ("--rules CP01", "LT12", [(1, "Keywords must be upper case.")]),
+        ("--rules LT12", "CP01", []),
+        ("--exclude-rules CP01", "CP01", []),
+    ],
+)
+def test_diff_quality_rule_options(
+    options, configured_rules, expected_violations, monkeypatch, tmp_path
+):
+    """Rule options must affect lint results, not just appear in the command (#1759)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\n"
+        "dialect = ansi\n"
+        f"rules = {configured_rules}\n"
+        "[sqlfluff:rules:capitalisation.keywords]\n"
+        "capitalisation_policy = upper\n"
+    )
+    (tmp_path / "example.sql").write_text("select 1\n")
+
+    def execute(command, exit_codes):
+        # Use the real CLI via the same in-process seam as the integration tests
+        # above, avoiding a subprocess while preserving option/config precedence.
+        args = [
+            c.decode(sys.getfilesystemencoding()) if isinstance(c, bytes) else c
+            for c in command
+        ]
+        result = invoke_assert_code(
+            ret_code=1 if expected_violations else 0,
+            args=[lint, args[2:]],
+        )
+        return result.output, ""
+
+    monkeypatch.setattr(diff_quality_plugin, "execute", execute)
+    reporter = diff_quality_plugin.diff_cover_report_quality(options=options)
+    reporter.driver_tool_installed = True
+    violations = reporter.violations_batch(["example.sql"])
+    assert [
+        (v.line, v.message) for v in violations["example.sql"]
+    ] == expected_violations

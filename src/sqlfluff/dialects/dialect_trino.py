@@ -1,0 +1,1553 @@
+"""The Trino dialect.
+
+See https://trino.io/docs/current/language.html
+"""
+
+from sqlfluff.core.dialects import load_raw_dialect
+from sqlfluff.core.parser import (
+    AnyNumberOf,
+    AnySetOf,
+    Anything,
+    BaseSegment,
+    Bracketed,
+    CodeSegment,
+    Dedent,
+    Delimited,
+    IdentifierSegment,
+    Indent,
+    LiteralSegment,
+    Matchable,
+    Nothing,
+    OneOf,
+    OptionallyBracketed,
+    Ref,
+    RegexLexer,
+    Sequence,
+    StringLexer,
+    StringParser,
+    SymbolSegment,
+    TypedParser,
+)
+from sqlfluff.core.parser.grammar.lookbehind import is_distinct_from_lookbehind
+from sqlfluff.dialects import dialect_ansi as ansi
+from sqlfluff.dialects.dialect_trino_keywords import (
+    trino_reserved_keywords,
+    trino_unreserved_keywords,
+)
+
+ansi_dialect = load_raw_dialect("ansi")
+trino_dialect = ansi_dialect.copy_as(
+    "trino",
+    formatted_name="Trino",
+    docstring="""**Default Casing**: ``lowercase``, although the case
+of a reference is used in the result set column label. If a column is defined
+using :code:`CREATE TEMPORARY TABLE foo (COL1 int)`, then :code:`SELECT * FROM foo`
+returns a column labelled :code:`col1`, however :code:`SELECT COL1 FROM foo`
+returns a column labelled :code:`COL1`.
+
+**Quotes**: String Literals: ``''``, Identifiers: ``""``
+
+The dialect for `Trino <https://trino.io/docs/current/>`_.""",
+)
+
+# Set the bare functions: https://trino.io/docs/current/functions/datetime.html
+trino_dialect.sets("bare_functions").update(
+    ["current_date", "current_time", "current_timestamp", "localtime", "localtimestamp"]
+)
+
+# Set keywords
+trino_dialect.sets("unreserved_keywords").clear()
+trino_dialect.update_keywords_set_from_multiline_string(
+    "unreserved_keywords", trino_unreserved_keywords
+)
+
+trino_dialect.sets("reserved_keywords").clear()
+trino_dialect.update_keywords_set_from_multiline_string(
+    "reserved_keywords", trino_reserved_keywords
+)
+
+trino_dialect.insert_lexer_matchers(
+    # Regexp Replace w/ Lambda: https://trino.io/docs/422/functions/regexp.html
+    [
+        StringLexer("right_arrow", "->", CodeSegment),
+        StringLexer("fat_right_arrow", "=>", CodeSegment),
+        # MATCH_RECOGNIZE PATTERN: the `$` end anchor (no other Trino construct
+        # uses a bare `$`, unlike `^`, which ansi already lexes), the
+        # reluctant-quantifier `?`, and the `{- -}` exclusion brackets.
+        # https://trino.io/docs/current/sql/match-recognize.html
+        StringLexer("dollar", "$", CodeSegment),
+        StringLexer("question_mark", "?", CodeSegment),
+        StringLexer("exclude_bracket_open", "{-", CodeSegment),
+        StringLexer("exclude_bracket_close", "-}", CodeSegment),
+    ],
+    before="like_operator",
+)
+
+trino_dialect.bracket_sets("bracket_pairs").update(
+    [
+        ("exclude", "StartExcludeBracketSegment", "EndExcludeBracketSegment", True),
+    ]
+)
+
+trino_dialect.add(
+    RightArrowOperator=StringParser("->", SymbolSegment, type="binary_operator"),
+    LambdaArrowSegment=StringParser("->", SymbolSegment, type="lambda_arrow"),
+    ExecuteArrowSegment=StringParser("=>", SymbolSegment, type="execute_arrow"),
+    StartAngleBracketSegment=StringParser(
+        "<", SymbolSegment, type="start_angle_bracket"
+    ),
+    EndAngleBracketSegment=StringParser(">", SymbolSegment, type="end_angle_bracket"),
+    FormatJsonEncodingGrammar=Sequence(
+        "FORMAT",
+        "JSON",
+        Sequence("ENCODING", OneOf("UTF8", "UTF16", "UTF32"), optional=True),
+    ),
+    # MATCH_RECOGNIZE PATTERN symbols. https://trino.io/docs/current/sql/match-recognize.html
+    CaretSegment=StringParser("^", SymbolSegment, type="caret"),
+    DollarSegment=StringParser("$", SymbolSegment, type="dollar"),
+    QuestionMarkSegment=StringParser("?", SymbolSegment, type="question_mark"),
+    StartExcludeBracketSegment=StringParser(
+        "{-", SymbolSegment, type="start_exclude_bracket"
+    ),
+    EndExcludeBracketSegment=StringParser(
+        "-}", SymbolSegment, type="end_exclude_bracket"
+    ),
+    PatternQuantifierGrammar=Sequence(
+        OneOf(
+            Ref("PositiveSegment"),
+            Ref("StarSegment"),
+            Ref("QuestionMarkSegment"),
+            Bracketed(
+                OneOf(
+                    Ref("NumericLiteralSegment"),
+                    # `{,}` is the same as `*`.
+                    Ref("CommaSegment"),
+                    Sequence(Ref("NumericLiteralSegment"), Ref("CommaSegment")),
+                    Sequence(Ref("CommaSegment"), Ref("NumericLiteralSegment")),
+                    Sequence(
+                        Ref("NumericLiteralSegment"),
+                        Ref("CommaSegment"),
+                        Ref("NumericLiteralSegment"),
+                    ),
+                ),
+                bracket_type="curly",
+                bracket_pairs_set="bracket_pairs",
+            ),
+        ),
+        # A trailing `?` puts the quantifier into reluctant mode, e.g. `{3,5}?`.
+        Ref("QuestionMarkSegment", optional=True),
+        allow_gaps=False,
+    ),
+    PatternSymbolGrammar=Sequence(
+        Ref("SingleIdentifierGrammar"),
+        Ref("PatternQuantifierGrammar", optional=True),
+        allow_gaps=False,
+    ),
+    PatternOperatorGrammar=OneOf(
+        Ref("PatternSymbolGrammar"),
+        Sequence(
+            OneOf(
+                # `{- ... -}`: exclude the matched portion from ALL ROWS output.
+                Bracketed(
+                    # One or more `|`-delimited alternatives, each itself a
+                    # concatenation of one or more operators (not a bare OneOf
+                    # of "all concatenation" vs "all alternation": that can't
+                    # represent `a b | c`, a concatenation on one side of `|`).
+                    Delimited(
+                        AnyNumberOf(Ref("PatternOperatorGrammar"), min_times=1),
+                        delimiter=Ref("PipeSegment"),
+                    ),
+                    bracket_type="exclude",
+                    bracket_pairs_set="bracket_pairs",
+                ),
+                # A parenthesised group, concatenation or `|`-delimited alternation.
+                # `()` on its own is the empty pattern.
+                Bracketed(
+                    Delimited(
+                        AnyNumberOf(Ref("PatternOperatorGrammar"), min_times=1),
+                        delimiter=Ref("PipeSegment"),
+                        optional=True,
+                    ),
+                ),
+                Sequence(
+                    "PERMUTE",
+                    Bracketed(Delimited(Ref("PatternSymbolGrammar"))),
+                ),
+            ),
+            Ref("PatternQuantifierGrammar", optional=True),
+            allow_gaps=False,
+        ),
+    ),
+)
+
+trino_dialect.bracket_sets("angle_bracket_pairs").update(
+    [
+        ("angle", "StartAngleBracketSegment", "EndAngleBracketSegment", False),
+    ]
+)
+
+trino_dialect.patch_lexer_matchers(
+    [
+        RegexLexer(
+            "double_quote",
+            r'"([^"]|"")*"',
+            CodeSegment,
+            segment_kwargs={
+                "quoted_value": (r'"((?:[^"]|"")*)"', 1),
+                "escape_replacements": [(r'""', '"')],
+            },
+        ),
+    ]
+)
+
+trino_dialect.replace(
+    DateTimeLiteralGrammar=OneOf(
+        Sequence(
+            OneOf("DATE", "TIME", "TIMESTAMP"),
+            TypedParser(
+                "single_quote", LiteralSegment, type="date_constructor_literal"
+            ),
+        ),
+        Ref("IntervalExpressionSegment"),
+    ),
+    LikeGrammar=Sequence("LIKE"),
+    # TODO: There are no custom SQL functions in Trino! How to handle this?
+    MLTableExpressionSegment=Nothing(),
+    JoinLikeClauseGrammar=Ref("MatchRecognizeClauseSegment"),
+    FromClauseTerminatorGrammar=OneOf(
+        "WHERE",
+        "LIMIT",
+        "OFFSET",
+        Sequence("GROUP", "BY"),
+        Sequence("ORDER", "BY"),
+        "HAVING",
+        "WINDOW",
+        Ref("SetOperatorSegment"),
+        Ref("WithNoSchemaBindingClauseSegment"),
+        Ref("WithDataClauseSegment"),
+        "FETCH",
+    ),
+    OrderByClauseTerminators=OneOf(
+        "LIMIT",
+        "OFFSET",
+        "HAVING",
+        # For window functions
+        "WINDOW",
+        Ref("FrameClauseUnitGrammar"),
+        "FETCH",
+    ),
+    SelectClauseTerminatorGrammar=OneOf(
+        Ref(
+            "FromKeywordSegment",
+            exclude=is_distinct_from_lookbehind,
+        ),
+        "WHERE",
+        Sequence("ORDER", "BY"),
+        "LIMIT",
+        Ref("SetOperatorSegment"),
+        "FETCH",
+    ),
+    WhereClauseTerminatorGrammar=OneOf(
+        "LIMIT",
+        "OFFSET",
+        Sequence("GROUP", "BY"),
+        Sequence("ORDER", "BY"),
+        "HAVING",
+        "WINDOW",
+        "FETCH",
+    ),
+    HavingClauseTerminatorGrammar=OneOf(
+        Sequence("ORDER", "BY"),
+        "LIMIT",
+        "OFFSET",
+        "WINDOW",
+        "FETCH",
+    ),
+    GroupByClauseTerminatorGrammar=OneOf(
+        Sequence("ORDER", "BY"),
+        "LIMIT",
+        "OFFSET",
+        "HAVING",
+        "WINDOW",
+        "FETCH",
+    ),
+    # NOTE: This block was copy/pasted from dialect_ansi.py with these changes made:
+    #  - "PRIOR" keyword removed
+    Expression_A_Unary_Operator_Grammar=OneOf(
+        Ref(
+            "SignedSegmentGrammar",
+            exclude=Sequence(Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Ref("TildeSegment"),
+        Ref("NotOperatorGrammar"),
+    ),
+    PostFunctionGrammar=ansi_dialect.get_grammar("PostFunctionGrammar").copy(
+        insert=[
+            Ref("WithinGroupClauseSegment"),
+            Ref("WithOrdinalityClauseSegment"),
+        ],
+    ),
+    FunctionContentsGrammar=AnyNumberOf(
+        Ref("ExpressionSegment"),
+        # A Cast-like function
+        Sequence(Ref("ExpressionSegment"), "AS", Ref("DatatypeSegment")),
+        # Trim function
+        Sequence(
+            Ref("TrimParametersGrammar"),
+            Ref("ExpressionSegment", optional=True, exclude=Ref.keyword("FROM")),
+            "FROM",
+            Ref("ExpressionSegment"),
+        ),
+        # An extract-like or substring-like function
+        Sequence(
+            OneOf(Ref("DatetimeUnitSegment"), Ref("ExpressionSegment")),
+            "FROM",
+            Ref("ExpressionSegment"),
+        ),
+        Sequence(
+            # Allow an optional distinct keyword here.
+            Ref.keyword("DISTINCT", optional=True),
+            OneOf(
+                # Most functions will be using the delimited route
+                # but for COUNT(*) or similar we allow the star segment
+                # here.
+                Ref("StarSegment"),
+                Delimited(Ref("FunctionContentsExpressionGrammar")),
+            ),
+        ),
+        Ref(
+            "OrderByClauseSegment"
+        ),  # used by string_agg (postgres), group_concat (exasol),listagg (snowflake)..
+        # like a function call: POSITION ( 'QL' IN 'SQL')
+        Sequence(
+            OneOf(
+                Ref("QuotedLiteralSegment"),
+                Ref("SingleIdentifierGrammar"),
+                Ref("ColumnReferenceSegment"),
+            ),
+            "IN",
+            OneOf(
+                Ref("QuotedLiteralSegment"),
+                Ref("SingleIdentifierGrammar"),
+                Ref("ColumnReferenceSegment"),
+            ),
+        ),
+        # For JSON_QUERY function
+        # https://trino.io/docs/current/functions/json.html#json-query
+        Sequence(
+            Ref("ExpressionSegment"),  # json_input
+            Ref("FormatJsonEncodingGrammar", optional=True),
+            Ref("CommaSegment"),
+            Ref("ExpressionSegment"),  # json_path
+            OneOf(
+                Sequence("WITHOUT", Ref.keyword("ARRAY", optional=True), "WRAPPER"),
+                Sequence(
+                    "WITH",
+                    OneOf("CONDITIONAL", "UNCONDITIONAL", optional=True),
+                    Ref.keyword("ARRAY", optional=True),
+                    "WRAPPER",
+                ),
+                optional=True,
+            ),
+        ),
+        # For JSON_OBJECT function: key : value [, ...]
+        # https://trino.io/docs/current/functions/json.html#json-object
+        Sequence(
+            Delimited(
+                Sequence(
+                    Ref("ExpressionSegment"),
+                    Ref("ColonDelimiterSegment"),
+                    Ref("ExpressionSegment"),
+                ),
+            ),
+            Sequence(
+                OneOf("NULL", "ABSENT"),
+                "ON",
+                "NULL",
+                optional=True,
+            ),
+            Sequence(
+                "RETURNING",
+                Ref("DatatypeSegment"),
+                Ref("FormatJsonEncodingGrammar", optional=True),
+                optional=True,
+            ),
+        ),
+        # For JSON_ARRAY / JSON_OBJECT functions: { NULL | ABSENT } ON NULL
+        # https://trino.io/docs/current/functions/json.html#json-array
+        # https://trino.io/docs/current/functions/json.html#json-object
+        Sequence(
+            OneOf("NULL", "ABSENT"),
+            "ON",
+            "NULL",
+        ),
+        # For JSON functions: RETURNING type [FORMAT JSON [ENCODING ...]]
+        # https://trino.io/docs/current/functions/json.html#json-array
+        Sequence(
+            "RETURNING",
+            Ref("DatatypeSegment"),
+            Ref("FormatJsonEncodingGrammar", optional=True),
+        ),
+        Ref("IgnoreRespectNullsGrammar"),
+        Ref("IndexColumnDefinitionSegment"),
+        Ref("EmptyStructLiteralSegment"),
+        Ref("ListaggOverflowClauseSegment"),
+    ),
+    BinaryOperatorGrammar=OneOf(
+        Ref("ArithmeticBinaryOperatorGrammar"),
+        Ref("StringBinaryOperatorGrammar"),
+        Ref("BooleanBinaryOperatorGrammar"),
+        Ref("ComparisonOperatorGrammar"),
+        # Add arrow operators for functions (e.g. regexp_replace)
+        Ref("RightArrowOperator"),
+    ),
+    AccessorGrammar=AnyNumberOf(
+        Ref("ArrayAccessorSegment"),
+        # Add in semi structured expressions
+        Ref("SemiStructuredAccessorSegment"),
+    ),
+    # match ANSI's naked identifier casefold, trino is case-insensitive.
+    QuotedIdentifierSegment=TypedParser(
+        "double_quote", IdentifierSegment, type="quoted_identifier", casefold=str.upper
+    ),
+    FunctionContentsExpressionGrammar=OneOf(
+        Ref("LambdaExpressionSegment"),
+        Ref("ExpressionSegment"),
+    ),
+    TemporaryTransientGrammar=Nothing(),
+    PrimaryKeyGrammar=Nothing(),
+    ForeignKeyGrammar=Nothing(),
+    UniqueKeyGrammar=Nothing(),
+    TemporaryGrammar=Nothing(),
+)
+
+
+class PrimitiveTypeSegment(BaseSegment):
+    """Primitive type segment.
+
+    See https://trino.io/docs/current/language/types.html
+    """
+
+    type = "primitive_type"
+    match_grammar = OneOf(
+        # Boolean
+        "BOOLEAN",
+        # Integer
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "INT",
+        "BIGINT",
+        # Floating-point
+        "REAL",
+        "DOUBLE",
+        # Fixed-precision
+        Sequence(
+            "DECIMAL",
+            Ref("BracketedArguments", optional=True),
+        ),
+        # String
+        Sequence(
+            OneOf("CHAR", "VARCHAR"),
+            Ref("BracketedArguments", optional=True),
+        ),
+        "VARBINARY",
+        "JSON",
+        # Date and time
+        "DATE",
+        Ref("TimeWithTZGrammar"),
+        # Others
+        "IPADDRESS",
+        "UUID",
+    )
+
+
+class DatatypeSegment(BaseSegment):
+    """Data type segment.
+
+    See https://trino.io/docs/current/language/types.html
+    """
+
+    type = "data_type"
+    match_grammar = OneOf(
+        Ref("PrimitiveTypeSegment"),
+        # Structural
+        Ref("ArrayTypeSegment"),
+        Ref("MapTypeSegment"),
+        Ref("RowTypeSegment"),
+    )
+
+
+class RowTypeSegment(ansi.StructTypeSegment):
+    """Expression to construct a ROW datatype."""
+
+    match_grammar = Sequence(
+        "ROW",
+        Ref("RowTypeSchemaSegment", optional=True),
+    )
+
+
+class RowTypeSchemaSegment(BaseSegment):
+    """Expression to construct the schema of a ROW datatype."""
+
+    type = "struct_type_schema"
+    match_grammar = Bracketed(
+        Delimited(  # Comma-separated list of field names/types
+            Sequence(
+                OneOf(
+                    # ParameterNames can look like Datatypes so can't use
+                    # Optional=True here and instead do a OneOf in order
+                    # with DataType only first, followed by both.
+                    Ref("DatatypeSegment"),
+                    Sequence(
+                        Ref("ParameterNameSegment"),
+                        Ref("DatatypeSegment"),
+                    ),
+                )
+            )
+        )
+    )
+
+
+class SemiStructuredAccessorSegment(BaseSegment):
+    """A semi-structured data accessor segment."""
+
+    type = "semi_structured_expression"
+    match_grammar = Sequence(
+        Ref("DotSegment"),
+        Ref("SingleIdentifierGrammar"),
+        Ref("ArrayAccessorSegment", optional=True),
+        AnyNumberOf(
+            Sequence(
+                Ref("DotSegment"),
+                Ref("SingleIdentifierGrammar"),
+                allow_gaps=True,
+            ),
+            Ref("ArrayAccessorSegment", optional=True),
+            allow_gaps=True,
+        ),
+        allow_gaps=True,
+    )
+
+
+class OverlapsClauseSegment(BaseSegment):
+    """An `OVERLAPS` clause like in `SELECT."""
+
+    type = "overlaps_clause"
+    match_grammar: Matchable = Nothing()
+
+
+class UnorderedSelectStatementSegment(ansi.UnorderedSelectStatementSegment):
+    """A `SELECT` statement without any ORDER clauses or later."""
+
+    match_grammar: Matchable = Sequence(
+        Ref("SelectClauseSegment"),
+        Ref("FromClauseSegment", optional=True),
+        Ref("WhereClauseSegment", optional=True),
+        Ref("GroupByClauseSegment", optional=True),
+        Ref("HavingClauseSegment", optional=True),
+        Ref("NamedWindowSegment", optional=True),
+    )
+
+
+class OffsetClauseSegment(ansi.OffsetClauseSegment):
+    """An `OFFSET` clause like in `SELECT`.
+
+    https://trino.io/docs/current/sql/select.html
+    """
+
+    type = "offset_clause"
+    match_grammar: Matchable = Sequence(
+        "OFFSET",
+        Indent,
+        OneOf(
+            Ref("NumericLiteralSegment"),
+            Ref("ExpressionSegment", exclude=Ref.keyword("ROW")),
+        ),
+        OneOf("ROW", "ROWS", optional=True),
+        Dedent,
+    )
+
+
+class SelectStatementSegment(ansi.SelectStatementSegment):
+    """A `SELECT` statement.
+
+    https://trino.io/docs/current/sql/select.html
+    """
+
+    match_grammar = UnorderedSelectStatementSegment.match_grammar.copy(
+        insert=[
+            Ref("OrderByClauseSegment", optional=True),
+            Ref("OffsetClauseSegment", optional=True),
+            Ref("LimitClauseSegment", optional=True),
+            Ref("FetchClauseSegment", optional=True),
+        ],
+        replace_terminators=True,
+        terminators=[
+            Ref("SetOperatorSegment"),
+            Ref("WithNoSchemaBindingClauseSegment"),
+            Ref("WithDataClauseSegment"),
+        ],
+    )
+
+
+class TemporalQuerySegment(ansi.TemporalQuerySegment):
+    """A time travel clause on a table reference, e.g. `FOR VERSION AS OF 123`.
+
+    It goes between the table name and its alias, and the snapshot can be any
+    expression (a version id, a branch or tag name, or a timestamp).
+
+    https://trino.io/docs/current/connector/iceberg.html#time-travel-queries
+    """
+
+    match_grammar: Matchable = Sequence(
+        "FOR",
+        OneOf("TIMESTAMP", "VERSION"),
+        "AS",
+        "OF",
+        Ref("ExpressionSegment"),
+    )
+
+
+class ValuesClauseSegment(ansi.ValuesClauseSegment):
+    """A `VALUES` clause within in `WITH`, `SELECT`, `INSERT`."""
+
+    match_grammar = Sequence(
+        "VALUES",
+        Indent,
+        Delimited(Ref("ExpressionSegment")),
+        Dedent,
+    )
+
+
+class IntervalExpressionSegment(BaseSegment):
+    """An interval representing a span of time.
+
+    https://trino.io/docs/current/language/types.html#interval-year-to-month
+    https://trino.io/docs/current/functions/datetime.html#date-and-time-operators
+    """
+
+    type = "interval_expression"
+    match_grammar = Sequence(
+        "INTERVAL",
+        Ref("QuotedLiteralSegment"),
+        OneOf("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"),
+    )
+
+
+class FrameClauseSegment(BaseSegment):
+    """A frame clause for window functions.
+
+    https://trino.io/blog/2021/03/10/introducing-new-window-features.html
+    """
+
+    type = "frame_clause"
+
+    _frame_extent = OneOf(
+        Sequence("CURRENT", "ROW"),
+        Sequence(
+            OneOf(
+                Ref("NumericLiteralSegment"), Ref("DateTimeLiteralGrammar"), "UNBOUNDED"
+            ),
+            OneOf("PRECEDING", "FOLLOWING"),
+        ),
+    )
+
+    match_grammar: Matchable = Sequence(
+        Ref("FrameClauseUnitGrammar"),
+        OneOf(_frame_extent, Sequence("BETWEEN", _frame_extent, "AND", _frame_extent)),
+    )
+
+
+class SetOperatorSegment(BaseSegment):
+    """A set operator such as Union, Intersect or Except.
+
+    Trino takes either quantifier after any of the three, and the grammar is
+    the same for all of them.
+
+    https://trino.io/docs/current/sql/select.html#union-clause
+    """
+
+    type = "set_operator"
+    match_grammar: Matchable = OneOf(
+        Sequence(
+            OneOf(
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+            ),
+            OneOf("DISTINCT", "ALL", optional=True),
+        ),
+        exclude=Sequence("EXCEPT", Bracketed(Anything())),
+    )
+
+
+class StatementSegment(ansi.StatementSegment):
+    """A generic segment, to any of its child subsegments."""
+
+    type = "statement"
+    match_grammar: Matchable = OneOf(
+        Ref("AlterTableStatementSegment"),
+        Ref("AnalyzeStatementSegment"),
+        Ref("CommentOnStatementSegment"),
+        Ref("CreateFunctionStatementSegment"),
+        Ref("CreateRoleStatementSegment"),
+        Ref("CreateSchemaStatementSegment"),
+        Ref("CreateMaterializedViewStatementSegment"),
+        Ref("CreateTableStatementSegment"),
+        Ref("CreateViewStatementSegment"),
+        Ref("DeleteStatementSegment"),
+        Ref("DescribeStatementSegment"),
+        Ref("DropFunctionStatementSegment"),
+        Ref("DropMaterializedViewStatementSegment"),
+        Ref("DropRoleStatementSegment"),
+        Ref("DropSchemaStatementSegment"),
+        Ref("DropTableStatementSegment"),
+        Ref("DropViewStatementSegment"),
+        Ref("ExplainStatementSegment"),
+        Ref("InsertStatementSegment"),
+        Ref("MergeStatementSegment"),
+        Ref("SelectableGrammar"),
+        Ref("SetSchemaStatementSegment"),
+        Ref("ShowStatementSegment"),
+        Ref("TransactionStatementSegment"),
+        Ref("TruncateStatementSegment"),
+        Ref("UpdateStatementSegment"),
+        Ref("UseStatementSegment"),
+        Ref("SetSessionStatementSegment"),
+        terminators=[Ref("DelimiterGrammar")],
+    )
+
+
+class AnalyzeStatementSegment(BaseSegment):
+    """An 'ANALYZE' statement.
+
+    As per docs https://trino.io/docs/current/sql/analyze.html
+    """
+
+    type = "analyze_statement"
+    match_grammar = Sequence(
+        "ANALYZE",
+        Ref("TableReferenceSegment"),
+        Sequence(
+            "WITH",
+            Bracketed(
+                Delimited(
+                    Sequence(
+                        Ref("ParameterNameSegment"),
+                        Ref("EqualsSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+            ),
+            optional=True,
+        ),
+    )
+
+
+class DescribeStatementSegment(BaseSegment):
+    """A `DESCRIBE` statement.
+
+    `DESCRIBE <table>` is an alias for `SHOW COLUMNS FROM <table>`, while
+    `DESCRIBE INPUT|OUTPUT` describes a prepared statement.
+
+    https://trino.io/docs/current/sql/describe.html
+    https://trino.io/docs/current/sql/describe-input.html
+    https://trino.io/docs/current/sql/describe-output.html
+    """
+
+    type = "describe_statement"
+    match_grammar = OneOf(
+        Sequence(
+            "DESCRIBE",
+            OneOf("INPUT", "OUTPUT"),
+            Ref("SingleIdentifierGrammar"),
+        ),
+        Sequence(
+            OneOf("DESCRIBE", "DESC"),
+            Ref("TableReferenceSegment"),
+        ),
+    )
+
+
+class ExplainStatementSegment(ansi.ExplainStatementSegment):
+    """An `EXPLAIN` statement.
+
+    https://trino.io/docs/current/sql/explain.html
+    https://trino.io/docs/current/sql/explain-analyze.html
+    """
+
+    match_grammar = Sequence(
+        "EXPLAIN",
+        OneOf(
+            Sequence("ANALYZE", Ref.keyword("VERBOSE", optional=True)),
+            Bracketed(
+                Delimited(
+                    OneOf(
+                        Sequence("FORMAT", OneOf("TEXT", "GRAPHVIZ", "JSON")),
+                        Sequence(
+                            "TYPE",
+                            OneOf("LOGICAL", "DISTRIBUTED", "VALIDATE", "IO"),
+                        ),
+                    ),
+                ),
+            ),
+            optional=True,
+        ),
+        OneOf(
+            ansi.ExplainStatementSegment.explainable_stmt,
+            Ref("MergeStatementSegment"),
+        ),
+    )
+
+
+class ShowStatementSegment(BaseSegment):
+    """A `SHOW` statement.
+
+    https://trino.io/docs/current/sql/show-catalogs.html
+    https://trino.io/docs/current/sql/show-columns.html
+    https://trino.io/docs/current/sql/show-create-table.html
+    https://trino.io/docs/current/sql/show-functions.html
+    https://trino.io/docs/current/sql/show-grants.html
+    https://trino.io/docs/current/sql/show-roles.html
+    https://trino.io/docs/current/sql/show-schemas.html
+    https://trino.io/docs/current/sql/show-session.html
+    https://trino.io/docs/current/sql/show-stats.html
+    https://trino.io/docs/current/sql/show-tables.html
+    """
+
+    type = "show_statement"
+
+    _like_clause = Sequence(
+        "LIKE",
+        Ref("QuotedLiteralSegment"),
+        Sequence("ESCAPE", Ref("QuotedLiteralSegment"), optional=True),
+        optional=True,
+    )
+
+    match_grammar = Sequence(
+        "SHOW",
+        OneOf(
+            Sequence("CATALOGS", _like_clause),
+            Sequence("SESSION", _like_clause),
+            Sequence(
+                "COLUMNS",
+                OneOf("FROM", "IN"),
+                Ref("TableReferenceSegment"),
+                _like_clause,
+            ),
+            Sequence(
+                "CREATE",
+                OneOf(
+                    Sequence(
+                        OneOf("TABLE", "VIEW", Sequence("MATERIALIZED", "VIEW")),
+                        Ref("TableReferenceSegment"),
+                    ),
+                    Sequence("SCHEMA", Ref("SchemaReferenceSegment")),
+                    Sequence("FUNCTION", Ref("FunctionNameSegment")),
+                ),
+            ),
+            Sequence(
+                "FUNCTIONS",
+                Sequence(
+                    OneOf("FROM", "IN"),
+                    Ref("SchemaReferenceSegment"),
+                    optional=True,
+                ),
+                _like_clause,
+            ),
+            Sequence(
+                "GRANTS",
+                Sequence(
+                    "ON",
+                    Ref.keyword("TABLE", optional=True),
+                    Ref("TableReferenceSegment"),
+                    optional=True,
+                ),
+            ),
+            Sequence(
+                OneOf(
+                    "ROLES",
+                    Sequence("CURRENT", "ROLES"),
+                    Sequence("ROLE", "GRANTS"),
+                ),
+                Sequence(
+                    OneOf("FROM", "IN"),
+                    Ref("SingleIdentifierGrammar"),
+                    optional=True,
+                ),
+            ),
+            Sequence(
+                "SCHEMAS",
+                Sequence(
+                    OneOf("FROM", "IN"),
+                    Ref("SingleIdentifierGrammar"),
+                    optional=True,
+                ),
+                _like_clause,
+            ),
+            Sequence(
+                "STATS",
+                "FOR",
+                OneOf(
+                    Ref("TableReferenceSegment"),
+                    Bracketed(Ref("SelectableGrammar")),
+                ),
+            ),
+            Sequence(
+                "TABLES",
+                Sequence(
+                    OneOf("FROM", "IN"),
+                    Ref("SchemaReferenceSegment"),
+                    optional=True,
+                ),
+                _like_clause,
+            ),
+        ),
+    )
+
+
+class WithOrdinalityClauseSegment(BaseSegment):
+    """A WITH ORDINALITY AS t(name1, name2) clause for CROSS JOIN UNNEST(...).
+
+    https://trino.io/docs/current/sql/select.html#unnest
+
+    Trino supports an optional WITH ORDINALITY clause on UNNEST, which
+    adds a numerical ordinality column to the UNNEST result.
+    """
+
+    type = "withordinality_clause"
+    match_grammar = Sequence(
+        "WITH",
+        "ORDINALITY",
+    )
+
+
+class WithinGroupClauseSegment(BaseSegment):
+    """An WITHIN GROUP clause for window functions.
+
+    https://trino.io/docs/current/functions/aggregate.html#array_agg
+
+    Trino supports an optional FILTER during aggregation that comes
+    immediately after the WITHIN GROUP clause.
+
+    https://trino.io/docs/current/functions/aggregate.html#filtering-during-aggregation
+    """
+
+    type = "withingroup_clause"
+    match_grammar = Sequence(
+        "WITHIN",
+        "GROUP",
+        Bracketed(Ref("OrderByClauseSegment", optional=False)),
+        Ref("FilterClauseGrammar", optional=True),
+    )
+
+
+class ListaggOverflowClauseSegment(BaseSegment):
+    """ON OVERFLOW clause of listagg function.
+
+    https://trino.io/docs/current/functions/aggregate.html#array_agg
+    """
+
+    type = "listagg_overflow_clause"
+    match_grammar = Sequence(
+        "ON",
+        "OVERFLOW",
+        OneOf(
+            "ERROR",
+            Sequence(
+                "TRUNCATE",
+                Ref("QuotedLiteralSegment", optional=True),
+                OneOf("WITH", "WITHOUT", optional=True),
+                Ref.keyword("COUNT", optional=True),
+            ),
+        ),
+    )
+
+
+class ArrayTypeSegment(ansi.ArrayTypeSegment):
+    """Prefix for array literals optionally specifying the type."""
+
+    type = "array_type"
+    match_grammar = Sequence(
+        "ARRAY",
+        Ref("ArrayTypeSchemaSegment", optional=True),
+    )
+
+
+class ArrayTypeSchemaSegment(ansi.ArrayTypeSegment):
+    """Data type segment of the array.
+
+    Trino supports ARRAY(DATA_TYPE) and ARRAY<DATA_TYPE>
+    """
+
+    type = "array_type_schema"
+    match_grammar = OneOf(
+        Bracketed(
+            Ref("DatatypeSegment"),
+            bracket_pairs_set="angle_bracket_pairs",
+            bracket_type="angle",
+        ),
+        Bracketed(
+            Ref("DatatypeSegment"),
+            bracket_pairs_set="bracket_pairs",
+            bracket_type="round",
+        ),
+    )
+
+
+class GroupByClauseSegment(BaseSegment):
+    """A `GROUP BY` clause like in `SELECT`."""
+
+    type = "groupby_clause"
+
+    match_grammar: Matchable = Sequence(
+        "GROUP",
+        "BY",
+        Indent,
+        OneOf(
+            "ALL",
+            Ref("CubeRollupClauseSegment"),
+            # Add GROUPING SETS support
+            Ref("GroupingSetsClauseSegment"),
+            Sequence(
+                Delimited(
+                    OneOf(
+                        Ref("ColumnReferenceSegment"),
+                        # Can `GROUP BY 1`
+                        Ref("NumericLiteralSegment"),
+                        # Can `GROUP BY coalesce(col, 1)`
+                        Ref("ExpressionSegment"),
+                    ),
+                    terminators=[Ref("GroupByClauseTerminatorGrammar")],
+                ),
+            ),
+        ),
+        Dedent,
+    )
+
+
+class CommentOnStatementSegment(BaseSegment):
+    """`COMMENT ON` statement.
+
+    https://trino.io/docs/current/sql/comment.html
+    """
+
+    type = "comment_clause"
+
+    match_grammar = Sequence(
+        "COMMENT",
+        "ON",
+        Sequence(
+            OneOf(
+                Sequence(
+                    OneOf(
+                        "TABLE",
+                        # TODO: Create a ViewReferenceSegment
+                        "VIEW",
+                    ),
+                    Ref("TableReferenceSegment"),
+                ),
+                Sequence(
+                    "COLUMN",
+                    # TODO: Does this correctly emit a Table Reference?
+                    Ref("ColumnReferenceSegment"),
+                ),
+            ),
+            Sequence("IS", OneOf(Ref("QuotedLiteralSegment"), "NULL")),
+        ),
+    )
+
+
+class FunctionDefinitionGrammar(ansi.FunctionDefinitionGrammar):
+    """This is the body of a `CREATE FUNCTION` statement in Trino."""
+
+    match_grammar: Matchable = OneOf(
+        ansi.FunctionDefinitionGrammar.match_grammar,
+        Sequence(
+            "RETURN",
+            Ref("ExpressionSegment"),
+        ),
+    )
+
+
+class LambdaExpressionSegment(BaseSegment):
+    """Lambda function used in a function."""
+
+    type = "lambda_function"
+    match_grammar = Sequence(
+        OneOf(
+            Ref("ParameterNameSegment"),
+            Bracketed(Delimited(Ref("ParameterNameSegment"))),
+        ),
+        Ref("LambdaArrowSegment"),
+        Ref("ExpressionSegment"),
+    )
+
+
+class CreateTableStatementSegment(ansi.CreateTableStatementSegment):
+    """A `CREATE TABLE` statement."""
+
+    type = "create_table_statement"
+    match_grammar: Matchable = Sequence(
+        "CREATE",
+        Ref("OrReplaceGrammar", optional=True),
+        "TABLE",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        # Columns and comment syntax:
+        Bracketed(
+            Delimited(
+                Ref("ColumnReferenceSegment"),
+                Ref("ColumnDefinitionSegment"),
+                Sequence(
+                    "LIKE",
+                    Ref("TableReferenceSegment"),
+                    Sequence(
+                        OneOf("INCLUDING", "EXCLUDING"),
+                        "PROPERTIES",
+                        optional=True,
+                    ),
+                ),
+            ),
+            optional=True,
+        ),
+        Ref("CommentClauseSegment", optional=True),
+        Sequence(
+            "WITH",
+            Bracketed(
+                Delimited(
+                    Ref("ParameterNameSegment"),
+                    Ref("EqualsSegment"),
+                    Ref("ExpressionSegment"),
+                ),
+            ),
+            optional=True,
+        ),
+        # Create AS syntax:
+        Sequence(
+            "AS",
+            OptionallyBracketed(Ref("SelectableGrammar")),
+            optional=True,
+        ),
+        # Create like syntax
+        Sequence("WITH", Ref.keyword("NO", optional=True), "DATA", optional=True),
+    )
+
+
+class CreateMaterializedViewStatementSegment(BaseSegment):
+    """A `CREATE MATERIALIZED VIEW` statement.
+
+    https://trino.io/docs/current/sql/create-materialized-view.html
+    """
+
+    type = "create_materialized_view_statement"
+    match_grammar: Matchable = Sequence(
+        "CREATE",
+        Ref("OrReplaceGrammar", optional=True),
+        "MATERIALIZED",
+        "VIEW",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Sequence("GRACE", "PERIOD", Ref("IntervalExpressionSegment"), optional=True),
+        Ref("CommentClauseSegment", optional=True),
+        Sequence(
+            "WITH",
+            Bracketed(
+                Delimited(
+                    Ref("ParameterNameSegment"),
+                    Ref("EqualsSegment"),
+                    Ref("ExpressionSegment"),
+                ),
+            ),
+            optional=True,
+        ),
+        "AS",
+        OptionallyBracketed(Ref("SelectableGrammar")),
+    )
+
+
+class DropMaterializedViewStatementSegment(BaseSegment):
+    """A `DROP MATERIALIZED VIEW` statement.
+
+    https://trino.io/docs/current/sql/drop-materialized-view.html
+    """
+
+    type = "drop_materialized_view_statement"
+    match_grammar: Matchable = Sequence(
+        "DROP",
+        "MATERIALIZED",
+        "VIEW",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+    )
+
+
+class ColumnDefinitionSegment(ansi.ColumnDefinitionSegment):
+    """A column definition, e.g. for CREATE TABLE or ALTER TABLE."""
+
+    type = "column_definition"
+    match_grammar: Matchable = Sequence(
+        Ref("SingleIdentifierGrammar"),  # Column name
+        Ref("DatatypeSegment"),  # Column type
+        AnySetOf(
+            Sequence(
+                "NOT",
+                "NULL",
+            ),
+            Ref("CommentClauseSegment"),
+            Sequence(
+                "WITH",
+                Bracketed(
+                    Delimited(
+                        Ref("ParameterNameSegment"),
+                        Ref("EqualsSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+class TransactionStatementSegment(ansi.TransactionStatementSegment):
+    """A `COMMIT`, `ROLLBACK` or `TRANSACTION` statement.
+
+    https://trino.io/docs/current/sql/commit.html
+    https://trino.io/docs/current/sql/rollback.html
+    https://trino.io/docs/current/sql/start-transaction.html
+    """
+
+    type = "transaction_statement"
+    match_grammar: Matchable = OneOf(
+        Sequence(
+            "COMMIT",
+            Ref.keyword("WORK", optional=True),
+        ),
+        Sequence(
+            "ROLLBACK",
+            Ref.keyword("WORK", optional=True),
+        ),
+        Sequence(
+            "START",
+            "TRANSACTION",
+            Delimited(
+                Sequence(
+                    "ISOLATION",
+                    "LEVEL",
+                    OneOf(
+                        Sequence("READ", "UNCOMMITTED"),
+                        Sequence("READ", "COMMITTED"),
+                        Sequence("REPEATABLE", "READ"),
+                        "SERIALIZABLE",
+                    ),
+                ),
+                Sequence(
+                    "READ",
+                    OneOf("ONLY", "WRITE"),
+                ),
+                optional=True,
+            ),
+        ),
+    )
+
+
+class InsertStatementSegment(ansi.InsertStatementSegment):
+    """An `INSERT` statement.
+
+    https://trino.io/docs/current/sql/insert.html
+    """
+
+    type = "insert_statement"
+    match_grammar: Matchable = Sequence(
+        "INSERT",
+        "INTO",
+        Indent,
+        Ref("TableReferenceSegment"),
+        Dedent,
+        OneOf(
+            Ref("SelectableGrammar"),
+            Sequence(
+                Indent,
+                Ref("BracketedColumnReferenceListGrammar"),
+                Dedent,
+                Ref("SelectableGrammar"),
+            ),
+            Ref("DefaultValuesGrammar"),
+        ),
+    )
+
+
+class SetSessionStatementSegment(BaseSegment):
+    """A `SET SESSION` statement.
+
+    https://trino.io/docs/current/sql/set-session.html
+    """
+
+    type = "set_session_statement"
+    match_grammar: Matchable = Sequence(
+        "SET",
+        "SESSION",
+        Sequence(
+            Ref("ParameterNameSegment"),
+            Ref("DotSegment"),
+            optional=True,
+        ),
+        Ref("ParameterNameSegment"),
+        Ref("EqualsSegment"),
+        Ref("ExpressionSegment"),
+    )
+
+
+class AlterTableStatementSegment(ansi.AlterTableStatementSegment):
+    """A `ALTER TABLE` statement.
+
+    https://trino.io/docs/current/sql/alter-table.html
+    """
+
+    match_grammar = Sequence(
+        "ALTER",
+        "TABLE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        OneOf(
+            Sequence(
+                "RENAME",
+                "TO",
+                Ref("TableReferenceSegment"),
+            ),
+            Sequence(
+                "ADD",
+                "COLUMN",
+                Ref("IfNotExistsGrammar", optional=True),
+                Ref("ColumnDefinitionSegment"),
+                OneOf(
+                    "FIRST",
+                    "LAST",
+                    Sequence(
+                        "AFTER",
+                        Ref("ColumnReferenceSegment"),
+                    ),
+                    optional=True,
+                ),
+            ),
+            Sequence(
+                "DROP",
+                "COLUMN",
+                Ref("IfExistsGrammar", optional=True),
+                Ref("ColumnReferenceSegment"),
+            ),
+            Sequence(
+                "RENAME",
+                "COLUMN",
+                Ref("IfExistsGrammar", optional=True),
+                Ref("ColumnReferenceSegment"),
+                "TO",
+                Ref("ColumnReferenceSegment"),
+            ),
+            Sequence(
+                "ALTER",
+                "COLUMN",
+                Ref("ColumnReferenceSegment"),
+                OneOf(
+                    Sequence(
+                        "SET",
+                        "DATA",
+                        "TYPE",
+                        Ref("DatatypeSegment"),
+                    ),
+                    Sequence(
+                        "DROP",
+                        "NOT",
+                        "NULL",
+                    ),
+                ),
+            ),
+            Sequence(
+                "SET",
+                "AUTHORIZATION",
+                OneOf(
+                    Ref("RoleReferenceSegment"),
+                    Sequence(
+                        "USER",
+                        Ref("RoleReferenceSegment"),
+                    ),
+                    Sequence(
+                        "ROLE",
+                        Ref("RoleReferenceSegment"),
+                    ),
+                ),
+            ),
+            Sequence(
+                "SET",
+                "PROPERTIES",
+                Delimited(
+                    Sequence(
+                        Ref("ParameterNameSegment"),
+                        Ref("EqualsSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+            ),
+            Sequence(
+                "EXECUTE",
+                Ref("FunctionNameSegment"),
+                Bracketed(
+                    Delimited(
+                        Sequence(
+                            Ref("ParameterNameSegment"),
+                            Ref("ExecuteArrowSegment"),
+                            Ref("ExpressionSegment"),
+                        ),
+                    ),
+                    optional=True,
+                ),
+                Sequence(
+                    "WHERE",
+                    Ref("ExpressionSegment"),
+                    optional=True,
+                ),
+            ),
+        ),
+    )
+
+
+class MapTypeSegment(BaseSegment):
+    """Expression to construct a MAP datatype."""
+
+    type = "map_type"
+    match_grammar = Sequence(
+        "MAP",
+        Ref("MapTypeSchemaSegment", optional=True),
+    )
+
+
+class MapTypeSchemaSegment(BaseSegment):
+    """Expression to construct the schema of a MAP datatype."""
+
+    type = "map_type_schema"
+    match_grammar = OneOf(
+        Bracketed(
+            Sequence(
+                Ref("PrimitiveTypeSegment"),
+                Ref("CommaSegment"),
+                Ref("DatatypeSegment"),
+            ),
+            bracket_pairs_set="angle_bracket_pairs",
+            bracket_type="angle",
+        ),
+        Bracketed(
+            Sequence(
+                Ref("PrimitiveTypeSegment"),
+                Ref("CommaSegment"),
+                Ref("DatatypeSegment"),
+            ),
+            bracket_pairs_set="bracket_pairs",
+            bracket_type="round",
+        ),
+    )
+
+
+class PatternSegment(BaseSegment):
+    """A `PATTERN` row-pattern expression inside `MATCH_RECOGNIZE`.
+
+    https://trino.io/docs/current/sql/match-recognize.html
+    """
+
+    type = "pattern_expression"
+    match_grammar = Sequence(
+        Ref("CaretSegment", optional=True),
+        # One or more `|`-delimited alternatives, each itself a concatenation
+        # of one or more operators, e.g. `A B+ C+ D+ | X Y` (a bare OneOf of
+        # "all concatenation" vs "all alternation" can't parse a concatenation
+        # on one side of a `|`).
+        Delimited(
+            AnyNumberOf(Ref("PatternOperatorGrammar"), min_times=1),
+            delimiter=Ref("PipeSegment"),
+        ),
+        Ref("DollarSegment", optional=True),
+    )
+
+
+class MatchRecognizeClauseSegment(BaseSegment):
+    """A `MATCH_RECOGNIZE` clause.
+
+    https://trino.io/docs/current/sql/match-recognize.html
+    """
+
+    type = "match_recognize_clause"
+    match_grammar = Sequence(
+        "MATCH_RECOGNIZE",
+        Bracketed(
+            Ref("PartitionClauseSegment", optional=True),
+            Ref("OrderByClauseSegment", optional=True),
+            Sequence(
+                "MEASURES",
+                Delimited(
+                    Sequence(
+                        OneOf("FINAL", "RUNNING", optional=True),
+                        Ref("ExpressionSegment"),
+                        Ref("AliasExpressionSegment"),
+                    ),
+                ),
+                optional=True,
+            ),
+            OneOf(
+                Sequence("ONE", "ROW", "PER", "MATCH"),
+                Sequence(
+                    "ALL",
+                    "ROWS",
+                    "PER",
+                    "MATCH",
+                    OneOf(
+                        Sequence("SHOW", "EMPTY", "MATCHES"),
+                        Sequence("OMIT", "EMPTY", "MATCHES"),
+                        Sequence("WITH", "UNMATCHED", "ROWS"),
+                        optional=True,
+                    ),
+                ),
+                optional=True,
+            ),
+            Sequence(
+                "AFTER",
+                "MATCH",
+                "SKIP",
+                OneOf(
+                    Sequence("PAST", "LAST", "ROW"),
+                    Sequence("TO", "NEXT", "ROW"),
+                    Sequence(
+                        "TO",
+                        OneOf("FIRST", "LAST", optional=True),
+                        Ref("SingleIdentifierGrammar"),
+                    ),
+                ),
+                optional=True,
+            ),
+            "PATTERN",
+            Bracketed(Ref("PatternSegment")),
+            # SUBSET names a union of pattern variables for use in DEFINE/MEASURES,
+            # e.g. `SUBSET U = (C, D)`. Trino has this; it isn't in the standard
+            # MATCH_RECOGNIZE clause other dialects here implement.
+            Sequence(
+                "SUBSET",
+                Delimited(
+                    Sequence(
+                        Ref("SingleIdentifierGrammar"),
+                        Ref("EqualsSegment"),
+                        Bracketed(Delimited(Ref("SingleIdentifierGrammar"))),
+                    ),
+                ),
+                optional=True,
+            ),
+            "DEFINE",
+            Delimited(
+                Sequence(
+                    Ref("SingleIdentifierGrammar"),
+                    "AS",
+                    Ref("ExpressionSegment"),
+                ),
+            ),
+        ),
+        # `MATCH_RECOGNIZE (...) AS m` or `MATCH_RECOGNIZE (...) m (x, y)`.
+        Ref("AliasExpressionSegment", optional=True),
+    )

@@ -1,0 +1,740 @@
+"""Test the BaseSegment class."""
+
+import pickle
+from itertools import product
+
+import pytest
+
+from sqlfluff.core import Linter
+from sqlfluff.core.parser import BaseSegment, PositionMarker, RawSegment
+from sqlfluff.core.parser.segments.base import PathStep
+from sqlfluff.core.rules.base import LintFix
+from sqlfluff.core.templaters import TemplatedFile
+
+
+def test__parser__base_segments_type(DummySegment):
+    """Test the .is_type() method."""
+    assert BaseSegment.class_is_type("base")
+    assert not BaseSegment.class_is_type("foo")
+    assert not BaseSegment.class_is_type("foo", "bar")
+    assert DummySegment.class_is_type("dummy")
+    assert DummySegment.class_is_type("base")
+    assert DummySegment.class_is_type("base", "foo", "bar")
+
+
+def test__parser__base_segments_class_types(DummySegment):
+    """Test the metaclass ._class_types attribute."""
+    assert DummySegment._class_types == {"dummy", "base"}
+
+
+def test__parser__base_segments_descendant_type_set(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .descendant_type_set() method."""
+    test_seg = DummySegment([DummyAuxSegment(raw_segments)])
+    assert test_seg.descendant_type_set == {"raw", "base", "dummy_aux"}
+
+
+def test__parser__base_segments_direct_descendant_type_set(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .direct_descendant_type_set() method."""
+    test_seg = DummySegment([DummyAuxSegment(raw_segments)])
+    assert test_seg.direct_descendant_type_set == {"base", "dummy_aux"}
+
+
+def test__parser__base_segments_to_tuple_a(raw_segments, DummySegment, DummyAuxSegment):
+    """Test the .to_tuple() method."""
+    test_seg = DummySegment([DummyAuxSegment(raw_segments)])
+    assert test_seg.to_tuple() == (
+        "dummy",
+        (("dummy_aux", (("raw", ()), ("raw", ()))),),
+    )
+
+
+def test__parser__base_segments_to_tuple_b(raw_segments, DummySegment, DummyAuxSegment):
+    """Test the .to_tuple() method."""
+    test_seg = DummySegment(
+        [DummyAuxSegment(raw_segments + (DummyAuxSegment(raw_segments[:1]),))]
+    )
+    assert test_seg.to_tuple() == (
+        "dummy",
+        (("dummy_aux", (("raw", ()), ("raw", ()), ("dummy_aux", (("raw", ()),)))),),
+    )
+
+
+def test__parser__base_segments_to_tuple_c(raw_segments, DummySegment, DummyAuxSegment):
+    """Test the .to_tuple() method with show_raw=True."""
+    test_seg = DummySegment(
+        [DummyAuxSegment(raw_segments + (DummyAuxSegment(raw_segments[:1]),))]
+    )
+    assert test_seg.to_tuple(show_raw=True) == (
+        "dummy",
+        (
+            (
+                "dummy_aux",
+                (
+                    ("raw", "foobar"),
+                    ("raw", ".barfoo"),
+                    ("dummy_aux", (("raw", "foobar"),)),
+                ),
+            ),
+        ),
+    )
+
+
+def test__parser__base_segments_as_record_a(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .as_record() method.
+
+    NOTE: In this test, note that there are lists, as some segment types
+    are duplicated within their parent segment.
+    """
+    test_seg = DummySegment([DummyAuxSegment(raw_segments)])
+    assert test_seg.as_record() == {
+        "dummy": {"dummy_aux": [{"raw": None}, {"raw": None}]}
+    }
+
+
+def test__parser__base_segments_as_record_b(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .as_record() method.
+
+    NOTE: In this test, note that there are no lists, every segment type
+    is unique within it's parent segment, and so there is no need.
+    """
+    test_seg = DummySegment(
+        [DummyAuxSegment(raw_segments[:1] + (DummyAuxSegment(raw_segments[:1]),))]
+    )
+    assert test_seg.as_record() == {
+        "dummy": {"dummy_aux": {"raw": None, "dummy_aux": {"raw": None}}}
+    }
+
+
+def test__parser__base_segments_as_record_c(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .as_record() method with show_raw=True.
+
+    NOTE: In this test, note that there are no lists, every segment type
+    is unique within it's parent segment, and so there is no need.
+    """
+    test_seg = DummySegment(
+        [DummyAuxSegment(raw_segments[:1] + (DummyAuxSegment(raw_segments[:1]),))]
+    )
+    assert test_seg.as_record(show_raw=True) == {
+        "dummy": {"dummy_aux": {"raw": "foobar", "dummy_aux": {"raw": "foobar"}}}
+    }
+
+
+def test__parser__base_segments_count_segments(
+    raw_segments, DummySegment, DummyAuxSegment
+):
+    """Test the .count_segments() method."""
+    test_seg = DummySegment([DummyAuxSegment(raw_segments)])
+    assert test_seg.count_segments() == 4
+    assert test_seg.count_segments(raw_only=True) == 2
+
+
+@pytest.mark.parametrize(
+    "list_in, result",
+    [
+        (["foo"], False),
+        (["foo", " "], True),
+        ([" ", "foo", " "], True),
+        ([" ", "foo"], True),
+        ([" "], True),
+        (["foo", " ", "foo"], False),
+    ],
+)
+def test__parser_base_segments_validate_non_code_ends(
+    generate_test_segments, DummySegment, list_in, result
+):
+    """Test BaseSegment.validate_non_code_ends()."""
+    if result:
+        # Assert that it _does_ raise an exception.
+        with pytest.raises(AssertionError):
+            # Validation happens on instantiation.
+            seg = DummySegment(segments=generate_test_segments(list_in))
+    else:
+        # Check that it _doesn't_ raise an exception...
+        seg = DummySegment(segments=generate_test_segments(list_in))
+        # ...even when explicitly validating.
+        seg.validate_non_code_ends()
+
+
+def test__parser__base_segments_path_to(raw_segments, DummySegment, DummyAuxSegment):
+    """Test the .path_to() method."""
+    test_seg_a = DummyAuxSegment(raw_segments)
+    test_seg_b = DummySegment([test_seg_a])
+    # With a direct parent/child relationship we only get
+    # one element of path.
+    # NOTE: All the dummy segments return True for .is_code()
+    # so that means the do appear in code_idxs.
+    assert test_seg_b.path_to(test_seg_a) == [PathStep(test_seg_b, 0, 1, (0,))]
+    # With a three segment chain - we get two path elements.
+    assert test_seg_b.path_to(raw_segments[0]) == [
+        PathStep(test_seg_b, 0, 1, (0,)),
+        PathStep(test_seg_a, 0, 2, (0, 1)),
+    ]
+    assert test_seg_b.path_to(raw_segments[1]) == [
+        PathStep(test_seg_b, 0, 1, (0,)),
+        PathStep(test_seg_a, 1, 2, (0, 1)),
+    ]
+
+
+def test__parser__base_segments_is_code_false_for_comment_only_file():
+    """Test .is_code() is False for a file containing only a comment.
+
+    `.is_code()` loops over `self.segments` and only reaches its final
+    `return False` once every child has been checked without finding any
+    code, so a real SQL file with no code content is needed to cover that
+    path.
+    """
+    linter = Linter(dialect="ansi")
+    tree = linter.parse_string("-- just a comment\n").tree
+    assert tree.is_code is False
+
+
+def test__parser__base_segments_stubs():
+    """Test stub methods that have no implementation in base class."""
+    template = TemplatedFile.from_string("foobar")
+    rs1 = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    base_segment = BaseSegment(segments=[rs1])
+
+    with pytest.raises(NotImplementedError):
+        base_segment.edit("foo")
+
+
+def test__parser__base_segments_raw(raw_seg):
+    """Test raw segments behave as expected."""
+    # Check Segment Return
+    assert raw_seg.segments == ()
+    assert raw_seg.raw == "foobar"
+    # Check Formatting and Stringification
+    assert str(raw_seg) == repr(raw_seg) == "<CodeSegment: ([L:  1, P:  1]) 'foobar'>"
+    assert (
+        raw_seg.stringify(ident=1, tabsize=2)
+        == "[L:  1, P:  1]      |  raw:                                                "
+        "        'foobar'\n"
+    )
+    # Check tuple
+    assert raw_seg.to_tuple() == ("raw", ())
+    # Check tuple
+    assert raw_seg.to_tuple(show_raw=True) == ("raw", "foobar")
+
+
+def test__parser__base_segments_base(raw_segments, fresh_ansi_dialect, DummySegment):
+    """Test base segments behave as expected."""
+    base_seg = DummySegment(raw_segments)
+    # Check we assume the position correctly
+    assert (
+        base_seg.pos_marker.start_point_marker()
+        == raw_segments[0].pos_marker.start_point_marker()
+    )
+    assert (
+        base_seg.pos_marker.end_point_marker()
+        == raw_segments[-1].pos_marker.end_point_marker()
+    )
+
+    # Check that we correctly reconstruct the raw
+    assert base_seg.raw == "foobar.barfoo"
+    # Check tuple
+    assert base_seg.to_tuple() == (
+        "dummy",
+        (raw_segments[0].to_tuple(), raw_segments[1].to_tuple()),
+    )
+    # Check Formatting and Stringification
+    assert str(base_seg) == repr(base_seg) == "<DummySegment: ([L:  1, P:  1])>"
+    assert base_seg.stringify(ident=1, tabsize=2) == (
+        "[L:  1, P:  1]      |  dummy:\n"
+        "[L:  1, P:  1]      |    raw:                                                 "
+        "     'foobar'\n"
+        "[L:  1, P:  7]      |    raw:                                                 "
+        "     '.barfoo'\n"
+    )
+
+
+def test__parser__base_segments_raw_compare():
+    """Test comparison of raw segments."""
+    template = TemplatedFile.from_string("foobar")
+    rs1 = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    rs2 = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    assert rs1 == rs2
+
+
+def test__parser__base_segments_base_compare(DummySegment, DummyAuxSegment):
+    """Test comparison of base segments."""
+    template = TemplatedFile.from_string("foobar")
+    rs1 = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    rs2 = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+
+    ds1 = DummySegment([rs1])
+    ds2 = DummySegment([rs2])
+    dsa2 = DummyAuxSegment([rs2])
+
+    # Check for equality
+    assert ds1 == ds2
+    # Check a different match on the same details are not the same
+    assert ds1 != dsa2
+
+
+def test__parser__base_segments_raw_segment_index(DummySegment):
+    """Test raw_segment_index() gives the same answers as list.index()."""
+    template = TemplatedFile.from_string("foobar")
+    foo = RawSegment("foo", PositionMarker(slice(0, 3), slice(0, 3), template))
+    bar = RawSegment("bar", PositionMarker(slice(3, 6), slice(3, 6), template))
+    # Two zero length segments at the same position are equal.
+    empty1 = RawSegment("", PositionMarker(slice(3, 3), slice(3, 3), template))
+    empty2 = RawSegment("", PositionMarker(slice(3, 3), slice(3, 3), template))
+    # A copy shares the uuid of the original, so they are equal too.
+    seg = DummySegment([foo, empty1, empty2, bar, foo.copy()])
+    for probe in (
+        foo,
+        bar,
+        # Equal to an earlier segment in the list, which is found first.
+        empty2,
+        seg.raw_segments[4],
+        # Equal segments which aren't in the list: a copy, a new segment at
+        # the same position, and a segment with the same uuid but no position.
+        bar.copy(),
+        RawSegment("bar", PositionMarker(slice(3, 6), slice(3, 6), template)),
+        RawSegment("bar", uuid=bar.uuid),
+    ):
+        assert seg.raw_segment_index(probe) == seg.raw_segments.index(probe)
+    # Segments which aren't equal to any of them raise, like list.index().
+    for probe in (
+        RawSegment("bar", PositionMarker(slice(0, 3), slice(0, 3), template)),
+        RawSegment("bar"),
+    ):
+        with pytest.raises(ValueError):
+            seg.raw_segment_index(probe)
+
+
+def test__parser__base_segments_select_children(DummySegment):
+    """Test the .select_children() method."""
+    template = TemplatedFile.from_string("abcde")
+    a, b, c, d, e = (
+        RawSegment(raw, PositionMarker(slice(i, i + 1), slice(i, i + 1), template))
+        for i, raw in enumerate("abcde")
+    )
+    seg = DummySegment([a, b, c, d, e])
+    # Between the start and stop segments, excluding both.
+    assert seg.select_children(start_seg=a, stop_seg=e) == [b, c, d]
+    # Only the segments which pass select_if.
+    assert seg.select_children(select_if=lambda s: s.raw != "c") == [a, b, d, e]
+    # Stops at the first segment which fails loop_while.
+    assert seg.select_children(start_seg=a, loop_while=lambda s: s.raw != "d") == [
+        b,
+        c,
+    ]
+
+
+def _reference_recursive_crawl(
+    segment,
+    *seg_type,
+    recurse_into=True,
+    no_recursive_seg_type=None,
+    allow_self=True,
+):
+    """The plain recursive crawl, which starts a crawl of every child.
+
+    .recursive_crawl() may skip the children which neither match nor contain a
+    match, but must not change which segments it yields, or their order.
+    """
+    if isinstance(no_recursive_seg_type, str):
+        no_recursive_seg_type = [no_recursive_seg_type]
+
+    if allow_self and segment.is_type(*seg_type):
+        match = True
+        yield segment
+    else:
+        match = False
+
+    if not segment.descendant_type_set.intersection(seg_type):
+        return None
+
+    if recurse_into or not match:
+        for seg in segment.segments:
+            if not no_recursive_seg_type or not seg.is_type(*no_recursive_seg_type):
+                yield from _reference_recursive_crawl(
+                    seg,
+                    *seg_type,
+                    recurse_into=recurse_into,
+                    no_recursive_seg_type=no_recursive_seg_type,
+                )
+
+
+# What to look for: only leaves, segments which can nest, several types at once,
+# every raw segment, and types which most of the trees don't contain.
+_RECURSIVE_CRAWL_TYPES = [
+    ("numeric_literal",),
+    ("expression",),
+    ("select_statement", "bracketed"),
+    ("raw",),
+    ("unparsable",),
+    ("case_expression",),
+]
+# Every combination of the options which change where a crawl goes.
+_RECURSIVE_CRAWL_OPTIONS = [
+    {
+        "recurse_into": recurse_into,
+        "no_recursive_seg_type": no_recursive_seg_type,
+        "allow_self": allow_self,
+    }
+    for recurse_into, no_recursive_seg_type, allow_self in product(
+        [True, False],
+        [None, "bracketed", ["expression", "select_statement"]],
+        [True, False],
+    )
+]
+
+
+@pytest.mark.parametrize(
+    "raw_sql_in",
+    [
+        # Flat.
+        "SELECT a, b FROM t WHERE c = 1",
+        # Nested expressions and subqueries.
+        "SELECT (a + (b * c)) AS x FROM (SELECT d FROM (SELECT 1 AS d) AS i) AS s",
+        # A CTE, a set expression and more than one statement.
+        "WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION ALL SELECT 2; SELECT 3",
+        # A case expression and functions, with a join.
+        (
+            "SELECT CASE WHEN a = 1 THEN f(b, g(c)) ELSE 0 END "
+            "FROM t1 JOIN t2 ON t1.id = t2.id"
+        ),
+        # Sections that don't parse: one inside an expression, one at the top level.
+        "SELECT 1 FROM t WHERE x = (3 4 5) AND y = 6; asd 3 qwe 4",
+    ],
+)
+def test__parser__base_segments_recursive_crawl(raw_sql_in):
+    """Test .recursive_crawl() finds the same segments as a crawl of every child.
+
+    Crawls start at every segment of the tree, so each one is crawled from above
+    and from within. Segments are compared by id, as segments with the same
+    content are equal.
+    """
+    tree = Linter(dialect="ansi").parse_string(raw_sql_in).tree
+    mismatches = []
+    for start in tree.recursive_crawl_all():
+        for seg_type, options in product(
+            _RECURSIVE_CRAWL_TYPES, _RECURSIVE_CRAWL_OPTIONS
+        ):
+            crawled = [id(seg) for seg in start.recursive_crawl(*seg_type, **options)]
+            expected = [
+                id(seg)
+                for seg in _reference_recursive_crawl(start, *seg_type, **options)
+            ]
+            if crawled != expected:
+                mismatches.append((start.type, seg_type, options))
+    assert not mismatches
+
+
+def test__parser__base_segments_pickle_safe(raw_segments):
+    """Test pickling and unpickling of BaseSegment."""
+    test_seg = BaseSegment([BaseSegment(raw_segments)])
+    test_seg.set_as_parent()
+    pickled = pickle.dumps(test_seg)
+    result_seg = pickle.loads(pickled)
+    assert test_seg == result_seg
+    # Check specifically the treatment of the parent position.
+    assert result_seg.segments[0].get_parent()[0] is result_seg
+
+
+def test__parser__base_segments_copy_isolation(DummySegment, raw_segments):
+    """Test copy isolation in BaseSegment.
+
+    First on one of the raws and then on the dummy segment.
+    """
+    # On a raw
+    a_seg = raw_segments[0]
+    a_copy = a_seg.copy()
+    assert a_seg is not a_copy
+    assert a_seg == a_copy
+    assert a_seg.pos_marker is a_copy.pos_marker
+    a_copy.pos_marker = None
+    assert a_copy.pos_marker is None
+    assert a_seg.pos_marker is not None
+
+    # On a base
+    b_seg = DummySegment(segments=raw_segments)
+    b_copy = b_seg.copy()
+    assert b_seg is not b_copy
+    assert b_seg == b_copy
+    assert b_seg.pos_marker is b_copy.pos_marker
+    b_copy.pos_marker = None
+    assert b_copy.pos_marker is None
+    assert b_seg.pos_marker is not None
+
+    # On addition to a lint Fix
+    fix = LintFix("replace", a_seg, [b_seg])
+    for s in fix.edit:
+        assert not s.pos_marker
+    assert b_seg.pos_marker
+
+
+def _build_nested_segment(DummyAuxSegment, leaf_segments, depth):
+    """Build a segment nested `depth` levels deep, wrapping `leaf_segments`.
+
+    Built iteratively (no recursion here) so the test setup itself never
+    contributes to the recursion depth being probed.
+    """
+    node = DummyAuxSegment(leaf_segments)
+    for _ in range(depth):
+        node = DummyAuxSegment((node,))
+    return node
+
+
+# ---------------------------------------------------------------------------
+# Deep-nesting regression tests: guard against these methods regressing back
+# to a genexpr/comprehension, which costs an extra stack frame per nesting
+# level and can blow Python's recursion limit on deep parse trees.
+# ---------------------------------------------------------------------------
+
+
+def _check_count_segments(tree, leaf_segments, depth):
+    # +1 for the innermost DummyAuxSegment directly wrapping the leaves,
+    # plus one more DummyAuxSegment per nesting level.
+    assert tree.count_segments() == depth + 1 + len(leaf_segments)
+
+
+def _check_copy(tree, leaf_segments, depth):
+    assert tree.copy().raw == tree.raw
+
+
+def _check_descendant_type_set(tree, leaf_segments, depth):
+    assert "raw" in tree.descendant_type_set
+
+
+# Each entry maps a recursive method/property to (depth, check). `check` just
+# needs to call the accessor and confirm it doesn't raise RecursionError;
+# a handful also assert a value, where that's cheap to do. Return shapes are
+# already covered by the non-deep-nesting tests elsewhere in this file.
+_DEEP_NESTING_CASES = {
+    "count_segments": (400, _check_count_segments),
+    "copy": (400, _check_copy),
+    "to_tuple": (400, lambda tree, leaf_segments, depth: tree.to_tuple()),
+    "descendant_type_set": (350, _check_descendant_type_set),
+    "is_code": (400, lambda tree, leaf_segments, depth: tree.is_code),
+    "is_comment": (400, lambda tree, leaf_segments, depth: tree.is_comment),
+    "is_whitespace": (400, lambda tree, leaf_segments, depth: tree.is_whitespace),
+    "raw_segments_with_ancestors": (
+        400,
+        lambda tree, leaf_segments, depth: tree.raw_segments_with_ancestors,
+    ),
+    "source_fixes": (400, lambda tree, leaf_segments, depth: tree.source_fixes),
+    "get_raw_segments": (
+        400,
+        lambda tree, leaf_segments, depth: tree.get_raw_segments(),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_DEEP_NESTING_CASES))
+def test__parser__base_segments_deep_nesting_no_recursion_error(
+    generate_test_segments, DummyAuxSegment, name
+):
+    """Recursive BaseSegment methods/properties survive deep nesting.
+
+    Fresh leaf segments are generated per call, rather than reusing the
+    module-scoped `raw_segments` fixture, so wrapping them at these depths
+    doesn't leave test__parser__base_segments_parent_ref seeing a stale
+    parent.
+    """
+    leaf_segments = generate_test_segments(["foobar", ".barfoo"])
+    depth, check = _DEEP_NESTING_CASES[name]
+    tree = _build_nested_segment(DummyAuxSegment, leaf_segments, depth)
+    check(tree, leaf_segments, depth)
+
+
+def test__parser__base_segments_parent_ref(DummySegment, raw_segments):
+    """Test getting and setting parents on BaseSegment."""
+    # Check initially no parent (because not set)
+    assert not raw_segments[0].get_parent()
+    # Add it to a segment (which also sets the parent value)
+    seg = DummySegment(segments=raw_segments)
+    # The DummySegment shouldn't have a parent.
+    assert seg.get_parent() is None
+    assert seg.segments[0].get_parent()[0] is seg
+    assert seg.segments[1].get_parent()[0] is seg
+    # Remove segment from parent, but don't unset.
+    # Should still check an return None.
+    seg_0 = seg.segments[0]
+    seg.segments = seg.segments[1:]
+    assert seg_0 not in seg.segments
+    assert not seg_0.get_parent()
+    # Check the other still works.
+    assert seg.segments[0].get_parent()[0]
+
+
+def test__parser__base_segments_copy_segments_reparents_children(
+    DummySegment, raw_segments
+):
+    """Test that .copy(segments=...) reparents the provided children."""
+    old_seg = DummySegment(segments=raw_segments)
+    assert old_seg.segments[0].get_parent()[0] is old_seg
+
+    new_seg = old_seg.copy(segments=raw_segments)
+    assert new_seg is not old_seg
+    # The children should now report the *new* segment as their parent...
+    assert new_seg.segments[0].get_parent()[0] is new_seg
+    assert new_seg.segments[1].get_parent()[0] is new_seg
+    # ...rather than the old one.
+    assert old_seg.segments[0].get_parent()[0] is not old_seg
+
+
+def test__parser__raw_segment_raw_normalized():
+    """Test comparison of raw segments."""
+    template = TemplatedFile.from_string('"a"""."e"')
+    rs1 = RawSegment(
+        '"a"""',
+        PositionMarker(slice(0, 5), slice(0, 5), template),
+        quoted_value=(r'"((?:[^"]|"")*)"', 1),
+        escape_replacements=[('""', '"')],
+        casefold=str.upper,
+    )
+    rs2 = RawSegment(
+        ".",
+        PositionMarker(slice(6, 7), slice(6, 7), template),
+    )
+    rs3 = RawSegment(
+        '"e"',
+        PositionMarker(slice(8, 10), slice(8, 10), template),
+        quoted_value=(r'"((?:[^"]|"")*)"', 1),
+        escape_replacements=[('""', '"')],
+        casefold=str.upper,
+    )
+    bs1 = BaseSegment(
+        (
+            rs1,
+            rs2,
+            rs3,
+        ),
+        PositionMarker(slice(0, 10), slice(0, 10), template),
+    )
+    assert rs1.raw == '"a"""'
+    assert rs1.raw_normalized(False) == 'a"'
+    assert rs1.raw_normalized() == 'A"'
+    assert rs2.raw == "."
+    assert rs2.raw_normalized(False) == "."
+    assert rs2.raw_normalized() == "."
+    assert rs3.raw == '"e"'
+    assert rs3.raw_normalized(False) == "e"
+    assert rs3.raw_normalized() == "E"
+    assert bs1.raw == '"a"""."e"'
+    assert bs1.raw_normalized() == 'A".E'
+
+
+def test__parser__base_segments_cached_property_names_autodetected():
+    """Test that _cached_property_names is auto-detected by the metaclass."""
+    # BaseSegment should have all its @cached_property fields detected.
+    expected_base = {
+        "_hash",
+        "is_code",
+        "_code_indices",
+        "is_comment",
+        "is_whitespace",
+        "raw",
+        "descendant_type_set",
+        "direct_descendant_type_set",
+        "raw_upper",
+        "raw_segments",
+        "_raw_segment_indices",
+        "raw_segments_with_ancestors",
+        "source_fixes",
+        "first_non_whitespace_segment_raw_upper",
+        "is_templated",
+    }
+    assert BaseSegment._cached_property_names == expected_base
+
+    # RawSegment inherits BaseSegment's cached props and adds its own.
+    assert "representation" in RawSegment._cached_property_names
+    assert RawSegment._cached_property_names == expected_base | {"representation"}
+
+    # Stale names from the old hardcoded list should NOT be present.
+    assert "matched_length" not in BaseSegment._cached_property_names
+    assert "full_type_set" not in BaseSegment._cached_property_names
+
+
+def test__parser__base_segments_recalculate_caches_clears_all():
+    """Test that _recalculate_caches clears every @cached_property."""
+    template = TemplatedFile.from_string("foobar")
+    rs = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    bs = BaseSegment([rs])
+
+    # Populate caches by accessing them.
+    bs.is_code
+    bs.raw
+    bs._hash
+    assert "_hash" in bs.__dict__
+    assert "raw" in bs.__dict__
+    assert "is_code" in bs.__dict__
+
+    # Clear them.
+    bs._recalculate_caches()
+    assert "_hash" not in bs.__dict__
+    assert "raw" not in bs.__dict__
+    assert "is_code" not in bs.__dict__
+
+
+def test__parser__base_segments_pos_marker_invalidation(raw_seg):
+    """Test that reassigning pos_marker invalidates pos-dependent caches.
+
+    Regression test for issue #3855: _hash and is_templated both read
+    pos_marker, but only `segments` reassignment triggered cache
+    invalidation. After fixing, pos_marker reassignment should also
+    clear caches so stale values are not retained.
+    """
+    template = TemplatedFile.from_string("foobar")
+    seg = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+
+    # Populate _hash cache.
+    old_hash = seg._hash
+    assert "_hash" in seg.__dict__
+
+    # Reassign pos_marker to a different source slice.
+    seg.pos_marker = PositionMarker(slice(6, 12), slice(6, 12), template)
+
+    # _hash should have been invalidated and recomputed with new slice.
+    assert "_hash" not in seg.__dict__
+    new_hash = seg._hash
+    assert new_hash != old_hash
+
+
+def test__parser__base_segments_copy_pos_marker_invalidation(raw_seg):
+    """Test that copy() + pos_marker reassignment doesn't keep stale caches.
+
+    This is the real-world path in _position_segments: copy inherits
+    cached values from the original, then pos_marker is reassigned.
+    The stale cache must be cleared.
+    """
+    template = TemplatedFile.from_string("foobar")
+    seg = RawSegment("foobar", PositionMarker(slice(0, 6), slice(0, 6), template))
+    original_hash = seg._hash
+
+    copied = seg.copy()
+    # copy() transfers cached values via __dict__.update.
+    assert copied._hash == original_hash
+
+    # Reassign pos_marker (as _position_segments does).
+    copied.pos_marker = PositionMarker(slice(6, 12), slice(6, 12), template)
+    assert copied._hash != original_hash
+
+
+def test__parser__base_segments_structural_simplify_with_position():
+    """Test structural_simplify with 3-element tuple (with position)."""
+    # This covers lines 603 and 614 in base.py
+    pos_info = {"start_line_no": 1}
+    elem = ("key", "value", pos_info)
+    result = BaseSegment.structural_simplify(elem)
+    assert result == {"key": "value", "start_line_no": 1}
+
+    # Also test with nested structure
+    elem_nested = ("parent", (("child", "val", pos_info),), pos_info)
+    result_nested = BaseSegment.structural_simplify(elem_nested)
+    assert result_nested["start_line_no"] == 1
+    assert result_nested["parent"]["child"] == "val"
+    assert result_nested["parent"]["start_line_no"] == 1

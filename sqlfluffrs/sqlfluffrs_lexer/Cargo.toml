@@ -1,0 +1,19 @@
+[package]
+name = "sqlfluffrs_lexer"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+hashbrown.workspace = true
+log.workspace = true
+itertools.workspace = true
+uuid.workspace = true
+sqlfluffrs_types = { path = "../sqlfluffrs_types" }
+sqlfluffrs_dialects = { path = "../sqlfluffrs_dialects" }
+sqlfluffrs_python = { path = "../sqlfluffrs_python", optional = true }
+pyo3 = { workspace = true, optional = true }
+
+[features]
+unicode = []
+python = ["unicode", "pyo3", "sqlfluffrs_python"]

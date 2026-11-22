@@ -1,0 +1,585 @@
+"""Test routines for fixing errors."""
+
+import logging
+
+import pytest
+
+from sqlfluff.core import Linter
+from sqlfluff.core.config import FluffConfig
+from sqlfluff.core.linter.fix import compute_anchor_edit_info
+from sqlfluff.core.linter.patch import (
+    FixPatch,
+    generate_source_patches,
+    merge_source_patches,
+)
+from sqlfluff.core.parser.markers import PositionMarker
+from sqlfluff.core.parser.segments import (
+    BaseSegment,
+    RawSegment,
+    TemplateSegment,
+)
+from sqlfluff.core.parser.segments.raw import SourceFix
+from sqlfluff.core.rules import BaseRule, LintResult, RulePack
+from sqlfluff.core.rules.crawlers import RootOnlyCrawler
+from sqlfluff.core.rules.fix import LintFix
+from sqlfluff.core.templaters import RawFileSlice, TemplatedFile
+from sqlfluff.core.templaters.base import TemplatedFileSlice
+
+
+@pytest.fixture(scope="module")
+def raw_segments(generate_test_segments):
+    """Construct a list of raw segments as a fixture."""
+    return generate_test_segments(["foobar", ".barfoo"])
+
+
+def test__rules_base_segments_compute_anchor_edit_info(raw_segments):
+    """Test BaseSegment.compute_anchor_edit_info()."""
+    # Construct a fix buffer, intentionally with:
+    # - one duplicate.
+    # - two different incompatible fixes on the same segment.
+    fixes = [
+        LintFix.replace(raw_segments[0], [raw_segments[0].edit(raw="a")]),
+        LintFix.replace(raw_segments[0], [raw_segments[0].edit(raw="a")]),
+        LintFix.replace(raw_segments[0], [raw_segments[0].edit(raw="b")]),
+    ]
+    anchor_info_dict = compute_anchor_edit_info(fixes)
+    # Check the target segment is the only key we have.
+    assert list(anchor_info_dict.keys()) == [raw_segments[0].uuid]
+    anchor_info = anchor_info_dict[raw_segments[0].uuid]
+    # Check that the duplicate as been deduplicated.
+    # i.e. this isn't 3.
+    assert anchor_info.replace == 2
+    # Check the fixes themselves.
+    # NOTE: There's no duplicated first fix.
+    assert anchor_info.fixes == [
+        LintFix.replace(raw_segments[0], [raw_segments[0].edit(raw="a")]),
+        LintFix.replace(raw_segments[0], [raw_segments[0].edit(raw="b")]),
+    ]
+    # Check the first replace
+    assert anchor_info._first_replace == LintFix.replace(
+        raw_segments[0], [raw_segments[0].edit(raw="a")]
+    )
+
+
+templated_file_1 = TemplatedFile.from_string("abc")
+templated_file_2 = TemplatedFile(
+    "{# blah #}{{ foo }}bc",
+    "<testing>",
+    "abc",
+    [
+        TemplatedFileSlice("comment", slice(0, 10), slice(0, 0)),
+        TemplatedFileSlice("templated", slice(10, 19), slice(0, 1)),
+        TemplatedFileSlice("literal", slice(19, 21), slice(1, 3)),
+    ],
+    [
+        RawFileSlice("{# blah #}", "comment", 0),
+        RawFileSlice("{{ foo }}", "templated", 10),
+        RawFileSlice("bc", "literal", 19),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "tree,templated_file,expected_result",
+    [
+        # Trivial example
+        (
+            RawSegment(
+                "abc",
+                PositionMarker(slice(0, 3), slice(0, 3), templated_file_1),
+                "code",
+            ),
+            templated_file_1,
+            [],
+        ),
+        # Simple literal edit example
+        (
+            RawSegment(
+                "abz",
+                PositionMarker(slice(0, 3), slice(0, 3), templated_file_1),
+                "code",
+            ),
+            templated_file_1,
+            [FixPatch(slice(0, 3), "abz", "literal", slice(0, 3), "abc", "abc")],
+        ),
+        # Nested literal edit example
+        (
+            BaseSegment(
+                [
+                    RawSegment(
+                        "a",
+                        PositionMarker(slice(0, 1), slice(0, 1), templated_file_1),
+                        "code",
+                    ),
+                    RawSegment(
+                        "b",
+                        PositionMarker(slice(1, 2), slice(1, 2), templated_file_1),
+                        "code",
+                    ),
+                    RawSegment(
+                        "z",
+                        PositionMarker(slice(2, 3), slice(2, 3), templated_file_1),
+                        "code",
+                    ),
+                ]
+            ),
+            templated_file_1,
+            [FixPatch(slice(0, 3), "abz", "literal", slice(0, 3), "abc", "abc")],
+        ),
+        # More complicated templating example
+        (
+            BaseSegment(
+                [
+                    TemplateSegment(
+                        PositionMarker(slice(0, 10), slice(0, 0), templated_file_2),
+                        "{# blah #}",
+                        "comment",
+                    ),
+                    RawSegment(
+                        "a",
+                        PositionMarker(slice(10, 20), slice(0, 1), templated_file_2),
+                        "code",
+                    ),
+                    RawSegment(
+                        "b",
+                        PositionMarker(slice(19, 20), slice(1, 2), templated_file_2),
+                        "code",
+                    ),
+                    RawSegment(
+                        "z",
+                        PositionMarker(slice(20, 21), slice(2, 3), templated_file_2),
+                        "code",
+                    ),
+                ]
+            ),
+            templated_file_2,
+            [FixPatch(slice(2, 3), "z", "literal", slice(20, 21), "c", "c")],
+        ),
+        # Templating example with fixes
+        (
+            BaseSegment(
+                [
+                    TemplateSegment(
+                        PositionMarker(slice(0, 10), slice(0, 0), templated_file_2),
+                        "{# blah #}",
+                        "comment",
+                        source_fixes=[
+                            SourceFix("{# fixed #}", slice(0, 10), slice(0, 0))
+                        ],
+                    ),
+                    RawSegment(
+                        "a",
+                        PositionMarker(slice(10, 19), slice(0, 1), templated_file_2),
+                        "code",
+                        source_fixes=[
+                            SourceFix("{{ bar }}", slice(10, 19), slice(0, 1))
+                        ],
+                    ),
+                    RawSegment(
+                        "b",
+                        PositionMarker(slice(19, 20), slice(1, 2), templated_file_2),
+                        "code",
+                    ),
+                    RawSegment(
+                        "z",
+                        PositionMarker(slice(20, 21), slice(2, 3), templated_file_2),
+                        "code",
+                    ),
+                ]
+            ),
+            templated_file_2,
+            [
+                FixPatch(
+                    slice(0, 0), "{# fixed #}", "source", slice(0, 10), "", "{# blah #}"
+                ),
+                FixPatch(
+                    slice(0, 1), "{{ bar }}", "source", slice(10, 19), "a", "{{ foo }}"
+                ),
+                FixPatch(slice(2, 3), "z", "literal", slice(20, 21), "c", "c"),
+            ],
+        ),
+    ],
+)
+def test__fix__generate_source_patches(tree, templated_file, expected_result, caplog):
+    """Test generate_source_patches.
+
+    This is part of fix_string().
+    """
+    with caplog.at_level(logging.DEBUG, logger="sqlfluff.linter"):
+        result = generate_source_patches(tree, templated_file)
+    assert result == expected_result
+
+
+def test__fix__jinja_empty_rendering_placeholder_adjacent_to_quotes(caplog):
+    """Regression test for empty Jinja placeholders inside quoted literals.
+
+    This covers the case where ``{{ foo.bar }}`` renders to an empty string and
+    appears adjacent to quote characters, while a fix (LT02 indentation) is
+    being applied elsewhere in the statement.
+    """
+    sql = "SELECT\n  '{{ foo.bar }}'\nFROM baz\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "LT02",
+            "templater": "jinja",
+            # Ensure the expression renders to an empty string.
+            "templater.jinja.context.foo": {"bar": ""},
+            "templater.jinja.context.bar": "",
+        }
+    )
+    linter = Linter(config=config)
+
+    with caplog.at_level(logging.WARNING, logger="sqlfluff.linter"):
+        linted_file = linter.lint_string(sql, fix=True)
+        fixed_sql, changed = linted_file.fix_string()
+
+    assert changed
+    assert fixed_sql == "SELECT\n    '{{ foo.bar }}'\nFROM baz\n"
+    assert "Skipping edit patch on uncertain templated section" not in caplog.text
+
+
+def test__fix__jinja_non_empty_context_adjacent_to_quotes(caplog):
+    """Regression test for quoted templated literals with non-empty context."""
+    sql = "SELECT\n  '{{ foo.bar }}'\nFROM baz\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "LT02",
+            "templater": "jinja",
+            "templater.jinja.context.foo": {"bar": "bar"},
+            "templater.jinja.context.bar": "bar",
+        }
+    )
+    linter = Linter(config=config)
+
+    with caplog.at_level(logging.WARNING, logger="sqlfluff.linter"):
+        linted_file = linter.lint_string(sql, fix=True)
+        fixed_sql, changed = linted_file.fix_string()
+
+    assert changed
+    assert fixed_sql == "SELECT\n    '{{ foo.bar }}'\nFROM baz\n"
+    assert "Skipping edit patch on uncertain templated section" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "rules,sql,expected",
+    [
+        # A new indent before the token.
+        (
+            "LT02",
+            "select\nb{% if true %}c{% endif %}\n",
+            "select\n    b{% if true %}c{% endif %}\n",
+        ),
+        # A deletion elsewhere in the same clause.
+        (
+            "LT01",
+            "select a  , b{% if true %}c{% endif %}\n",
+            "select a, b{% if true %}c{% endif %}\n",
+        ),
+        (
+            "LT01",
+            "select a  , b{# note #}c\n",
+            "select a, b{# note #}c\n",
+        ),
+        # A new newline after the tag placeholder and its indent.
+        (
+            "LT09",
+            "select a, b{% if true %}c{% endif %}\n",
+            "select\na,\nb{% if true %}c{% endif %}\n",
+        ),
+        # A new indent, then a move of the whole token.
+        (
+            "LT02,LT09",
+            "select\nb{# note #}c\n",
+            "select bc    {# note #}\n",
+        ),
+        # The token only spans the tag in the variant which renders the block.
+        (
+            "LT05",
+            "{% if false %}select " + "a" * 65 + "{% endif %}select 1\n",
+            "{% if false %}\n    select\n" + "a" * 65 + "{% endif %}select 1\n",
+        ),
+    ],
+)
+def test__fix__token_spanning_jinja_tag(rules, sql, expected):
+    """Fixes keep the part of a token before a Jinja tag inside it.
+
+    See: https://github.com/sqlfluff/sqlfluff/issues/8611
+    """
+    linter = Linter(config=FluffConfig(overrides={"dialect": "ansi", "rules": rules}))
+    linted_file = linter.lint_string(sql, fix=True)
+    fixed_sql, changed = linted_file.fix_string()
+
+    assert changed
+    assert fixed_sql == expected
+
+
+def test__fix__jinja_dbt_var_subscript_allows_layout_fix():
+    """Regression test for dbt `var()` placeholders used with subscripts."""
+    sql = "select {{ var('123')['123'] }} ,1/2 as d from d\n"
+    config = FluffConfig.from_string(
+        "[sqlfluff]\n"
+        "dialect = snowflake\n"
+        "rules = LT01\n"
+        "templater = jinja\n"
+        "[sqlfluff:templater:jinja]\n"
+        "apply_dbt_builtins = True\n"
+    )
+    linter = Linter(config=config)
+
+    linted_file = linter.lint_string(sql, fname="test.sql", fix=True)
+    fixed_sql, changed = linted_file.fix_string()
+
+    assert changed
+    assert not any(v.rule_code() == "PRS" for v in linted_file.get_violations())
+    assert fixed_sql == "select {{ var('123')['123'] }}, 1 / 2 as d from d\n"
+
+
+def test__fix__jinja_dbt_config_allows_start_of_file_fix(caplog):
+    """Regression test for LT13 before an empty-rendering dbt config block."""
+    sql = (
+        "\n{{\n"
+        "    config(\n"
+        '        materialized = "ephemeral",\n'
+        "    )\n"
+        "}}\n\n"
+        "SELECT 1\n"
+    )
+    config = FluffConfig.from_string(
+        "[sqlfluff]\n"
+        "dialect = databricks\n"
+        "rules = LT13\n"
+        "templater = jinja\n"
+        "[sqlfluff:templater:jinja]\n"
+        "apply_dbt_builtins = True\n"
+    )
+    linter = Linter(config=config)
+
+    with caplog.at_level(logging.WARNING, logger="sqlfluff.linter"):
+        linted_file = linter.lint_string(sql, fname="test.sql", fix=True)
+        fixed_sql, changed = linted_file.fix_string()
+
+    assert changed
+    assert fixed_sql == sql[1:]
+    assert "Skipping edit patch on uncertain templated section" not in caplog.text
+
+
+def test__fix__warning_only_violations_are_still_fixed(tmp_path):
+    """Test that warning-level violations are fixed even without errors.
+
+    Regression test for https://github.com/sqlfluff/sqlfluff/issues/7101.
+    When all fixable violations are configured as warnings (via the
+    ``warnings`` config), ``persist_tree`` should still apply the fixes
+    rather than skipping the file.
+    """
+    # LT02 = incorrect indentation.  Configure it as a warning.
+    sql = "SELECT a\nFROM\n        foo;\n"
+    expected_fixed = "SELECT a\nFROM\n    foo;\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "LT02",
+            "warnings": "LT02",
+        }
+    )
+    linter = Linter(config=config)
+    linted_file = linter.lint_string(sql, fix=True)
+
+    # The violation should be present but marked as a warning.
+    all_violations = linted_file.get_violations(filter_warning=False)
+    assert any(v.warning for v in all_violations), (
+        "Expected at least one warning-level violation"
+    )
+
+    # fix_string should produce the corrected SQL.
+    fixed_sql, changed = linted_file.fix_string()
+    assert changed
+    assert fixed_sql == expected_fixed
+
+    # persist_tree should detect the fixable warning and write it out.
+    sql_file = tmp_path / "test.sql"
+    sql_file.write_text(sql)
+    linted_file_on_disk = linter.lint_string(sql, fname=str(sql_file), fix=True)
+    success = linted_file_on_disk.persist_tree()
+    assert success
+    assert sql_file.read_text() == expected_fixed
+
+
+def test__fix__warning_and_error_violations_both_fixed(tmp_path):
+    """When a file has both warning and error violations, both are fixed.
+
+    Companion to the warning-only test above: make sure mixed severity
+    still works after the change.
+    """
+    # LT02 = indentation (warning), CP01 = capitalisation (error).
+    sql = "SELECT a\nfrom\n        foo;\n"
+    expected_fixed = "SELECT a\nFROM\n    foo;\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "LT02,CP01",
+            "warnings": "LT02",
+        }
+    )
+    linter = Linter(config=config)
+
+    sql_file = tmp_path / "test.sql"
+    sql_file.write_text(sql)
+    linted_file = linter.lint_string(sql, fname=str(sql_file), fix=True)
+    success = linted_file.persist_tree()
+    assert success
+    assert sql_file.read_text() == expected_fixed
+
+
+def test__fix__merge_source_patches_dedupes_and_skips_conflicts():
+    """Cross-variant patch merging should keep only safe source edits."""
+    patch_a = FixPatch(slice(1, 2), "A", "literal", slice(1, 2), "b", "b")
+    patch_a_dup = FixPatch(slice(1, 2), "A", "literal", slice(1, 2), "b", "b")
+    patch_b = FixPatch(slice(3, 4), "B", "literal", slice(3, 4), "d", "d")
+    conflicting_patch = FixPatch(slice(3, 4), "C", "literal", slice(3, 4), "d", "d")
+
+    assert merge_source_patches(
+        [[patch_a, patch_b], [patch_a_dup, conflicting_patch]]
+    ) == [patch_a, patch_b]
+
+
+def test__fix__merge_source_patches_skips_conflicting_insertions_at_same_point():
+    """Insert-only patches at the same source point should conflict."""
+    first_insertion = FixPatch(
+        slice(2, 2),
+        "A",
+        "mid_point",
+        slice(2, 2),
+        "",
+        "",
+    )
+    conflicting_insertion = FixPatch(
+        slice(5, 5),
+        "B",
+        "mid_point",
+        # NOTE: This slices compares unequal, but is effectively equal.
+        slice(2, 2, 1),
+        "",
+        "",
+    )
+
+    assert merge_source_patches([[first_insertion], [conflicting_insertion]]) == [
+        first_insertion
+    ]
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        (
+            "select\n{% if true %}{% if false %}    a,\n{% endif %}{% endif %}    b\n",
+            "select\n    {% if true %}\n        {% if false %}    a,\n        "
+            "{% endif %}{% endif %}    b\n",
+        ),
+        (
+            "SELECT\n{% if true %}{% if true %}    a\n{% endif %}{% endif %}\n",
+            "SELECT\n    {% if true %}{% if true %}    a\n    {% endif %}{% endif %}\n",
+        ),
+        (
+            "select\n  a, {% if true %}{% if false %}b,{% endif %}{% endif %}\n  c\n",
+            "select\n    a,{% if true %}{% if false %}\n        "
+            "b,{% endif %}{% endif %}\n    c\n",
+        ),
+    ],
+)
+def test__fix__jinja_lt02_nested_block_tags_reach_a_fixed_point(sql, expected):
+    """Regression test for LT02 oscillating on nested Jinja tags on one line."""
+    config = FluffConfig(overrides={"dialect": "ansi"})
+    linter = Linter(config=config)
+
+    once, changed_once = linter.lint_string(
+        sql, fname="test.sql", fix=True
+    ).fix_string()
+    twice, changed_twice = linter.lint_string(
+        once, fname="test.sql", fix=True
+    ).fix_string()
+
+    assert changed_once
+    assert not changed_twice
+    assert twice == once
+    assert once == expected
+    assert not linter.lint_string(once, fname="test.sql").get_violations()
+
+
+class Rule_T901(BaseRule):
+    """A post-phase rule which counts evaluations and returns no results."""
+
+    groups = ("all",)
+    crawl_behaviour = RootOnlyCrawler()
+    is_fix_compatible = True
+    lint_phase = "post"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.evaluations = 0
+
+    def _eval(self, context):
+        self.evaluations += 1
+
+
+class Rule_T902(Rule_T901):
+    """A post-phase rule which returns a fix that leaves the tree unchanged."""
+
+    def _eval(self, context):
+        self.evaluations += 1
+        anchor = context.segment.raw_segments[0]
+        return LintResult(anchor=anchor, fixes=[LintFix.replace(anchor, [anchor])])
+
+
+class Rule_T903(BaseRule):
+    """A main-phase rule which replaces the first "a" with "b"."""
+
+    groups = ("all",)
+    crawl_behaviour = RootOnlyCrawler()
+    is_fix_compatible = True
+
+    def _eval(self, context):
+        for seg in context.segment.raw_segments:
+            if seg.raw == "a":
+                return LintResult(
+                    anchor=seg, fixes=[LintFix.replace(seg, [seg.edit("b")])]
+                )
+
+
+def _lint_fix_with_rules(*rule_classes):
+    config = FluffConfig(overrides={"dialect": "ansi"})
+    linter = Linter(config=config)
+    tree = linter.parse_string("SELECT a FROM b\n").tree
+    rules = [
+        rule_cls(code=rule_cls.__name__.removeprefix("Rule_"), description="Test rule.")
+        for rule_cls in rule_classes
+    ]
+    rule_pack = RulePack(rules=rules, reference_map={})
+    fixed_tree, _, _, timings = Linter.lint_fix_parsed(
+        tree, config, rule_pack, fix=True
+    )
+    return rules, tree, fixed_tree, timings
+
+
+def test__fix__post_phase_skipped_when_main_phase_clean():
+    """A post rule runs once on a clean file in fix mode."""
+    (rule,), tree, fixed_tree, timings = _lint_fix_with_rules(Rule_T901)
+    assert rule.evaluations == 1
+    assert fixed_tree is tree
+    assert len(timings) == 1
+
+
+def test__fix__post_phase_runs_when_final_main_loop_returned_fixes():
+    """Fixes returned but not applied in the last main loop keep the post phase."""
+    (rule,), tree, fixed_tree, _ = _lint_fix_with_rules(Rule_T902)
+    # Once in the main phase and once in the post phase.
+    assert rule.evaluations == 2
+    assert fixed_tree.raw == tree.raw
+
+
+def test__fix__post_phase_skipped_when_main_phase_settles_after_a_fix():
+    """The post phase is skipped when the main phase settles after a fix."""
+    (_, post_rule), _, fixed_tree, _ = _lint_fix_with_rules(Rule_T903, Rule_T901)
+    assert post_rule.evaluations == 2
+    assert fixed_tree.raw == "SELECT b FROM b\n"

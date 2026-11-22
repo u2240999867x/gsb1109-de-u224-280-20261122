@@ -1,0 +1,155 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: d81662c3fce3520c62fc13041f0609391c1d260714d2c4eb17662d205697bdc6
+file:
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        quoted_literal: "'select 1'"
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        quoted_literal: "$$\n  SELECT PI();\n$$"
+- statement_terminator: ;
+- statement:
+    set_statement:
+      keyword: SET
+      variable: pie
+      comparison_operator:
+        raw_comparison_operator: '='
+      expression:
+        quoted_literal: "$$\n  SELECT PI();\n$$"
+- statement_terminator: ;
+- statement:
+    set_statement:
+      keyword: SET
+      variable: one
+      comparison_operator:
+        raw_comparison_operator: '='
+      expression:
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    set_statement:
+      keyword: SET
+      variable: two
+      comparison_operator:
+        raw_comparison_operator: '='
+      expression:
+        numeric_literal: '2'
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        variable: $pie
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        variable: $pie
+    - keyword: USING
+    - bracketed:
+      - start_bracket: (
+      - variable: one
+      - comma: ','
+      - variable: two
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    set_statement:
+      keyword: SET
+      variable: three
+      comparison_operator:
+        raw_comparison_operator: '='
+      expression:
+        quoted_literal: "'select ? + ?'"
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        bind_variable:
+          colon_prefix: ':'
+          variable: three
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+        bind_variable:
+          colon_prefix: ':'
+          variable: three
+    - keyword: USING
+    - bracketed:
+      - start_bracket: (
+      - variable: one
+      - comma: ','
+      - variable: two
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - keyword: FROM
+    - quoted_literal: "'./insert-inventory.sql'"
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - keyword: FROM
+    - storage_location:
+        stage_path: '@my_stage/scripts/create-inventory.sql'
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - expression:
+      - quoted_literal: "'CREATE OR REPLACE TABLE '"
+      - binary_operator:
+        - pipe: '|'
+        - pipe: '|'
+      - bind_variable:
+          colon_prefix: ':'
+          variable: backup_table_name
+      - binary_operator:
+        - pipe: '|'
+        - pipe: '|'
+      - quoted_literal: "' AS SELECT * FROM t'"
+- statement_terminator: ;
+- statement:
+    execute_immediate_clause:
+    - keyword: EXECUTE
+    - keyword: IMMEDIATE
+    - keyword: FROM
+    - quoted_literal: "'/scripts/foo.sql'"
+    - keyword: USING
+    - bracketed:
+      - start_bracket: (
+      - snowflake_keyword_expression:
+          parameter: env
+          parameter_assigner: =>
+          quoted_literal: "'prod'"
+      - comma: ','
+      - snowflake_keyword_expression:
+          parameter: region
+          parameter_assigner: =>
+          quoted_literal: "'us'"
+      - end_bracket: )
+- statement_terminator: ;

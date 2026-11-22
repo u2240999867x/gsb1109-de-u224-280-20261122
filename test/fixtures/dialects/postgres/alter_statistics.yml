@@ -1,0 +1,110 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 7427090d8127fe2e7abbb3ddb72e90636c7d6edaa8eaab6c82bdc753ebd21e32
+file:
+- statement:
+    alter_statistics_statement:
+    - keyword: ALTER
+    - keyword: STATISTICS
+    - statistics_reference:
+        naked_identifier: s1
+    - keyword: SET
+    - keyword: STATISTICS
+    - numeric_literal: '100'
+- statement_terminator: ;
+- statement:
+    alter_statistics_statement:
+    - keyword: ALTER
+    - keyword: STATISTICS
+    - keyword: IF
+    - keyword: EXISTS
+    - statistics_reference:
+        naked_identifier: s1
+    - keyword: SET
+    - keyword: STATISTICS
+    - numeric_literal: '100'
+- statement_terminator: ;
+- statement:
+    alter_statistics_statement:
+    - keyword: ALTER
+    - keyword: STATISTICS
+    - statistics_reference:
+        naked_identifier: s1
+    - keyword: OWNER
+    - keyword: TO
+    - keyword: current_user
+- statement_terminator: ;
+- statement:
+    alter_statistics_statement:
+    - keyword: ALTER
+    - keyword: STATISTICS
+    - statistics_reference:
+        naked_identifier: s1
+    - keyword: RENAME
+    - keyword: TO
+    - statistics_reference:
+        naked_identifier: s2
+- statement_terminator: ;
+- statement:
+    alter_statistics_statement:
+    - keyword: ALTER
+    - keyword: STATISTICS
+    - statistics_reference:
+        naked_identifier: s1
+    - keyword: SET
+    - keyword: SCHEMA
+    - schema_reference:
+        naked_identifier: my_schema
+- statement_terminator: ;
+- statement:
+    create_statistics_statement:
+    - keyword: CREATE
+    - keyword: STATISTICS
+    - statistics_reference:
+        naked_identifier: s1
+    - bracketed:
+        start_bracket: (
+        keyword: correlation
+        end_bracket: )
+    - keyword: 'ON'
+    - column_reference:
+        naked_identifier: a
+    - comma: ','
+    - column_reference:
+        naked_identifier: b
+    - keyword: FROM
+    - table_reference:
+        naked_identifier: t
+- statement_terminator: ;
+- statement:
+    create_statistics_statement:
+    - keyword: CREATE
+    - keyword: STATISTICS
+    - keyword: IF
+    - keyword: NOT
+    - keyword: EXISTS
+    - statistics_reference:
+        naked_identifier: s1
+    - bracketed:
+      - start_bracket: (
+      - keyword: ndistinct
+      - comma: ','
+      - keyword: dependencies
+      - comma: ','
+      - keyword: mcv
+      - comma: ','
+      - keyword: correlation
+      - end_bracket: )
+    - keyword: 'ON'
+    - column_reference:
+        naked_identifier: a
+    - comma: ','
+    - column_reference:
+        naked_identifier: b
+    - keyword: FROM
+    - table_reference:
+        naked_identifier: t
+- statement_terminator: ;

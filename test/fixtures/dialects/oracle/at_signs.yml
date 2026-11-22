@@ -1,0 +1,52 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: c2a20b67329b6944b76ff3dd1f1234dc1b8364ca05c7978eb7c2c60f59c3a7c8
+file:
+- execute_file_statement:
+  - at_sign: '@'
+  - at_sign: '@'
+  - naked_identifier: some_other_sql_file
+  - dot: .
+  - naked_identifier: sql
+- execute_file_statement:
+  - at_sign: '@'
+  - at_sign: '@'
+  - naked_identifier: some_other_sql_file_with_args
+  - dot: .
+  - naked_identifier: sql
+  - naked_identifier: foo
+  - naked_identifier: bar
+  - naked_identifier: baz
+- execute_file_statement:
+  - at_sign: '@'
+  - naked_identifier: some_other_sql_file
+  - dot: .
+  - naked_identifier: sql
+- execute_file_statement:
+  - at_sign: '@'
+  - naked_identifier: some_other_sql_file_with_args
+  - dot: .
+  - naked_identifier: sql
+  - naked_identifier: foo
+  - naked_identifier: bar
+  - naked_identifier: baz
+- batch:
+    statement:
+      select_statement:
+        select_clause:
+          keyword: SELECT
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: from
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: some_table
+    statement_terminator: ;

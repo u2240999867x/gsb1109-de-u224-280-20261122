@@ -1,0 +1,364 @@
+"""For autogenerating rust lexers."""
+
+import argparse
+import re
+import sys
+from collections.abc import Callable
+from typing import Optional, Union
+
+from sqlfluff.core.dialects import dialect_selector
+from sqlfluff.core.parser.client_commands import ArgumentKind, BufferAction
+from sqlfluff.core.parser.lexer import LexerType
+
+
+def generate_use():
+    """Generates the `use` statements."""
+    print("use std::sync::LazyLock;")
+    print("use sqlfluffrs_types::{LexMatcher, LexMatcherConfig};")
+    print("use sqlfluffrs_types::{Token, RegexModeGroup};")
+    print("use sqlfluffrs_types::token::CaseFold;")
+    print("use sqlfluffrs_types::{BracketPairEntry, BracketPairSet};")
+
+
+def segment_to_token_name(s: str):
+    """Convert a segment class name to a token name."""
+    base_name = (
+        re.sub("([A-Z])", r"_\1", s).strip("_").lower().replace("segment", "token")
+    )
+    return base_name
+
+
+def generate_lexer(dialect: str):
+    """Generate the lexers for all dialects."""
+    loaded_dialect = dialect_selector(dialect)
+    print(
+        f"pub static {dialect.upper()}_LEXERS:"
+        " LazyLock<Vec<LexMatcher>> = LazyLock::new(|| {"
+        " vec!["
+    )
+    for matcher in loaded_dialect.get_lexer_matchers():
+        print(f"{_as_rust_lexer_matcher(matcher, dialect.capitalize())},")
+    print("]});")
+
+
+def _rust_str(value: str) -> str:
+    """A Rust string literal for `value`, which must be printable ASCII."""
+    assert value.isascii() and value.isprintable(), value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _rust_option_str(value: Optional[str]) -> str:
+    return "None" if value is None else f"Some({_rust_str(value)})"
+
+
+def generate_client_commands(dialect: str):
+    """Generate the dialect's client command rules, if it has any.
+
+    See `sqlfluff.core.parser.client_commands`.
+    """
+    rules = dialect_selector(dialect).client_commands
+    name = f"{dialect.upper()}_CLIENT_COMMANDS"
+    rules_type = "sqlfluffrs_types::ClientCommandRules"
+    client_commands = "sqlfluffrs_types::client_commands"
+    if rules is None:
+        print(f"pub static {name}: Option<{rules_type}> = None;")
+        return
+    arguments = {
+        ArgumentKind.DELIMITER: f"{client_commands}::ArgumentKind::Delimiter",
+        ArgumentKind.FILE_NAME: f"{client_commands}::ArgumentKind::FileName",
+    }
+    buffers = {
+        BufferAction.KEEP: f"{client_commands}::BufferAction::Keep",
+        BufferAction.END: f"{client_commands}::BufferAction::End",
+        BufferAction.DISCARD: f"{client_commands}::BufferAction::Discard",
+    }
+    print(f"pub static {name}: Option<{rules_type}> = Some({rules_type} {{")
+    print("    long_commands: &[")
+    for long in rules.long_commands:
+        print(
+            f"        {client_commands}::LongClientCommand {{"
+            f" name: {_rust_str(long.name)},"
+            f" argument: {arguments[long.argument]} }},"
+        )
+    print("    ],")
+    print("    short_commands: &[")
+    for short in rules.short_commands:
+        argument = (
+            "None" if short.argument is None else f"Some({arguments[short.argument]})"
+        )
+        print(
+            f"        {client_commands}::ShortClientCommand {{"
+            f" text: {_rust_str(short.text)},"
+            f" buffer_action: {buffers[short.buffer_action]},"
+            f" argument: {argument} }},"
+        )
+    print("    ],")
+    opaque = ", ".join(_rust_str(n) for n in sorted(rules.opaque_token_names))
+    print(f"    opaque_token_names: &[{opaque}],")
+    after_comment = str(rules.line_command_after_block_comment).lower()
+    print(f"    line_command_after_block_comment: {after_comment},")
+    dash_dash = str(rules.dash_dash_comment_at_statement_start).lower()
+    print(f"    dash_dash_comment_at_statement_start: {dash_dash},")
+    marker = _rust_option_str(rules.collected_line_marker)
+    print(f"    collected_line_marker: {marker},")
+    print(f"    default_delimiter: {_rust_str(rules.default_delimiter)},")
+    limit = rules.max_delimiter_bytes
+    print(f"    max_delimiter_bytes: {'None' if limit is None else f'Some({limit})'},")
+    print("});")
+
+
+def generate_bracket_pairs(dialect: str):
+    """Generate the dialect's BracketPairEntry set.
+
+    Used by the Rust lexer/parser for bracket matching, stray-closing-bracket
+    detection, and Anything-grammar bracket recursion. `persists` is whether
+    the matched span is kept as a structured `bracketed` node vs flattened
+    to raw siblings.
+    """
+    loaded_dialect = dialect_selector(dialect)
+    print(
+        f"pub static {dialect.upper()}_BRACKET_PAIRS:"
+        " LazyLock<BracketPairSet>"
+        " = LazyLock::new(|| { BracketPairSet(vec!["
+    )
+    for _bracket_type, start_ref, end_ref, persists in sorted(
+        loaded_dialect.bracket_sets("bracket_pairs")
+    ):
+        start_seg = loaded_dialect.ref(start_ref)
+        end_seg = loaded_dialect.ref(end_ref)
+        start_template = start_seg.template
+        end_template = end_seg.template
+        # The segment type the parser assigns to the matched bracket, e.g.
+        # "start_bracket" / "start_exclude_bracket" (matches Python's
+        # StartBracketSegment / StartExcludeBracketSegment instance_types).
+        start_type = (start_seg._instance_types or (start_seg.raw_class.type,))[0]
+        end_type = (end_seg._instance_types or (end_seg.raw_class.type,))[0]
+        print(
+            f'    BracketPairEntry {{ open: "{start_template}", '
+            f'close: "{end_template}", start_type: "{start_type}", '
+            f'end_type: "{end_type}", persists: {str(bool(persists)).lower()} }},'
+        )
+    print("]) });")
+
+
+def generate_reserved_keyword_list(dialect: str):
+    """Generate the keywords for a dialects."""
+    loaded_dialect = dialect_selector(dialect)
+    print(
+        f"pub static {dialect.upper()}_KEYWORDS:"
+        " LazyLock<Vec<String>> = LazyLock::new(|| {"
+        " vec!["
+    )
+    for kw in sorted(loaded_dialect.sets("reserved_keywords")):
+        print(f'    "{kw}".to_string(),')
+    print("]});")
+
+
+def _as_rust_lexer_matcher(lexer_matcher: LexerType, dialect: str, is_subdivide=False):
+    lexer_class = lexer_matcher.__class__.__name__
+    segment_name = segment_to_token_name(lexer_matcher.segment_class.__name__)
+    subdivider = (
+        "Some(Box::new("
+        f"{_as_rust_lexer_matcher(lexer_matcher.subdivider, dialect, True)}))"
+        if lexer_matcher.subdivider
+        else None
+    )
+    trim_post_subdivide = (
+        "Some(Box::new("
+        f"{_as_rust_lexer_matcher(lexer_matcher.trim_post_subdivide, dialect, True)}))"
+        if lexer_matcher.trim_post_subdivide
+        else None
+    )
+
+    fallback_function = {
+        "block_comment": "Some(extract_nested_block_comment)",
+    }
+
+    is_match_valid_dict = {
+        "block_comment": '|input| input.starts_with("/")',
+        "dollar_quote": '|input| input.starts_with("$")',
+        "single_quote": r"""|input| match input.as_bytes() {
+        [b'\'', ..] => true,                     // Single quote case
+        [b'R' | b'r', b'\'', ..] => true,        // r' or R'
+        [b'B' | b'b', b'\'', ..] => true,        // b' or B'
+        [b'R' | b'r', b'B' | b'b', b'\'', ..] => true, // rb', RB', etc.
+        [b'B' | b'b', b'R' | b'r', b'\'', ..] => true, // br', Br', etc.
+        _ => false,
+    }""",
+        "double_quote": r"""|input| match input.as_bytes() {
+        [b'"', ..] => true,                     // Just a double quote
+        [b'R' | b'r', b'"', ..] => true,        // r" or R"
+        [b'B' | b'b', b'"', ..] => true,        // b" or B"
+        [b'R' | b'r', b'B' | b'b', b'"', ..] => true, // rb", RB", etc.
+        [b'B' | b'b', b'R' | b'r', b'"', ..] => true, // br", Br", etc.
+        _ => false,
+    }""",
+        "numeric_literal": "|input| input.starts_with("
+        "['x','X','.','0','1','2','3','4','5','6','7','8','9', "
+        "'-', '+', '$', '¢', '£', '¤', '¥', '৲', '৳', '฿', '៛', "
+        "'₠', '₡', '₢', '₣', '₤', '₥', '₦', '₧', '₨', '₩', '₪', "
+        "'₫', '€', '₭', '₮', '₯', '₰', '₱', '﹩', '＄', "
+        "'￠', '￡', '￥', '￦'])",
+        "inline_comment": "|input| input.starts_with(['#','-','/'])",
+        "escaped_single_quote": "|input| input.starts_with(['E', 'e'])",
+        "meta_command": r"|input| input.starts_with(['\\'])",
+        "meta_command_query_buffer": r"|input| input.starts_with(['\\'])",
+        "prompt_command": """|input| input.starts_with("PROMPT")""",
+    }
+
+    trim_start: Optional[str] = lexer_matcher.segment_kwargs.get("trim_start")
+    if trim_start:
+        trim_start = (
+            'Some(vec![String::from("' + '"), String::from("'.join(trim_start) + '")])'
+        )
+    trim_chars: Optional[str] = lexer_matcher.segment_kwargs.get("trim_chars")
+    if trim_chars:
+        trim_chars = (
+            'Some(vec![String::from("' + '"), String::from("'.join(trim_chars) + '")])'
+        )
+    kwarg_type: Optional[str] = lexer_matcher.segment_kwargs.get("type")
+    if kwarg_type:
+        kwarg_type = f'Some(String::from("{kwarg_type}"))'
+
+    quoted_value: Optional[Union[str, int]] = lexer_matcher.segment_kwargs.get(
+        "quoted_value"
+    )
+    escape_replacements: Optional[list[tuple[str, str]]] = (
+        lexer_matcher.segment_kwargs.get("escape_replacements")
+    )
+    casefold: Optional[Callable[[str], str]] = lexer_matcher.segment_kwargs.get(
+        "casefold"
+    )
+
+    # Convert Python casefold function to Rust CaseFold enum
+    if casefold is None:
+        casefold_rust = "CaseFold::None"
+    elif casefold == str.upper:
+        casefold_rust = "CaseFold::Upper"
+    elif casefold == str.lower:
+        casefold_rust = "CaseFold::Lower"
+    else:
+        # Unknown casefold function, default to None
+        casefold_rust = "CaseFold::None"
+
+    if lexer_class == "StringLexer":
+        rust_fn = "string_lexer"
+        # Escape controls too: Rust source normalizes literal CRLF to LF.
+        template = lexer_matcher.template.translate(
+            {
+                **{char: rf"\u{{{char:x}}}" for char in (*range(0x20), 0x7F)},
+                ord("\\"): r"\\",
+                ord('"'): r"\"",
+            }
+        )
+        template = f'"{template}"'
+        fallback = ""
+        is_match_valid = ""
+    elif lexer_class == "RegexLexer":
+        rust_fn = "regex_subdivider" if is_subdivide else "regex_lexer"
+        template = f'r#"{lexer_matcher.template}"#'
+        if template == r'r#"\[{2}([^[\\]|\\.)*\]{2}"#':
+            template = r'r#"\[{2}([^\[\\]|\\.)*\]{2}"#'
+        fallback = f"\n        {fallback_function.get(lexer_matcher.name, None)},"
+        is_match_valid = (
+            f"\n        {is_match_valid_dict.get(lexer_matcher.name, '|_| true')},"
+        )
+    else:
+        raise ValueError
+
+    if quoted_value:
+        quoted_value = f'r#"{quoted_value[0]}"#', quoted_value[1]
+        if quoted_value[0] == r'r#"\[{2}([^[\\]|\\.)*\]{2}"#':
+            quoted_value = r'r#"\[{2}([^\[\\]|\\.)*\]{2}"#', quoted_value[1]
+        if isinstance(quoted_value[1], int):
+            quoted_value = (
+                f"Some(({quoted_value[0]}.to_string(),"
+                f" RegexModeGroup::Index({quoted_value[1]})))"
+            )
+        else:
+            quoted_value = (
+                f"Some(({quoted_value[0]}.to_string(),"
+                f' RegexModeGroup::Name("{quoted_value[1]}".to_string())))'
+            )
+
+    if escape_replacements:
+        # Plural: emit every pair, not just the first - Python applies each
+        # escape_replacements pair in order (RawSegment._get_normalized_value,
+        # segments/raw.py), so dropping any but the first silently changes what
+        # a token normalizes to on the Rust side.
+        rust_pairs = []
+        for pattern, replacement in escape_replacements:
+            pattern, replacement = f'r#"{pattern}"#', f'r#"{replacement}"#'
+            if pattern == r'r#"\[{2}([^[\\]|\\.)*\]{2}"#':
+                pattern = r'r#"\[{2}([^\[\\]|\\.)*\]{2}"#'
+            if replacement == r'r#"\[{2}([^[\\]|\\.)*\]{2}"#':
+                replacement = r'r#"\[{2}([^\[\\]|\\.)*\]{2}"#'
+            rust_pairs.append(f"({pattern}.to_string(), {replacement}.to_string())")
+        escape_replacements_rust = (
+            "Some(std::sync::Arc::new(vec![" + ", ".join(rust_pairs) + "]))"
+        )
+    else:
+        escape_replacements_rust = None
+
+    # TokenGenerator is `fn(String, PositionMarker, TokenConfig) -> Token`, which
+    # every `Token::{kind}_token` constructor already matches directly.
+    token_fn = f"Token::{segment_name}"
+
+    config = f"""LexMatcherConfig {{
+        subdivider: {subdivider},
+        trim_post_subdivide: {trim_post_subdivide},
+        trim_start: {trim_start},
+        trim_chars: {trim_chars},
+        quoted_value: {quoted_value},
+        escape_replacements: {escape_replacements_rust},
+        casefold: {casefold_rust},
+        kwarg_type: {kwarg_type},
+    }}"""
+
+    return f"""
+    LexMatcher::{rust_fn}(
+        "{lexer_matcher.name}",
+        {template},{token_fn},{fallback}{is_match_valid}
+        {config},
+    )"""
+
+
+def generate_extract_nested_block_comments(dialect: str):
+    """This function handles nested block comments.
+
+    Since this function is now shared across all dialects, we just need
+    to generate a wrapper that passes the dialect name to the shared implementation.
+    """
+    print(f"""
+// Wrapper function that passes the dialect name to the shared implementation
+fn extract_nested_block_comment(input: &str) -> Option<&str> {{
+    crate::extract_nested_block_comment(input, "{dialect}")
+}}""")
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(newline="\n", encoding="utf-8")  # Force LF line endings
+    parser = argparse.ArgumentParser(
+        description="Build generated Rust output for a dialect."
+    )
+    parser.add_argument(
+        "dialect",
+    )
+    args = parser.parse_args()
+    print("/* This is a generated file! */")
+    print("/* Generated by `utils/build_lexers.py` via `utils/rustify.py` */")
+    print("/* This process can be run via tox: `tox -e generate-rs` */")
+    print("#![cfg_attr(rustfmt, rustfmt_skip)]")
+
+    generate_use()
+    print()
+    generate_reserved_keyword_list(args.dialect)
+    print()
+    generate_lexer(args.dialect)
+    print()
+    generate_bracket_pairs(args.dialect)
+    print()
+    generate_client_commands(args.dialect)
+    print()
+    generate_extract_nested_block_comments(args.dialect)

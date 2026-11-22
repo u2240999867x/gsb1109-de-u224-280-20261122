@@ -1,0 +1,1319 @@
+"""The Db2 dialect.
+
+https://www.ibm.com/docs/en/i/7.4?topic=overview-db2-i
+"""
+
+from sqlfluff.core.dialects import load_raw_dialect
+from sqlfluff.core.parser import (
+    AnyNumberOf,
+    AnySetOf,
+    BaseSegment,
+    Bracketed,
+    CodeSegment,
+    CommentSegment,
+    Dedent,
+    Delimited,
+    IdentifierSegment,
+    Indent,
+    Nothing,
+    OneOf,
+    OptionallyBracketed,
+    ParseMode,
+    Ref,
+    RegexLexer,
+    RegexParser,
+    SegmentGenerator,
+    Sequence,
+    StringLexer,
+    StringParser,
+    SymbolSegment,
+    WordSegment,
+)
+from sqlfluff.dialects import dialect_ansi as ansi
+from sqlfluff.dialects.dialect_db2_keywords import UNRESERVED_KEYWORDS
+
+ansi_dialect = load_raw_dialect("ansi")
+
+db2_dialect = ansi_dialect.copy_as(
+    "db2",
+    formatted_name="IBM Db2",
+    docstring="The dialect for IBM `Db2 <https://www.ibm.com/analytics/db2>`_.",
+)
+db2_dialect.sets("reserved_keywords").remove("NATURAL")
+db2_dialect.sets("unreserved_keywords").update(UNRESERVED_KEYWORDS)
+
+
+db2_dialect.replace(
+    # Db2 allows # in field names, and doesn't use it as a comment
+    NakedIdentifierSegment=SegmentGenerator(
+        # Generate the anti template from the set of reserved keywords
+        lambda dialect: RegexParser(
+            r"[A-Z0-9_#]*[A-Z#][A-Z0-9_#]*",
+            IdentifierSegment,
+            type="naked_identifier",
+            anti_template=r"^("
+            + r"|".join(sorted(dialect.sets("reserved_keywords")))
+            + r")$",
+            casefold=str.upper,
+        )
+    ),
+    FunctionContentsExpressionGrammar=OneOf(
+        Ref("ExpressionSegment"),
+        Ref("NamedArgumentSegment"),
+    ),
+    ConditionalCrossJoinKeywordsGrammar=Nothing(),
+    NaturalJoinKeywordsGrammar=Nothing(),
+    UnconditionalCrossJoinKeywordsGrammar=Ref.keyword("CROSS"),
+    PreTableFunctionKeywordsGrammar=OneOf("LATERAL"),
+    PostFunctionGrammar=OneOf(
+        Ref("OverClauseSegment"),
+        Ref("WithinGroupClauseSegment"),
+    ),
+    SelectClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "SelectClauseTerminatorGrammar"
+    ).copy(
+        insert=[
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    FromClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "FromClauseTerminatorGrammar"
+    ).copy(
+        insert=[
+            Ref.keyword("OFFSET"),
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    WhereClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "WhereClauseTerminatorGrammar"
+    ).copy(
+        insert=[
+            Ref.keyword("OFFSET"),
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    GroupByClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "GroupByClauseTerminatorGrammar"
+    ).copy(
+        insert=[
+            Ref.keyword("OFFSET"),
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    HavingClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "HavingClauseTerminatorGrammar"
+    ).copy(
+        insert=[
+            Ref.keyword("OFFSET"),
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    OrderByClauseTerminators=ansi_dialect.get_grammar("OrderByClauseTerminators").copy(
+        insert=[
+            Ref.keyword("OFFSET"),
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    ),
+    Expression_C_Grammar=OneOf(
+        Sequence("EXISTS", Bracketed(Ref("SelectableGrammar"))),
+        # should be first priority, otherwise EXISTS() would be matched as a function
+        Sequence(
+            OneOf(
+                Ref("Expression_D_Grammar"),
+                Ref("CaseExpressionSegment"),
+            ),
+            AnyNumberOf(Ref("TimeZoneGrammar")),
+        ),
+        Ref("ShorthandCastSegment"),
+        Ref("LabeledDurationGrammar"),
+    ),
+    BracketedSetExpressionGrammar=Bracketed(Ref("SetExpressionSegment")),
+    AlterTableDropColumnGrammar=Sequence(
+        "DROP",
+        Ref.keyword("COLUMN", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("DropBehaviorGrammar", optional=True),
+    ),
+    ColumnGeneratedGrammar=Sequence(
+        "GENERATED",
+        OneOf("ALWAYS", Sequence("BY", "DEFAULT")),
+        "AS",
+        OneOf(
+            Sequence(
+                "IDENTITY",
+                Bracketed(Ref("IdentityOptionsGrammar"), optional=True),
+            ),
+            Bracketed(Ref("ExpressionSegment")),
+        ),
+    ),
+)
+
+
+db2_dialect.insert_lexer_matchers(
+    [
+        StringLexer("right_arrow", "=>", CodeSegment),
+    ],
+    before="equals",
+)
+
+db2_dialect.patch_lexer_matchers(
+    [
+        # Patching comments to remove hash comments
+        RegexLexer(
+            "inline_comment",
+            r"(--)[^\n]*",
+            CommentSegment,
+            segment_kwargs={"trim_start": ("--",)},
+        ),
+        # In Db2, the only escape character is ' for single quote strings
+        RegexLexer(
+            "single_quote",
+            r"'((?:[^']|'')*)'",
+            CodeSegment,
+            segment_kwargs={
+                "quoted_value": (r"'((?:[^']|'')*)'", 1),
+                "escape_replacements": [(r"''", "'")],
+            },
+        ),
+        # In Db2, the escape character is "" for double quote strings
+        RegexLexer(
+            "double_quote",
+            r'"((?:[^"]|"")*)"',
+            CodeSegment,
+            segment_kwargs={
+                "quoted_value": (r'"((?:[^"]|"")*)"', 1),
+                "escape_replacements": [(r'""', '"')],
+            },
+        ),
+        # In Db2, a field could have a # pound/hash sign
+        RegexLexer("word", r"[0-9a-zA-Z_#]+", WordSegment),
+    ]
+)
+
+db2_dialect.add(
+    RightArrowSegment=StringParser("=>", SymbolSegment, type="right_arrow"),
+    # Db2-specific trailing clauses for CREATE TABLE. These are only used by
+    # TableEndClauseSegment and don't need dedicated segment types.
+    CompressClauseGrammar=Sequence(
+        "COMPRESS",
+        OneOf(
+            Sequence(
+                "YES",
+                OneOf("ADAPTIVE", "STATIC", optional=True),
+            ),
+            "NO",
+        ),
+    ),
+    ValueCompressionClauseGrammar=Sequence("VALUE", "COMPRESSION"),
+    DataCaptureClauseGrammar=Sequence("DATA", "CAPTURE", OneOf("NONE", "CHANGES")),
+    NotLoggedInitiallyClauseGrammar=Sequence("NOT", "LOGGED", "INITIALLY"),
+    CcsidClauseGrammar=Sequence(
+        "CCSID",
+        OneOf("ASCII", "EBCDIC", "UNICODE", Ref("NumericLiteralSegment")),
+    ),
+    SecurityPolicyClauseGrammar=Sequence(
+        "SECURITY", "POLICY", Ref("ObjectReferenceSegment")
+    ),
+    TableOptionsClauseGrammar=Sequence(
+        "OPTIONS",
+        Bracketed(
+            Delimited(
+                Sequence(
+                    Ref("ParameterNameSegment"),
+                    Ref("QuotedLiteralSegment"),
+                ),
+            ),
+        ),
+    ),
+    # https://www.ibm.com/docs/en/db2/11.5?topic=expressions-datetime-operations-durations
+    LabeledDurationGrammar=Sequence(
+        OneOf(
+            Ref("LiteralGrammar"),
+            Ref("BareFunctionSegment"),
+            Ref("FunctionSegment"),
+            Ref("ColumnReferenceSegment"),
+            Ref("Expression_D_Grammar"),
+        ),
+        OneOf(
+            "DAY",
+            "DAYS",
+            "HOUR",
+            "HOURS",
+            "MICROSECOND",
+            "MICROSECONDS",
+            "MINUTE",
+            "MINUTES",
+            "MONTH",
+            "MONTHS",
+            "SECOND",
+            "SECONDS",
+            "YEAR",
+            "YEARS",
+        ),
+    ),
+    # https://www.ibm.com/docs/en/db2/11.5?topic=elements-special-registers
+    SpecialRegisterGrammar=OneOf(
+        "CURRENT_DATE",
+        "CURRENT_PATH",
+        "CURRENT_SCHEMA",
+        "CURRENT_SERVER",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMEZONE",
+        "CURRENT_USER",
+        "SESSION_USER",
+        "SYSTEM_USER",
+        "USER",
+        Sequence(
+            "CURRENT",
+            OneOf(
+                "CLIENT_ACCTNG",
+                "CLIENT_APPLNAME",
+                "CLIENT_USERID",
+                "CLIENT_WRKSTNNAME",
+                "DATE",
+                "DBPARTITIONNUM",
+                Sequence("DECFLOAT", "ROUNDING", "MODE"),
+                Sequence("DEFAULT", "TRANSFORM", "GROUP"),
+                "DEGREE",
+                Sequence("EXPLAIN", OneOf("MODE", "SNAPSHOT")),
+                Sequence("FEDERATED", "ASYNCHRONY"),
+                Sequence("IMPLICIT", "XMLPARSE", "OPTION"),
+                "ISOLATION",
+                Sequence("LOCALE", OneOf("LC_MESSAGES", "LC_TIME")),
+                Sequence("LOCK", "TIMEOUT"),
+                Sequence("MAINTAINED", "TABLE", "TYPES", "FOR", "OPTIMIZATION"),
+                Sequence("MDC", "ROLLOUT", "MODE"),
+                "MEMBER",
+                Sequence("OPTIMIZATION", "PROFILE"),
+                Sequence("PACKAGE", "PATH"),
+                "PATH",
+                Sequence("QUERY", "OPTIMIZATION"),
+                Sequence("REFRESH", "AGE"),
+                "SCHEMA",
+                "SERVER",
+                "SQL_CCFLAGS",
+                Sequence("TEMPORAL", OneOf("BUSINESS_TIME", "SYSTEM_TIME")),
+                "TIME",
+                "TIMESTAMP",
+                "TIMEZONE",
+                "USER",
+            ),
+        ),
+    ),
+    XmlIndexSpecificationGrammar=Sequence(
+        "GENERATE",
+        OneOf("KEY", "KEYS"),
+        "USING",
+        "XMLPATTERN",
+        Ref("QuotedLiteralSegment"),  # XmlPatternClause
+        Ref("XmlTypeClauseGrammar"),
+    ),
+    XmlTypeClauseGrammar=Sequence(
+        "AS",
+        "SQL",
+        Ref("DatatypeSegment"),
+        Sequence(
+            OneOf("IGNORE", "REJECT"),
+            "INVALID",
+            "VALUES",
+            optional=True,
+        ),
+    ),
+    # Options of a `GENERATED ... AS IDENTITY` column. Db2 allows identity
+    # values to be signed, hence the wider literal grammar.
+    IdentityValueGrammar=OneOf(
+        Ref("NumericLiteralSegment"),
+        Ref("QualifiedNumericLiteralSegment"),
+    ),
+    IdentityOptionsGrammar=AnyNumberOf(
+        OneOf(
+            Sequence("START", "WITH", Ref("IdentityValueGrammar")),
+            Sequence("INCREMENT", "BY", Ref("IdentityValueGrammar")),
+            Sequence("MINVALUE", Ref("IdentityValueGrammar")),
+            Sequence("MAXVALUE", Ref("IdentityValueGrammar")),
+            Sequence("NO", "MINVALUE"),
+            "NOMINVALUE",
+            Sequence("NO", "MAXVALUE"),
+            "NOMAXVALUE",
+            "CYCLE",
+            Sequence("NO", "CYCLE"),
+            "NOCYCLE",
+            Sequence("CACHE", Ref("IdentityValueGrammar")),
+            Sequence("NO", "CACHE"),
+            "NOCACHE",
+            "ORDER",
+            Sequence("NO", "ORDER"),
+            "NOORDER",
+        )
+    ),
+)
+
+
+class BareFunctionSegment(BaseSegment):
+    """A function that can be called without parenthesis per ANSI specification.
+
+    DB2 extends this to include `special registers`.
+    """
+
+    type = "bare_function"
+    match_grammar = Ref("SpecialRegisterGrammar")
+
+
+class CallStoredProcedureSegment(BaseSegment):
+    """This is a CALL statement used to execute a stored procedure.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-call
+    """
+
+    type = "call_segment"
+
+    match_grammar = Sequence(
+        "CALL",
+        OneOf(
+            Ref("FunctionSegment"),
+            # Call without parenthesis
+            Ref("FunctionNameSegment", reset_terminators=True),
+        ),
+    )
+
+
+class CopyOptionsSegment(BaseSegment):
+    """Copy-options when using like or as for creating a table.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-table#sdx-synid_frag-copy-options
+    """
+
+    type = "copy_options"
+
+    match_grammar = AnySetOf(
+        Sequence(
+            OneOf("INCLUDING", "EXCLUDING"),
+            Ref.keyword("COLUMN", optional=True),
+            "DEFAULTS",
+        ),
+        Sequence(
+            OneOf("INCLUDING", "EXCLUDING"),
+            "IDENTITY",
+            Sequence(
+                "COLUMN",
+                "ATTRIBUTES",
+                optional=True,
+            ),
+        ),
+    )
+
+
+class DeclareGlobalTempTableSegment(BaseSegment):
+    """DECLARE GLOBAL TEMPORARY TABLE statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-declare-global-temporary-table
+    """
+
+    type = "declare_temp_table"
+
+    match_grammar = Sequence(
+        "DECLARE",
+        "GLOBAL",
+        "TEMPORARY",
+        "TABLE",
+        Ref("TableReferenceSegment"),
+        OneOf(
+            # Columns and comment syntax:
+            Sequence(
+                Bracketed(
+                    Delimited(
+                        Ref("ColumnDefinitionSegment"),
+                    ),
+                )
+            ),
+            # Create AS syntax:
+            Sequence(
+                "AS",
+                OptionallyBracketed(Ref("SelectableGrammar")),
+                Ref("WithDataClauseSegment"),
+                Ref("CopyOptionsSegment", optional=True),
+            ),
+            # Create like syntax
+            Sequence(
+                "LIKE",
+                Ref("TableReferenceSegment"),
+                Ref("CopyOptionsSegment", optional=True),
+            ),
+        ),
+        AnySetOf(
+            Ref("TableOrganizationClauseSegment"),
+            OneOf(
+                Sequence(
+                    "ON",
+                    "COMMIT",
+                    OneOf("DELETE", "PRESERVE"),
+                    "ROWS",
+                ),
+            ),
+            OneOf(
+                "LOGGED",
+                Sequence(
+                    "NOT",
+                    "LOGGED",
+                    Sequence(
+                        "ON",
+                        "ROLLBACK",
+                        OneOf("DELETE", "PRESERVE"),
+                        "ROWS",
+                        optional=True,
+                    ),
+                ),
+            ),
+            Sequence(
+                "WITH",
+                "REPLACE",
+            ),
+            Sequence(
+                "IN",
+                Ref("TablespaceReferenceSegment"),
+            ),
+            Ref("DistributionClauseSegment"),
+        ),
+    )
+
+
+class TableOrganizationClauseSegment(BaseSegment):
+    """Db2 ``ORGANIZE BY`` clause for table creation.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-table
+    """
+
+    type = "table_organization_clause"
+    match_grammar = Sequence(
+        "ORGANIZE",
+        "BY",
+        OneOf("ROW", "COLUMN"),
+    )
+
+
+class DistributionClauseSegment(BaseSegment):
+    """Distribution clause for table creation.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-table
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-declare-global-temporary-table
+    """
+
+    type = "distribution_clause"
+    match_grammar = Sequence(
+        "DISTRIBUTE",
+        OneOf("BY", "ON"),
+        OneOf(
+            Sequence(
+                Ref.keyword("HASH", optional=True),
+                Bracketed(
+                    Delimited(
+                        Ref("ColumnReferenceSegment"),
+                    ),
+                ),
+            ),
+            "RANDOM",
+            "REPLICATION",
+        ),
+    )
+
+
+class TablespaceClauseSegment(BaseSegment):
+    """Db2 tablespace clause for table creation.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-table
+    """
+
+    type = "tablespace_clause"
+    match_grammar = Sequence(
+        "IN",
+        Ref("TablespaceReferenceSegment"),
+        Sequence(
+            "INDEX",
+            "IN",
+            Ref("TablespaceReferenceSegment"),
+            optional=True,
+        ),
+        Sequence(
+            "LONG",
+            "IN",
+            Ref("TablespaceReferenceSegment"),
+            optional=True,
+        ),
+    )
+
+
+class WithRestrictOnDropClauseSegment(BaseSegment):
+    """Db2 ``WITH RESTRICT ON DROP`` clause for table creation."""
+
+    type = "with_restrict_on_drop_clause"
+    match_grammar = Sequence("WITH", "RESTRICT", "ON", "DROP")
+
+
+class TableEndClauseSegment(ansi.TableEndClauseSegment):
+    """Db2-specific trailing clauses for ``CREATE TABLE``."""
+
+    match_grammar = AnySetOf(
+        Ref("TableOrganizationClauseSegment"),
+        Ref("DistributionClauseSegment"),
+        Ref("TablespaceClauseSegment"),
+        Ref("WithRestrictOnDropClauseSegment"),
+        Ref("CompressClauseGrammar"),
+        Ref("ValueCompressionClauseGrammar"),
+        Ref("DataCaptureClauseGrammar"),
+        Ref("NotLoggedInitiallyClauseGrammar"),
+        Ref("CcsidClauseGrammar"),
+        Ref("SecurityPolicyClauseGrammar"),
+        Ref("TableOptionsClauseGrammar"),
+    )
+
+
+class IndexColumnDefinitionSegment(ansi.IndexColumnDefinitionSegment):
+    """A column definition for CREATE INDEX."""
+
+    type = "index_column_definition"
+    match_grammar = Sequence(
+        OneOf(
+            Ref("SingleIdentifierGrammar"),  # Column name
+            Ref("ExpressionSegment"),  # key expression
+        ),
+        OneOf("ASC", "DESC", "RANDOM", optional=True),
+    )
+
+
+class CreateIndexStatementSegment(ansi.CreateIndexStatementSegment):
+    """A `CREATE INDEX` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-index
+    """
+
+    type = "create_index_statement"
+    match_grammar = Sequence(
+        "CREATE",
+        Ref.keyword("UNIQUE", optional=True),
+        "INDEX",
+        Ref("IndexReferenceSegment"),
+        "ON",
+        Ref("TableReferenceSegment"),
+        Sequence(
+            Bracketed(
+                Delimited(
+                    Ref("IndexColumnDefinitionSegment"),
+                    Sequence("BUSINESS_TIME", "WITHOUT", "OVERLAPS"),
+                ),
+            )
+        ),
+        AnySetOf(
+            Sequence(Ref.keyword("NOT", optional=True), "PARTITIONED"),
+            Sequence("IN", Ref("TablespaceReferenceSegment")),
+            Sequence("SPECIFICATION", "ONLY"),
+            Sequence(
+                "INCLUDE",
+                Bracketed(
+                    Delimited(
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        Ref("ExpressionSegment"),  # key expression
+                    )
+                ),
+            ),
+            OneOf(
+                Ref("XmlIndexSpecificationGrammar"),
+                "CLUSTER",
+                Sequence(
+                    "EXTEND",
+                    "USING",
+                    OptionallyBracketed(
+                        Ref("IndexReferenceSegment"),
+                        Bracketed(Delimited(Ref("BaseExpressionElementGrammar"))),
+                    ),
+                ),
+            ),
+            Sequence("PCTFREE", Ref("NumericLiteralSegment")),
+            Sequence("LEVEL2", "PCTFREE", Ref("NumericLiteralSegment")),
+            Sequence("MINPCTUSED", Ref("NumericLiteralSegment")),
+            Sequence(OneOf("ALLOW", "DISALLOW"), "REVERSE", "SCANS"),
+            Sequence("PAGE", "SPLIT", OneOf("SYMMETRIC", "HIGH", "LOW")),
+            Sequence(
+                "COLLECT",
+                Sequence(
+                    OneOf("SAMPLED", "UNSAMPLED", optional=True),
+                    "DETAILED",
+                    optional=True,
+                ),
+                "STATISTICS",
+            ),
+            Sequence("COMPRESS", OneOf("YES", "NO")),
+            Sequence(OneOf("INCLUDE", "EXCLUDE"), "NULL", "KEYS"),
+        ),
+    )
+
+
+class NamedArgumentSegment(BaseSegment):
+    """Named argument to a function.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-call
+    """
+
+    type = "named_argument"
+    match_grammar = Sequence(
+        Ref("NakedIdentifierSegment"),
+        Ref("RightArrowSegment"),
+        Ref("ExpressionSegment"),
+    )
+
+
+class OffsetClauseSegment(BaseSegment):
+    """OFFSET clause in as SELECT statement."""
+
+    type = "offset_clause"
+
+    match_grammar = Sequence(
+        "OFFSET",
+        OneOf(
+            Ref("NumericLiteralSegment"),
+            Ref("ExpressionSegment"),
+        ),
+        OneOf("ROW", "ROWS"),
+    )
+
+
+class LimitClauseSegment(BaseSegment):
+    """A `LIMIT` clause like in `SELECT`."""
+
+    type = "limit_clause"
+    match_grammar = OneOf(
+        Sequence(
+            "LIMIT",
+            Indent,
+            OptionallyBracketed(
+                OneOf(
+                    # Allow a number by itself OR
+                    Ref("NumericLiteralSegment"),
+                    # An arbitrary expression
+                    Ref("ExpressionSegment"),
+                    "ALL",
+                )
+            ),
+            OneOf(
+                Sequence(
+                    "OFFSET",
+                    OneOf(
+                        # Allow a number by itself OR
+                        Ref("NumericLiteralSegment"),
+                        # An arbitrary expression
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+                Sequence(
+                    Ref("CommaSegment"),
+                    Ref("NumericLiteralSegment"),
+                ),
+                optional=True,
+            ),
+            Dedent,
+        ),
+        Sequence(
+            Ref("OffsetClauseSegment", optional=True),
+            Ref("FetchClauseSegment", optional=True),
+        ),
+    )
+
+
+class ReadOnlyClauseSegment(BaseSegment):
+    """A Db2 read-only clause in a `SELECT` statement.
+
+    https://www.ibm.com/docs/en/db2-for-zos/13?topic=statement-read-only-clause
+    """
+
+    type = "read_only_clause"
+
+    match_grammar = Sequence(
+        "FOR",
+        OneOf(
+            Sequence("READ", "ONLY"),
+            Sequence("FETCH", "ONLY"),
+        ),
+    )
+
+
+class LockClauseSegment(BaseSegment):
+    """A Db2 lock clause that can follow certain isolation levels.
+
+    https://www.ibm.com/docs/en/db2-for-zos/13?topic=statement-isolation-clause
+    """
+
+    type = "lock_clause"
+
+    match_grammar = OneOf(
+        Sequence(
+            "USE",
+            "AND",
+            "KEEP",
+            OneOf("EXCLUSIVE", "UPDATE", "SHARE"),
+            "LOCKS",
+        ),
+        Sequence(
+            "KEEP",
+            "UPDATE",
+            "LOCKS",
+        ),
+    )
+
+
+class IsolationClauseSegment(BaseSegment):
+    """A Db2 isolation clause in a `SELECT` statement.
+
+    https://www.ibm.com/docs/en/db2-for-zos/13?topic=statement-isolation-clause
+    """
+
+    type = "isolation_clause"
+
+    match_grammar = Sequence(
+        "WITH",
+        OneOf(
+            Sequence(
+                OneOf("RR", "RS"),
+                Ref("LockClauseSegment", optional=True),
+            ),
+            "CS",
+            "UR",
+        ),
+    )
+
+
+class WithinGroupClauseSegment(BaseSegment):
+    """An WITHIN GROUP clause for window functions."""
+
+    type = "withingroup_clause"
+
+    match_grammar = Sequence(
+        "WITHIN",
+        "GROUP",
+        Bracketed(
+            Ref("OrderByClauseSegment", optional=True), parse_mode=ParseMode.GREEDY
+        ),
+    )
+
+
+class CommentOnStatementSegment(BaseSegment):
+    """A `COMMENT ON` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-comment
+    """
+
+    type = "comment_clause"
+
+    _version_identifier = OneOf(
+        Ref("QuotedIdentifierSegment"),
+        Ref("QuotedLiteralSegment"),
+        Ref("NakedIdentifierSegment"),
+        Sequence(
+            Ref("NumericLiteralSegment"),
+            AnyNumberOf(Ref("NumericLiteralSegment")),
+            allow_gaps=False,
+        ),
+    )
+
+    _routine_designator = OneOf(
+        Sequence(
+            OneOf("FUNCTION", "PROCEDURE"),
+            Ref("FunctionNameSegment"),
+            Bracketed(Delimited(Ref("DatatypeSegment")), optional=True),
+        ),
+        Sequence(
+            "SPECIFIC",
+            OneOf("FUNCTION", "PROCEDURE"),
+            Ref("ObjectReferenceSegment"),
+        ),
+    )
+
+    _alias_designator = Sequence(
+        Ref.keyword("PUBLIC", optional=True),
+        OneOf("ALIAS", "SYNONYM"),
+        Ref("ObjectReferenceSegment"),
+        Sequence(
+            "FOR",
+            OneOf("TABLE", "MODULE", "SEQUENCE"),
+            optional=True,
+        ),
+    )
+
+    _type_designator = OneOf(
+        Sequence("TYPE", "MAPPING", Ref("ObjectReferenceSegment")),
+        Sequence(
+            OneOf("DISTINCT", "DATA"),
+            "TYPE",
+            Ref("ObjectReferenceSegment"),
+        ),
+        Sequence("TYPE", Ref("ObjectReferenceSegment")),
+    )
+
+    _security_designator = OneOf(
+        Sequence(
+            "SECURITY",
+            "LABEL",
+            "COMPONENT",
+            Ref("ObjectReferenceSegment"),
+        ),
+        Sequence(
+            "SECURITY",
+            OneOf("LABEL", "POLICY"),
+            Ref("ObjectReferenceSegment"),
+        ),
+    )
+
+    _service_class_designator = Sequence(
+        "SERVICE",
+        "CLASS",
+        Ref("ObjectReferenceSegment"),
+        Sequence("UNDER", Ref("ObjectReferenceSegment"), optional=True),
+    )
+
+    _server_option_designator = Sequence(
+        "SERVER",
+        "OPTION",
+        Ref("ObjectReferenceSegment"),
+        "FOR",
+        OneOf(
+            Sequence(
+                "SERVER",
+                Ref("ObjectReferenceSegment"),
+                Sequence(
+                    "SERVER",
+                    "TYPE",
+                    OneOf(
+                        Ref("NakedIdentifierSegment"),
+                        Ref("QuotedLiteralSegment"),
+                    ),
+                    optional=True,
+                ),
+                Sequence(
+                    "VERSION",
+                    _version_identifier,
+                    optional=True,
+                ),
+            ),
+            Sequence(
+                "WRAPPER",
+                Ref("ObjectReferenceSegment"),
+                Sequence(
+                    "VERSION",
+                    _version_identifier,
+                    optional=True,
+                ),
+            ),
+        ),
+    )
+
+    match_grammar = Sequence(
+        "COMMENT",
+        "ON",
+        OneOf(
+            Sequence(
+                OneOf(
+                    Sequence("COLUMN", Ref("ColumnReferenceSegment")),
+                    Sequence("CONSTRAINT", Ref("ObjectReferenceSegment")),
+                    Sequence("INDEX", Ref("IndexReferenceSegment")),
+                    Sequence("SCHEMA", Ref("SchemaReferenceSegment")),
+                    _alias_designator,
+                    _routine_designator,
+                    _type_designator,
+                    _security_designator,
+                    _service_class_designator,
+                    _server_option_designator,
+                    Sequence(
+                        "FUNCTION",
+                        "MAPPING",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence(
+                        "DATABASE",
+                        "PARTITION",
+                        "GROUP",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence("NODEGROUP", Ref("ObjectReferenceSegment")),
+                    Sequence(
+                        "HISTOGRAM",
+                        "TEMPLATE",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence(
+                        "AUDIT",
+                        "POLICY",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence("MASK", Ref("ObjectReferenceSegment")),
+                    Sequence("MODULE", Ref("ObjectReferenceSegment")),
+                    Sequence("NICKNAME", Ref("ObjectReferenceSegment")),
+                    Sequence(
+                        "PACKAGE",
+                        Ref("ObjectReferenceSegment"),
+                        Sequence(
+                            "VERSION",
+                            _version_identifier,
+                            optional=True,
+                        ),
+                    ),
+                    Sequence("PERMISSION", Ref("ObjectReferenceSegment")),
+                    Sequence("ROLE", Ref("ObjectReferenceSegment")),
+                    Sequence("SERVER", Ref("ObjectReferenceSegment")),
+                    Sequence("STOGROUP", Ref("ObjectReferenceSegment")),
+                    Sequence("TABLE", Ref("ObjectReferenceSegment")),
+                    Sequence("TABLESPACE", Ref("ObjectReferenceSegment")),
+                    Sequence("THRESHOLD", Ref("ObjectReferenceSegment")),
+                    Sequence("TRIGGER", Ref("ObjectReferenceSegment")),
+                    Sequence(
+                        "TRUSTED",
+                        "CONTEXT",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence("USAGE", "LIST", Ref("ObjectReferenceSegment")),
+                    Sequence("VARIABLE", Ref("ObjectReferenceSegment")),
+                    Sequence("VIEW", Ref("ObjectReferenceSegment")),
+                    Sequence(
+                        "WORK",
+                        OneOf(
+                            Sequence("ACTION", "SET"),
+                            Sequence("CLASS", "SET"),
+                        ),
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence("WORKLOAD", Ref("ObjectReferenceSegment")),
+                    Sequence("WRAPPER", Ref("ObjectReferenceSegment")),
+                    Sequence("XSROBJECT", Ref("ObjectReferenceSegment")),
+                    Sequence("SEQUENCE", Ref("ObjectReferenceSegment")),
+                ),
+                "IS",
+                Ref("QuotedLiteralSegment"),
+            ),
+            # The multi-column form takes a bare table name, e.g.
+            # COMMENT ON my_table (col1 IS 'a', col2 IS 'b')
+            Sequence(
+                Ref("TableReferenceSegment"),
+                Bracketed(
+                    Delimited(
+                        Sequence(
+                            Ref("SingleIdentifierGrammar"),
+                            "IS",
+                            Ref("QuotedLiteralSegment"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+class AccessTargetSegment(ansi.AccessTargetSegment):
+    """An access target.
+
+    Db2 allows the ``USER``/``GROUP``/``ROLE`` qualifier to be repeated for
+    each grantee in the list, and ``PUBLIC`` to be mixed in with them.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-grant-table-view-nickname-privileges
+    """
+
+    match_grammar = OneOf(
+        Delimited(
+            OneOf(
+                Sequence("USER", Ref("UserReferenceSegment")),
+                Sequence("GROUP", Ref("ObjectReferenceSegment")),
+                Sequence("ROLE", Ref("RoleReferenceSegment")),
+                "PUBLIC",
+                Ref("RoleReferenceSegment"),
+            ),
+        ),
+        Delimited(Ref("FunctionSegment")),
+    )
+
+
+class RowMovementClauseSegment(BaseSegment):
+    """A `WITH [NO] ROW MOVEMENT` clause of a `CREATE VIEW` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-view
+    """
+
+    type = "row_movement_clause"
+
+    match_grammar = Sequence(
+        "WITH",
+        Ref.keyword("NO", optional=True),
+        "ROW",
+        "MOVEMENT",
+    )
+
+
+class ViewCheckOptionClauseSegment(BaseSegment):
+    """A `WITH [CASCADED|LOCAL] CHECK OPTION` clause of a `CREATE VIEW` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-view
+    """
+
+    type = "check_option_clause"
+
+    match_grammar = Sequence(
+        "WITH",
+        OneOf("CASCADED", "LOCAL", optional=True),
+        "CHECK",
+        "OPTION",
+    )
+
+
+class CreateViewStatementSegment(ansi.CreateViewStatementSegment):
+    """A `CREATE VIEW` statement.
+
+    Db2 allows a trailing row movement or check option clause.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-view
+    """
+
+    match_grammar = ansi.CreateViewStatementSegment.match_grammar.copy(
+        insert=[
+            OneOf(
+                Ref("RowMovementClauseSegment"),
+                Ref("ViewCheckOptionClauseSegment"),
+                optional=True,
+            ),
+        ],
+    )
+
+
+class CreateAliasStatementSegment(BaseSegment):
+    """A Db2 ``CREATE ALIAS`` or ``CREATE SYNONYM`` statement.
+
+    Db2 treats ``ALIAS`` and ``SYNONYM`` as the same object with identical
+    syntax.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-alias
+    """
+
+    type = "create_alias_statement"
+
+    match_grammar = Sequence(
+        "CREATE",
+        Ref("OrReplaceGrammar", optional=True),
+        Ref.keyword("PUBLIC", optional=True),
+        OneOf("ALIAS", "SYNONYM"),
+        Ref("ObjectReferenceSegment"),
+        "FOR",
+        Sequence(
+            OneOf("TABLE", "MODULE", "SEQUENCE", optional=True),
+            Ref("ObjectReferenceSegment"),
+        ),
+    )
+
+
+class DropAliasStatementSegment(BaseSegment):
+    """A Db2 ``DROP ALIAS`` or ``DROP SYNONYM`` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-drop
+    """
+
+    type = "drop_alias_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        Ref.keyword("PUBLIC", optional=True),
+        OneOf("ALIAS", "SYNONYM"),
+        Ref("ObjectReferenceSegment"),
+        Sequence(
+            "FOR",
+            OneOf("TABLE", "MODULE", "SEQUENCE"),
+            optional=True,
+        ),
+    )
+
+
+class StatementSegment(ansi.StatementSegment):
+    """An element in the targets of a select statement."""
+
+    match_grammar = ansi.StatementSegment.match_grammar.copy(
+        insert=[
+            Ref("CallStoredProcedureSegment"),
+            Ref("CommentOnStatementSegment"),
+            Ref("DeclareGlobalTempTableSegment"),
+            Ref("CreateAliasStatementSegment"),
+            Ref("DropAliasStatementSegment"),
+        ]
+    )
+
+
+class ValuesClauseSegment(ansi.ValuesClauseSegment):
+    """A `VALUES` clause like in `INSERT` or as a standalone statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=queries-fullselect#sdx-synid_frag-values-clause
+    """
+
+    type = "values_clause"
+    match_grammar = Sequence(
+        "VALUES",
+        Indent,
+        Delimited(
+            Bracketed(
+                Delimited(
+                    "DEFAULT",
+                    Ref("ExpressionSegment"),
+                ),
+                parse_mode=ParseMode.GREEDY,
+            ),
+            "DEFAULT",
+            Ref("ExpressionSegment"),
+        ),
+        Dedent,
+        Ref("OrderByClauseSegment", optional=True),
+        Ref("LimitClauseSegment", optional=True),
+    )
+
+
+class UnorderedSelectStatementSegment(ansi.UnorderedSelectStatementSegment):
+    """A Db2 `SELECT` arm that can end before trailing fullselect clauses."""
+
+    match_grammar = ansi.UnorderedSelectStatementSegment.match_grammar.copy(
+        terminators=[
+            Ref("ReadOnlyClauseSegment"),
+            Ref("IsolationClauseSegment"),
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ]
+    )
+
+
+class SetExpressionSegment(ansi.SetExpressionSegment):
+    """A set expression with Db2-specific trailing clauses."""
+
+    match_grammar = ansi.SetExpressionSegment.match_grammar.copy(
+        insert=[
+            Ref("ReadOnlyClauseSegment", optional=True),
+            Ref("IsolationClauseSegment", optional=True),
+        ],
+        terminators=[
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    )
+
+
+class SelectStatementSegment(ansi.SelectStatementSegment):
+    """A `SELECT` statement with Db2-specific trailing clauses."""
+
+    match_grammar = ansi.SelectStatementSegment.match_grammar.copy(
+        insert=[
+            Ref("ReadOnlyClauseSegment", optional=True),
+            Ref("IsolationClauseSegment", optional=True),
+        ],
+        terminators=[
+            Ref("RowMovementClauseSegment"),
+            Ref("ViewCheckOptionClauseSegment"),
+        ],
+    )
+
+
+class CreateSequenceOptionsSegment(ansi.CreateSequenceOptionsSegment):
+    """Options for a Db2 ``CREATE SEQUENCE`` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-create-sequence
+    """
+
+    type = "create_sequence_options_segment"
+
+    match_grammar = OneOf(
+        # Db2 sequences can be restricted to a specific data type.
+        Sequence("AS", Ref("DatatypeSegment")),
+        Sequence(
+            "START",
+            Ref.keyword("WITH", optional=True),
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence(
+            "INCREMENT",
+            "BY",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence(
+            "MINVALUE",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence(
+            "MAXVALUE",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence("NO", "MINVALUE"),
+        "NOMINVALUE",
+        Sequence("NO", "MAXVALUE"),
+        "NOMAXVALUE",
+        Sequence("CACHE", Ref("NumericLiteralSegment")),
+        Sequence("NO", "CACHE"),
+        "NOCACHE",
+        "CYCLE",
+        Sequence("NO", "CYCLE"),
+        "NOCYCLE",
+        "ORDER",
+        Sequence("NO", "ORDER"),
+        "NOORDER",
+    )
+
+
+class AlterSequenceOptionsSegment(ansi.AlterSequenceOptionsSegment):
+    """Options for a Db2 ``ALTER SEQUENCE`` statement.
+
+    https://www.ibm.com/docs/en/db2/11.5?topic=statements-alter-sequence
+    """
+
+    type = "alter_sequence_options_segment"
+
+    match_grammar = OneOf(
+        Sequence(
+            "RESTART",
+            Ref.keyword("WITH", optional=True),
+            OneOf(
+                Ref("NumericLiteralSegment"),
+                Ref("QualifiedNumericLiteralSegment"),
+                optional=True,
+            ),
+        ),
+        Sequence(
+            "INCREMENT",
+            "BY",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence(
+            "MINVALUE",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence(
+            "MAXVALUE",
+            OneOf(Ref("NumericLiteralSegment"), Ref("QualifiedNumericLiteralSegment")),
+        ),
+        Sequence("NO", "MINVALUE"),
+        "NOMINVALUE",
+        Sequence("NO", "MAXVALUE"),
+        "NOMAXVALUE",
+        Sequence("CACHE", Ref("NumericLiteralSegment")),
+        Sequence("NO", "CACHE"),
+        "NOCACHE",
+        "CYCLE",
+        Sequence("NO", "CYCLE"),
+        "NOCYCLE",
+        "ORDER",
+        Sequence("NO", "ORDER"),
+        "NOORDER",
+    )

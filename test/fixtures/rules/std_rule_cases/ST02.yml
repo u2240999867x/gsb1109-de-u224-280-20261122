@@ -1,0 +1,454 @@
+rule: ST02
+
+test_fail_negated_case_is_null:
+  fail_str: SELECT CASE WHEN TRUE THEN FALSE ELSE TRUE END IS NULL;
+  fix_str: SELECT (not coalesce(TRUE, false)) IS NULL;
+
+test_fail_negated_case_comparison:
+  fail_str: SELECT CASE WHEN TRUE THEN FALSE ELSE TRUE END = FALSE;
+  fix_str: SELECT (not coalesce(TRUE, false)) = FALSE;
+
+test_fail_negated_case_and:
+  fail_str: SELECT CASE WHEN FALSE THEN FALSE ELSE TRUE END AND FALSE;
+  fix_str: SELECT (not coalesce(FALSE, false)) AND FALSE;
+
+test_fail_negated_case_standalone:
+  fail_str: SELECT CASE WHEN TRUE THEN FALSE ELSE TRUE END;
+  fix_str: SELECT not coalesce(TRUE, false);
+
+test_fail_negated_case_parenthesised:
+  fail_str: SELECT (CASE WHEN TRUE THEN FALSE ELSE TRUE END);
+  fix_str: SELECT (not coalesce(TRUE, false));
+
+test_pass_case_cannot_be_reduced_1:
+  pass_str: |
+    select
+        fab > 0 as is_fab
+    from fancy_table
+test_pass_case_cannot_be_reduced_2:
+  pass_str: |
+    select
+        case when fab > 0 then true end as is_fab
+    from fancy_table
+test_pass_case_cannot_be_reduced_3:
+  pass_str: |
+    select
+        case when fab is not null then false end as is_fab
+    from fancy_table
+test_pass_case_cannot_be_reduced_4:
+  pass_str: |
+    select
+        case when fab > 0 then true else true end as is_fab
+    from fancy_table
+test_pass_case_cannot_be_reduced_5:
+  pass_str: |
+    select
+        case when fab <> 0 then 'just a string' end as fab_category
+    from fancy_table
+test_pass_case_cannot_be_reduced_6:
+  pass_str: |
+    select
+        case
+          when fab <> 0 then true
+          when fab < 0 then 'not a bool'
+        end as fab_category
+    from fancy_table
+test_pass_case_cannot_be_reduced_7:
+  pass_str: |
+    select
+        foo,
+        case
+            when
+                bar is null then bar
+            else '123'
+        end as test
+    from baz;
+test_pass_case_cannot_be_reduced_8:
+  pass_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null then '123'
+            else bar
+        end as test
+    from baz;
+test_pass_case_cannot_be_reduced_9:
+  pass_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null then '123'
+            when
+                foo is not null then '456'
+            else bar
+        end as test
+    from baz;
+test_pass_case_cannot_be_reduced_10:
+  pass_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null and abs(foo) > 0 then '123'
+            else bar
+        end as test
+    from baz;
+test_pass_case_cannot_be_reduced_11:
+  pass_str: |
+    SELECT
+        dv_runid,
+        CASE
+            WHEN LEAD(dv_startdateutc) OVER (
+                PARTITION BY rowid ORDER BY dv_startdateutc
+            ) IS NULL
+            THEN 1
+            ELSE 0
+        END AS loadstate
+    FROM d;
+test_pass_case_cannot_be_reduced_12:
+  pass_str: |
+    select
+        field_1,
+        field_2,
+        field_3,
+        case
+            when coalesce(field_2, field_3) is null then 1 else 0
+        end as field_4
+    from my_table;
+test_pass_case_cannot_be_reduced_13:
+  pass_str: |
+    SELECT
+        CASE
+            WHEN item.submitted_timestamp IS NOT NULL
+            THEN item.sitting_id
+        END
+  configs:
+    core:
+      dialect: postgres
+test_pass_array_accessors:
+  pass_str: |
+    SELECT
+    CASE
+        WHEN genres[0] IS NULL
+           THEN 'x'
+        ELSE genres
+    END
+    AS g
+    FROM table_t
+  configs:
+    core:
+      dialect: snowflake
+test_fail_unnecessary_case_1:
+  fail_str: |
+    select
+        case
+            when fab > 0 then true else false end as is_fab
+    from fancy_table
+  fix_str: |
+    select
+        coalesce(fab > 0, false) as is_fab
+    from fancy_table
+test_fail_unnecessary_case_2:
+  fail_str: |
+    select
+        case
+            when fab > 0 then false else true end as is_fab
+    from fancy_table
+  fix_str: |
+    select
+        not coalesce(fab > 0, false) as is_fab
+    from fancy_table
+test_fail_unnecessary_case_3:
+  fail_str: |
+    select
+        case
+            when fab > 0 and tot > 0 then true else false end as is_fab
+    from fancy_table
+  fix_str: |
+    select
+        coalesce(fab > 0 and tot > 0, false) as is_fab
+    from fancy_table
+test_fail_unnecessary_case_4:
+  fail_str: |
+    select
+        case
+            when fab > 0 and tot > 0 then false else true end as is_fab
+    from fancy_table
+  fix_str: |
+    select
+        not coalesce(fab > 0 and tot > 0, false) as is_fab
+    from fancy_table
+test_fail_unnecessary_case_5:
+  fail_str: |
+    select
+        case
+            when not fab > 0 or tot > 0 then false else true end as is_fab
+    from fancy_table
+  fix_str: |
+    select
+        not coalesce(not fab > 0 or tot > 0, false) as is_fab
+    from fancy_table
+test_fail_unnecessary_case_6:
+  fail_str: |
+    select
+        subscriptions_xf.metadata_migrated,
+
+        case  -- BEFORE ST02 FIX
+            when perks.perk is null then false
+            else true
+        end as perk_redeemed,
+
+        perks.received_at as perk_received_at
+
+    from subscriptions_xf
+  fix_str: |
+    select
+        subscriptions_xf.metadata_migrated,
+
+        not coalesce(perks.perk is null, false) as perk_redeemed,
+
+        perks.received_at as perk_received_at
+
+    from subscriptions_xf
+test_fail_unnecessary_case_7:
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is null then '123'
+            else bar
+        end as test
+    from baz;
+  fix_str: |
+    select
+        foo,
+        coalesce(bar, '123') as test
+    from baz;
+test_fail_unnecessary_case_8:
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null then bar
+            else '123'
+        end as test
+    from baz;
+  fix_str: |
+    select
+        foo,
+        coalesce(bar, '123') as test
+    from baz;
+test_fail_unnecessary_case_9:
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is null then null
+            else bar
+        end as test
+    from baz;
+  fix_str: |
+    select
+        foo,
+        bar as test
+    from baz;
+test_fail_unnecessary_case_10:
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null then bar
+            else null
+        end as test
+    from baz;
+  fix_str: |
+    select
+        foo,
+        bar as test
+    from baz;
+test_fail_unnecessary_case_11:
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is not null then bar
+        end as test
+    from baz;
+  fix_str: |
+    select
+        foo,
+        bar as test
+    from baz;
+
+test_fail_no_copy_code_out_of_template:
+  # The rule wants to replace the case statement with coalesce(), but
+  # LintFix.has_template_conflicts() correctly prevents it copying code out
+  # of the templated region. Hence, the query is not modified.
+  fail_str: |
+    select
+        foo,
+        case
+            when
+                bar is null then {{ result }}
+            else bar
+        end as test
+    from baz;
+  configs:
+    core:
+      ignore_templated_areas: false
+    templater:
+      jinja:
+        context:
+          result: "'123'"
+
+test_pass_simple_case_ignored:
+  # This ensures the rule ignores "Simple CASE" statements
+  # instead of trying to force it into a COALESCE.
+  pass_str: |
+    SELECT
+        CASE status_code
+            WHEN 100 THEN true
+            ELSE false
+        END AS is_success
+    FROM a
+  configs:
+    core:
+      dialect: redshift
+
+test_fail_indexed_expression_when_null_else_null:
+  fail_str: |
+    SELECT CASE WHEN genres[0] IS NULL THEN NULL ELSE genres[0] END
+  fix_str: |
+    SELECT genres[0]
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_indexed_expression_when_not_null_no_else:
+  fail_str: |
+    SELECT CASE WHEN genres[0] IS NOT NULL THEN genres[0] END
+  fix_str: |
+    SELECT genres[0]
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_qualified_indexed_expression_when_not_null_no_else:
+  fail_str: |
+    SELECT CASE WHEN table_name.genres[0] IS NOT NULL THEN table_name.genres[0] END
+  fix_str: |
+    SELECT table_name.genres[0]
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_multiple_indexed_expression_when_not_null_no_else:
+  fail_str: |
+    SELECT CASE WHEN genres[0][1] IS NOT NULL THEN genres[0][1] END
+  fix_str: |
+    SELECT genres[0][1]
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_identical_quoted_indexed_expression_when_not_null_no_else:
+  fail_str: |
+    SELECT CASE WHEN "genres"[0] IS NOT NULL THEN "genres"[0] END
+  fix_str: |
+    SELECT "genres"[0]
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_mixed_case_indexed_expression_when_not_null_no_else:
+  fail_str: |
+    SELECT CASE WHEN genres[0] IS NOT NULL THEN GENRES[0] END
+  fix_str: |
+    SELECT GENRES[0]
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_indexed_condition_does_not_change_bare_then_expression:
+  pass_str: |
+    SELECT CASE WHEN genres[0] IS NOT NULL THEN genres END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_null_condition_does_not_change_bare_then_expression:
+  pass_str: |
+    SELECT CASE WHEN genres[0] IS NULL THEN genres END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_null_condition_does_not_change_indexed_then_expression:
+  pass_str: |
+    SELECT CASE WHEN genres[0] IS NULL THEN genres[0] END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_composite_condition_does_not_change_indexed_then_expression:
+  pass_str: |
+    SELECT CASE WHEN genres[0] + other IS NOT NULL THEN genres[0] END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_composite_condition_with_else_null_does_not_change_indexed_then_expression:
+  pass_str: |
+    SELECT CASE
+      WHEN genres[0] + other IS NOT NULL THEN genres[0]
+      ELSE NULL
+    END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_distinct_from_null_does_not_change_expression:
+  pass_str: |
+    SELECT CASE WHEN value IS DISTINCT FROM NULL THEN NULL ELSE value END
+
+test_pass_not_distinct_from_null_does_not_change_expression:
+  pass_str: |
+    SELECT CASE WHEN value IS NOT DISTINCT FROM NULL THEN value ELSE NULL END
+
+test_pass_dynamic_index_does_not_change_expression:
+  pass_str: |
+    SELECT CASE
+      WHEN genres[uniform(0, 9, random())] IS NOT NULL
+      THEN genres[uniform(0, 9, random())]
+    END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_differently_cased_quoted_indexed_columns:
+  pass_str: |
+    SELECT CASE WHEN "genres"[0] IS NOT NULL THEN "GENRES"[0] END
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_differently_cased_clickhouse_indexed_columns_with_else_null:
+  pass_str: |
+    SELECT CASE WHEN genres[1] IS NOT NULL THEN GENRES[1] ELSE NULL END
+  configs:
+    core:
+      dialect: clickhouse
+
+test_pass_differently_cased_clickhouse_indexed_columns_no_else:
+  pass_str: |
+    SELECT CASE WHEN genres[1] IS NOT NULL THEN GENRES[1] END
+  configs:
+    core:
+      dialect: clickhouse

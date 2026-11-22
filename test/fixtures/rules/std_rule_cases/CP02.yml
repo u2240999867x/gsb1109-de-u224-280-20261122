@@ -1,0 +1,673 @@
+rule: CP02
+
+test_pass_bigquery_chained_datetime_dateparts:
+  pass_str: |
+    SELECT
+        (year).REGEXP_EXTRACT(month),
+        (year).DATE_ADD(INTERVAL 5 YEAR),
+        (year).DATE_DIFF(month, YEAR),
+        (day).DATETIME_DIFF(hour, DAY),
+        (minute).TIME_DIFF(second, MINUTE),
+        (hour).TIMESTAMP_DIFF(minute, HOUR),
+        (year).DATE_TRUNC(MONTH),
+        (day).DATETIME_TRUNC(HOUR, month),
+        (hour).TIME_TRUNC(MINUTE),
+        (year).TIMESTAMP_TRUNC(DAY, month),
+        (year).LAST_DAY(WEEK(MONDAY)),
+        (month).LAST_DAY()
+    FROM foo;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+
+test_fail_bigquery_datepart_named_function_arguments:
+  fail_str: |
+    SELECT
+        REGEXP_EXTRACT(YEAR, r'[0-9]{4}'),
+        DATE_ADD(YEAR, INTERVAL 5 YEAR),
+        DATE_DIFF(YEAR, MONTH, YEAR),
+        SAFE.DATE_DIFF(YEAR, MONTH, YEAR),
+        LAST_DAY(YEAR, MONTH),
+        TIMESTAMP_TRUNC(YEAR, HOUR, MONTH)
+    FROM foo;
+  fix_str: |
+    SELECT
+        REGEXP_EXTRACT(year, r'[0-9]{4}'),
+        DATE_ADD(year, INTERVAL 5 YEAR),
+        DATE_DIFF(year, month, YEAR),
+        SAFE.DATE_DIFF(year, month, YEAR),
+        LAST_DAY(year, MONTH),
+        TIMESTAMP_TRUNC(year, HOUR, month)
+    FROM foo;
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+
+test_fail_snowflake_ordinary_date_unit_identifiers:
+  fail_str: |
+    SELECT my_udf(YEAR, 1), my_udf(DAY, MONTH), my_udf(YEAR),
+        my_udf("YEAR", t.DAY), analytics.my_udf(YEAR, MONTH),
+        analytics.DATEADD(YEAR, DAY, MONTH), "DATEADD"(YEAR, DAY, MONTH),
+        DATEADD(YEAR, DAY, MONTH), LAST_DAY(YEAR, MONTH),
+        TRUNC(YEAR, SCALE), TRUNC(YEAR, MONTH), TRUNCATE(YEAR, DAY),
+        TIME_SLICE(DAY, YEAR, 'month')
+    FROM t;
+  fix_str: |
+    SELECT my_udf(year, 1), my_udf(day, month), my_udf(year),
+        my_udf("YEAR", t.day), analytics.my_udf(year, month),
+        analytics.DATEADD(year, day, month), "DATEADD"(year, day, month),
+        DATEADD(YEAR, day, month), LAST_DAY(year, MONTH),
+        TRUNC(year, scale), TRUNC(year, MONTH), TRUNCATE(year, DAY),
+        TIME_SLICE(day, year, 'month')
+    FROM t;
+  configs:
+    core:
+      dialect: snowflake
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+
+test_pass_snowflake_real_date_units:
+  pass_str: |
+    SELECT DATEADD(YEAR, day, month), TIMEADD(DD, year, month),
+        TIMESTAMPADD(MS, day, month), DATEDIFF(DAY, year, month),
+        TIMEDIFF(HH, year, month), TIMESTAMPDIFF(NS, year, month),
+        DATE_TRUNC(MONTH, year), DATE_PART(YEAR, day), EXTRACT(YEAR, day),
+        DATE_PART(YEAR FROM day), EXTRACT(YEAR FROM month), LAST_DAY(year, MONTH),
+        TRUNC(year, MONTH), TRUNCATE(year, DAY)
+    FROM t;
+  configs:
+    core:
+      dialect: snowflake
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+
+test_pass_consistent_capitalisation_1:
+  pass_str: SELECT a, b
+
+test_pass_consistent_capitalisation_2:
+  pass_str: SELECT A, B
+
+test_pass_consistent_capitalisation_with_null:
+  # Test that NULL is classed as a keyword and not an identifier
+  pass_str: SELECT NULL,   a
+
+test_pass_consistent_capitalisation_with_single_letter_upper:
+  # Single-letter ambiguity: Upper vs Capitalise
+  pass_str: SELECT A, Boo
+
+test_pass_consistent_capitalisation_with_single_word_snake:
+  # Snake is refuted as ambiguous
+  pass_str: SELECT apple, banana_split
+
+test_fail_consistent_capitalisation_with_single_word_pascal:
+  # Single-word ambiguity: Pascal vs Capitalise
+  fail_str: SELECT AppleFritter, Banana
+  fix_str: SELECT APPLEFRITTER, BANANA
+
+test_fail_consistent_capitalisation_with_multiple_words_with_numbers:
+  # Numbers count as part of words so following letter can be upper or lower
+  fail_str: SELECT AppleFritter, Apple123fritter, Apple123Fritter
+  fix_str: SELECT APPLEFRITTER, APPLE123FRITTER, APPLE123FRITTER
+
+test_pass_consistent_capitalisation_with_leading_underscore:
+  pass_str: SELECT _a, b
+
+test_fail_inconsistent_capitalisation_lowercase_1:
+  # Test that fixes are consistent, and that we capture
+  # table names and aliases.
+  fail_str: SELECT a, B AS C FROM FOO AS BAR
+  fix_str: SELECT a, b AS c FROM foo AS bar
+
+test_fail_inconsistent_capitalisation_lowercase_2:
+  # Test that consistency between columns and tables still counts.
+  fail_str: SELECT a FROM FOO
+  fix_str: SELECT a FROM foo
+
+test_fail_inconsistent_capitalisation_uppercase:
+  fail_str: SELECT B, a FROM foo
+  fix_str: SELECT B, A FROM FOO
+
+# PascalCase tests are based on this comment by @alanmcruickshank:
+# https://github.com/sqlfluff/sqlfluff/issues/820#issuecomment-787050507
+test_pass_consistent_capitalisation_policy_pascal_1:
+  pass_str: SELECT PascalCase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_pass_consistent_capitalisation_policy_pascal_2:
+  pass_str: SELECT Pascalcase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_pass_consistent_capitalisation_policy_pascal_3:
+  fail_str: SELECT pascalCase
+  fix_str: SELECT PascalCase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_pass_consistent_capitalisation_policy_pascal_4:
+  pass_str: SELECT PasCalCaSe
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_pass_consistent_capitalisation_policy_pascal_5:
+  pass_str: SELECT PAscalcase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_pass_consistent_capitalisation_policy_pascal_6:
+  # This could be argued as not PascalCase but technically it is
+  # unless we introduce a full dictionarry of words to recognise
+  # where word breaks are (an impossible task!). Also what about
+  # abbreviations (e.g. NASA)?
+  pass_str: SELECT PASCALCASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_fail_inconsistent_capitalisation_policy_pascal_1:
+  fail_str: SELECT pascalcase
+  fix_str: SELECT Pascalcase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_fail_inconsistent_capitalisation_policy_pascal_2:
+  fail_str: SELECT pascal_case
+  fix_str: SELECT Pascal_Case
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_fail_inconsistent_capitalisation_policy_pascal_3:
+  # Similar to above, you could argue the fixed string is
+  # Not really Pascal Case, but it's closer than it was!
+  fail_str: SELECT pASCAL_CASE
+  fix_str: SELECT PASCAL_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_fail_inconsistent_capitalisation_policy_pascal_4:
+  fail_str: SELECT PasCalCase
+  fix_str: SELECT pascalcase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+
+test_fail_consistent_capitalisation_policy_pascal_5:
+  fail_str: SELECT PascalCaseNAME
+  fix_str: SELECT PASCALCASENAME
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: upper
+
+test_fail_inconsistent_capitalisation_pascal_v_capitalise:
+  # Pascal vs Capitalise
+  fail_str: SELECT AppleFritter, Banana_split
+  fix_str: SELECT AppleFritter, Banana_Split
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+
+test_fail_inconsistent_capitalisation_policy_camel_1:
+  fail_str: SELECT Camelcase
+  fix_str: SELECT camelcase
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: camel
+
+test_fail_inconsistent_capitalisation_policy_camel_2:
+  fail_str: SELECT Camel_Case
+  fix_str: SELECT camel_case
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: camel
+
+test_fail_inconsistent_capitalisation_policy_camel_3:
+  # Similar to above, you could argue the fixed string is
+  # Not really Pascal Case, but it's closer than it was!
+  fail_str: SELECT cAMEL_CASE
+  fix_str: SELECT cAMEL_cASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: camel
+
+test_pass_policy_unquoted_identifiers_aliases_1:
+  pass_str: SELECT a,   B
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_pass_policy_unquoted_identifiers_aliases_2:
+  pass_str: SELECT B,   a
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_pass_policy_unquoted_identifiers_aliases_3:
+  # See above commentsin regards to whether this should
+  # really be considered PascalCase (we treat as yes)
+  pass_str: SELECT PASCAL_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+        unquoted_identifiers_policy: aliases
+
+test_pass_policy_unquoted_identifiers_aliases_4:
+  pass_str: SELECT UPPER_CASE AS low_case, PascalCase AS low_case
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_policy_unquoted_identifiers_aliases_5:
+  fail_str: SELECT UPPER_CASE AS PascalCase, PascalCase AS lower_case
+  fix_str: SELECT UPPER_CASE AS PASCALCASE, PascalCase AS LOWER_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_policy_unquoted_identifiers_aliases_6:
+  fail_str: SELECT UPPER_CASE AS PascalCase, PascalCase AS lower_case
+  fix_str: SELECT UPPER_CASE AS PASCALCASE, PascalCase AS LOWER_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: upper
+        unquoted_identifiers_policy: aliases
+
+test_policy_unquoted_identifiers_aliases_7:
+  fail_str: SELECT UPPER_CASE AS low_case, PascalCase AS low_case FROM UPPER_CASE AS UPPER_CASE
+  fix_str: SELECT UPPER_CASE AS low_case, PascalCase AS low_case FROM UPPER_CASE AS upper_case
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_policy_unquoted_identifiers_aliases_8:
+  fail_str: SELECT UPPER_CASE AS PascalCase, PascalCase AS lower_case FROM lower_case AS lower_case
+  fix_str: SELECT UPPER_CASE AS PASCALCASE, PascalCase AS LOWER_CASE FROM lower_case AS LOWER_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: aliases
+
+test_policy_unquoted_identifiers_column_aliases_1:
+  pass_str: SELECT UPPER_CASE AS low_case, PascalCase AS low_case FROM UPPER_CASE AS UPPER_CASE
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: column_aliases
+
+test_policy_unquoted_identifiers_aliases_2:
+  fail_str: SELECT UPPER_CASE AS PascalCase, PascalCase AS lower_case FROM lower_case AS lower_case
+  fix_str: SELECT UPPER_CASE AS PASCALCASE, PascalCase AS LOWER_CASE FROM lower_case AS lower_case
+  configs:
+    rules:
+      capitalisation.identifiers:
+        unquoted_identifiers_policy: column_aliases
+
+test_pass_ignore_word:
+  pass_str: SELECT A, b
+  configs:
+    rules:
+      capitalisation.identifiers:
+        capitalisation_policy: upper
+        ignore_words: b
+
+test_pass_consistent_capitalisation_properties_naked_identifier:
+  pass_str: SHOW TBLPROPERTIES customer (created.by.user)
+  configs:
+    core:
+      dialect: sparksql
+
+test_fail_inconsistent_capitalisation_properties_naked_identifier:
+  # Test that fixes are consistent
+  fail_str: SHOW TBLPROPERTIES customer (created.BY.user)
+  fix_str: SHOW TBLPROPERTIES customer (created.by.user)
+  configs:
+    core:
+      dialect: sparksql
+
+test_fail_inconsistent_capitalisation_properties_naked_identifier_2:
+  fail_str: SHOW TBLPROPERTIES customer (Created.By.User)
+  fix_str: SHOW TBLPROPERTIES customer (created.by.user)
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_bigquery_safe_does_not_trigger:
+  pass_str: SELECT SAFE.myFunction(1) AS col1
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_databricks_case_sensitive_property:
+  pass_str: SET spark.databricks.delta.properties.defaults.enableChangeDataFeed = true;
+  configs:
+    core:
+      dialect: databricks
+
+test_fail_snake_aliases:
+  # Test for issue #5470
+  # similar to PascalCase, case logic defined in CP01, but tested in CP02
+  fail_str: |
+    SELECT
+    test1,
+    test_2,
+    testColumn3,
+    TestColumn4,
+    TESTCOLUMN5,
+    TEST_COLUMN6,
+    test_column_7_
+  fix_str: |
+    SELECT
+    test_1,
+    test_2,
+    test_column_3,
+    test_column_4,
+    testcolumn_5,
+    test_column_6,
+    test_column_7_
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: snake
+
+test_fail_camel_aliases:
+  # Test for issue #5470
+  # similar to PascalCase, case logic defined in CP01, but tested in CP02
+  fail_str: |
+    SELECT
+    test1,
+    test_2,
+    testColumn3,
+    TestColumn4,
+    TESTCOLUMN5,
+    TEST_COLUMN6,
+    test_colUmn_7
+  fix_str: |
+    SELECT
+    test1,
+    test_2,
+    testColumn3,
+    testColumn4,
+    tESTCOLUMN5,
+    tEST_cOLUMN6,
+    test_colUmn_7
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: camel
+
+test_pass_placeholder_templater_colon_parameters:
+  # Test that placeholder parameters are not incorrectly qualified with table aliases
+  pass_str: |
+    DELETE
+    FROM STATUSVIEWDATAENTITY
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM REFERENCEDSTATUSID AS R
+        WHERE
+            R.PACHLIACCOUNTID = :accountId
+    )
+  configs:
+    core:
+      templater: placeholder
+    templater:
+      placeholder:
+        param_style: colon
+
+
+test_fail_placeholder_templater_colon_parameters:
+  # Test that placeholder parameters are not incorrectly qualified with table aliases
+  fail_str: |
+    DELETE
+    FROM STATUSVIEWDATAENTITY
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM REFERENCEDSTATUSID AS R
+        WHERE
+            r.PACHLIACCOUNTID = :accountId
+    )
+  fix_str: |
+    DELETE
+    FROM STATUSVIEWDATAENTITY
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM REFERENCEDSTATUSID AS R
+        WHERE
+            R.PACHLIACCOUNTID = :accountId
+    )
+  configs:
+    core:
+      templater: placeholder
+    templater:
+      placeholder:
+        param_style: colon
+
+test_pass_placeholder_templater_dollar_parameters:
+  # Test that dollar-style placeholder parameters are not incorrectly qualified
+  pass_str: SELECT * FROM users WHERE id = $userId AND name = $userName
+  configs:
+    core:
+      templater: placeholder
+    templater:
+      placeholder:
+        param_style: dollar
+
+test_pass_placeholder_templater_percent_parameters:
+  # Test that percent-style placeholder parameters are not incorrectly qualified
+  pass_str: SELECT * FROM users WHERE id = %s AND name = %s
+  configs:
+    core:
+      templater: placeholder
+    templater:
+      placeholder:
+        param_style: percent
+
+test_fail_jinja_mixed_identifier_lower:
+  # Issue #5616: only the literal part of a partly templated identifier is
+  # checked and fixed. The template itself is left alone.
+  fail_str: SELECT a FROM {{ env_type }}_MY_DB.my_schema.my_table
+  fix_str: SELECT a FROM {{ env_type }}_my_db.my_schema.my_table
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          env_type: DEV
+
+test_fail_jinja_mixed_identifier_same_length_render:
+  # The template renders to the same length as its source. The fix is still
+  # applied to the literal source text only.
+  fail_str: SELECT a FROM {{x}}_MY_DB
+  fix_str: SELECT a FROM {{x}}_my_db
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          x: ABCDE
+
+test_fail_jinja_mixed_identifier_several_literals:
+  fail_str: USE ROLE {{ env_type }}_{{ role_name }}_RL
+  fix_str: USE ROLE {{ env_type }}_{{ role_name }}_rl
+  configs:
+    core:
+      dialect: snowflake
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          env_type: DEV
+          role_name: ADMIN
+
+test_pass_jinja_mixed_identifier_literal_ok:
+  # The template renders upper case text, but the literal part is lower case.
+  pass_str: SELECT a FROM {{ env_type }}_my_db
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          env_type: DEV
+
+test_pass_jinja_fully_templated_identifier:
+  pass_str: SELECT a FROM {{ db_name }}
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          db_name: MY_DB
+
+test_fail_jinja_mixed_identifier_capitalise_split_literals:
+  # Only the literal part that starts the identifier is capitalised.
+  fail_str: SELECT A FROM ab{{ env }}CD
+  fix_str: SELECT A FROM Ab{{ env }}cd
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: capitalise
+    templater:
+      jinja:
+        context:
+          env: X
+
+test_fail_jinja_mixed_identifier_capitalise_after_template:
+  # The identifier starts with the template, so the literal part is not
+  # capitalised.
+  fail_str: SELECT A FROM {{ env }}Db
+  fix_str: SELECT A FROM {{ env }}db
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: capitalise
+    templater:
+      jinja:
+        context:
+          env: X
+
+test_fail_jinja_mixed_identifier_pascal:
+  fail_str: SELECT A FROM {{ env }}_my_db
+  fix_str: SELECT A FROM {{ env }}_My_Db
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: pascal
+    templater:
+      jinja:
+        context:
+          env: dev
+
+test_fail_jinja_mixed_identifier_snake_no_fix:
+  # Snake case adds an underscore, which can't be mapped back onto the
+  # literal text, so this is reported without a fix.
+  fail_str: SELECT a FROM {{ env }}_MyDb
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: snake
+    templater:
+      jinja:
+        context:
+          env: dev
+
+test_fail_jinja_mixed_identifier_template_at_end:
+  fail_str: SELECT a FROM MY_{{ env }}
+  fix_str: SELECT a FROM my_{{ env }}
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+    templater:
+      jinja:
+        context:
+          env: DEV
+
+test_fail_jinja_mixed_identifier_consistent:
+  # With the default consistent policy, the literal part is compared with the
+  # other identifiers. The rendered DEV doesn't count.
+  fail_str: SELECT my_col FROM {{ env }}_MY_DB
+  fix_str: SELECT my_col FROM {{ env }}_my_db
+  configs:
+    templater:
+      jinja:
+        context:
+          env: DEV
+
+test_pass_jinja_mixed_identifier_ignore_regex_literal:
+  # The ignore settings are matched against the literal text.
+  pass_str: SELECT a FROM {{ env }}_MY_DB
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+        ignore_words_regex: MY_DB$
+    templater:
+      jinja:
+        context:
+          env: DEV
+
+test_fail_jinja_mixed_identifier_ignore_regex_template_only:
+  # The rendered template text isn't checked, so it can't trigger an ignore
+  # either. Otherwise the result would depend on the template context.
+  fail_str: SELECT a FROM {{ env }}_MY_DB
+  fix_str: SELECT a FROM {{ env }}_my_db
+  configs:
+    rules:
+      capitalisation.identifiers:
+        extended_capitalisation_policy: lower
+        ignore_words_regex: ^DEV
+    templater:
+      jinja:
+        context:
+          env: DEV

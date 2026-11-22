@@ -1,0 +1,84 @@
+-- Merge using Table
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN NOT MATCHED THEN
+INSERT (b) VALUES (c);
+
+-- Merge using Select
+MERGE INTO t USING (SELECT * FROM u) AS u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN NOT MATCHED THEN
+INSERT (b) VALUES (c);
+
+-- Merge using Delete
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN MATCHED THEN DELETE;
+
+-- Merge using multiple operations
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED AND a > b THEN
+UPDATE SET a = b
+WHEN MATCHED AND ( a < b AND c < d ) THEN DELETE
+WHEN NOT MATCHED THEN
+INSERT (a, c) VALUES (b, d);
+
+-- Merge using sparksql specific matched clause
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED AND ( a < b AND c < d ) THEN
+UPDATE SET *
+WHEN NOT MATCHED THEN
+INSERT *;
+
+-- Merge with WHEN NOT MATCHED BY TARGET (Iceberg)
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN NOT MATCHED BY TARGET THEN
+INSERT (b) VALUES (c);
+
+-- Merge with WHEN NOT MATCHED BY SOURCE (Iceberg)
+MERGE INTO t USING u ON (a = b)
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET status = 'invalid';
+
+MERGE INTO t USING u ON (a = b)
+WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
+-- Merge with all matched / not matched clauses and predicates
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED AND a > b THEN
+UPDATE SET a = b
+WHEN NOT MATCHED BY TARGET AND a < b THEN
+INSERT (a, c) VALUES (b, d)
+WHEN NOT MATCHED BY SOURCE AND c < d THEN
+DELETE;
+
+-- Merge with UPDATE SET * EXCEPT (...)
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET * EXCEPT (col1);
+
+-- Merge with UPDATE SET * EXCEPT multiple columns
+MERGE INTO t USING u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET * EXCEPT (col1, col2, col3);
+
+-- Merge with INSERT * EXCEPT (...)
+MERGE INTO t USING u ON (a = b)
+WHEN NOT MATCHED THEN
+INSERT * EXCEPT (col1);
+
+-- Merge with INSERT * EXCEPT multiple columns
+MERGE INTO t USING u ON (a = b)
+WHEN NOT MATCHED THEN
+INSERT * EXCEPT (col1, col2, col3);
+
+-- Merge with both UPDATE SET * EXCEPT and INSERT * EXCEPT
+MERGE INTO t USING u ON (t.key = u.key)
+WHEN MATCHED THEN
+UPDATE SET * EXCEPT (last_updated)
+WHEN NOT MATCHED THEN
+INSERT * EXCEPT (last_updated);

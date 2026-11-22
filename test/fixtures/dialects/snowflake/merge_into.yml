@@ -1,0 +1,344 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: b51b91ac8219e5e30972d164dcde89f9172b63cfc99408c5e6ee2cdb3a005191
+file:
+- statement:
+    alter_table_statement:
+    - keyword: ALTER
+    - keyword: TABLE
+    - table_reference:
+      - naked_identifier: xxxx
+      - dot: .
+      - naked_identifier: example_table
+    - alter_table_table_column_action:
+      - keyword: MODIFY
+      - keyword: COLUMN
+      - column_reference:
+          naked_identifier: employeeCode
+      - keyword: SET
+      - keyword: MASKING
+      - keyword: POLICY
+      - function_name:
+          function_name_identifier: example_MASKING_POLICY
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: merge
+    - keyword: into
+    - table_reference:
+        naked_identifier: target_table
+    - keyword: using
+    - table_reference:
+        naked_identifier: source_table
+    - join_on_condition:
+        keyword: 'on'
+        expression:
+        - column_reference:
+          - naked_identifier: target_table
+          - dot: .
+          - naked_identifier: id
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: source_table
+          - dot: .
+          - naked_identifier: id
+    - merge_match:
+        merge_when_matched_clause:
+        - keyword: when
+        - keyword: matched
+        - keyword: then
+        - merge_update_clause:
+            keyword: update
+            set_clause_list:
+              keyword: set
+              set_clause:
+              - column_reference:
+                - naked_identifier: target_table
+                - dot: .
+                - naked_identifier: description
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                - naked_identifier: source_table
+                - dot: .
+                - naked_identifier: description
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: merge
+    - keyword: into
+    - table_reference:
+        naked_identifier: t1
+    - keyword: using
+    - table_reference:
+        naked_identifier: t2
+    - join_on_condition:
+        keyword: 'on'
+        expression:
+        - column_reference:
+          - naked_identifier: t1
+          - dot: .
+          - naked_identifier: t1key
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: t2
+          - dot: .
+          - naked_identifier: t2key
+    - merge_match:
+        merge_when_matched_clause:
+        - keyword: when
+        - keyword: matched
+        - keyword: and
+        - expression:
+            column_reference:
+            - naked_identifier: t2
+            - dot: .
+            - naked_identifier: marked
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+        - keyword: then
+        - merge_delete_clause:
+            keyword: delete
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: merge
+    - keyword: into
+    - table_reference:
+        naked_identifier: t1
+    - keyword: using
+    - table_reference:
+        naked_identifier: t2
+    - join_on_condition:
+        keyword: 'on'
+        expression:
+        - column_reference:
+          - naked_identifier: t1
+          - dot: .
+          - naked_identifier: t1key
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: t2
+          - dot: .
+          - naked_identifier: t2key
+    - merge_match:
+        merge_when_not_matched_clause:
+        - keyword: when
+        - keyword: not
+        - keyword: matched
+        - keyword: and
+        - expression:
+            column_reference:
+            - naked_identifier: t2
+            - dot: .
+            - naked_identifier: marked
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+        - keyword: then
+        - merge_insert_clause:
+            keyword: insert
+            bracketed:
+              start_bracket: (
+              column_reference:
+                naked_identifier: marked
+              end_bracket: )
+            values_clause:
+              keyword: values
+              bracketed:
+                start_bracket: (
+                expression:
+                  numeric_literal: '1'
+                end_bracket: )
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: MERGE
+    - keyword: INTO
+    - table_reference:
+        naked_identifier: target_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: t
+    - keyword: USING
+    - table_reference:
+        naked_identifier: source_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: s
+    - join_on_condition:
+        keyword: 'ON'
+        expression:
+        - column_reference:
+          - naked_identifier: t
+          - dot: .
+          - naked_identifier: id
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: s
+          - dot: .
+          - naked_identifier: id
+    - merge_match:
+        merge_when_matched_clause:
+        - keyword: WHEN
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_update_clause:
+          - keyword: UPDATE
+          - keyword: ALL
+          - keyword: BY
+          - keyword: NAME
+        merge_when_not_matched_clause:
+        - keyword: WHEN
+        - keyword: NOT
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_insert_clause:
+          - keyword: INSERT
+          - keyword: ALL
+          - keyword: BY
+          - keyword: NAME
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: MERGE
+    - keyword: INTO
+    - table_reference:
+        naked_identifier: target_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: t
+    - keyword: USING
+    - table_reference:
+        naked_identifier: source_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: s
+    - join_on_condition:
+        keyword: 'ON'
+        expression:
+        - column_reference:
+          - naked_identifier: t
+          - dot: .
+          - naked_identifier: id
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: s
+          - dot: .
+          - naked_identifier: id
+    - merge_match:
+        merge_when_matched_clause:
+        - keyword: WHEN
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_update_clause:
+          - keyword: UPDATE
+          - keyword: ALL
+          - keyword: BY
+          - keyword: NAME
+        merge_when_not_matched_clause:
+        - keyword: WHEN
+        - keyword: NOT
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_insert_clause:
+            keyword: INSERT
+            bracketed:
+            - start_bracket: (
+            - column_reference:
+                naked_identifier: id
+            - comma: ','
+            - column_reference:
+                naked_identifier: name
+            - end_bracket: )
+            values_clause:
+              keyword: VALUES
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                  - naked_identifier: s
+                  - dot: .
+                  - naked_identifier: id
+              - comma: ','
+              - expression:
+                  column_reference:
+                  - naked_identifier: s
+                  - dot: .
+                  - naked_identifier: name
+              - end_bracket: )
+- statement_terminator: ;
+- statement:
+    merge_statement:
+    - keyword: MERGE
+    - keyword: INTO
+    - table_reference:
+        naked_identifier: target_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: t
+    - keyword: USING
+    - table_reference:
+        naked_identifier: source_table
+    - alias_expression:
+        alias_operator:
+          keyword: AS
+        naked_identifier: s
+    - join_on_condition:
+        keyword: 'ON'
+        expression:
+        - column_reference:
+          - naked_identifier: t
+          - dot: .
+          - naked_identifier: id
+        - comparison_operator:
+            raw_comparison_operator: '='
+        - column_reference:
+          - naked_identifier: s
+          - dot: .
+          - naked_identifier: id
+    - merge_match:
+        merge_when_matched_clause:
+        - keyword: WHEN
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_update_clause:
+            keyword: UPDATE
+            set_clause_list:
+              keyword: SET
+              set_clause:
+              - column_reference:
+                - naked_identifier: t
+                - dot: .
+                - naked_identifier: name
+              - comparison_operator:
+                  raw_comparison_operator: '='
+              - column_reference:
+                - naked_identifier: s
+                - dot: .
+                - naked_identifier: name
+        merge_when_not_matched_clause:
+        - keyword: WHEN
+        - keyword: NOT
+        - keyword: MATCHED
+        - keyword: THEN
+        - merge_insert_clause:
+          - keyword: INSERT
+          - keyword: ALL
+          - keyword: BY
+          - keyword: NAME
+- statement_terminator: ;

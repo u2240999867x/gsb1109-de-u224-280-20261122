@@ -1,0 +1,34 @@
+# NOTE: Install with -U to keep all requirements up-to-date.
+
+# code linting and formatting
+# ---------------------------
+ruff
+import-linter
+yamllint
+
+# python testing
+# --------------
+coverage>=6.4
+hypothesis
+pytest
+pytest-cov
+pytest-xdist
+tox
+
+# MyPy
+# ----
+# `types-*` dependencies here should be the same as in `.pre-commit-config.yaml`.
+# If you update these dependencies, make sure to update those too.
+mypy[mypyc]
+types-chardet
+types-appdirs
+types-colorama
+types-pyyaml
+types-regex
+types-tqdm
+
+# util.py dependencies
+# ----
+requests
+ghapi
+fastcore!=1.12.2 # 1.12.2 breaks for python <= 3.11, revisit later

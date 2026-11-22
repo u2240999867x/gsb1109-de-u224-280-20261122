@@ -1,0 +1,1107 @@
+rule: RF02
+
+test_pass_using_columns_case_insensitive:
+  pass_str: |
+    SELECT a, B FROM t1 JOIN t2 USING (A, b)
+
+test_pass_using_columns_case_insensitive_postgres:
+  pass_str: |
+    SELECT a, B FROM t1 JOIN t2 USING (A, b)
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_using_columns_case_insensitive_snowflake:
+  pass_str: |
+    SELECT a, B FROM t1 JOIN t2 USING (A, b)
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_using_columns_quoted_postgres:
+  pass_str: |
+    SELECT A, "b", "Mixed" FROM t1 JOIN t2 USING ("a", B, "Mixed")
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_using_columns_quoted_ansi:
+  pass_str: |
+    SELECT a, "B", "Mixed" FROM t1 JOIN t2 USING ("A", b, "Mixed")
+
+test_fail_using_columns_distinct_quoted_postgres:
+  fail_str: |
+    SELECT "A" FROM t1 JOIN t2 USING (a)
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_using_columns_distinct_quoted_ansi:
+  fail_str: |
+    SELECT "a" FROM t1 JOIN t2 USING (a)
+
+test_fail_using_columns_unrelated_reference:
+  fail_str: |
+    SELECT a, other FROM t1 JOIN t2 USING (A)
+  violations:
+    - code: RF02
+      description: Unqualified reference 'other' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 1
+      start_line_pos: 11
+      start_file_pos: 10
+      end_line_no: 1
+      end_line_pos: 16
+      end_file_pos: 15
+
+test_pass_qualified_references_multi_table_statements:
+  pass_str: |
+    SELECT foo.a, vee.b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+
+test_fail_unqualified_references_multi_table_statements:
+  fail_str: |
+    SELECT a, b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+
+test_pass_qualified_references_multi_table_statements_subquery:
+  pass_str: |
+    SELECT a
+    FROM (
+        SELECT foo.a, vee.b
+        FROM foo
+        LEFT JOIN vee ON vee.a = foo.a
+    )
+
+test_fail_unqualified_references_multi_table_statements_subquery:
+  fail_str: |
+    SELECT a
+    FROM (
+        SELECT a, b
+        FROM foo
+        LEFT JOIN vee ON vee.a = foo.a
+    )
+
+test_pass_qualified_references_multi_table_statements_subquery_mix:
+  pass_str: |
+    SELECT foo.a, vee.b
+    FROM (
+        SELECT c
+        FROM bar
+    ) AS foo
+    LEFT JOIN vee ON vee.a = foo.a
+
+test_allow_date_parts_as_function_parameter_bigquery:
+  # Allow use of BigQuery date parts (which are not quoted and were previously
+  # mistaken for column references and flagged by this rule).
+  pass_str: |
+    SELECT timestamp_trunc(a.ts, month) AS t
+    FROM a
+    JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: bigquery
+
+test_allow_date_parts_as_function_parameter_snowflake:
+  # Allow use of Snowflake date parts (which are not quoted and were previously
+  # mistaken for column references and flagged by this rule).
+  pass_str: |
+    SELECT datediff(year, a.column1, b.column2)
+    FROM a
+    JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: snowflake
+
+test_ignore_value_table_functions_when_counting_tables:
+  # Allow use of unnested value tables from bigquery without counting as a
+  # table reference. This test passes despite unqualified reference
+  # because we "only select from one table"
+  pass_str: |
+    select
+        unqualified_reference_from_table_a,
+        _t_start
+    from a
+    left join unnest(generate_timestamp_array(
+            '2020-01-01', '2020-01-30', interval 1 day)) as _t_start
+        on true
+  configs:
+    core:
+      dialect: bigquery
+
+test_ignore_value_table_functions_when_counting_unqualified_aliases:
+  # Allow use of unnested value tables from bigquery without qualification.
+  # The function `unnest` returns a table which is only one unnamed column.
+  # This is impossible to qualify further, and as such the rule allows it.
+  pass_str: |
+    select
+        a.*,
+        b.*,
+        _t_start
+    from a
+    left join b
+        on true
+    left join unnest(generate_timestamp_array(
+            '2020-01-01', '2020-01-30', interval 1 day)) as _t_start
+        on true
+  configs:
+    core:
+      dialect: bigquery
+
+test_allow_unqualified_references_in_sparksql_lambdas:
+  pass_str: |
+    SELECT transform(array(1, 2, 3), x -> x + 1);
+  configs:
+    core:
+      dialect: sparksql
+
+test_allow_unqualified_references_in_vertica_lambdas:
+  pass_str: |
+    select
+        hit_code,
+        array_find(
+            hit_categories_array,
+            e -> e not in (
+                'Apple', 'Banana', 'Cherry', 'Durian', 'Elderberry', 'Fig'
+            )
+        ) > -1 as is_unknown_category_flg
+    from hits
+  configs:
+    core:
+      dialect: vertica
+
+test_pass_databricks_lambdas:
+  pass_str: |
+    select
+        i.*,
+        aggregate(i.some_column, 0, (acc, x) -> acc + x) as y
+    from some_table as o
+    inner join some_other_table as i
+        on o.id = i.id;
+  configs:
+    core:
+      dialect: databricks
+
+test_allow_unqualified_references_in_snowflake_lambdas:
+  pass_str: |
+    select
+        t.v,
+        o.v,
+        transform(t.arr1, x int -> x + 1) as f1,
+        filter(t.arr2, y -> y:value > 0) as f2,
+        reduce(o.arr, 0, (acc, val) -> acc + val) as f3
+    from some_table as t
+    inner join some_other_table as o
+        on t.id = o.id;
+  configs:
+    core:
+      dialect: snowflake
+
+test_allow_unqualified_references_in_athena_lambdas:
+  pass_str: |
+    select
+        t1.id,
+        filter(array[t1.col1, t1.col2, t2.col3], x -> x is not null) as flt
+    from t1
+    inner join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: athena
+
+test_allow_unqualified_references_in_athena_lambdas_with_several_arguments:
+  pass_str: |
+    select
+        t1.id,
+        filter(array[(t1.col1, t1.col2)], (x, y) -> x + y) as flt
+    from t1
+    inner join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: athena
+
+test_disallow_unqualified_references_in_malformed_lambdas:
+  fail_str: |
+    select
+        t1.id,
+        filter(array[(t1.col1, t1.col2)], (x, y), z -> x + y) as flt
+    from t1
+    inner join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: athena
+
+test_json_arrow_operator_is_not_a_lambda_duckdb:
+  # The `->` here is the JSON extraction operator, not a lambda arrow. The
+  # left operand is a cast, not a lambda parameter, so it must not be treated
+  # as a lambda (and must not crash the analyzer).
+  pass_str: |
+    select 1::json -> 'a' from t
+  configs:
+    core:
+      dialect: duckdb
+
+test_json_arrow_operator_is_not_a_lambda_trino:
+  pass_str: |
+    select 1::json -> 'a' from t
+  configs:
+    core:
+      dialect: trino
+
+test_arrow_with_non_parameter_left_operand_is_not_a_lambda:
+  # The left operand of `->` is a function call, not a single lambda parameter,
+  # so it is not treated as a lambda (and must not crash the analyzer). All real
+  # column references are qualified, so there is nothing for RF02 to flag.
+  pass_str: |
+    select filter(t1.arr, foo() -> 1) from t1 join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: databricks
+
+test_json_arrow_on_plain_column_is_not_a_lambda_duckdb:
+  # A plain column on the left of `->` is still JSON extraction, not a lambda
+  # parameter, so the column must still be reported as unqualified.
+  fail_str: |
+    select payload -> 'a' from t1 join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: duckdb
+
+test_json_arrow_on_plain_column_is_not_a_lambda_trino:
+  fail_str: |
+    select payload -> 'a' from t1 join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: trino
+
+test_lambda_parameters_are_still_standalone_duckdb:
+  # The lambda parameter `x` is declared in place and must not be reported.
+  fail_str: |
+    select list_filter(t1.l, x -> x > n) from t1 join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: duckdb
+
+test_lambda_parameters_are_still_standalone_snowflake:
+  fail_str: |
+    select filter(t1.l, x -> x > n) from t1 join t2 on t1.id = t2.id
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_column_and_alias_same_name:
+  # See issue #2169
+  fail_str: |
+    SELECT
+        foo AS foo,
+        bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+
+test_pass_column_and_alias_same_name_1:
+  pass_str: |
+    SELECT
+        a.foo AS foo,
+        b.bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+
+test_pass_column_and_alias_same_name_2:
+  # Possible for unqualified columns if
+  # it is actually an alias of another column.
+  pass_str: |
+    SELECT
+        a.bar AS baz,
+        baz
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+
+test_pass_qualified_references_multi_table_statements_mysql:
+  pass_str: |
+    SELECT foo.a, vee.b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+  configs:
+    core:
+      dialect: mysql
+
+test_fail_unqualified_references_multi_table_statements_mysql:
+  fail_str: |
+    SELECT a, b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_bigquery_normalized_whole_row_alias_references:
+  pass_str: |
+    SELECT FORMAT('%t', s1), s2.id
+    FROM main AS S1
+    JOIN secondary AS s2 ON S1.id = s2.id;
+
+    SELECT FORMAT('%t', `s1`), s2.id
+    FROM main AS `s1`
+    JOIN secondary AS s2 ON `s1`.id = s2.id
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_postgres_whole_row_table_function_argument:
+  # A table name denotes its composite row when used as a function argument.
+  # Regression coverage for #5953; the behavior is already supported.
+  pass_str: |
+    SELECT othertable.c, myadd(mytable)
+    FROM mytable, othertable;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_normalized_whole_row_alias_function_argument:
+  pass_str: |
+    SELECT o.c, myadd(M)
+    FROM mytable AS m, othertable AS o;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_quoted_whole_row_alias_function_argument:
+  pass_str: |
+    SELECT o.c, myadd("MyTable")
+    FROM mytable AS "MyTable", othertable AS o;
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_postgres_unqualified_column_beside_whole_row_argument:
+  # Recognizing a row argument must not hide an ordinary unqualified column.
+  fail_str: |
+    SELECT o.c, myadd(m), a
+    FROM mytable AS m, othertable AS o;
+  violations:
+    - code: RF02
+      description: Unqualified reference 'a' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 1
+      start_line_pos: 23
+      start_file_pos: 22
+      end_line_no: 1
+      end_line_pos: 24
+      end_file_pos: 23
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_mysql_alias_named_unqualified_column:
+  fail_str: |
+    SELECT o, s.id
+    FROM orders AS o
+    JOIN shipments AS s ON o.id = s.order_id
+  configs:
+    core:
+      dialect: mysql
+
+test_fail_column_and_alias_same_name_mysql:
+  # See issue #2169
+  fail_str: |
+    SELECT
+        foo AS foo,
+        bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_column_and_alias_same_name_1_mysql:
+  pass_str: |
+    SELECT
+        a.foo AS foo,
+        b.bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_column_and_alias_same_name_2_mysql:
+  # Possible for unqualified columns if
+  # it is actually an alias of another column.
+  pass_str: |
+    SELECT
+        a.bar AS baz,
+        baz
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_variable_reference_in_where_clause_mysql:
+  pass_str: |
+    SET @someVar = 1;
+    SELECT
+        Table1.Col1,
+        Table2.Col2
+    FROM Table1
+    LEFT JOIN Table2 ON Table1.Join1 = Table2.Join1
+    WHERE Table1.FilterCol = @someVar;
+  configs:
+    core:
+      dialect: mysql
+
+test_pass_qualified_references_multi_table_statements_tsql:
+  pass_str: |
+    SELECT foo.a, vee.b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_unqualified_references_multi_table_statements_tsql:
+  fail_str: |
+    SELECT a, b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_column_and_alias_same_name_tsql:
+  # See issue #2169
+  fail_str: |
+    SELECT
+        foo AS foo,
+        bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_column_and_alias_same_name_1_tsql:
+  pass_str: |
+    SELECT
+        a.foo AS foo,
+        b.bar AS bar
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_column_and_alias_same_name_2_tsql:
+  # Possible for unqualified columns if
+  # it is actually an alias of another column.
+  pass_str: |
+    SELECT
+        a.bar AS baz,
+        baz
+    FROM
+        a LEFT JOIN b ON a.id = b.id
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_rowtype_with_join:
+  # Check we don't wrongly interpret rowtype attributes
+  # as field alias when more than one tables in join
+  pass_str: |
+    select
+        cast(row(t1.attr, t2.attr) as row(fld1 double, fld2 double)) as flds
+    from sch.tab1 as t1
+    join sch.tab2 as t2 on t2.id = t1.id
+  configs:
+    core:
+      dialect: hive
+
+test_fail_table_plus_flatten_snowflake_1:
+  # FLATTEN() returns a table, thus there are two tables, thus lint failure.
+  fail_str: |
+    SELECT
+        r.rec:foo::string AS foo,
+        value:bar::string AS bar
+    FROM foo.bar AS r, LATERAL FLATTEN(input => r.rec:result) AS x
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_table_plus_flatten_snowflake_2:
+  # FLATTEN() returns a table, thus there are two tables, thus lint failure,
+  # even though there's no alias provided for FLATTEN().
+  fail_str: |
+    SELECT
+        r.rec:foo::string AS foo,
+        value:bar::string AS bar
+    FROM foo.bar AS r, LATERAL FLATTEN(input => r.rec:result)
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_table_plus_flatten_snowflake_1:
+  # FLATTEN() returns a table, thus there are two tables. This one passes,
+  # unlike the above, because both aliases are used.
+  pass_str: |
+    SELECT
+        r.rec:foo::string AS foo,
+        x.value:bar::string AS bar
+    FROM foo.bar AS r, LATERAL FLATTEN(input => r.rec:result) AS x
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_ignore_words_column_name:
+  pass_str: |
+    SELECT test1, test2
+    FROM t_table1
+    LEFT JOIN t_table_2
+        ON TRUE
+  configs:
+    rules:
+      references.qualification:
+        ignore_words: test1,test2
+
+test_pass_ignore_words_regex_column_name:
+  pass_str: |
+    SELECT _test1, _test2
+    FROM t_table1
+    LEFT JOIN t_table_2
+        ON TRUE
+  configs:
+    rules:
+      references.qualification:
+        ignore_words_regex: ^_
+
+test_pass_ignore_words_regex_bigquery_declare_example:
+  pass_str: DECLARE _test INT64 DEFAULT 42;
+    SELECT _test
+    FROM t_table1
+    LEFT JOIN t_table_2
+    ON TRUE
+  configs:
+    core:
+      dialect: bigquery
+    rules:
+      references.qualification:
+        ignore_words_regex: ^_
+
+test_pass_redshift:
+  # This was failing in issue 3380.
+  pass_str: SELECT account.id
+    FROM salesforce_sd.account
+    INNER JOIN salesforce_sd."user" ON salesforce_sd."user".id = account.ownerid
+  configs:
+    core:
+      dialect: redshift
+
+test_pass_tsql:
+  # This was failing in issue 3342.
+  pass_str: select
+    psc.col1
+    from
+    tbl1 as psc
+    where
+    exists
+    (
+    select 1 as data
+    from
+    tbl2 as pr
+    join tbl2 as c on c.cid = pr.cid
+    where
+    c.col1 = 'x'
+    and pr.col2 <= convert(date, getdate())
+    and pr.pid = psc.pid
+    )
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_ansi:
+  # This was failing in issue 3055.
+  pass_str: |
+    SELECT my_col
+    FROM my_table
+    WHERE EXISTS (
+        SELECT 1
+        FROM other_table
+        INNER JOIN mapping_table ON (mapping_table.other_fk = other_table.id_pk)
+        WHERE mapping_table.kind = my_table.kind
+    )
+
+test_pass_redshift_convert:
+  # This was failing in issue 3651.
+  pass_str: |
+    SELECT
+        sellers.name,
+        CONVERT(integer, sales.pricepaid) AS price
+    FROM sales
+    LEFT JOIN sellers ON sales.sellerid = sellers.sellerid
+    WHERE sales.salesid = 100
+  configs:
+    core:
+      dialect: redshift
+
+test_fail_unreferenced_subquery_column:
+  # Issue 6067
+  fail_str: |
+    SELECT a
+    FROM foo
+    WHERE a IN (SELECT a FROM bar)
+
+test_pass_referenced_subquery_column:
+  # Issue 6067
+  pass_str: |
+    SELECT a
+    FROM foo
+    WHERE a IN (SELECT bar.a FROM bar)
+
+test_pass_referenced_subquery_is_self:
+  pass_str: |
+    SELECT *
+    FROM (SELECT a FROM table)
+
+test_pass_declared_bigquery_variable:
+  pass_str: |
+    DECLARE run_time TIMESTAMP DEFAULT '2020-01-01 00:00:00';
+
+    SELECT table_a.age FROM table_a
+    INNER JOIN
+        table_b
+        ON
+            table_a.id = table_b.id
+    WHERE table_a.start_date <= run_time;
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_from_clause_subquery:
+  pass_str: |
+    SELECT
+        a.id AS a_id,
+        b.id AS b_id
+    FROM
+        (
+            SELECT id
+            FROM foo
+        ) AS a
+    INNER JOIN bar AS b ON a.id = b.ib;
+
+test_pass_join_clause_subquery:
+  pass_str: |
+    SELECT
+        a.id AS a_id,
+        b.id AS b_id
+    FROM bar AS b
+    JOIN (
+            SELECT id
+            FROM foo
+        ) AS a
+    ON a.id = b.id;
+
+test_fail_nested_correlated_subquery_inside_from_clause:
+  fail_str: |
+    SELECT
+        a.id AS a_id,
+        b.id AS b_id
+    FROM
+        (
+            SELECT id
+            FROM foo
+            WHERE id IN (SELECT id FROM baz)
+        ) AS a
+    INNER JOIN bar AS b ON a.id = b.id;
+
+test_fail_select_scalar_subquery:
+  fail_str: |
+    SELECT
+        (SELECT max(id) FROM foo2) AS f1
+    FROM bar;
+
+test_fail_exists_subquery:
+  fail_str: |
+    SELECT id
+    FROM bar
+    WHERE EXISTS (
+        SELECT 1 FROM foo2
+        WHERE bar.id = id
+    );
+
+test_pass_ignore_deeper_alias_6389:
+  pass_str: |
+    SELECT (SELECT MAX(x.col) AS m FROM x) AS _stats
+    FROM stats_today AS t
+    LEFT JOIN stats_this_month AS tm
+      ON tm.x = t.x
+    WHERE _stats IS NOT NULL;
+
+test_fail_unqual_refs_multi_table_statements_ignore_external_references:
+  fail_str: |
+    SELECT a, b
+    FROM foo
+    LEFT JOIN vee ON vee.a = foo.a
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_fail_unqual_refs_multi_table_statements_subq_ignore_external_references:
+  fail_str: |
+    SELECT a
+    FROM (
+        SELECT a, b
+        FROM foo
+        LEFT JOIN vee ON vee.a = foo.a
+    )
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_pass_unreferenced_subquery_column_subqueries_ignore_external_references:
+  pass_str: |
+    SELECT a
+    FROM foo
+    WHERE a IN (SELECT a FROM bar)
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_pass_select_scalar_subquery_subqueries_ignore_external_references:
+  pass_str: |
+    SELECT
+        (SELECT max(id) FROM foo2) AS f1
+    FROM bar;
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_pass_exists_subquery_subqueries_ignore_external_references:
+  pass_str: |
+    SELECT id
+    FROM bar
+    WHERE EXISTS (
+        SELECT 1 FROM foo2
+        WHERE bar.id = id
+    );
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_pass_redshift_object_unpivot:
+  # Redshift SUPER type object unpivoting introduces standalone aliases.
+  # Unqualified references to unpivot output aliases should be allowed.
+  # See: https://github.com/sqlfluff/sqlfluff/issues/6765
+  pass_str: |
+    SELECT
+        x.json,
+        key1,
+        value2.field2
+    FROM table1 AS x,
+        UNPIVOT x.json AS value1 AT key1,
+        value1.field1 AS value2 AT key2
+  configs:
+    core:
+      dialect: redshift
+
+test_pass_redshift_from_unpivot_output_aliases:
+  # Redshift UNPIVOT introduces standalone output aliases.
+  # Unqualified references to the generated output columns should be allowed.
+  pass_str: |
+    SELECT
+        color,
+        cnt
+    FROM count_by_color UNPIVOT (
+        cnt FOR color IN (red, green, blue)
+    )
+  configs:
+    core:
+      dialect: redshift
+
+test_pass_snowflake_from_unpivot_output_aliases:
+  # Snowflake UNPIVOT introduces standalone output aliases.
+  pass_str: |
+    SELECT
+        col_name,
+        val
+    FROM my_tbl
+    UNPIVOT (val FOR col_name IN (a, b))
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_bigquery_single_column_unpivot_output_aliases:
+  # BigQuery single-column UNPIVOT introduces standalone output aliases.
+  pass_str: |
+    SELECT
+        quarter,
+        sales
+    FROM Produce
+    UNPIVOT(sales FOR quarter IN (Q1, Q2, Q3, Q4))
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_duckdb_single_key_unpivot_output_aliases:
+  # DuckDB single-key UNPIVOT introduces standalone output aliases.
+  pass_str: |
+    SELECT
+        month,
+        sales
+    FROM monthly_sales UNPIVOT (
+        sales
+        FOR month IN (jan, feb, mar, apr, may, jun)
+    )
+  configs:
+    core:
+      dialect: duckdb
+
+test_pass_redshift_array_unnest:
+  # Redshift array unnesting introduces standalone aliases.
+  # Unqualified references to unnest output aliases should be allowed.
+  pass_str: |
+    SELECT
+        ed.shop_id,
+        key,
+        value
+    FROM example_data AS ed,
+        ed.inventory AS value AT key
+  configs:
+    core:
+      dialect: redshift
+
+test_pass_databricks_star_except:
+  # Columns inside a SELECT * EXCEPT (...) clause name what to drop from the
+  # star expansion, so they don't need qualification.
+  # https://github.com/sqlfluff/sqlfluff/issues/5764
+  pass_str: |
+    SELECT
+        test.* EXCEPT (test_column),
+        test_2.*
+    FROM test
+    LEFT JOIN test_2 ON test.test_column = test_2.test_column
+  configs:
+    core:
+      dialect: databricks
+
+test_pass_sparksql_star_except:
+  pass_str: |
+    SELECT a.* EXCEPT (col_one, col_two)
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_clickhouse_star_except:
+  pass_str: |
+    SELECT a.* EXCEPT (col_one, col_two)
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: clickhouse
+
+test_fail_unqualified_reference_with_star_except:
+  # The EXCEPT exclusion is scoped to the EXCEPT clause; a genuinely
+  # unqualified reference elsewhere in the select should still fail.
+  fail_str: |
+    SELECT
+        a.* EXCEPT (col_one),
+        col_two
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: databricks
+
+test_pass_sparksql_broadcast_hint:
+  # The argument of a query hint names a table/alias for the planner, not a
+  # column in the select, so it doesn't need qualification.
+  # https://github.com/sqlfluff/sqlfluff/issues/6771
+  pass_str: |
+    SELECT /*+ BROADCAST(a) */
+        a.col_one,
+        b.col_two
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_sparksql_merge_hint_multiple_tables:
+  pass_str: |
+    SELECT /*+ MERGE(a, b) */
+        a.col_one,
+        b.col_two
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: sparksql
+
+test_fail_unqualified_reference_with_hint:
+  # The hint exclusion is scoped to the hint; a genuinely unqualified
+  # reference elsewhere in the select should still fail.
+  fail_str: |
+    SELECT /*+ BROADCAST(a) */
+        col_one,
+        b.col_two
+    FROM table_a AS a
+    JOIN table_b AS b ON a.id = b.id
+  configs:
+    core:
+      dialect: sparksql
+
+test_pass_tsql_bracketed_nested_join_target:
+  # T-SQL allows a bracketed join as a join target, which nests the whole
+  # join under a single table_expression. The tables it declares reached
+  # RF02's column-reference buffer and were reported as unqualified columns.
+  pass_str: |
+    SELECT b.x
+    FROM a
+    LEFT JOIN ((b INNER JOIN c ON 1 = 1) LEFT JOIN d ON 1 = 1) ON 1 = 1;
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_tsql_bracketed_nested_join_target_unqualified_column:
+  # The counterpart: excluding the nested declarations must not stop a real
+  # unqualified column in the same statement from failing. Without this a
+  # rule that returned nothing at all would satisfy the pass case above.
+  fail_str: |
+    SELECT b.x, zzz
+    FROM a
+    LEFT JOIN ((b INNER JOIN c ON 1 = 1) LEFT JOIN d ON 1 = 1) ON 1 = 1;
+  violations:
+    - code: RF02
+      description: Unqualified reference 'zzz' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 1
+      start_line_pos: 13
+      start_file_pos: 12
+      end_line_no: 1
+      end_line_pos: 16
+      end_file_pos: 15
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_tsql_bracketed_nested_join_target_three_deep:
+  # A deeper tree than the case above. The crawl that finds these is already
+  # recursive, so this does not reach new lines in select.py; it pins that a
+  # depth-limited rewrite of the exclusion would be caught.
+  pass_str: |
+    SELECT b.x
+    FROM a
+    LEFT JOIN (((b INNER JOIN c ON 1 = 1) LEFT JOIN d ON 1 = 1) LEFT JOIN e ON 1 = 1) ON 1 = 1;
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_tsql_containstable_reports_only_the_column_argument:
+  # CONTAINSTABLE is another table_expression whose table arrives under a
+  # non-table_reference child, so the same exclusion applies. The violation
+  # list below is the whole expected set: `col` is a genuine column and is
+  # still reported, and the absence of `tbl` is the assertion that the table
+  # argument stopped being reported. RF01.yml already takes the position that
+  # these arguments are function inputs rather than FROM-clause references.
+  fail_str: |
+    SELECT ft_tbl.name
+    FROM production.product AS ft_tbl
+    INNER JOIN CONTAINSTABLE(tbl, col, 'x') AS key_tbl
+        ON ft_tbl.id = key_tbl.[key];
+  violations:
+    - code: RF02
+      description: Unqualified reference 'col' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 3
+      start_line_pos: 31
+      start_file_pos: 83
+      end_line_no: 3
+      end_line_pos: 34
+      end_file_pos: 86
+  configs:
+    core:
+      dialect: tsql
+
+test_allow_unqualified_references_in_bigquery_with_expression:
+  pass_str: |
+    SELECT WITH(a AS t1.x, a + t2.y) AS z
+    FROM t1
+    INNER JOIN t2 ON WITH(c AS t1.id, c = t2.id)
+    WHERE WITH(b AS t1.x, b) > 0
+  configs:
+    core:
+      dialect: bigquery
+
+test_fail_unqualified_reference_in_bigquery_with_expression:
+  fail_str: |
+    SELECT WITH(a AS t1.x, a + y) AS z
+    FROM t1
+    INNER JOIN t2 ON t1.id = t2.id
+  configs:
+    core:
+      dialect: bigquery
+
+test_fail_bigquery_with_expression_variable_before_assignment:
+  # A WITH variable is in scope only after its own assignment.
+  fail_str: |
+    SELECT WITH(a AS a + 1, a) AS z
+    FROM t1
+    INNER JOIN t2 ON t1.id = t2.id
+  configs:
+    core:
+      dialect: bigquery
+
+test_fail_bigquery_with_expression_variable_outside_subquery:
+  # A WITH variable in a subquery does not hide a column of the outer select.
+  fail_str: |
+    SELECT
+        a,
+        (SELECT WITH(a AS 1, a)) AS z
+    FROM t1
+    INNER JOIN t2 ON t1.id = t2.id
+  configs:
+    core:
+      dialect: bigquery
+
+test_allow_bigquery_with_expression_variable_in_subquery:
+  # A subquery inside a WITH expression can use the variables before it.
+  pass_str: |
+    SELECT WITH(a AS 1, (SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id)) AS z
+  configs:
+    core:
+      dialect: bigquery
+
+test_fail_bigquery_with_expression_variable_in_own_subquery:
+  # A subquery in the assignment of a variable cannot use that variable.
+  fail_str: |
+    SELECT WITH(a AS (SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id), a) AS z
+  configs:
+    core:
+      dialect: bigquery
+
+test_allow_bigquery_nested_with_expression_variables_in_subquery:
+  # A subquery can use the variables of every WITH expression around it.
+  pass_str: |
+    SELECT WITH(a AS 1, WITH(b AS 2, (SELECT a + b FROM t1 INNER JOIN t2 ON t1.id = t2.id))) AS z
+  configs:
+    core:
+      dialect: bigquery

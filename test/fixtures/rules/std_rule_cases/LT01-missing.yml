@@ -1,0 +1,287 @@
+rule: LT01
+
+test_pass_tsql_values_alias_columns:
+  pass_str: SELECT * FROM (VALUES (1, 2)) AS t(a, b);
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_tsql_alias_columns_preserve_newline:
+  pass_str: |
+    SELECT * FROM (VALUES (1, 2)) AS t
+    (a, b);
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_tsql_values_alias_columns_excess_space:
+  fail_str: SELECT * FROM (VALUES (1, 2)) AS t  (a, b);
+  fix_str: SELECT * FROM (VALUES (1, 2)) AS t(a, b);
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_no_space_after_using_clause:
+  fail_str: select * from a JOIN b USING(x)
+  fix_str: select * from a JOIN b USING (x)
+
+test_pass_newline_after_using_clause:
+  # Check LT01 passes if there's a newline between
+  pass_str: |
+    select * from a JOIN b USING
+    (x)
+
+test_fail_cte_no_space_after_as:
+  # Check fixing of single space rule when space is missing
+  fail_str: WITH a AS(select 1) select * from a
+  fix_str: WITH a AS (select 1) select * from a
+
+test_fail_multiple_spaces_after_as:
+  # Check fixing of single space rule on multiple spaces
+  fail_str: WITH a AS  (select 1) select * from a
+  fix_str: WITH a AS (select 1) select * from a
+
+test_fail_cte_newline_after_as:
+  # Check fixing of replacing newline with space
+  fail_str: |
+    WITH a AS
+    (
+      select 1
+    )
+    select * from a
+  fix_str: |
+    WITH a AS (
+      select 1
+    )
+    select * from a
+
+test_fail_cte_newline_and_spaces_after_as:
+  # Check stripping newlines and extra whitespace
+  fail_str: |
+    WITH a AS
+
+
+        (
+      select 1
+    )
+    select * from a
+  fix_str: |
+    WITH a AS (
+      select 1
+    )
+    select * from a
+
+test_pass_tsql_table_alias_column_list_touching:
+  # T-SQL table-valued methods use a touching column alias list, e.g. r(c).
+  # https://github.com/sqlfluff/sqlfluff/issues/6733
+  pass_str: |
+    DECLARE @xml XML = '<rows><row><column>asdf</column></row></rows>';
+    SELECT r.c.value('column[1]', 'varchar(10)') AS 'Value'
+    FROM @xml.nodes('/rows/row') AS r(c);
+    SELECT * FROM (SELECT 1 AS a, 2 AS b) AS derived(a, b);
+    SELECT * FROM (SELECT 1 AS a, 2 AS b) implicit_alias(a, b);
+  configs:
+    core:
+      dialect: tsql
+
+test_fail_tsql_table_alias_column_list_spaced:
+  fail_str: SELECT * FROM (SELECT 1 AS a) AS spaced_alias (a);
+  fix_str: SELECT * FROM (SELECT 1 AS a) AS spaced_alias(a);
+  configs:
+    core:
+      dialect: tsql
+
+test_pass_tsql_table_alias_column_list_spacing_override:
+  pass_str: SELECT * FROM (SELECT 1 AS a) AS spaced_alias (a);
+  configs:
+    core:
+      dialect: tsql
+    layout:
+      type:
+        alias_column_list:
+          spacing_before: any
+
+test_pass_cte_comment_after_as:
+  # https://github.com/sqlfluff/sqlfluff/issues/6125
+  # When handling the 'single:inline' constraint,
+  # prohibit stripping newlines after comment segments.
+  pass_str: |
+    WITH
+    a AS -- comment
+    (
+    select 1
+    )
+    select * from a
+
+test_fail_postgres_cycle_clause_with_blank_line:
+  # PostgreSQL CYCLE clause should be on same line as closing bracket
+  # LT01 should remove blank lines and add single space between ) and CYCLE
+  fail_str: |
+    WITH RECURSIVE t (n) AS (
+        VALUES (1)
+        UNION ALL
+        SELECT n + 1 FROM t
+        WHERE n < 10
+    )
+
+    CYCLE n SET is_cycle USING path
+    SELECT * FROM t;
+  fix_str: |
+    WITH RECURSIVE t (n) AS (
+        VALUES (1)
+        UNION ALL
+        SELECT n + 1 FROM t
+        WHERE n < 10
+    ) CYCLE n SET is_cycle USING path
+    SELECT * FROM t;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_cycle_clause:
+  # PostgreSQL CYCLE clause correctly formatted
+  pass_str: |
+    WITH RECURSIVE t (n) AS (
+        VALUES (1)
+        UNION ALL
+        SELECT n + 1 FROM t
+        WHERE n < 10
+    ) CYCLE n SET is_cycle USING path
+    SELECT * FROM t;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_search_clause:
+  # PostgreSQL SEARCH clause correctly formatted
+  pass_str: |
+    WITH RECURSIVE t (id, link) AS (
+        SELECT id, link FROM tree
+        UNION ALL
+        SELECT t.id, t.link FROM tree t, t st WHERE t.id = st.link
+    ) SEARCH DEPTH FIRST BY id SET ordercol
+    SELECT * FROM t;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_oracle_bind_variable_into_clause:
+  # Oracle trigger correlation variables (:NEW, :OLD) and bind variables
+  # must not trigger LT01 spacing violations.  The natural space before ":"
+  # should be kept and there must be no space between ":" and the name.
+  pass_str: |
+    BEGIN
+        SELECT seq.NEXTVAL INTO :NEW.col FROM DUAL;
+    END;
+  configs:
+    core:
+      dialect: oracle
+
+test_fail_oracle_bind_variable_no_space_before_colon:
+  # Missing space before bind-variable colon should be flagged and fixed.
+  fail_str: |
+    BEGIN
+        SELECT seq.NEXTVAL INTO:NEW.col FROM DUAL;
+    END;
+  fix_str: |
+    BEGIN
+        SELECT seq.NEXTVAL INTO :NEW.col FROM DUAL;
+    END;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_bind_variable_simple:
+  pass_str: SELECT :var FROM DUAL;
+  configs:
+    core:
+      dialect: oracle
+
+# Substitution variable tests (&var, &&var)
+test_pass_oracle_substitution_variable_single:
+  # &var should have no internal spaces.
+  pass_str: SELECT &col FROM DUAL;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_substitution_variable_double:
+  # &&var should have no internal spaces.
+  pass_str: SELECT &&col FROM DUAL;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_substitution_variable_in_where:
+  pass_str: SELECT * FROM employees WHERE department_id = &dept_id;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_substitution_variable_as_table:
+  pass_str: SELECT * FROM &table_name;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_substitution_variable_positional:
+  # Positional substitution variables (&1, &&1) are substituted from the
+  # arguments passed to the calling script - see
+  # https://github.com/sqlfluff/sqlfluff/issues/8074
+  pass_str: SELECT &1, &&2 FROM employees WHERE department_id = &3;
+  configs:
+    core:
+      dialect: oracle
+
+test_pass_oracle_substitution_variable_concatenated:
+  # A substitution variable concatenated to surrounding text (here inside a
+  # script file name run with "@") must not require whitespace around the
+  # ampersand - see https://github.com/sqlfluff/sqlfluff/issues/8074
+  pass_str: "@LOGANALYZER_&&CLIENT_OS..SQL &&1. &&2."
+  configs:
+    core:
+      dialect: oracle
+
+# psql client variable interpolation (:var, :'var', :"var") must not be
+# broken by LT01 - see https://github.com/sqlfluff/sqlfluff/issues/6686
+test_pass_postgres_psql_variable_naked:
+  pass_str: |
+    SELECT count(*)
+    FROM foo
+    WHERE status = :status;
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_psql_variable_quoted_literal:
+  pass_str: |
+    SELECT count(*)
+    FROM foo
+    WHERE status = :'status';
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_psql_variable_quoted_identifier:
+  pass_str: |
+    SELECT count(*)
+    FROM foo
+    WHERE status = :"status";
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_postgres_psql_variable_excess_space_before_colon:
+  # Excess whitespace before the variable should be collapsed to a single
+  # space (as normal), while the colon and variable name must stay touching.
+  fail_str: |
+    SELECT count(*)
+    FROM foo
+    WHERE status =    :status;
+  fix_str: |
+    SELECT count(*)
+    FROM foo
+    WHERE status = :status;
+  configs:
+    core:
+      dialect: postgres

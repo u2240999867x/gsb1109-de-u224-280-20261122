@@ -1,0 +1,293 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 9caf4e6077d0587e5054ed4489a37f0bb4dc42b74cc8d018cc10dc9615146ab6
+file:
+- statement:
+    select_statement:
+      select_clause:
+      - keyword: select
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_query
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                    naked_identifier: payload
+              - keyword: format
+              - keyword: json
+              - comma: ','
+              - expression:
+                  quoted_literal: "'lax $.unstructured.abcd[*].field?(@ > 0.5)'"
+              - keyword: with
+              - keyword: array
+              - keyword: wrapper
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_query
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                    naked_identifier: payload
+              - keyword: format
+              - keyword: json
+              - keyword: encoding
+              - keyword: utf8
+              - comma: ','
+              - expression:
+                  quoted_literal: "'lax $.unstructured.abcd[*].field?(@ > 0.5)'"
+              - keyword: without
+              - keyword: array
+              - keyword: wrapper
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_query
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                    naked_identifier: payload
+              - keyword: format
+              - keyword: json
+              - keyword: encoding
+              - keyword: utf16
+              - comma: ','
+              - expression:
+                  quoted_literal: "'lax $.unstructured.abcd[*].field?(@ > 0.5)'"
+              - keyword: with
+              - keyword: conditional
+              - keyword: wrapper
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_query
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                    naked_identifier: payload
+              - keyword: format
+              - keyword: json
+              - keyword: encoding
+              - keyword: utf32
+              - comma: ','
+              - expression:
+                  quoted_literal: "'lax $.unstructured.abcd[*].field?(@ > 0.5)'"
+              - keyword: with
+              - keyword: unconditional
+              - keyword: array
+              - keyword: wrapper
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_query
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  column_reference:
+                    naked_identifier: payload
+              - keyword: format
+              - keyword: json
+              - comma: ','
+              - expression:
+                  quoted_literal: "'lax $.unstructured.abcd[*].field?(@ > 0.5)'"
+              - end_bracket: )
+- statement_terminator: ;
+- statement:
+    select_statement:
+      select_clause:
+      - keyword: select
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_array
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  numeric_literal: '2'
+              - comma: ','
+              - expression:
+                  numeric_literal: '3'
+              - keyword: 'null'
+              - keyword: 'on'
+              - keyword: 'null'
+              - keyword: returning
+              - data_type:
+                  primitive_type:
+                    keyword: varbinary
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_array
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  numeric_literal: '2'
+              - comma: ','
+              - expression:
+                  numeric_literal: '3'
+              - keyword: absent
+              - keyword: 'on'
+              - keyword: 'null'
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_array
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  numeric_literal: '2'
+              - comma: ','
+              - expression:
+                  numeric_literal: '3'
+              - keyword: returning
+              - data_type:
+                  primitive_type:
+                    keyword: json
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_array
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  numeric_literal: '2'
+              - comma: ','
+              - expression:
+                  numeric_literal: '3'
+              - keyword: 'null'
+              - keyword: 'on'
+              - keyword: 'null'
+              - keyword: returning
+              - data_type:
+                  primitive_type:
+                    keyword: json
+              - keyword: format
+              - keyword: json
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_array
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  numeric_literal: '2'
+              - comma: ','
+              - expression:
+                  numeric_literal: '3'
+              - keyword: 'null'
+              - keyword: 'on'
+              - keyword: 'null'
+              - keyword: returning
+              - data_type:
+                  primitive_type:
+                    keyword: varchar
+              - keyword: format
+              - keyword: json
+              - keyword: encoding
+              - keyword: utf8
+              - end_bracket: )
+- statement_terminator: ;
+- statement:
+    select_statement:
+      select_clause:
+      - keyword: select
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_object
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  quoted_literal: "'key1'"
+              - colon_delimiter: ':'
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  quoted_literal: "'key2'"
+              - colon_delimiter: ':'
+              - expression:
+                  boolean_literal: 'true'
+              - end_bracket: )
+      - comma: ','
+      - select_clause_element:
+          function:
+            function_name:
+              function_name_identifier: json_object
+            function_contents:
+              bracketed:
+              - start_bracket: (
+              - expression:
+                  quoted_literal: "'key1'"
+              - colon_delimiter: ':'
+              - expression:
+                  numeric_literal: '1'
+              - comma: ','
+              - expression:
+                  quoted_literal: "'key2'"
+              - colon_delimiter: ':'
+              - expression:
+                  boolean_literal: 'true'
+              - keyword: 'null'
+              - keyword: 'on'
+              - keyword: 'null'
+              - keyword: returning
+              - data_type:
+                  primitive_type:
+                    keyword: varchar
+              - keyword: format
+              - keyword: json
+              - keyword: encoding
+              - keyword: utf8
+              - end_bracket: )
+- statement_terminator: ;

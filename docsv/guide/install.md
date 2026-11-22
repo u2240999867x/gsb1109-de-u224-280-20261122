@@ -1,0 +1,90 @@
+# Installation Guide
+
+To get started with *SQLFluff* you'll need `python` and `pip` installed
+on your machine, if you're already set up, you can skip straight to
+[Installing sqlfluff](#installing-sqlfluff).
+
+## Installing Python
+
+How to install `python` and `pip` depends on what operating system
+you're using. In any case, the python wiki provides up to date
+[instructions for all platforms here](https://wiki.python.org/moin/BeginnersGuide/Download).
+
+There's a chance that you'll be offered the choice between `python`
+versions. Support for python 2 was dropped in early 2020, so you
+should always opt for a version number starting with a 3. As for
+more specific options beyond that, *SQLFluff* aims to be compatible
+with all current python versions, and so it's best to pick the most
+recent.
+
+You can confirm that python is working as expected by heading to
+your terminal or console of choice and typing `python --version`
+which should give you a sensible read out and not an error.
+
+```bash
+python --version
+Python 3.9.1
+```
+
+For most people, their installation of python will come with
+`pip` (the python package manager) preinstalled. To confirm
+this you can type `pip --version` similar to python above.
+
+```bash
+pip --version
+pip 21.3.1 from
+```
+
+If however, you do have python installed but not `pip`, then
+the best instructions for what to do next are [on the python website](https://pip.pypa.io/en/stable/installation/).
+
+## Installing SQLFluff
+
+Assuming that python and pip are already installed, then installing
+*SQLFluff* is straightforward.
+
+```bash
+pip install sqlfluff
+```
+
+If you want the optional Rust-backed parser and lexer, install the `rs` extra:
+
+```bash
+pip install sqlfluff[rs]
+```
+
+On supported CPython 3.10+ platforms this installs a prebuilt ABI3 wheel. If a
+wheel is not available for your platform, architecture, or Python
+implementation, `pip` falls back to building `sqlfluffrs` from source. In that
+case you will need a Rust toolchain and a working native build toolchain for
+your platform. The easiest way to install Rust is via [rustup](https://rustup.rs/).
+
+You can confirm its installation by getting *SQLFluff* to show its
+version number.
+
+```bash
+sqlfluff version
+```
+
+This prints the version installed on your machine.
+
+## Going further
+
+From here, there are several more things to explore.
+
+* To understand how *SQLFluff* is interpreting your file
+  explore the `parse` command. You can learn more about
+  that command and more by running `sqlfluff --help` or
+  `sqlfluff parse --help`.
+* To start linting more than just one file at a time, experiment
+  with passing SQLFluff directories rather than just single files.
+  Try running `sqlfluff lint .` (to lint every sql file in the
+  current folder) or `sqlfluff lint path/to/my/sqlfiles`.
+* To find out more about which rules are available, see [Rules Reference](/reference/rules/index).
+* To find out more about configuring *SQLFluff* and what other options
+  are available, see [Configuration](/configuration/).
+* Once you're ready to start using *SQLFluff* on a project or with the
+  rest of your team, check out [Team Rollout](/usage/team-rollout).
+
+If you encounter a bug or unexpected behaviour, the best place to report
+it is [GitHub Issues](https://github.com/sqlfluff/sqlfluff/issues).

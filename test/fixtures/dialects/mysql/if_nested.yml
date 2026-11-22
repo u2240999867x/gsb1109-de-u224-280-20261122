@@ -1,0 +1,108 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 08414dfdca5375d7361fe018c33a94540a9dce69d1814e06a82c5ce2efbc4212
+file:
+- statement:
+    if_then_statement:
+    - keyword: if
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: x
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '0'
+          end_bracket: )
+    - keyword: then
+    - statement_list:
+      - statement:
+          select_statement:
+            select_clause:
+              keyword: select
+              select_clause_element:
+                numeric_literal: '0'
+      - statement_terminator: ;
+      - statement:
+          if_then_statement:
+          - keyword: if
+          - expression:
+              bracketed:
+                start_bracket: (
+                expression:
+                  column_reference:
+                    naked_identifier: y
+                  comparison_operator:
+                    raw_comparison_operator: '='
+                  numeric_literal: '1'
+                end_bracket: )
+          - keyword: then
+          - statement_list:
+            - statement:
+                set_statement:
+                  keyword: set
+                  variable: '@errmsg'
+                  comparison_operator:
+                    raw_comparison_operator: '='
+                  quoted_literal: "''"
+            - statement_terminator: ;
+            - statement:
+                select_statement:
+                  select_clause:
+                    keyword: select
+                    select_clause_element:
+                      numeric_literal: '1'
+            - statement_terminator: ;
+          - keyword: end
+          - keyword: if
+      - statement_terminator: ;
+    - keyword: end
+    - keyword: if
+- statement_terminator: ;
+- statement:
+    if_then_statement:
+    - keyword: if
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: x
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '0'
+          end_bracket: )
+    - keyword: then
+    - statement_list:
+        statement:
+          select_statement:
+            select_clause:
+              keyword: select
+              select_clause_element:
+                expression:
+                  case_expression:
+                  - keyword: case
+                  - when_clause:
+                    - keyword: when
+                    - expression:
+                        column_reference:
+                          naked_identifier: a
+                        comparison_operator:
+                          raw_comparison_operator: '='
+                        numeric_literal: '1'
+                    - keyword: then
+                    - expression:
+                        numeric_literal: '1'
+                  - else_clause:
+                      keyword: else
+                      expression:
+                        numeric_literal: '2'
+                  - keyword: end
+        statement_terminator: ;
+    - keyword: end
+    - keyword: if
+- statement_terminator: ;

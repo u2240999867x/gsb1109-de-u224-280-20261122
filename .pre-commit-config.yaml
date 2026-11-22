@@ -1,0 +1,82 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+      # If adding any exceptions here, make sure to add them to .editorconfig as well
+      - id: end-of-file-fixer
+        exclude: |
+          (?x)^
+          (
+            test/fixtures/templater/jinja_l_metas/0(0[134578]|11).sql|
+            test/fixtures/linter/sqlfluffignore/[^/]*/[^/]*.sql|
+            test/fixtures/config/inheritance_b/(nested/)?example.sql|
+            (.*)/trailing_newlines.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/dbt_project/models/my_new_project/multiple_trailing_newline.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/templated_output/macro_in_macro.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/templated_output/(dbt_utils_0.8.0/)?last_day.sql|
+            test/fixtures/linter/indentation_errors.sql|
+            test/fixtures/templater/jinja_d_roundtrip/test.sql|
+            test/fixtures/linter/autofix/ansi/036_long_order_by_semicolon_without_final_newline/(before|after).sql
+          )$
+      - id: trailing-whitespace
+        exclude: |
+          (?x)^(
+            test/fixtures/linter/indentation_errors.sql|
+            test/fixtures/templater/jinja_d_roundtrip/test.sql|
+            test/fixtures/config/inheritance_b/example.sql|
+            test/fixtures/config/inheritance_b/nested/example.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/templated_output/macro_in_macro.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/templated_output/last_day.sql|
+            plugins/sqlfluff-templater-dbt/test/fixtures/dbt.*/templated_output/dbt_utils_0.8.0/last_day.sql|
+            test/fixtures/linter/sqlfluffignore/
+          )$
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          # NOTE: These dependencies should be the same as the `types-*` dependencies in
+          # `requirements_dev.txt`. If you update these, make sure to update those too.
+          [
+            types-toml,
+            types-chardet,
+            types-colorama,
+            types-pyyaml,
+            types-regex,
+            types-tqdm,
+            # Type stubs are obvious to import, but some dependencies also define their own
+            # types directly (e.g. jinja). pre-commit doesn't actually install the python
+            # package, and so doesn't automatically install the dependencies from
+            # `pyproject.toml` either. We include them here to make sure mypy can function
+            # properly.
+            jinja2,
+            pathspec,
+            pytest,  # and by extension... pluggy
+            click,
+            platformdirs,
+          ]
+        files: ^src/sqlfluff/.*
+        # The mypy pre-commit hook by default sets a few arguments that we don't normally
+        # use. To undo that we reset the `args` to be empty here. This is important to
+        # ensure we don't get conflicting  results from the pre-commit hook and from the
+        # CI job.
+        args: []
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args: [-c=.yamllint]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: "v0.15.5"
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        exclude: (?x)^(test/fixtures/.*|pyproject.toml|docsv/pnpm-lock.yaml)$
+        additional_dependencies: [tomli]

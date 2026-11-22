@@ -1,0 +1,164 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: b19bacf50376d28a073039f3e6bf3de2267fc8dd758648579425addf890c39a1
+file:
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t1
+    - bracketed:
+        start_bracket: (
+        column_definition:
+        - naked_identifier: col1
+        - data_type:
+            data_type_identifier: VARCHAR
+            bracketed_arguments:
+              bracketed:
+                start_bracket: (
+                numeric_literal: '5'
+                end_bracket: )
+        - column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - character_set: latin1
+        - column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              naked_identifier: latin1_german1_ci
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t1
+    - bracketed:
+        start_bracket: (
+        column_definition:
+        - naked_identifier: col1
+        - data_type:
+            data_type_identifier: VARCHAR
+            bracketed_arguments:
+              bracketed:
+                start_bracket: (
+                numeric_literal: '5'
+                end_bracket: )
+        - column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - quoted_identifier: '`latin1`'
+        - column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              quoted_identifier: '`latin1_german1_ci`'
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t1
+    - bracketed:
+        start_bracket: (
+        column_definition:
+        - naked_identifier: col1
+        - data_type:
+            data_type_identifier: VARCHAR
+            bracketed_arguments:
+              bracketed:
+                start_bracket: (
+                numeric_literal: '5'
+                end_bracket: )
+        - column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - quoted_identifier: "'latin1'"
+        - column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              quoted_literal: "'latin1_german1_ci'"
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t1
+    - bracketed:
+        start_bracket: (
+        column_definition:
+        - naked_identifier: col1
+        - data_type:
+            data_type_identifier: VARCHAR
+            bracketed_arguments:
+              bracketed:
+                start_bracket: (
+                numeric_literal: '5'
+                end_bracket: )
+        - column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - quoted_identifier: '"latin1"'
+        - column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              quoted_literal: '"latin1_german1_ci"'
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t2
+    - bracketed:
+        start_bracket: (
+        column_definition:
+        - naked_identifier: col1
+        - data_type:
+            data_type_identifier: TEXT
+        - column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - character_set: ascii
+        - column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              naked_identifier: ascii_bin
+        end_bracket: )
+- statement_terminator: ;
+- statement:
+    create_table_statement:
+    - keyword: CREATE
+    - keyword: TABLE
+    - table_reference:
+        naked_identifier: t3
+    - bracketed:
+      - start_bracket: (
+      - column_definition:
+          naked_identifier: col1
+          data_type:
+            data_type_identifier: TEXT
+          column_constraint_segment:
+          - keyword: CHARACTER
+          - keyword: SET
+          - keyword: binary
+      - comma: ','
+      - column_definition:
+          naked_identifier: col2
+          data_type:
+            data_type_identifier: TEXT
+          column_constraint_segment:
+            keyword: COLLATE
+            collation_reference:
+              keyword: binary
+      - end_bracket: )
+- statement_terminator: ;

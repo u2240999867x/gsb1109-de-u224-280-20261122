@@ -1,0 +1,213 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: c7b979cfe81e5b4c06f38cb7be34874462d4adac02a157ce0b1f9410752d20a0
+file:
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: insert_data
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            keyword: integer
+        - comma: ','
+        - data_type:
+            keyword: integer
+        - end_bracket: )
+    - keyword: RENAME
+    - keyword: TO
+    - function_name:
+        function_name_identifier: insert_record
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: insert_data
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            keyword: integer
+        - comma: ','
+        - data_type:
+            keyword: integer
+        - end_bracket: )
+    - keyword: OWNER
+    - keyword: TO
+    - role_reference:
+        naked_identifier: joe
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: insert_data
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            keyword: integer
+        - comma: ','
+        - data_type:
+            keyword: integer
+        - end_bracket: )
+    - keyword: OWNER
+    - keyword: TO
+    - keyword: CURRENT_USER
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: insert_data
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            keyword: integer
+        - comma: ','
+        - data_type:
+            keyword: integer
+        - end_bracket: )
+    - keyword: SET
+    - keyword: SCHEMA
+    - schema_reference:
+        naked_identifier: accounting
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: insert_data
+    - function_parameter_list:
+        bracketed:
+        - start_bracket: (
+        - data_type:
+            keyword: integer
+        - comma: ','
+        - data_type:
+            keyword: integer
+        - end_bracket: )
+    - keyword: DEPENDS
+    - keyword: 'ON'
+    - keyword: EXTENSION
+    - extension_reference:
+        naked_identifier: myext
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: check_password
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          data_type:
+            keyword: text
+          end_bracket: )
+    - alter_procedure_action_segment:
+      - keyword: SET
+      - parameter: search_path
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - naked_identifier: admin
+      - comma: ','
+      - naked_identifier: pg_temp
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: check_password
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          data_type:
+            keyword: text
+          end_bracket: )
+    - alter_procedure_action_segment:
+        keyword: RESET
+        parameter: search_path
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: check_password
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          data_type:
+            keyword: text
+          end_bracket: )
+    - alter_procedure_action_segment:
+      - keyword: SECURITY
+      - keyword: DEFINER
+      - keyword: SET
+      - parameter: search_path
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - naked_identifier: admin
+      - comma: ','
+      - naked_identifier: pg_temp
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: check_password
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          data_type:
+            keyword: text
+          end_bracket: )
+    - alter_procedure_action_segment:
+      - keyword: EXTERNAL
+      - keyword: SECURITY
+      - keyword: INVOKER
+      - keyword: RESET
+      - keyword: ALL
+      - keyword: RESTRICT
+- statement_terminator: ;
+- statement:
+    alter_procedure_statement:
+    - keyword: ALTER
+    - keyword: PROCEDURE
+    - function_name:
+        function_name_identifier: check_password
+    - function_parameter_list:
+        bracketed:
+          start_bracket: (
+          data_type:
+            keyword: text
+          end_bracket: )
+    - alter_procedure_action_segment:
+      - keyword: SET
+      - parameter: search_path
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - quoted_identifier: '"$user"'
+      - comma: ','
+      - naked_identifier: public
+      - keyword: SET
+      - parameter: work_mem
+      - comparison_operator:
+          raw_comparison_operator: '='
+      - quoted_literal: "'1MB'"
+- statement_terminator: ;

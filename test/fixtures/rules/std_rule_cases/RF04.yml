@@ -1,0 +1,281 @@
+rule: RF04
+
+test_pass_valid_identifier:
+  pass_str: CREATE TABLE artist(artist_name TEXT)
+
+test_fail_keyword_as_identifier_column:
+  fail_str: CREATE TABLE artist(create TEXT)
+
+test_fail_keyword_as_identifier_column_alias:
+  fail_str: SELECT 1 as parameter
+
+test_fail_keyword_as_identifier_table_alias:
+  fail_str: SELECT x FROM tbl AS parameter
+
+test_pass_valid_identifier_not_alias:
+  # should pass on default config as not alias
+  pass_str: SELECT parameter
+
+test_fail_keyword_as_identifier_not_alias_all:
+  fail_str: SELECT parameter
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_valid_identifier_table_alias_column_alias_config:
+  pass_str: SELECT x FROM tbl AS parameter
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: column_aliases
+
+test_fail_keyword_as_identifier_column_alias_config:
+  fail_str: SELECT x AS date FROM tbl AS parameter
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: column_aliases
+
+test_fail_keyword_as_column_alias_in_derived_table_config:
+  # A column alias belonging to a derived table's own SELECT is still a
+  # column alias, even though it sits underneath the outer FROM clause.
+  fail_str: SELECT * FROM (SELECT 1 AS date) x
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: column_aliases
+
+test_pass_keyword_as_column_alias_in_derived_table_table_aliases_config:
+  # Under table_aliases the column alias above must NOT be flagged - it is
+  # not a table alias.
+  pass_str: SELECT * FROM (SELECT 1 AS date) x
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: table_aliases
+
+test_fail_keyword_as_derived_table_alias_table_aliases_config:
+  # Here the keyword is the derived table's OWN alias, sitting directly in
+  # the outer from_clause - a genuine table alias, unlike the column-alias
+  # cases above.
+  fail_str: SELECT * FROM (SELECT 1) AS date
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: table_aliases
+
+test_pass_keyword_as_derived_table_alias_column_aliases_config:
+  # Under column_aliases the derived table's own alias above must NOT be
+  # flagged - it is not a column alias.
+  pass_str: SELECT * FROM (SELECT 1) AS date
+  configs:
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: column_aliases
+
+test_pass_valid_quoted_identifier:
+  pass_str: CREATE TABLE [artist]([artist_name] TEXT)
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: aliases
+    core:
+      dialect: tsql
+
+test_fail_keyword_as_quoted_identifier_column:
+  fail_str: CREATE TABLE "artist"("create" TEXT)
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: aliases
+
+test_pass_keyword_as_quoted_identifier_column_none_policy:
+  pass_str: CREATE TABLE "artist"("create" TEXT)
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: none
+
+test_fail_keyword_as_quoted_identifier_column_alias:
+  fail_str: SELECT 1 as [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: aliases
+    core:
+      dialect: tsql
+
+test_fail_keyword_as_quoted_identifier_table_alias:
+  fail_str: SELECT [x] FROM [tbl] AS [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: aliases
+    core:
+      dialect: tsql
+
+test_pass_valid_quoted_identifier_not_alias:
+  # should pass on default config as not alias
+  pass_str: SELECT [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: aliases
+    core:
+      dialect: tsql
+
+test_fail_keyword_as_quoted_identifier_not_alias_all:
+  fail_str: SELECT [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: all
+    core:
+      dialect: tsql
+
+test_pass_valid_quoted_identifier_table_alias_column_alias_config:
+  pass_str: SELECT [x] FROM [tbl] AS [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: column_aliases
+    core:
+      dialect: tsql
+
+test_fail_keyword_as_quoted_identifier_column_alias_config:
+  fail_str: SELECT [x] AS [date] FROM [tbl] AS [parameter]
+  configs:
+    rules:
+      references.keywords:
+        quoted_identifiers_policy: column_aliases
+    core:
+      dialect: tsql
+
+test_pass_ignore_word1:
+  pass_str: CREATE TABLE artist(create TEXT)
+  configs:
+    rules:
+      references.keywords:
+        ignore_words: create
+
+
+test_pass_ignore_word2:
+  pass_str: SELECT col1 AS date FROM table1
+  configs:
+    rules:
+      references.keywords:
+        ignore_words: date
+
+test_pass_ignore_words_regex1:
+  pass_str: CREATE TABLE artist(create TEXT)
+  configs:
+    rules:
+      references.keywords:
+        ignore_words_regex: ^cr
+
+
+test_pass_ignore_words_regex2:
+  pass_str: SELECT col1 AS date FROM table1
+  configs:
+    rules:
+      references.keywords:
+        ignore_words_regex: ^da
+
+test_pass_one_character_identifier:
+  pass_str: SELECT d.col1 FROM table1 d
+  configs:
+    core:
+      dialect: snowflake
+
+test_fail_keyword_as_column_name_postgres:
+  fail_str: CREATE TABLE test_table (type varchar(30) NOT NULL)
+  configs:
+    core:
+      dialect: postgres
+
+# --- MySQL/MariaDB charset & collation names are not user identifiers ---
+# With unquoted_identifiers_policy=all, charset/collation names that happen to be
+# keywords (e.g. `ascii`) must not be flagged: they are matched as dedicated
+# character_set / keyword segments, not naked identifiers.
+
+test_pass_mysql_column_charset_keyword_name:
+  pass_str: CREATE TABLE t (col1 TEXT CHARACTER SET ascii COLLATE ascii_bin)
+  configs:
+    core:
+      dialect: mysql
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_mysql_alter_convert_charset_keyword_name:
+  pass_str: ALTER TABLE t CONVERT TO CHARACTER SET ascii
+  configs:
+    core:
+      dialect: mysql
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_mysql_alter_default_charset_keyword_name:
+  pass_str: ALTER TABLE t DEFAULT CHARACTER SET ascii
+  configs:
+    core:
+      dialect: mysql
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_mariadb_column_charset_keyword_name:
+  pass_str: CREATE TABLE t (col1 TEXT CHARACTER SET ascii COLLATE ascii_bin)
+  configs:
+    core:
+      dialect: mariadb
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+# Guard: a real keyword used as a column name must still be flagged, i.e. the
+# charset fix did not broaden the rule away from genuine misuse.
+test_fail_mysql_keyword_column_name_still_flagged:
+  fail_str: CREATE TABLE t (ascii TEXT)
+  configs:
+    core:
+      dialect: mysql
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_postgres_provider_column_name:
+  # `provider` is not a PostgreSQL keyword. It's an option name in
+  # `CREATE COLLATION`, which is why it used to be listed as one, and that
+  # made RF04 flag it as an identifier. See #7823.
+  pass_str: CREATE TABLE test (provider TEXT NOT NULL)
+  configs:
+    core:
+      dialect: postgres
+
+test_fail_postgres_keyword_column_name_still_flagged:
+  # Guard: a real PostgreSQL keyword used as a column name is still flagged.
+  fail_str: CREATE TABLE test (user TEXT NOT NULL)
+  configs:
+    core:
+      dialect: postgres
+
+test_pass_postgres_collation_words_as_columns:
+  # These are collation option values/names, not PostgreSQL keywords.
+  pass_str: SELECT icu, libc, deterministic FROM test
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.keywords:
+        unquoted_identifiers_policy: all
+
+test_pass_postgres_collation_words_as_column_definitions:
+  # `icu` and `libc` are values for the locale provider, not PostgreSQL
+  # keywords, so they're fine as column names under the default policy too.
+  pass_str: CREATE TABLE t (icu text, libc text)
+  configs:
+    core:
+      dialect: postgres

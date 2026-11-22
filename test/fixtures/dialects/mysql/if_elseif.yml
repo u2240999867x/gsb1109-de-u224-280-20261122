@@ -1,0 +1,91 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: b537cecc01f455dbc596a15b5b07fd9b24a4def22c59cd270da5a6cd03b56845
+file:
+  statement:
+    if_then_statement:
+    - keyword: if
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: x
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '0'
+          end_bracket: )
+    - keyword: then
+    - statement_list:
+      - statement:
+          set_statement:
+            keyword: set
+            variable: '@errmsg'
+            comparison_operator:
+              raw_comparison_operator: '='
+            quoted_literal: "''"
+      - statement_terminator: ;
+      - statement:
+          select_statement:
+            select_clause:
+              keyword: select
+              select_clause_element:
+                numeric_literal: '1'
+      - statement_terminator: ;
+    - keyword: elseif
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: x
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+          end_bracket: )
+    - keyword: then
+    - statement_list:
+        statement:
+          set_statement:
+            keyword: set
+            variable: _test
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+        statement_terminator: ;
+    - keyword: elseif
+    - expression:
+        bracketed:
+          start_bracket: (
+          expression:
+            column_reference:
+              naked_identifier: x
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '2'
+          end_bracket: )
+    - keyword: then
+    - statement_list:
+        statement:
+          set_statement:
+            keyword: set
+            variable: _test
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '2'
+        statement_terminator: ;
+    - keyword: else
+    - statement_list:
+        statement:
+          select_statement:
+            select_clause:
+              keyword: select
+              select_clause_element:
+                numeric_literal: '2'
+        statement_terminator: ;
+    - keyword: end
+    - keyword: if
+  statement_terminator: ;

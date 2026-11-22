@@ -1,0 +1,8 @@
+[package]
+name = "sqlfluffrs_dialects"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+sqlfluffrs_types = { path = "../sqlfluffrs_types" }

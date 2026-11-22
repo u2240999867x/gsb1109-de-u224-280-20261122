@@ -1,0 +1,298 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 4e049f770b344894fbe1e7505b3786b715c1695d68808a96b0525c339ba6d52f
+file:
+- statement:
+    explain_statement:
+      keyword: explain
+      select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: explain
+      update_statement:
+        keyword: update
+        table_reference:
+          naked_identifier: tbl
+        set_clause_list:
+          keyword: set
+          set_clause:
+            column_reference:
+              naked_identifier: foo
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+        where_clause:
+          keyword: where
+          expression:
+            column_reference:
+              naked_identifier: bar
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '2'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: explain
+      delete_statement:
+        keyword: delete
+        from_clause:
+          keyword: from
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: tbl
+        where_clause:
+          keyword: where
+          expression:
+            column_reference:
+              naked_identifier: foo
+            comparison_operator:
+              raw_comparison_operator: '='
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: explain
+      insert_statement:
+      - keyword: insert
+      - keyword: into
+      - table_reference:
+          naked_identifier: tbl
+      - bracketed:
+          start_bracket: (
+          column_reference:
+            naked_identifier: col1
+          end_bracket: )
+      - values_clause:
+          keyword: values
+          bracketed:
+            start_bracket: (
+            numeric_literal: '123'
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: explain
+      replace_statement:
+      - keyword: replace
+      - keyword: into
+      - table_reference:
+          naked_identifier: tbl
+      - bracketed:
+          start_bracket: (
+          column_reference:
+            naked_identifier: col1
+          end_bracket: )
+      - values_clause:
+          keyword: values
+          bracketed:
+            start_bracket: (
+            numeric_literal: '123'
+            end_bracket: )
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: explain
+      table_reference:
+        naked_identifier: tbl
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: describe
+      table_reference:
+        naked_identifier: tbl
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: desc
+      table_reference:
+        naked_identifier: tbl
+      column_reference:
+        naked_identifier: col1
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: describe
+      table_reference:
+        naked_identifier: tbl
+      quoted_literal: "'col%'"
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: describe
+      select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: json
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: tree
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: from
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: tbl
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: traditional
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: analyze
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: from
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: tbl
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: analyze
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: tree
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: json
+    - keyword: into
+    - variable: '@plan'
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: for
+    - keyword: connection
+    - numeric_literal: '4'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: json
+    - keyword: for
+    - keyword: connection
+    - numeric_literal: '4'
+- statement_terminator: ;
+- statement:
+    explain_statement:
+      keyword: describe
+      table_reference:
+        naked_identifier: tbl
+      column_reference:
+        naked_identifier: col1
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: for
+    - keyword: schema
+    - database_reference:
+        naked_identifier: db1
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            wildcard_expression:
+              wildcard_identifier:
+                star: '*'
+        from_clause:
+          keyword: from
+          from_expression:
+            from_expression_element:
+              table_expression:
+                table_reference:
+                  naked_identifier: tbl
+- statement_terminator: ;
+- statement:
+    explain_statement:
+    - keyword: explain
+    - keyword: format
+    - comparison_operator:
+        raw_comparison_operator: '='
+    - keyword: json
+    - keyword: for
+    - keyword: database
+    - database_reference:
+        naked_identifier: db1
+    - select_statement:
+        select_clause:
+          keyword: select
+          select_clause_element:
+            numeric_literal: '1'
+- statement_terminator: ;

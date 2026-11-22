@@ -1,0 +1,204 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: b43ed5e30b7222a9591ba114f3ad87609d2353ad2653bb5860b426b07ae1200b
+file:
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYSE
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - keyword: VERBOSE
+    - table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: VERBOSE
+      - comma: ','
+      - keyword: SKIP_LOCKED
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: VERBOSE
+      - boolean_literal: 'FALSE'
+      - comma: ','
+      - keyword: SKIP_LOCKED
+      - boolean_literal: 'TRUE'
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: SKIP_LOCKED
+      - comma: ','
+      - keyword: VERBOSE
+      - boolean_literal: 'FALSE'
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - keyword: VERBOSE
+    - table_reference:
+        naked_identifier: foo
+    - bracketed:
+      - start_bracket: (
+      - column_reference:
+          naked_identifier: bar
+      - comma: ','
+      - column_reference:
+          naked_identifier: bat
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - table_reference:
+        naked_identifier: foo
+    - bracketed:
+      - start_bracket: (
+      - column_reference:
+          naked_identifier: bar
+      - comma: ','
+      - column_reference:
+          naked_identifier: bat
+      - end_bracket: )
+    - comma: ','
+    - table_reference:
+        naked_identifier: foo2
+    - bracketed:
+      - start_bracket: (
+      - column_reference:
+          naked_identifier: bar2
+      - comma: ','
+      - column_reference:
+          naked_identifier: bat2
+      - end_bracket: )
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: VERBOSE
+      - keyword: 'ON'
+      - comma: ','
+      - keyword: SKIP_LOCKED
+      - keyword: 'OFF'
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: VERBOSE
+      - numeric_literal: '1'
+      - comma: ','
+      - keyword: SKIP_LOCKED
+      - numeric_literal: '0'
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+        start_bracket: (
+        keyword: BUFFER_USAGE_LIMIT
+        numeric_literal: '256'
+        end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+      keyword: ANALYZE
+      bracketed:
+      - start_bracket: (
+      - keyword: BUFFER_USAGE_LIMIT
+      - quoted_literal: "'1MB'"
+      - comma: ','
+      - keyword: VERBOSE
+      - end_bracket: )
+      table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - keyword: ONLY
+    - table_reference:
+        naked_identifier: foo
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - keyword: VERBOSE
+    - keyword: ONLY
+    - table_reference:
+        naked_identifier: foo
+    - bracketed:
+      - start_bracket: (
+      - column_reference:
+          naked_identifier: bar
+      - comma: ','
+      - column_reference:
+          naked_identifier: bat
+      - end_bracket: )
+    - comma: ','
+    - table_reference:
+        naked_identifier: foo2
+    - star: '*'
+- statement_terminator: ;
+- statement:
+    analyze_statement:
+    - keyword: ANALYZE
+    - bracketed:
+        start_bracket: (
+        keyword: SKIP_LOCKED
+        end_bracket: )
+    - keyword: ONLY
+    - table_reference:
+        naked_identifier: foo
+    - comma: ','
+    - keyword: ONLY
+    - table_reference:
+        naked_identifier: foo2
+    - bracketed:
+        start_bracket: (
+        column_reference:
+          naked_identifier: bar2
+        end_bracket: )
+- statement_terminator: ;

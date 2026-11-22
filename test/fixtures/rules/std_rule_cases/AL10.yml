@@ -1,0 +1,292 @@
+rule: AL10
+
+# Derived table (subquery) without an alias should fail.
+test_fail_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+
+# Derived table with an alias should pass.
+test_pass_derived_table_with_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    ) AS derived
+
+# Derived table with implicit alias (no AS keyword) should pass.
+test_pass_derived_table_with_implicit_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    ) derived
+
+# Regular table reference (not a derived table) should pass.
+test_pass_plain_table:
+  pass_str: SELECT * FROM my_table
+
+# Derived table with UNION should fail without alias.
+test_fail_union_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+        UNION ALL
+        SELECT 2 AS a
+    )
+
+# Derived table with UNION and alias should pass.
+test_pass_union_derived_table_with_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+        UNION ALL
+        SELECT 2 AS a
+    ) AS combined
+
+# Subquery in JOIN without alias should fail.
+test_fail_derived_table_in_join_no_alias:
+  fail_str: |
+    SELECT *
+    FROM my_table
+    JOIN (
+        SELECT id FROM other_table
+    ) ON my_table.id = id
+
+# Subquery in JOIN with alias should pass.
+test_pass_derived_table_in_join_with_alias:
+  pass_str: |
+    SELECT *
+    FROM my_table
+    JOIN (
+        SELECT id FROM other_table
+    ) AS sub ON my_table.id = sub.id
+
+# Subquery in LEFT JOIN without alias should fail.
+test_fail_derived_table_in_left_join_no_alias:
+  fail_str: |
+    SELECT *
+    FROM my_table
+    LEFT JOIN (
+        SELECT id, value FROM other_table
+    ) ON my_table.id = id
+
+# CTE is fine (not a derived table in FROM).
+test_pass_cte:
+  pass_str: |
+    WITH cte AS (
+        SELECT 1 AS a
+    )
+    SELECT * FROM cte
+
+# Nested derived table: outer has alias, inner missing alias should fail.
+test_fail_nested_derived_table_inner_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT *
+        FROM (
+            SELECT 1 AS a
+        )
+    ) AS outer_derived
+
+# Multiple derived tables: one with alias, one without should fail.
+test_fail_one_of_two_derived_tables_missing_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    ) AS derived1
+    JOIN (
+        SELECT 2 AS b
+    ) ON derived1.a = b
+
+# MySQL dialect: derived table without alias should fail.
+test_fail_mysql_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: mysql
+
+# PostgreSQL dialect: derived table without alias should fail.
+test_fail_postgres_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: postgres
+
+# T-SQL dialect: derived table without alias should fail.
+test_fail_tsql_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: tsql
+
+# BigQuery, DuckDB, Snowflake and SQLite accept a derived table without an alias.
+test_pass_bigquery_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: bigquery
+
+test_pass_duckdb_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: duckdb
+
+test_pass_duckdb_joined_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+    JOIN (
+        SELECT 1 AS b
+    ) ON a = b
+  configs:
+    core:
+      dialect: duckdb
+
+test_pass_snowflake_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: snowflake
+
+test_pass_sqlite_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: sqlite
+
+# ClickHouse accepts a derived table without an alias when it is the only
+# source of the FROM clause.
+test_pass_clickhouse_single_derived_table_no_alias:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS a
+    )
+  configs:
+    core:
+      dialect: clickhouse
+
+# ARRAY JOIN does not add a table source.
+test_pass_clickhouse_derived_table_no_alias_array_join:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT [1, 2] AS arr
+    )
+    ARRAY JOIN arr
+  configs:
+    core:
+      dialect: clickhouse
+
+# ClickHouse requires an alias on a joined subquery (on either side of the
+# join, or in a comma list) while `joined_subquery_requires_alias` is on.
+test_fail_clickhouse_joined_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM my_table AS t
+    JOIN (
+        SELECT 1 AS id
+    ) USING id
+  configs:
+    core:
+      dialect: clickhouse
+
+test_fail_clickhouse_left_of_join_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT 1 AS id
+    )
+    JOIN my_table AS t USING id
+  configs:
+    core:
+      dialect: clickhouse
+
+test_fail_clickhouse_comma_list_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM my_table AS t, (
+        SELECT 1 AS id
+    )
+  configs:
+    core:
+      dialect: clickhouse
+
+test_pass_clickhouse_joined_derived_table_with_alias:
+  pass_str: |
+    SELECT *
+    FROM my_table AS t
+    JOIN (
+        SELECT 1 AS id
+    ) AS s USING id
+  configs:
+    core:
+      dialect: clickhouse
+
+# The single outer source needs no alias, the joined inner one does.
+test_fail_clickhouse_nested_joined_derived_table_no_alias:
+  fail_str: |
+    SELECT *
+    FROM (
+        SELECT *
+        FROM my_table AS t
+        JOIN (
+            SELECT 1 AS id
+        ) USING id
+    )
+  configs:
+    core:
+      dialect: clickhouse
+
+# Sources of an inner FROM clause do not count towards the outer one.
+test_pass_clickhouse_single_derived_table_with_inner_join:
+  pass_str: |
+    SELECT *
+    FROM (
+        SELECT *
+        FROM my_table AS t
+        JOIN (
+            SELECT 1 AS id
+        ) AS s USING id
+    )
+  configs:
+    core:
+      dialect: clickhouse

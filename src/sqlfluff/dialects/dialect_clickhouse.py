@@ -1,0 +1,3742 @@
+"""The clickhouse dialect.
+
+https://clickhouse.com/
+"""
+
+from sqlfluff.core.dialects import load_raw_dialect
+from sqlfluff.core.parser import (
+    AnyNumberOf,
+    AnySetOf,
+    Anything,
+    BaseSegment,
+    Bracketed,
+    CodeSegment,
+    CompositeComparisonOperatorSegment,
+    Conditional,
+    Dedent,
+    Delimited,
+    IdentifierSegment,
+    ImplicitIndent,
+    Indent,
+    LiteralSegment,
+    Matchable,
+    Nothing,
+    OneOf,
+    OptionallyBracketed,
+    ParseMode,
+    Ref,
+    RegexLexer,
+    RegexParser,
+    SegmentGenerator,
+    Sequence,
+    StringLexer,
+    StringParser,
+    SymbolSegment,
+    TypedParser,
+)
+from sqlfluff.dialects import dialect_ansi as ansi
+from sqlfluff.dialects.dialect_clickhouse_keywords import (
+    FORMAT_KEYWORDS,
+    UNRESERVED_KEYWORDS,
+)
+
+ansi_dialect = load_raw_dialect("ansi")
+
+clickhouse_dialect = ansi_dialect.copy_as(
+    "clickhouse",
+    formatted_name="ClickHouse",
+    docstring="""**Default Casing**: Clickhouse is case sensitive throughout,
+regardless of quoting. An unquoted reference to an object using the wrong
+case will raise an :code:`UNKNOWN_IDENTIFIER` error.
+
+**Quotes**: String Literals: ``''``, Identifiers: ``""`` or |back_quotes|.
+Note as above, that because identifiers are always resolved case sensitively, the
+only reason for quoting identifiers is when they contain invalid characters or
+reserved keywords.
+
+The dialect for `ClickHouse <https://clickhouse.com/>`_.""",
+)
+clickhouse_dialect.sets("unreserved_keywords").update(UNRESERVED_KEYWORDS)
+
+clickhouse_dialect.insert_lexer_matchers(
+    # https://clickhouse.com/docs/en/sql-reference/functions#higher-order-functions---operator-and-lambdaparams-expr-function
+    [StringLexer("lambda", r"->", SymbolSegment)],
+    before="newline",
+)
+
+
+clickhouse_dialect.insert_lexer_matchers(
+    [StringLexer("double_equals", "==", CodeSegment)],
+    before="equals",
+)
+
+clickhouse_dialect.insert_lexer_matchers(
+    # https://clickhouse.com/docs/reference/syntax#numeric
+    [
+        # Regex for binary must start with 0b (uppercase B is not allowed),
+        # only 0, 1 and _ are allowed, binary can't start with an underscore
+        # or end with it, e.g. 0b_100 or 0b100_ are not allowed.
+        # Decimal point is also not allowed.
+        # Negative lookahead assertion to ensure we don't match decimal points
+        # or words, e.g. 0b1.1 or 0b100foo or 0b1. are not allowed.
+        RegexLexer(
+            "binary_literal",
+            r"0b[01]+(?:_[01]+)*(?![.\w])",  # e.g. 0b1_00
+            LiteralSegment,
+            segment_kwargs={"type": "numeric_literal"},
+        ),
+        # Regex for hex can start with either 0x or 0X, underscore is allowed
+        # if it is not at the start or at the end., e.g. 0x1_ or 0x_1 are not allowed.
+        # Optional exponential part is expressed with [pP], e.g 0xap1 (equals to 10 * 2^1).
+        # Negative lookahead assertion to ensure we don't match decimal points
+        # or words, e.g. 0x1.1.1 or 0x1.1foo are not allowed.
+        RegexLexer(
+            "hexadecimal_literal",
+            r"0[xX][a-fA-F\d]+(?:_[a-fA-F\d]+)*"  # hex int e.g. 0xab34_cd
+            r"(?:"  # hex decimal (either ends in . or has a decimal part)
+            r"\.(?:[a-fA-F\d]+(?:_[a-fA-F\d]+)*)?"
+            r")?"
+            r"(?:[pP][+-]?\d+(?:_\d+)*)?"  # optional exponential e.g. 0XAB34_CDp-10
+            r"(?![.\w])",
+            LiteralSegment,
+            segment_kwargs={"type": "numeric_literal"},
+        ),
+    ],
+    before="numeric_literal",
+)
+
+clickhouse_dialect.insert_lexer_matchers(
+    # https://clickhouse.com/docs/reference/operators#is-not-distinct-from
+    [StringLexer("is_not_distinct_from", "<=>", CodeSegment)],
+    before="less_than",
+)
+
+clickhouse_dialect.patch_lexer_matchers(
+    [
+        RegexLexer(
+            "double_quote",
+            r'"([^"\\]|""|\\.)*"',
+            CodeSegment,
+            segment_kwargs={
+                "quoted_value": (r'"((?:[^"\\]|""|\\.)*)"', 1),
+                "escape_replacements": [(r'(""|\\")', '"')],
+            },
+        ),
+        RegexLexer(
+            "back_quote",
+            r"`(?:[^`\\]|``|\\.)*`",
+            CodeSegment,
+            segment_kwargs={
+                "quoted_value": (r"`((?:[^`\\]|``|\\.)*)`", 1),
+                "escape_replacements": [(r"(``|\\`)", "`")],
+            },
+        ),
+        # Numeric literal matches integers, decimals, and exponential formats,
+        # Patch to support single underscores.
+        # Pattern breakdown:
+        # (?>                      Atomic grouping
+        #                          (https://www.regular-expressions.info/atomic.html).
+        #  \d+(_\d+)*\.\d+(_\d+)*  e.g. 123.456 or 123_000.456_000
+        #  |\d+(_\d+)*\.(?![\.\w]) e.g. 123. or 1_23.
+        #                          (N.B. negative lookahead assertion to ensure we
+        #                          don't match range operators `..` in Exasol, and
+        #                          that in bigquery we don't match the "."
+        #                          in "asd-12.foo").
+        #     |\.\d+(_\d+)*        e.g. .456 or .456_000
+        #     |\d+(_\d+)*          e.g. 123 or 123_000
+        # )
+        # (\.?[eE][+-]?\d+(_\d+)*)?  Optional exponential.
+        # (
+        #     (?<=\.)              If matched character ends with . (e.g. 123.) then
+        #                          don't worry about word boundary check.
+        #     |(?=\b)              Check that we are at word boundary to avoid matching
+        #                          valid naked identifiers (e.g. 123column).
+        # )
+        RegexLexer(
+            "numeric_literal",
+            r"(?>\d+(_\d+)*\.\d+(_\d+)*"  # Decimal numbers with underscores
+            r"|\d+(_\d+)*\.(?![.\w])"  # Integer with trailing dot
+            r"|\.\d+(_\d+)*"  # Decimal starting with dot
+            r"|\d+(_\d+)*)"  # Integer with underscores
+            r"(\.?[eE][+-]?\d+(_\d+)*)?"  # Optional exponential
+            r"((?<=\.)|(?=\b))",  # Word boundary check
+            LiteralSegment,
+        ),
+    ]
+)
+
+clickhouse_dialect.add(
+    BackQuotedIdentifierSegment=TypedParser(
+        "back_quote",
+        IdentifierSegment,
+        type="quoted_identifier",
+    ),
+    LambdaFunctionSegment=TypedParser("lambda", SymbolSegment, type="lambda"),
+    QuestionMarkSegment=StringParser("?", SymbolSegment, type="question"),
+    RawDoubleEqualsSegment=StringParser(
+        "==", SymbolSegment, type="raw_comparison_operator"
+    ),
+    RawIsNotDistinctFromSegment=StringParser(
+        "<=>", SymbolSegment, type="raw_comparison_operator"
+    ),
+    PositionalPlacementGrammar=OneOf(
+        Sequence(
+            "AFTER",
+            Ref("SingleIdentifierGrammar"),
+        ),
+        "FIRST",
+    ),
+    # https://clickhouse.com/docs/reference/statements/alter/partition#how-to-set-partition-expression
+    PartitionExpressionGrammar=OneOf(
+        # ALTER TABLE visits DETACH PARTITION 201901
+        Ref("NumericLiteralSegment"),
+        # ALTER TABLE visits DETACH PARTITION -201901
+        Ref("QualifiedNumericLiteralSegment"),
+        Sequence(
+            # ALTER TABLE visits DETACH PARTITION ID '201901'
+            Ref.keyword("ID", optional=True),
+            # ALTER TABLE visits ATTACH PARTITION 'JP'
+            Ref("SingleQuotedIdentifierSegment"),
+        ),
+        # ALTER TABLE example DROP PARTITION TRUE;
+        Ref("BooleanLiteralGrammar"),
+        # ALTER TABLE example DROP PARTITION ('JP', 1, toYYYYMM(toDate('2019-01-25')))
+        Ref("TupleSegment"),
+        # ALTER TABLE visits DETACH PARTITION tuple(toYYYYMM(toDate('2019-01-25')))
+        Ref("FunctionSegment"),
+    ),
+)
+
+clickhouse_dialect.replace(
+    LateralColumnAliasExpressionGrammar=Sequence(
+        Ref("ExpressionSegment"),
+        Ref("AliasExpressionSegment"),
+    ),
+    BinaryOperatorGrammar=OneOf(
+        Ref("ArithmeticBinaryOperatorGrammar"),
+        Ref("StringBinaryOperatorGrammar"),
+        Ref("BooleanBinaryOperatorGrammar"),
+        Ref("ComparisonOperatorGrammar"),
+        # Add Lambda Function
+        Ref("LambdaFunctionSegment"),
+    ),
+    ComparisonOperatorGrammar=OneOf(
+        Ref("EqualsSegment"),
+        Ref("DoubleEqualsSegment"),
+        Ref("GreaterThanSegment"),
+        Ref("LessThanSegment"),
+        Ref("GreaterThanOrEqualToSegment"),
+        Ref("LessThanOrEqualToSegment"),
+        Ref("NotEqualToSegment"),
+        Ref("LikeOperatorSegment"),
+        Ref("IsDistinctFromGrammar"),
+        Ref("IsNotDistinctFromSegment"),
+    ),
+    # https://clickhouse.com/docs/en/sql-reference/statements/select/join/#supported-types-of-join
+    JoinTypeKeywordsGrammar=Sequence(
+        Ref.keyword("GLOBAL", optional=True),
+        OneOf(
+            # This case INNER [ANY,ALL] JOIN
+            Sequence("INNER", OneOf("ALL", "ANY", optional=True)),
+            # This case [ANY,ALL] INNER JOIN
+            Sequence(OneOf("ALL", "ANY", optional=True), "INNER"),
+            # This case FULL ALL OUTER JOIN
+            Sequence(
+                "FULL",
+                Ref.keyword("ALL", optional=True),
+                Ref.keyword("OUTER", optional=True),
+            ),
+            # This case ALL FULL OUTER JOIN
+            Sequence(
+                Ref.keyword("ALL", optional=True),
+                "FULL",
+                Ref.keyword("OUTER", optional=True),
+            ),
+            # This case LEFT [OUTER,ANTI,SEMI,ANY,ASOF] JOIN
+            Sequence(
+                "LEFT",
+                OneOf(
+                    "ANTI",
+                    "SEMI",
+                    OneOf("ANY", "ALL", optional=True),
+                    "ASOF",
+                    optional=True,
+                ),
+                Ref.keyword("OUTER", optional=True),
+            ),
+            # This case [ANTI,SEMI,ANY,ASOF] LEFT JOIN
+            Sequence(
+                OneOf(
+                    "ANTI",
+                    "SEMI",
+                    OneOf("ANY", "ALL", optional=True),
+                    "ASOF",
+                ),
+                "LEFT",
+            ),
+            # This case RIGHT [OUTER,ANTI,SEMI,ANY,ASOF] JOIN
+            Sequence(
+                "RIGHT",
+                OneOf(
+                    "OUTER",
+                    "ANTI",
+                    "SEMI",
+                    OneOf("ANY", "ALL", optional=True),
+                    optional=True,
+                ),
+                Ref.keyword("OUTER", optional=True),
+            ),
+            # This case [OUTER,ANTI,SEMI,ANY] RIGHT JOIN
+            Sequence(
+                OneOf(
+                    "ANTI",
+                    "SEMI",
+                    OneOf("ANY", "ALL", optional=True),
+                    optional=True,
+                ),
+                "RIGHT",
+            ),
+            # This case ASOF JOIN
+            "ASOF",
+            # This case ANY JOIN
+            "ANY",
+            # This case ALL JOIN
+            "ALL",
+        ),
+    ),
+    JoinUsingConditionGrammar=Sequence(
+        "USING",
+        Conditional(Indent, indented_using_on=False),
+        Delimited(
+            OneOf(
+                Bracketed(
+                    Delimited(Ref("SingleIdentifierGrammar")),
+                    parse_mode=ParseMode.GREEDY,
+                ),
+                Delimited(Ref("SingleIdentifierGrammar")),
+            ),
+        ),
+        Conditional(Dedent, indented_using_on=False),
+    ),
+    ConditionalCrossJoinKeywordsGrammar=Nothing(),
+    UnconditionalCrossJoinKeywordsGrammar=Sequence(
+        Ref.keyword("GLOBAL", optional=True),
+        Ref.keyword("CROSS"),
+    ),
+    HorizontalJoinKeywordsGrammar=Sequence(
+        Ref.keyword("GLOBAL", optional=True),
+        Ref.keyword("PASTE"),
+    ),
+    NaturalJoinKeywordsGrammar=Nothing(),
+    JoinLikeClauseGrammar=Sequence(
+        AnyNumberOf(
+            Ref("ArrayJoinClauseSegment"),
+            min_times=1,
+        ),
+    ),
+    QuotedLiteralSegment=OneOf(
+        TypedParser(
+            "single_quote",
+            LiteralSegment,
+            type="quoted_literal",
+        ),
+        TypedParser(
+            "dollar_quote",
+            LiteralSegment,
+            type="quoted_literal",
+        ),
+    ),
+    # Drop casefold from ANSI, clickhouse is always case sensitive, even when
+    # unquoted.
+    NakedIdentifierSegment=SegmentGenerator(
+        # Generate the anti template from the set of reserved keywords
+        lambda dialect: RegexParser(
+            r"[a-zA-Z_][0-9a-zA-Z_]*",
+            IdentifierSegment,
+            type="naked_identifier",
+            anti_template=r"^("
+            + r"|".join(sorted(dialect.sets("reserved_keywords")))
+            + r")$",
+        )
+    ),
+    SingleIdentifierGrammar=OneOf(
+        Ref("NakedIdentifierSegment"),
+        Ref("QuotedIdentifierSegment"),
+        Ref("SingleQuotedIdentifierSegment"),
+        Ref("BackQuotedIdentifierSegment"),
+    ),
+    InOperatorGrammar=Sequence(
+        Ref.keyword("GLOBAL", optional=True),
+        Ref.keyword("NOT", optional=True),
+        "IN",
+        OneOf(
+            Ref("FunctionSegment"),  # E.g. IN tuple(1, 2)
+            Ref("ArrayLiteralSegment"),  # E.g. IN [1, 2]
+            Ref("TupleSegment"),  # E.g. IN (1, 2)
+            Ref("SingleIdentifierGrammar"),  # E.g. IN TABLE, IN CTE
+            Bracketed(
+                OneOf(
+                    Delimited(
+                        Ref("Expression_A_Grammar"),
+                    ),
+                    Ref("SelectableGrammar"),
+                ),
+                parse_mode=ParseMode.GREEDY,
+            ),
+        ),
+    ),
+    SelectClauseTerminatorGrammar=ansi_dialect.get_grammar(
+        "SelectClauseTerminatorGrammar"
+    )
+    .copy(
+        insert=[
+            Ref.keyword("PREWHERE"),
+            Ref.keyword("SETTINGS"),
+            Ref.keyword("INTO"),
+            Ref.keyword("FORMAT"),
+        ],
+        before=Ref.keyword("WHERE"),
+    )
+    .copy(
+        insert=[Sequence("GROUP", "BY")],
+        before=Sequence("ORDER", "BY"),
+    ),
+    FromClauseTerminatorGrammar=ansi_dialect.get_grammar("FromClauseTerminatorGrammar")
+    .copy(
+        insert=[
+            Ref.keyword("PREWHERE"),
+            Ref.keyword("INTO"),
+            Ref.keyword("FORMAT"),
+        ],
+        before=Ref.keyword("WHERE"),
+    )
+    .copy(insert=[Ref("SettingsClauseSegment")]),
+    DateTimeLiteralGrammar=Sequence(
+        OneOf("DATE", "TIME", "TIMESTAMP"),
+        TypedParser("single_quote", LiteralSegment, type="date_constructor_literal"),
+    ),
+    AlterTableDropColumnGrammar=Sequence(
+        Ref("OnClusterClauseSegment", optional=True),
+        "DROP",
+        Ref.keyword("COLUMN"),
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+    ),
+    Expression_D_Grammar=OneOf(
+        Ref("TupleElementAccessSegment"),
+        ansi_dialect.get_grammar("Expression_D_Grammar"),
+    ),
+    # Allow tuple element access (`.N`) as a postfix accessor alongside array
+    # subscripting, so it can follow any Expression_D base -- e.g. a function
+    # call `f(x).2`, a subscript `arr[1].2`, or a tuple literal `(a, b).1` --
+    # not just a bare/bracketed column reference.
+    AccessorGrammar=AnyNumberOf(
+        Ref("ArrayAccessorSegment"),
+        Ref("TupleElementAccessorSegment"),
+    ),
+    # ClickHouse C-style ternary `cond ? then : else`; the lowest-precedence
+    # operator, so the optional tail wraps the whole Expression_A condition.
+    # https://clickhouse.com/docs/en/sql-reference/functions/conditional-functions#ternary-operator
+    Expression_A_Grammar=Sequence(
+        ansi_dialect.get_grammar("Expression_A_Grammar"),
+        Sequence(
+            Ref("QuestionMarkSegment"),
+            Ref("ExpressionSegment"),
+            Ref("ColonSegment"),
+            Ref("ExpressionSegment"),
+            optional=True,
+        ),
+    ),
+    LikeGrammar=OneOf("LIKE", "ILIKE", "REGEXP"),
+    LikeExpressionGrammar=Sequence(
+        OneOf(
+            Sequence(
+                Ref.keyword("NOT", optional=True),
+                # REGEXP does not support the NOT keyword
+                Ref("LikeGrammar", exclude=Ref.keyword("REGEXP")),
+                Ref("Expression_A_Grammar"),
+                Sequence(
+                    "ESCAPE",
+                    Ref("Tail_Recurse_Expression_A_Grammar"),
+                    optional=True,
+                ),
+            ),
+            # REGEXP does not support the ESCAPE keyword
+            Sequence(
+                "REGEXP",
+                Ref("Tail_Recurse_Expression_A_Grammar"),
+            ),
+        ),
+    ),
+)
+
+# Set the datetime units
+clickhouse_dialect.sets("datetime_units").clear()
+clickhouse_dialect.sets("datetime_units").update(
+    [
+        # https://github.com/ClickHouse/ClickHouse/blob/1cdccd527f0cbf5629b21d29970e28d5156003dc/src/Parsers/parseIntervalKind.cpp#L8
+        "NANOSECOND",
+        "NANOSECONDS",
+        "SQL_TSI_NANOSECOND",
+        "NS",
+        "MICROSECOND",
+        "MICROSECONDS",
+        "SQL_TSI_MICROSECOND",
+        "MCS",
+        "MILLISECOND",
+        "MILLISECONDS",
+        "SQL_TSI_MILLISECOND",
+        "MS",
+        "SECOND",
+        "SECONDS",
+        "SQL_TSI_SECOND",
+        "SS",
+        "S",
+        "MINUTE",
+        "MINUTES",
+        "SQL_TSI_MINUTE",
+        "MI",
+        "N",
+        "HOUR",
+        "HOURS",
+        "SQL_TSI_HOUR",
+        "HH",
+        "H",
+        "DAY",
+        "DAYS",
+        "SQL_TSI_DAY",
+        "DD",
+        "D",
+        "WEEK",
+        "WEEKS",
+        "SQL_TSI_WEEK",
+        "WK",
+        "WW",
+        "MONTH",
+        "MONTHS",
+        "SQL_TSI_MONTH",
+        "MM",
+        "M",
+        "QUARTER",
+        "QUARTERS",
+        "SQL_TSI_QUARTER",
+        "QQ",
+        "Q",
+        "YEAR",
+        "YEARS",
+        "SQL_TSI_YEAR",
+        "YYYY",
+        "YY",
+    ]
+)
+
+
+class DoubleEqualsSegment(CompositeComparisonOperatorSegment):
+    """Double equals operator."""
+
+    match_grammar: Matchable = Ref("RawDoubleEqualsSegment")
+
+
+class IsNotDistinctFromSegment(CompositeComparisonOperatorSegment):
+    """IS NOT DISTINCT FROM operator (<=>)."""
+
+    match_grammar: Matchable = Ref("RawIsNotDistinctFromSegment")
+
+
+class AccessPermissionSegment(ansi.AccessPermissionSegment):
+    """A ClickHouse access permission.
+
+    Based on https://clickhouse.com/docs/sql-reference/statements/grant#privileges
+    """
+
+    match_grammar: Matchable = OneOf(
+        # SELECT privilege
+        Sequence(
+            "SELECT",
+            Ref("BracketedColumnReferenceListGrammar", optional=True),
+        ),
+        # INSERT privilege
+        Sequence(
+            "INSERT",
+            Ref("BracketedColumnReferenceListGrammar", optional=True),
+        ),
+        # DELETE privilege (standalone)
+        Sequence(
+            "DELETE",
+            Ref("BracketedColumnReferenceListGrammar", optional=True),
+        ),
+        # UPDATE privilege (standalone)
+        Sequence(
+            "UPDATE",
+            Ref("BracketedColumnReferenceListGrammar", optional=True),
+        ),
+        # ALTER privileges - hierarchical structure
+        Sequence(
+            "ALTER",
+            OneOf(
+                # ALTER TABLE
+                "TABLE",
+                # ALTER ADD/DROP/MODIFY/CLEAR/COMMENT/RENAME COLUMN
+                Sequence(
+                    OneOf("ADD", "DROP", "MODIFY", "CLEAR", "COMMENT", "RENAME"),
+                    "COLUMN",
+                ),
+                # ALTER CONSTRAINT
+                Sequence(
+                    OneOf("ADD", "DROP"),
+                    "CONSTRAINT",
+                ),
+                # ALTER TTL/ORDER BY/SAMPLE BY
+                Sequence(
+                    OneOf("MODIFY", "REMOVE"),
+                    OneOf(
+                        "TTL",
+                        Sequence("ORDER", "BY"),
+                        Sequence("SAMPLE", "BY"),
+                    ),
+                ),
+                # ALTER MATERIALIZE TTL
+                Sequence("MATERIALIZE", "TTL"),
+                # ALTER DELETE, ALTER UPDATE (data manipulation)
+                "DELETE",
+                "UPDATE",
+                # ALTER MOVE PARTITION/PART
+                Sequence(
+                    "MOVE",
+                    OneOf("PARTITION", "PART"),
+                ),
+                # ALTER FETCH PARTITION
+                Sequence("FETCH", "PARTITION"),
+                # ALTER FREEZE PARTITION
+                Sequence("FREEZE", "PARTITION"),
+                # ALTER INDEX
+                Sequence(
+                    OneOf("ADD", "DROP", "MATERIALIZE", "CLEAR"),
+                    "INDEX",
+                ),
+                # ALTER PROJECTION
+                Sequence(
+                    OneOf(
+                        "ADD", "MODIFY", "DROP", "MATERIALIZE", "CLEAR", optional=True
+                    ),
+                    "PROJECTION",
+                ),
+                # ALTER VIEW - REFRESH/MODIFY QUERY
+                Sequence(
+                    "VIEW",
+                    OneOf("REFRESH", Sequence("MODIFY", "QUERY")),
+                ),
+                optional=True,
+            ),
+        ),
+        # CREATE privileges
+        Sequence(
+            "CREATE",
+            OneOf(
+                "DATABASE",
+                "TABLE",
+                "VIEW",
+                "DICTIONARY",
+                Sequence("TEMPORARY", "TABLE"),
+                optional=True,
+            ),
+        ),
+        # DROP privileges
+        Sequence(
+            "DROP",
+            OneOf(
+                "DATABASE",
+                "TABLE",
+                "VIEW",
+                "DICTIONARY",
+                optional=True,
+            ),
+        ),
+        # TRUNCATE privilege
+        "TRUNCATE",
+        # OPTIMIZE privilege
+        "OPTIMIZE",
+        # SHOW privileges
+        Sequence(
+            "SHOW",
+            OneOf(
+                "DATABASES",
+                "TABLES",
+                "COLUMNS",
+                "DICTIONARIES",
+                optional=True,
+            ),
+        ),
+        # ACCESS MANAGEMENT privileges
+        # CREATE/ALTER/DROP USER
+        Sequence(
+            OneOf("CREATE", "ALTER", "DROP"),
+            "USER",
+        ),
+        # CREATE/ALTER/DROP ROLE
+        Sequence(
+            OneOf("CREATE", "ALTER", "DROP"),
+            "ROLE",
+        ),
+        # CREATE/ALTER/DROP ROW POLICY
+        Sequence(
+            OneOf("CREATE", "ALTER", "DROP"),
+            "ROW",
+            "POLICY",
+        ),
+        # CREATE/ALTER/DROP QUOTA
+        Sequence(
+            OneOf("CREATE", "ALTER", "DROP"),
+            "QUOTA",
+        ),
+        # CREATE/ALTER/DROP SETTINGS PROFILE
+        Sequence(
+            OneOf("CREATE", "ALTER", "DROP"),
+            "SETTINGS",
+            "PROFILE",
+        ),
+        # SHOW ACCESS
+        Sequence("SHOW", "ACCESS"),
+        # ROLE ADMIN
+        Sequence("ROLE", "ADMIN"),
+        # ACCESS MANAGEMENT (general)
+        Sequence("ACCESS", "MANAGEMENT"),
+        # ALL or ALL PRIVILEGES
+        Sequence("ALL", Ref.keyword("PRIVILEGES", optional=True)),
+    )
+
+
+class IntoOutfileClauseSegment(BaseSegment):
+    """An `INTO OUTFILE` clause like in `SELECT`."""
+
+    type = "into_outfile_clause"
+    match_grammar: Matchable = Sequence(
+        "INTO",
+        "OUTFILE",
+        Ref("QuotedLiteralSegment"),
+        Ref("FormatClauseSegment", optional=True),
+    )
+
+
+class FormatClauseSegment(BaseSegment):
+    """A `FORMAT` clause like in `SELECT`."""
+
+    type = "format_clause"
+    match_grammar: Matchable = Sequence(
+        "FORMAT",
+        OneOf(*[Ref.keyword(allowed_format) for allowed_format in FORMAT_KEYWORDS]),
+        Ref("SettingsClauseSegment", optional=True),
+    )
+
+
+class InsertFormatClauseSegment(BaseSegment):
+    """The `FORMAT` clause that names the format of an `INSERT`'s row data.
+
+    Unlike the `SELECT` `FORMAT` clause, nothing can follow the format name:
+    ClickHouse reads everything after `FORMAT format_name` as data, so query
+    `SETTINGS` have to come before it.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/insert-into
+    """
+
+    type = "format_clause"
+    match_grammar: Matchable = Sequence(
+        "FORMAT",
+        OneOf(*[Ref.keyword(allowed_format) for allowed_format in FORMAT_KEYWORDS]),
+    )
+
+
+class InsertStatementSegment(ansi.InsertStatementSegment):
+    """An `INSERT` statement, with ClickHouse's `SETTINGS` and `FORMAT` forms.
+
+    `FORMAT format_name` stands in for the `VALUES`/`SELECT` source, with the
+    row data supplied after it (out of band, e.g. over client stdin). It does
+    not combine with `VALUES`, which is itself the `Values` format. Query
+    `SETTINGS` go after the column list and before the source.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/insert-into
+    """
+
+    type = "insert_statement"
+    match_grammar: Matchable = Sequence(
+        "INSERT",
+        Ref.keyword("OVERWRITE", optional=True),
+        "INTO",
+        Ref("TableReferenceSegment"),
+        OneOf(
+            Sequence(
+                Ref("SettingsClauseSegment", optional=True),
+                OneOf(
+                    Ref("SelectableGrammar"),
+                    Ref("InsertFormatClauseSegment"),
+                ),
+            ),
+            Sequence(
+                Ref("BracketedColumnReferenceListGrammar"),
+                Ref("SettingsClauseSegment", optional=True),
+                OneOf(
+                    Ref("SelectableGrammar"),
+                    Ref("InsertFormatClauseSegment"),
+                ),
+            ),
+            Ref("DefaultValuesGrammar"),
+        ),
+    )
+
+
+class MergeTreesOrderByClauseSegment(BaseSegment):
+    """A `ORDER BY` clause for the MergeTree family engine."""
+
+    type = "merge_tree_order_by_clause"
+    match_grammar: Matchable = Sequence(
+        "ORDER",
+        "BY",
+        OneOf(
+            Sequence(
+                "TUPLE",
+                Bracketed(),  # tuple() not tuple
+            ),
+            Bracketed(
+                Delimited(
+                    Ref("ColumnReferenceSegment"),
+                    Ref("ExpressionSegment"),
+                    # The brackets might be empty i.e. `ORDER BY ()`.
+                    optional=True,
+                ),
+            ),
+            Ref("ColumnReferenceSegment"),
+        ),
+    )
+
+
+class PreWhereClauseSegment(BaseSegment):
+    """A `PREWHERE` clause like in `SELECT` or `INSERT`."""
+
+    type = "prewhere_clause"
+    match_grammar: Matchable = Sequence(
+        "PREWHERE",
+        # NOTE: The indent here is implicit to allow
+        # constructions like:
+        #
+        #    PREWHERE a
+        #        AND b
+        #
+        # to be valid without forcing an indent between
+        # "PREWHERE" and "a".
+        ImplicitIndent,
+        OptionallyBracketed(Ref("ExpressionSegment")),
+        Dedent,
+    )
+
+
+class SettingsClauseSegment(BaseSegment):
+    """A `SETTINGS` clause for engines or query-level settings."""
+
+    type = "settings_clause"
+    match_grammar: Matchable = Sequence(
+        "SETTINGS",
+        Delimited(
+            Sequence(
+                Ref("NakedIdentifierSegment"),
+                Ref("EqualsSegment"),
+                OneOf(
+                    Ref("NakedIdentifierSegment"),
+                    Ref("NumericLiteralSegment"),
+                    Ref("QuotedLiteralSegment"),
+                    Ref("BooleanLiteralGrammar"),
+                ),
+                optional=True,
+            ),
+        ),
+        optional=True,
+    )
+
+
+class QualifyClauseSegment(BaseSegment):
+    """A `QUALIFY` clause like in `SELECT`.
+
+    https://clickhouse.com/docs/sql-reference/statements/select/qualify
+    """
+
+    type = "qualify_clause"
+    match_grammar = Sequence(
+        "QUALIFY",
+        Indent,
+        OptionallyBracketed(Ref("ExpressionSegment")),
+        Dedent,
+    )
+
+
+class SelectStatementSegment(ansi.SelectStatementSegment):
+    """Enhance `SELECT` statement to include QUALIFY."""
+
+    match_grammar = (
+        ansi.SelectStatementSegment.match_grammar.copy(
+            insert=[Ref("PreWhereClauseSegment", optional=True)],
+            before=Ref("WhereClauseSegment", optional=True),
+        )
+        .copy(
+            insert=[
+                Ref("FormatClauseSegment", optional=True),
+                Ref("IntoOutfileClauseSegment", optional=True),
+                Ref("SettingsClauseSegment", optional=True),
+            ],
+        )
+        .copy(
+            insert=[Ref("QualifyClauseSegment", optional=True)],
+            before=Ref("OrderByClauseSegment", optional=True),
+        )
+    )
+
+
+class UnorderedSelectStatementSegment(ansi.UnorderedSelectStatementSegment):
+    """Enhance unordered `SELECT` statement to include QUALIFY."""
+
+    match_grammar = ansi.UnorderedSelectStatementSegment.match_grammar.copy(
+        insert=[Ref("PreWhereClauseSegment", optional=True)],
+        before=Ref("WhereClauseSegment", optional=True),
+        terminators=[
+            Ref("FormatClauseSegment"),
+            Ref("IntoOutfileClauseSegment"),
+            Ref("SettingsClauseSegment"),
+        ],
+    )
+
+
+class UnorderedSetExpressionSegment(ansi.UnorderedSetExpressionSegment):
+    """Allow ``ORDER BY`` / ``LIMIT`` / ``SETTINGS`` on non-final union members.
+
+    Unlike ANSI - where a trailing ``ORDER BY`` / ``LIMIT`` binds to the whole
+    set - ClickHouse permits each member preceding a set operator to carry its
+    own ``ORDER BY``, ``LIMIT`` and ``SETTINGS`` clauses without being
+    parenthesised. Matching those clauses in the position between a member and
+    the following set operator keeps them attached to the (non-final) member,
+    while the clauses trailing the final member continue to bind to the whole
+    set expression.
+    """
+
+    match_grammar = Sequence(
+        Ref("NonSetSelectableGrammar"),
+        AnyNumberOf(
+            Sequence(
+                Ref("OrderByClauseSegment", optional=True),
+                Ref("LimitClauseSegment", optional=True),
+                Ref("SettingsClauseSegment", optional=True),
+                Ref("SetOperatorSegment"),
+                Ref("NonSetSelectableGrammar"),
+            ),
+            min_times=1,
+        ),
+    )
+
+
+class SetExpressionSegment(ansi.SetExpressionSegment):
+    """Enhance set expression to include ClickHouse-specific clauses.
+
+    Built from the ClickHouse ``UnorderedSetExpressionSegment`` so that
+    per-member ``ORDER BY`` / ``LIMIT`` / ``SETTINGS`` are recognised, while the
+    clauses trailing the final member bind to the whole set expression.
+    """
+
+    match_grammar = UnorderedSetExpressionSegment.match_grammar.copy(
+        insert=[
+            Ref("OrderByClauseSegment", optional=True),
+            Ref("LimitClauseSegment", optional=True),
+            Ref("NamedWindowSegment", optional=True),
+            Ref("FormatClauseSegment", optional=True),
+            Ref("SettingsClauseSegment", optional=True),
+            Ref("IntoOutfileClauseSegment", optional=True),
+        ],
+    )
+
+
+class GroupByClauseSegment(BaseSegment):
+    """Enhance `GROUP BY` with ClickHouse `WITH ROLLUP` / `CUBE` / `TOTALS`.
+
+    ClickHouse allows the ``WITH ROLLUP``, ``WITH CUBE`` and ``WITH TOTALS``
+    modifiers to trail a ``GROUP BY`` clause. ``ROLLUP`` and ``CUBE`` are
+    mutually exclusive, and either may be combined with ``TOTALS``.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select/group-by
+    """
+
+    type = "groupby_clause"
+
+    match_grammar: Matchable = Sequence(
+        "GROUP",
+        "BY",
+        Indent,
+        OneOf(
+            "ALL",
+            Ref("GroupingSetsClauseSegment"),
+            Ref("CubeRollupClauseSegment"),
+            Sequence(
+                Delimited(
+                    OneOf(
+                        Ref("ColumnReferenceSegment"),
+                        Ref("NumericLiteralSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                    terminators=[Ref("GroupByClauseTerminatorGrammar")],
+                ),
+            ),
+        ),
+        Sequence("WITH", OneOf("ROLLUP", "CUBE"), optional=True),
+        Sequence("WITH", "TOTALS", optional=True),
+        Dedent,
+    )
+
+
+class SetOperatorSegment(ansi.SetOperatorSegment):
+    """A set operator such as Union, Minus, Except or Intersect.
+
+    ClickHouse documents the DISTINCT qualifier on INTERSECT and EXCEPT as well
+    as on UNION. Unlike standard SQL, the default for INTERSECT and EXCEPT is to
+    keep duplicates, so DISTINCT changes the result rather than restating it.
+
+    https://clickhouse.com/docs/sql-reference/statements/select/except
+    https://clickhouse.com/docs/sql-reference/statements/select/intersect
+
+    Excludes ClickHouse `SELECT * EXCEPT (...)` wildcard exclusions from being
+    consumed as set operators.
+    """
+
+    match_grammar = OneOf(
+        Ref("UnionGrammar"),
+        Sequence(
+            OneOf(
+                "INTERSECT",
+                "EXCEPT",
+            ),
+            OneOf("DISTINCT", "ALL", optional=True),
+        ),
+        "MINUS",
+        exclude=Sequence("EXCEPT", Bracketed(Anything())),
+    )
+
+
+class WithFillSegment(ansi.WithFillSegment):
+    """Enhances `ORDER BY` clauses to include WITH FILL.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select/order-by#order-by-expr-with-fill-modifier
+    """
+
+    match_grammar: Matchable = Sequence(
+        "WITH",
+        "FILL",
+        Sequence("FROM", Ref("ExpressionSegment"), optional=True),
+        Sequence("TO", Ref("ExpressionSegment"), optional=True),
+        Sequence(
+            "STEP",
+            OneOf(
+                Ref("NumericLiteralSegment"),
+                Ref("IntervalExpressionSegment"),
+            ),
+            optional=True,
+        ),
+    )
+
+
+class OrderByClauseSegment(ansi.OrderByClauseSegment):
+    """An `ORDER BY` clause with ClickHouse's trailing `INTERPOLATE`.
+
+    Unlike `WITH FILL`, which attaches to an individual sort key, `INTERPOLATE`
+    is a single clause that follows the whole comma-delimited `ORDER BY` list.
+
+    https://clickhouse.com/docs/sql-reference/statements/select/order-by
+    #filling-columns-with-interpolate
+    """
+
+    match_grammar: Matchable = Sequence(
+        "ORDER",
+        "BY",
+        Indent,
+        Delimited(
+            Sequence(
+                OneOf(
+                    Ref("ColumnReferenceSegment"),
+                    # Can `ORDER BY 1`
+                    Ref("NumericLiteralSegment"),
+                    # Can order by an expression
+                    Ref("ExpressionSegment"),
+                ),
+                OneOf("ASC", "DESC", optional=True),
+                Sequence("NULLS", OneOf("FIRST", "LAST"), optional=True),
+                Ref("WithFillSegment", optional=True),
+            ),
+            terminators=[
+                Ref("LimitClauseSegment"),
+                Ref("FrameClauseUnitGrammar"),
+                "INTERPOLATE",
+            ],
+        ),
+        Sequence(
+            "INTERPOLATE",
+            Bracketed(
+                Delimited(
+                    Sequence(
+                        Ref("ColumnReferenceSegment"),
+                        Sequence("AS", Ref("ExpressionSegment"), optional=True),
+                    ),
+                ),
+                optional=True,
+            ),
+            optional=True,
+        ),
+        Dedent,
+    )
+
+
+class BracketedArguments(ansi.BracketedArguments):
+    """A series of bracketed arguments.
+
+    e.g. the bracketed part of numeric(1, 3)
+    """
+
+    match_grammar = Bracketed(
+        Delimited(
+            OneOf(
+                # Dataypes like Nullable allow optional datatypes here.
+                Ref("DatatypeSegment"),
+            ),
+            # The brackets might be empty for some cases...
+            optional=True,
+        ),
+    )
+
+
+class DateTime64ArgumentsSegment(BaseSegment):
+    """Arguments for DateTime64(precision[, 'timezone'])."""
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Sequence(
+            Ref("NumericLiteralSegment"),  # precision
+            Sequence(
+                Ref("CommaSegment"),
+                Ref("QuotedLiteralSegment"),  # timezone
+                optional=True,
+            ),
+            # The brackets might be empty i.e. `DateTime64()`.
+            optional=True,
+        )
+    )
+
+
+class DateTimeArgumentsSegment(BaseSegment):
+    """Arguments for DateTime('timezone')."""
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Ref("QuotedLiteralSegment"),
+    )
+
+
+class NumericArgumentsSegment(BaseSegment):
+    """Arguments for single numeric parameter types (e.g. FixedString(8))."""
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Ref("NumericLiteralSegment"),
+    )
+
+
+class NestedArgumentsSegment(BaseSegment):
+    """Arguments for Nested(name Type, ...)."""
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Delimited(
+            Sequence(
+                Ref("SingleIdentifierGrammar"),
+                Ref("DatatypeSegment"),
+            ),
+        )
+    )
+
+
+class EnumArgumentsSegment(BaseSegment):
+    """Arguments for Enum8/Enum16."""
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Delimited(
+            Sequence(
+                Ref("QuotedLiteralSegment"),
+                Ref("EqualsSegment"),
+                Ref("NumericLiteralSegment"),
+            ),
+        )
+    )
+
+
+class JSONPathSegment(BaseSegment):
+    """A (possibly dotted) path inside a JSON type definition."""
+
+    type = "json_path"
+    match_grammar = Delimited(
+        Ref("SingleIdentifierGrammar"),
+        delimiter=Ref("DotSegment"),
+        allow_gaps=False,
+    )
+
+
+class JSONArgumentsSegment(BaseSegment):
+    """Arguments for the JSON type (params, typed paths, SKIP).
+
+    https://clickhouse.com/docs/sql-reference/data-types/newjson
+    """
+
+    type = "bracketed_arguments"
+    match_grammar = Bracketed(
+        Delimited(
+            OneOf(
+                # max_dynamic_paths=N / max_dynamic_types=N
+                Sequence(
+                    Ref("ParameterNameSegment"),
+                    Ref("EqualsSegment"),
+                    Ref("NumericLiteralSegment"),
+                ),
+                # SKIP path / SKIP REGEXP 'regexp'
+                Sequence(
+                    "SKIP",
+                    OneOf(
+                        Sequence(
+                            "REGEXP",
+                            Ref("QuotedLiteralSegment"),
+                        ),
+                        Ref("JSONPathSegment"),
+                    ),
+                ),
+                # Typed-path hint: some.path Type
+                Sequence(
+                    Ref("JSONPathSegment"),
+                    Ref("DatatypeSegment"),
+                ),
+            ),
+        )
+    )
+
+
+class DatatypeSegment(BaseSegment):
+    """Support complex Clickhouse data types.
+
+    Complex data types are typically used in either DDL statements or as
+    the target type in casts.
+    """
+
+    type = "data_type"
+    match_grammar = OneOf(
+        # Nullable(Type)
+        Sequence(
+            StringParser("NULLABLE", CodeSegment, type="data_type_identifier"),
+            Ref("BracketedArguments"),
+        ),
+        # LowCardinality(Type)
+        Sequence(
+            StringParser("LOWCARDINALITY", CodeSegment, type="data_type_identifier"),
+            Ref("BracketedArguments"),
+        ),
+        # DateTime64(precision, 'timezone')
+        Sequence(
+            StringParser("DATETIME64", CodeSegment, type="data_type_identifier"),
+            Ref("DateTime64ArgumentsSegment", optional=True),
+        ),
+        # DateTime('timezone')
+        Sequence(
+            StringParser("DATETIME", CodeSegment, type="data_type_identifier"),
+            Ref("DateTimeArgumentsSegment", optional=True),
+        ),
+        # Time64(precision)
+        Sequence(
+            StringParser("TIME64", CodeSegment, type="data_type_identifier"),
+            Ref("NumericArgumentsSegment"),
+        ),
+        # FixedString(length)
+        Sequence(
+            StringParser("FIXEDSTRING", CodeSegment, type="data_type_identifier"),
+            Ref("NumericArgumentsSegment"),  # length
+        ),
+        # Array(Type)
+        Sequence(
+            StringParser("ARRAY", CodeSegment, type="data_type_identifier"),
+            Ref("BracketedArguments"),
+        ),
+        # Map(KeyType, ValueType)
+        Sequence(
+            StringParser("MAP", CodeSegment, type="data_type_identifier"),
+            Ref("BracketedArguments"),
+        ),
+        # Nested(name1 Type1, name2 Type2)
+        Sequence(
+            StringParser("NESTED", CodeSegment, type="data_type_identifier"),
+            Ref("NestedArgumentsSegment"),
+        ),
+        # JSON(param=N, path Type, SKIP ...)
+        Sequence(
+            StringParser("JSON", CodeSegment, type="data_type_identifier"),
+            Ref("JSONArgumentsSegment", optional=True),
+        ),
+        # Enum8('val1' = 1, 'val2' = 2)
+        Sequence(
+            OneOf(
+                StringParser("ENUM8", CodeSegment, type="data_type_identifier"),
+                StringParser("ENUM16", CodeSegment, type="data_type_identifier"),
+            ),
+            Ref("EnumArgumentsSegment"),
+        ),
+        # double args
+        Sequence(
+            OneOf(
+                StringParser("DECIMAL", CodeSegment, type="data_type_identifier"),
+                StringParser("NUMERIC", CodeSegment, type="data_type_identifier"),
+            ),
+            Ref("BracketedArguments", optional=True),
+        ),
+        # single args
+        Sequence(
+            OneOf(
+                StringParser("DECIMAL32", CodeSegment, type="data_type_identifier"),
+                StringParser("DECIMAL64", CodeSegment, type="data_type_identifier"),
+                StringParser("DECIMAL128", CodeSegment, type="data_type_identifier"),
+                StringParser("DECIMAL256", CodeSegment, type="data_type_identifier"),
+            ),
+            Ref("NumericArgumentsSegment"),  # scale
+        ),
+        Ref("TupleTypeSegment"),
+        Ref("DatatypeIdentifierSegment"),
+        Ref("NumericLiteralSegment"),
+        Sequence(
+            StringParser("DATETIME64", CodeSegment, type="data_type_identifier"),
+            Ref("DateTime64ArgumentsSegment", optional=True),
+        ),
+        Sequence(
+            StringParser("ARRAY", CodeSegment, type="data_type_identifier"),
+            Ref("BracketedArguments"),
+        ),
+    )
+
+
+class TupleTypeSegment(ansi.StructTypeSegment):
+    """Expression to construct a Tuple datatype."""
+
+    match_grammar = Sequence(
+        "TUPLE",
+        Ref("TupleTypeSchemaSegment"),  # Tuple() can't be empty
+    )
+
+
+class TupleTypeSchemaSegment(BaseSegment):
+    """Expression to construct the schema of a Tuple datatype."""
+
+    type = "tuple_type_schema"
+    match_grammar = Bracketed(
+        Delimited(
+            OneOf(
+                # Named tuple element: name Type
+                Sequence(
+                    OneOf(
+                        Ref("SingleIdentifierGrammar"),
+                        Ref("QuotedIdentifierSegment"),
+                    ),
+                    Ref("DatatypeSegment"),
+                ),
+                # Regular tuple element: just Type
+                Ref("DatatypeSegment"),
+            ),
+            bracket_pairs_set="bracket_pairs",
+        ),
+        bracket_pairs_set="bracket_pairs",
+        bracket_type="round",
+    )
+
+
+class ArrayJoinClauseSegment(BaseSegment):
+    """[LEFT] ARRAY JOIN does not support Join conditions and doesn't work as real JOIN.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select/array-join
+    """
+
+    type = "array_join_clause"
+
+    match_grammar: Matchable = Sequence(
+        Ref.keyword("LEFT", optional=True),
+        "ARRAY",
+        Ref("JoinKeywordsGrammar"),
+        Indent,
+        Delimited(
+            Ref("SelectClauseElementSegment"),
+        ),
+        Dedent,
+    )
+
+
+class CTEDefinitionSegment(ansi.CTEDefinitionSegment):
+    """A CTE Definition from a WITH statement.
+
+    Overridden from ANSI to allow expression CTEs.
+    https://clickhouse.com/docs/en/sql-reference/statements/select/with/
+    """
+
+    type = "common_table_expression"
+    match_grammar: Matchable = OneOf(
+        Sequence(
+            Ref("SingleIdentifierGrammar"),
+            Ref("CTEColumnList", optional=True),
+            "AS",
+            Ref.keyword("MATERIALIZED", optional=True),
+            Bracketed(
+                # Ephemeral here to subdivide the query.
+                Ref("SelectableGrammar"),
+                parse_mode=ParseMode.GREEDY,
+            ),
+        ),
+        Sequence(
+            Ref("ExpressionSegment"),
+            "AS",
+            Ref("SingleIdentifierGrammar"),
+        ),
+    )
+
+
+class AliasExpressionSegment(ansi.AliasExpressionSegment):
+    """A reference to an object with an `AS` clause."""
+
+    type = "alias_expression"
+    match_grammar: Matchable = Sequence(
+        Indent,
+        Ref("AsAliasOperatorSegment", optional=True),
+        OneOf(
+            Sequence(
+                Ref("SingleIdentifierGrammar"),
+                # Column alias in VALUES clause
+                Bracketed(Ref("SingleIdentifierListSegment"), optional=True),
+            ),
+            Ref("SingleQuotedIdentifierSegment"),
+            exclude=OneOf(
+                "LATERAL",
+                "WINDOW",
+                "KEYS",
+            ),
+        ),
+        Dedent,
+    )
+
+
+class WildcardExpressionSegment(ansi.WildcardExpressionSegment):
+    """An extension of the star expression for Clickhouse."""
+
+    match_grammar = Sequence(
+        Ref("WildcardIdentifierSegment"),
+        Ref("ExceptClauseSegment", optional=True),
+        AnyNumberOf(Ref("ApplyClauseSegment")),
+    )
+
+
+class ExceptClauseSegment(BaseSegment):
+    """A Clickhouse SELECT EXCEPT clause.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select#except
+    """
+
+    type = "select_except_clause"
+    match_grammar = Sequence(
+        "EXCEPT",
+        OneOf(
+            Bracketed(Delimited(Ref("SingleIdentifierGrammar"))),
+            Ref("SingleIdentifierGrammar"),
+        ),
+    )
+
+
+class ApplyClauseSegment(BaseSegment):
+    """A Clickhouse SELECT APPLY clause.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select#apply-modifier
+    """
+
+    type = "select_apply_clause"
+    match_grammar = Sequence(
+        "APPLY",
+        Bracketed(Ref("ExpressionSegment")),
+    )
+
+
+class SelectClauseModifierSegment(ansi.SelectClauseModifierSegment):
+    """Things that come after SELECT but before the columns.
+
+    Overridden from ANSI to allow DISTINCT ON ()
+    https://clickhouse.com/docs/en/sql-reference/statements/select/distinct
+    """
+
+    match_grammar = OneOf(
+        Sequence(
+            "DISTINCT",
+            Sequence(
+                "ON",
+                Bracketed(Delimited(Ref("ExpressionSegment"))),
+                optional=True,
+            ),
+        ),
+        "ALL",
+    )
+
+
+class SamplingExpressionSegment(BaseSegment):
+    """A ClickHouse `SAMPLE` clause.
+
+    Overridden from ANSI: ClickHouse's own SAMPLE syntax is a bare numeric
+    factor (or ratio), not ANSI's `TABLESAMPLE (BERNOULLI|SYSTEM) (n)`.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select/sample
+    """
+
+    type = "sample_expression"
+
+    _coefficient = Sequence(
+        Ref("NumericLiteralSegment"),
+        Sequence(
+            Ref("DivideSegment"),
+            Ref("NumericLiteralSegment"),
+            optional=True,
+        ),
+    )
+
+    match_grammar: Matchable = Sequence(
+        "SAMPLE",
+        _coefficient,
+        Sequence(
+            "OFFSET",
+            _coefficient,
+            optional=True,
+        ),
+    )
+
+
+class FromExpressionElementSegment(ansi.FromExpressionElementSegment):
+    """A table expression.
+
+    Overridden from ANSI to allow FINAL modifier.
+    https://clickhouse.com/docs/en/sql-reference/statements/select/from#final-modifier
+    """
+
+    type = "from_expression_element"
+    match_grammar: Matchable = Sequence(
+        Ref("PreTableFunctionKeywordsGrammar", optional=True),
+        OptionallyBracketed(Ref("TableExpressionSegment")),
+        Ref(
+            "AliasExpressionSegment",
+            exclude=OneOf(
+                Ref("FromClauseTerminatorGrammar"),
+                Ref("SamplingExpressionSegment"),
+                Ref("JoinLikeClauseGrammar"),
+                "FINAL",
+                Ref("JoinClauseSegment"),
+            ),
+            optional=True,
+        ),
+        Ref.keyword("FINAL", optional=True),
+        # https://cloud.google.com/bigquery/docs/reference/standard-sql/arrays#flattening_arrays
+        Sequence("WITH", "OFFSET", Ref("AliasExpressionSegment"), optional=True),
+        Ref("SamplingExpressionSegment", optional=True),
+        Ref("PostTableExpressionGrammar", optional=True),
+    )
+
+
+class TableEngineFunctionSegment(BaseSegment):
+    """A ClickHouse `ENGINE` clause function.
+
+    With this segment we attempt to match all possible engines.
+    """
+
+    type = "table_engine_function"
+    match_grammar: Matchable = Sequence(
+        Sequence(
+            Ref(
+                "FunctionNameSegment",
+                exclude=OneOf(
+                    Ref("DatePartFunctionNameSegment"),
+                    Ref("ValuesClauseSegment"),
+                ),
+            ),
+            Ref("FunctionContentsSegment", optional=True),
+        ),
+    )
+
+
+class OnClusterClauseSegment(BaseSegment):
+    """A `ON CLUSTER` clause."""
+
+    type = "on_cluster_clause"
+    match_grammar = Sequence(
+        "ON",
+        "CLUSTER",
+        OneOf(
+            Ref("SingleIdentifierGrammar"),
+            # Support for placeholders like '{cluster}'
+            Ref("QuotedLiteralSegment"),
+        ),
+    )
+
+
+class TableEngineSegment(BaseSegment):
+    """An `ENGINE` used in `CREATE TABLE`."""
+
+    type = "engine"
+    match_grammar = Sequence(
+        "ENGINE",
+        Ref("EqualsSegment", optional=True),
+        Sequence(
+            Ref("TableEngineFunctionSegment"),
+            AnySetOf(
+                Ref("MergeTreesOrderByClauseSegment"),
+                Sequence(
+                    "PARTITION",
+                    "BY",
+                    Ref("ExpressionSegment"),
+                ),
+                Sequence(
+                    "PRIMARY",
+                    "KEY",
+                    Ref("ExpressionSegment"),
+                ),
+                Sequence(
+                    "SAMPLE",
+                    "BY",
+                    Ref("ExpressionSegment"),
+                ),
+            ),
+            Ref("SettingsClauseSegment", optional=True),
+        ),
+    )
+
+
+class DatabaseEngineFunctionSegment(BaseSegment):
+    """A ClickHouse `ENGINE` clause function.
+
+    With this segment we attempt to match all possible engines.
+    """
+
+    type = "engine_function"
+    match_grammar: Matchable = Sequence(
+        Sequence(
+            OneOf(
+                "ATOMIC",
+                "MYSQL",
+                "MATERIALIZEDMYSQL",
+                "LAZY",
+                "POSTGRESQL",
+                "MATERIALIZEDPOSTGRESQL",
+                "REPLICATED",
+                "SQLITE",
+            ),
+            Ref("FunctionContentsSegment", optional=True),
+        ),
+    )
+
+
+class DatabaseEngineSegment(BaseSegment):
+    """An `ENGINE` used in `CREATE TABLE`."""
+
+    type = "database_engine"
+
+    match_grammar = Sequence(
+        "ENGINE",
+        Ref("EqualsSegment"),
+        Sequence(
+            Ref("DatabaseEngineFunctionSegment"),
+            AnySetOf(
+                Ref("MergeTreesOrderByClauseSegment"),
+                Sequence(
+                    "PARTITION",
+                    "BY",
+                    Ref("ExpressionSegment"),
+                    optional=True,
+                ),
+                Sequence(
+                    "PRIMARY",
+                    "KEY",
+                    Ref("ExpressionSegment"),
+                    optional=True,
+                ),
+                Sequence(
+                    "SAMPLE",
+                    "BY",
+                    Ref("ExpressionSegment"),
+                    optional=True,
+                ),
+            ),
+            Ref("SettingsClauseSegment", optional=True),
+        ),
+    )
+
+
+class ColumnTTLSegment(BaseSegment):
+    """A TTL clause for columns as used in CREATE TABLE.
+
+    Specified in
+    https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree/#mergetree-column-ttl
+    """
+
+    type = "column_ttl_segment"
+
+    match_grammar = Sequence(
+        "TTL",
+        Ref("ExpressionSegment"),
+    )
+
+
+class TableTTLSegment(BaseSegment):
+    """A TTL clause for tables as used in CREATE TABLE.
+
+    Specified in
+    https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree/#mergetree-table-ttl
+    """
+
+    type = "table_ttl_segment"
+
+    match_grammar = Sequence(
+        "TTL",
+        Delimited(
+            Sequence(
+                Ref("ExpressionSegment"),
+                OneOf(
+                    "DELETE",
+                    Sequence(
+                        "TO",
+                        "VOLUME",
+                        Ref("QuotedLiteralSegment"),
+                    ),
+                    Sequence(
+                        "TO",
+                        "DISK",
+                        Ref("QuotedLiteralSegment"),
+                    ),
+                    optional=True,
+                ),
+                Ref("WhereClauseSegment", optional=True),
+                Ref("GroupByClauseSegment", optional=True),
+            )
+        ),
+    )
+
+
+class ColumnConstraintSegment(BaseSegment):
+    """ClickHouse specific column constraints.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/create/table#constraints
+    """
+
+    type = "column_constraint_segment"
+
+    match_grammar = AnySetOf(
+        Sequence(
+            Sequence(
+                "CONSTRAINT",
+                Ref("ObjectReferenceSegment"),
+                optional=True,
+            ),
+            OneOf(
+                Sequence(Ref.keyword("NOT", optional=True), "NULL"),
+                Sequence("CHECK", Bracketed(Ref("ExpressionSegment"))),
+                Sequence(
+                    OneOf(
+                        "DEFAULT",
+                        "MATERIALIZED",
+                        "ALIAS",
+                    ),
+                    OneOf(
+                        Ref("LiteralGrammar"),
+                        Ref("FunctionSegment"),
+                        Ref("BareFunctionSegment"),
+                    ),
+                ),
+                Sequence(
+                    "EPHEMERAL",
+                    OneOf(
+                        Ref("LiteralGrammar"),
+                        Ref("FunctionSegment"),
+                        Ref("BareFunctionSegment"),
+                        optional=True,
+                    ),
+                ),
+                Ref("PrimaryKeyGrammar"),
+                Sequence(
+                    "CODEC",
+                    Ref("FunctionContentsGrammar"),
+                    optional=True,
+                ),
+                Ref("ColumnTTLSegment"),
+            ),
+        )
+    )
+
+
+class TableConstraintSegment(ansi.TableConstraintSegment):
+    """A table constraint, e.g. for CREATE TABLE.
+
+    ClickHouse's CONSTRAINT clause only supports CHECK and ASSUME
+    https://clickhouse.com/docs/en/sql-reference/statements/create/table#constraints
+    """
+
+    type = "table_constraint"
+    match_grammar: Matchable = Sequence(
+        "CONSTRAINT",
+        Ref("ObjectReferenceSegment"),
+        OneOf(
+            "CHECK",
+            "ASSUME",
+        ),
+        Ref("ExpressionSegment"),
+    )
+
+
+class CreateDatabaseStatementSegment(ansi.CreateDatabaseStatementSegment):
+    """A `CREATE DATABASE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/create/database
+    """
+
+    type = "create_database_statement"
+
+    match_grammar = Sequence(
+        "CREATE",
+        "DATABASE",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("DatabaseReferenceSegment"),
+        AnySetOf(
+            Ref("OnClusterClauseSegment", optional=True),
+            Ref("DatabaseEngineSegment", optional=True),
+            Sequence(
+                "COMMENT",
+                Ref("SingleIdentifierGrammar"),
+                optional=True,
+            ),
+        ),
+        AnyNumberOf(
+            "TABLE",
+            "OVERRIDE",
+            Ref("TableReferenceSegment"),
+            Bracketed(
+                Delimited(
+                    Ref("TableConstraintSegment"),
+                    Ref("ColumnDefinitionSegment"),
+                    Ref("ColumnConstraintSegment"),
+                ),
+                optional=True,
+            ),
+            optional=True,
+        ),
+    )
+
+
+class RenameStatementSegment(BaseSegment):
+    """A `RENAME TABLE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/rename/
+    """
+
+    type = "rename_table_statement"
+
+    match_grammar = Sequence(
+        "RENAME",
+        OneOf(
+            Sequence(
+                "TABLE",
+                Delimited(
+                    Sequence(
+                        Ref("TableReferenceSegment"),
+                        "TO",
+                        Ref("TableReferenceSegment"),
+                    )
+                ),
+            ),
+            Sequence(
+                "DATABASE",
+                Delimited(
+                    Sequence(
+                        Ref("DatabaseReferenceSegment"),
+                        "TO",
+                        Ref("DatabaseReferenceSegment"),
+                    )
+                ),
+            ),
+            Sequence(
+                "DICTIONARY",
+                Delimited(
+                    Sequence(
+                        Ref("ObjectReferenceSegment"),
+                        "TO",
+                        Ref("ObjectReferenceSegment"),
+                    )
+                ),
+            ),
+        ),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class CreateTableStatementSegment(ansi.CreateTableStatementSegment):
+    """A `CREATE TABLE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/create/table/
+    """
+
+    type = "create_table_statement"
+
+    match_grammar: Matchable = OneOf(
+        Sequence(
+            OneOf(
+                # CREATE [OR REPLACE] TABLE
+                # https://clickhouse.com/docs/reference/statements/create/table/replace-table#syntax
+                Sequence(
+                    "CREATE",
+                    Ref("OrReplaceGrammar", optional=True),
+                    "TABLE",
+                ),
+                # REPLACE TABLE
+                # https://clickhouse.com/docs/reference/statements/create/table/replace-table#syntax
+                Sequence(
+                    "REPLACE",
+                    "TABLE",
+                ),
+                # CREATE TABLE IF NOT EXISTS
+                Sequence(
+                    "CREATE",
+                    "TABLE",
+                    Ref("IfNotExistsGrammar"),
+                ),
+            ),
+            Ref("TableReferenceSegment"),
+            Ref("OnClusterClauseSegment", optional=True),
+            OneOf(
+                # CREATE TABLE (...):
+                Sequence(
+                    Bracketed(
+                        Delimited(
+                            OneOf(
+                                Ref("TableConstraintSegment"),
+                                Ref("ColumnDefinitionSegment"),
+                                Ref("ColumnConstraintSegment"),
+                                Ref("ProjectionDefinitionSegment"),
+                            ),
+                        ),
+                        # Column definition may be missing if using AS SELECT
+                        optional=True,
+                    ),
+                    Ref("TableEngineSegment"),
+                    # CREATE TABLE (...) AS SELECT:
+                    Sequence(
+                        "AS",
+                        Ref("SelectableGrammar"),
+                        optional=True,
+                    ),
+                ),
+                # CREATE TABLE AS other_table:
+                Sequence(
+                    # https://clickhouse.com/docs/reference/statements/create/table#with-a-schema-and-data-cloned-from-another-table
+                    Ref.keyword("CLONE", optional=True),
+                    "AS",
+                    Ref("TableReferenceSegment"),
+                    Ref("TableEngineSegment", optional=True),
+                ),
+                # CREATE TABLE AS table_function():
+                Sequence(
+                    "AS",
+                    Ref("FunctionSegment"),
+                ),
+            ),
+            AnySetOf(
+                Sequence(
+                    "COMMENT",
+                    OneOf(
+                        Ref("SingleIdentifierGrammar"),
+                        Ref("QuotedIdentifierSegment"),
+                    ),
+                ),
+                Ref("TableTTLSegment"),
+                optional=True,
+            ),
+            Ref("TableEndClauseSegment", optional=True),
+        ),
+        # CREATE TEMPORARY TABLE
+        Sequence(
+            OneOf(
+                # CREATE [OR REPLACE] TEMPORARY TABLE
+                # https://clickhouse.com/docs/reference/statements/create/table/replace-table#syntax
+                Sequence(
+                    "CREATE",
+                    Ref("OrReplaceGrammar", optional=True),
+                    "TEMPORARY",
+                    "TABLE",
+                ),
+                # REPLACE TEMPORARY TABLE
+                # https://clickhouse.com/docs/reference/statements/create/table/replace-table#syntax
+                Sequence(
+                    "REPLACE",
+                    "TEMPORARY",
+                    "TABLE",
+                ),
+                # CREATE TEMPORARY TABLE IF NOT EXISTS
+                Sequence(
+                    "CREATE",
+                    "TEMPORARY",
+                    "TABLE",
+                    Ref("IfNotExistsGrammar"),
+                ),
+            ),
+            Ref("TableReferenceSegment"),
+            OneOf(
+                # CREATE TEMPORARY TABLE (...):
+                Sequence(
+                    Bracketed(
+                        Delimited(
+                            OneOf(
+                                Ref("TableConstraintSegment"),
+                                Ref("ColumnDefinitionSegment"),
+                                Ref("ColumnConstraintSegment"),
+                                Ref("ProjectionDefinitionSegment"),
+                            ),
+                        ),
+                        # Column definition may be missing if using AS SELECT
+                        optional=True,
+                    ),
+                    Ref("TableEngineSegment", optional=True),
+                    # CREATE TEMPORARY TABLE (...) AS SELECT:
+                    Sequence(
+                        "AS",
+                        Ref("SelectableGrammar"),
+                        optional=True,
+                    ),
+                ),
+                # CREATE TEMPORARY TABLE AS other_table:
+                Sequence(
+                    # https://clickhouse.com/docs/reference/statements/create/table#with-a-schema-and-data-cloned-from-another-table
+                    Ref.keyword("CLONE", optional=True),
+                    "AS",
+                    Ref("TableReferenceSegment"),
+                    Ref("TableEngineSegment", optional=True),
+                ),
+                # CREATE TEMPORARY TABLE AS table_function():
+                Sequence(
+                    "AS",
+                    Ref("FunctionSegment"),
+                ),
+            ),
+            AnySetOf(
+                Sequence(
+                    "COMMENT",
+                    OneOf(
+                        Ref("SingleIdentifierGrammar"),
+                        Ref("QuotedIdentifierSegment"),
+                    ),
+                ),
+                Ref("TableTTLSegment"),
+                optional=True,
+            ),
+            Ref("TableEndClauseSegment", optional=True),
+        ),
+    )
+
+
+class CreateViewStatementSegment(BaseSegment):
+    """A `CREATE VIEW` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/create/view
+    """
+
+    type = "create_view_statement"
+
+    _view_column_list = Bracketed(
+        Delimited(Ref("SingleIdentifierGrammar")),
+        optional=True,
+    )
+    _definer_clause = Sequence(
+        "DEFINER",
+        Ref("EqualsSegment"),
+        OneOf(
+            Ref("SingleIdentifierGrammar"),
+            "CURRENT_USER",
+        ),
+        optional=True,
+    )
+    _sql_security_clause = Sequence(
+        "SQL",
+        "SECURITY",
+        # NOTE: "NONE" is deprecated but still accepted by ClickHouse.
+        OneOf("DEFINER", "INVOKER", "NONE"),
+        optional=True,
+    )
+
+    match_grammar = Sequence(
+        "CREATE",
+        Ref("OrReplaceGrammar", optional=True),
+        "VIEW",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        _view_column_list,
+        Ref("OnClusterClauseSegment", optional=True),
+        _definer_clause,
+        _sql_security_clause,
+        "AS",
+        Ref(
+            "SelectableGrammar",
+            terminators=[Sequence("COMMENT", Ref("QuotedLiteralSegment"))],
+        ),
+        Ref("CommentClauseSegment", optional=True),
+        Ref("TableEndClauseSegment", optional=True),
+    )
+
+
+class CreateMaterializedViewStatementSegment(BaseSegment):
+    """A `CREATE MATERIALIZED VIEW` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/create/table/
+    """
+
+    type = "create_materialized_view_statement"
+
+    _definer_clause = Sequence(
+        "DEFINER",
+        Ref("EqualsSegment"),
+        OneOf(
+            Ref("SingleIdentifierGrammar"),
+            "CURRENT_USER",
+        ),
+        optional=True,
+    )
+    _sql_security_clause = Sequence(
+        "SQL",
+        "SECURITY",
+        # NOTE: "NONE" is deprecated but still accepted by ClickHouse.
+        OneOf("DEFINER", "NONE"),
+        optional=True,
+    )
+
+    match_grammar = Sequence(
+        "CREATE",
+        "MATERIALIZED",
+        "VIEW",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        OneOf(
+            Sequence(
+                "TO",
+                Ref("TableReferenceSegment"),
+                # Add support for column list in TO clause
+                Bracketed(
+                    Delimited(
+                        Ref("SingleIdentifierGrammar"),
+                    ),
+                    optional=True,
+                ),
+                Ref("TableEngineSegment", optional=True),
+            ),
+            Sequence(
+                Ref("TableEngineSegment", optional=True),
+                # Add support for PARTITION BY clause
+                Sequence(
+                    "PARTITION",
+                    "BY",
+                    Ref("ExpressionSegment"),
+                    optional=True,
+                ),
+                # Add support for ORDER BY clause
+                Ref("MergeTreesOrderByClauseSegment", optional=True),
+                # Add support for TTL clause
+                Ref("TableTTLSegment", optional=True),
+                # Add support for SETTINGS clause
+                Ref("SettingsClauseSegment", optional=True),
+                Sequence("POPULATE", optional=True),
+            ),
+        ),
+        _definer_clause,
+        _sql_security_clause,
+        "AS",
+        Ref(
+            "SelectableGrammar",
+            terminators=[Sequence("COMMENT", Ref("QuotedLiteralSegment"))],
+        ),
+        Ref("CommentClauseSegment", optional=True),
+        Ref("TableEndClauseSegment", optional=True),
+    )
+
+
+class CreateDictionaryStatementSegment(BaseSegment):
+    """A `CREATE DICTIONARY` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/create/dictionary
+    """
+
+    type = "create_dictionary_statement"
+
+    _dictionary_attribute = Sequence(
+        Ref("SingleIdentifierGrammar"),
+        Ref("DatatypeSegment"),
+        Sequence(
+            OneOf("DEFAULT", "EXPRESSION"),
+            Ref("ExpressionSegment"),
+            optional=True,
+        ),
+        AnySetOf(
+            "IS_OBJECT_ID",
+            "HIERARCHICAL",
+            "INJECTIVE",
+            optional=True,
+        ),
+    )
+    _dictionary_parameter = Sequence(
+        Ref("SingleIdentifierGrammar"),
+        OneOf(
+            Ref("QuotedLiteralSegment"),
+            Ref("NumericLiteralSegment"),
+            Ref("BooleanLiteralGrammar"),
+            Ref("NakedIdentifierSegment"),
+        ),
+    )
+    _dictionary_parameter_list = AnyNumberOf(
+        _dictionary_parameter,
+        min_times=1,
+        optional=True,
+    )
+    _dictionary_parameters = Bracketed(
+        _dictionary_parameter_list,
+    )
+    _dictionary_function = Sequence(
+        Ref("SingleIdentifierGrammar"),
+        _dictionary_parameters,
+    )
+    _dictionary_source_clause = Sequence(
+        "SOURCE",
+        Bracketed(
+            OneOf(
+                Ref("SingleIdentifierGrammar"),
+                # NULL() is a valid SOURCE
+                # https://clickhouse.com/docs/reference/statements/create/dictionary/sources/null
+                "NULL",
+            ),
+            _dictionary_parameters,
+        ),
+    )
+    _dictionary_layout_clause = Sequence(
+        "LAYOUT",
+        Bracketed(
+            _dictionary_function,
+        ),
+    )
+    _dictionary_lifetime_clause = Sequence(
+        "LIFETIME",
+        Bracketed(
+            OneOf(
+                Sequence(
+                    "MIN",
+                    Ref("NumericLiteralSegment"),
+                    "MAX",
+                    Ref("NumericLiteralSegment"),
+                ),
+                Ref("NumericLiteralSegment"),
+            ),
+        ),
+    )
+    _dictionary_range_clause = Sequence(
+        "RANGE",
+        Bracketed(
+            "MIN",
+            Ref("SingleIdentifierGrammar"),
+            "MAX",
+            Ref("SingleIdentifierGrammar"),
+        ),
+        optional=True,
+    )
+    _dictionary_settings_clause = Sequence(
+        "SETTINGS",
+        Bracketed(
+            Delimited(
+                Sequence(
+                    Ref("NakedIdentifierSegment"),
+                    Ref("EqualsSegment"),
+                    OneOf(
+                        Ref("NakedIdentifierSegment"),
+                        Ref("NumericLiteralSegment"),
+                        Ref("QuotedLiteralSegment"),
+                        Ref("BooleanLiteralGrammar"),
+                    ),
+                ),
+            ),
+        ),
+        optional=True,
+    )
+    _dictionary_mandatory_clauses = (
+        _dictionary_source_clause,
+        _dictionary_layout_clause,
+        _dictionary_lifetime_clause,
+    )
+    match_grammar = Sequence(
+        "CREATE",
+        Ref("OrReplaceGrammar", optional=True),
+        "DICTIONARY",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        Bracketed(
+            Delimited(
+                _dictionary_attribute,
+            ),
+        ),
+        "PRIMARY",
+        "KEY",
+        OptionallyBracketed(Delimited(Ref("SingleIdentifierGrammar"))),
+        # The order of SOURCE, LAYOUT, LIFETIME, SETTINGS, RANGE clauses
+        # is not strictly defined. However, there is a couple of rules:
+        # 1. These clauses must be stated after the PRIMARY KEY clause.
+        # 2. These clauses must be stated before the COMMENT clause.
+        # 3. SOURCE, LAYOUT, LIFETIME clauses are mandatory.
+        # 4. SETTINGS, RANGE clauses are optional.
+        OneOf(
+            # SOURCE, LAYOUT, LIFETIME
+            AnySetOf(
+                *_dictionary_mandatory_clauses,
+                min_times=3,
+            ),
+            # SOURCE, LAYOUT, LIFETIME, RANGE
+            AnySetOf(
+                *_dictionary_mandatory_clauses,
+                _dictionary_range_clause,
+                min_times=4,
+            ),
+            # SOURCE, LAYOUT, LIFETIME, SETTINGS
+            AnySetOf(
+                *_dictionary_mandatory_clauses,
+                _dictionary_settings_clause,
+                min_times=4,
+            ),
+            # SOURCE, LAYOUT, LIFETIME, RANGE, SETTINGS
+            AnySetOf(
+                *_dictionary_mandatory_clauses,
+                _dictionary_range_clause,
+                _dictionary_settings_clause,
+                min_times=5,
+            ),
+        ),
+        Ref("CommentClauseSegment", optional=True),
+    )
+
+
+class TruncateStatementSegment(ansi.TruncateStatementSegment):
+    """A `TRUNCATE TABLE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/sql-reference/statements/truncate
+    """
+
+    type = "truncate_table"
+
+    match_grammar: Matchable = Sequence(
+        "TRUNCATE",
+        # TABLE keyword is optional, even though the documentation
+        # doesn't state it
+        Ref.keyword("TABLE", optional=True),
+        Indent,
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Dedent,
+        Ref("OnClusterClauseSegment", optional=True),
+        Ref.keyword("SYNC", optional=True),
+    )
+
+
+class TruncateDatabaseStatementSegment(BaseSegment):
+    """A `TRUNCATE DATABASE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/sql-reference/statements/truncate
+    """
+
+    type = "truncate_database"
+
+    match_grammar: Matchable = Sequence(
+        "TRUNCATE",
+        "DATABASE",
+        Indent,
+        Ref("IfExistsGrammar", optional=True),
+        Ref("DatabaseReferenceSegment"),
+        Dedent,
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class TruncateTablesStatementSegment(BaseSegment):
+    """A `TRUNCATE TABLES` statement.
+
+    As specified in
+    https://clickhouse.com/docs/sql-reference/statements/truncate
+    """
+
+    type = "truncate_tables"
+
+    match_grammar: Matchable = Sequence(
+        "TRUNCATE",
+        Ref.keyword("ALL", optional=True),
+        "TABLES",
+        "FROM",
+        Indent,
+        Ref("IfExistsGrammar", optional=True),
+        Ref("DatabaseReferenceSegment"),
+        Dedent,
+        # We specifically do not use LikeExpressionGrammar here,
+        # as it covers cases that TRUNCATE TABLES does not support.
+        # For instance, something like
+        # TRUNCATE TABLES FROM test LIKE 'users|_%' escape '|';
+        # is not supported.
+        Sequence(
+            Ref.keyword("NOT", optional=True),
+            Ref("LikeGrammar", exclude=Ref.keyword("REGEXP")),
+            Ref("QuotedLiteralSegment"),
+            optional=True,
+        ),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class DropTableStatementSegment(ansi.DropTableStatementSegment):
+    """A `DROP TABLE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_table_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        Ref.keyword("TEMPORARY", optional=True),
+        "TABLE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        Ref.keyword("SYNC", optional=True),
+    )
+
+
+class DropDatabaseStatementSegment(ansi.DropDatabaseStatementSegment):
+    """A `DROP DATABASE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_database_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "DATABASE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("DatabaseReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        Ref.keyword("SYNC", optional=True),
+    )
+
+
+class DropDictionaryStatementSegment(BaseSegment):
+    """A `DROP DICTIONARY` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_dictionary_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "DICTIONARY",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref.keyword("SYNC", optional=True),
+    )
+
+
+class DropUserStatementSegment(ansi.DropUserStatementSegment):
+    """A `DROP USER` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_user_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "USER",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class CreateUserStatementSegment(BaseSegment):
+    """A `CREATE USER` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/create/user/
+    """
+
+    type = "create_user_statement"
+
+    match_grammar = Sequence(
+        "CREATE",
+        "USER",
+        Ref("IfNotExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+        # IDENTIFIED BY 'password' or IDENTIFIED WITH ... BY ...
+        Sequence(
+            "IDENTIFIED",
+            Sequence(
+                "WITH",
+                Ref("SingleIdentifierGrammar"),
+                optional=True,
+            ),
+            Sequence(
+                "BY",
+                Ref("QuotedLiteralSegment"),
+            ),
+            optional=True,
+        ),
+    )
+
+
+class DropRoleStatementSegment(ansi.DropRoleStatementSegment):
+    """A `DROP ROLE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_user_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "ROLE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class DropQuotaStatementSegment(BaseSegment):
+    """A `DROP QUOTA` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_quota_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "QUOTA",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class DropSettingProfileStatementSegment(BaseSegment):
+    """A `DROP setting PROFILE` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_setting_profile_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        Delimited(
+            Ref("NakedIdentifierSegment"),
+            min_delimiters=0,
+        ),
+        "PROFILE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class DropViewStatementSegment(ansi.DropViewStatementSegment):
+    """A `DROP VIEW` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_view_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "VIEW",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        Ref.keyword("SYNC", optional=True),
+    )
+
+
+class DropFunctionStatementSegment(ansi.DropFunctionStatementSegment):
+    """A `DROP FUNCTION` statement.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/drop/
+    """
+
+    type = "drop_function_statement"
+
+    match_grammar = Sequence(
+        "DROP",
+        "FUNCTION",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class SystemMergesSegment(BaseSegment):
+    """A `SYSTEM ... MERGES` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_merges_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "MERGES",
+        OneOf(
+            Sequence(
+                "ON",
+                "VOLUME",
+                Ref("ObjectReferenceSegment"),
+            ),
+            Ref("TableReferenceSegment"),
+        ),
+    )
+
+
+class SystemTTLMergesSegment(BaseSegment):
+    """A `SYSTEM ... TTL MERGES` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_ttl_merges_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "TTL",
+        "MERGES",
+        Ref("TableReferenceSegment", optional=True),
+    )
+
+
+class SystemMovesSegment(BaseSegment):
+    """A `SYSTEM ... MOVES` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_moves_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "MOVES",
+        Ref("TableReferenceSegment", optional=True),
+    )
+
+
+class SystemReplicaSegment(BaseSegment):
+    """A `SYSTEM ... REPLICA` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_replica_segment"
+
+    match_grammar = OneOf(
+        Sequence(
+            "SYNC",
+            "REPLICA",
+            Ref("OnClusterClauseSegment", optional=True),
+            Ref("TableReferenceSegment"),
+            Sequence("STRICT", optional=True),
+        ),
+        Sequence(
+            "DROP",
+            "REPLICA",
+            Ref("SingleIdentifierGrammar"),
+            Sequence(
+                "FROM",
+                OneOf(
+                    Sequence(
+                        "DATABASE",
+                        Ref("ObjectReferenceSegment"),
+                    ),
+                    Sequence(
+                        "TABLE",
+                        Ref("TableReferenceSegment"),
+                    ),
+                    Sequence(
+                        "ZKPATH",
+                        Ref("PathSegment"),
+                    ),
+                ),
+                optional=True,
+            ),
+        ),
+        Sequence(
+            "RESTART",
+            "REPLICA",
+            Ref("TableReferenceSegment"),
+        ),
+        Sequence(
+            "RESTORE",
+            "REPLICA",
+            Ref("TableReferenceSegment"),
+            Ref("OnClusterClauseSegment", optional=True),
+        ),
+    )
+
+
+class SystemFilesystemSegment(BaseSegment):
+    """A `SYSTEM ... FILESYSTEM` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_filesystem_segment"
+
+    match_grammar = Sequence(
+        "DROP",
+        "FILESYSTEM",
+        "CACHE",
+    )
+
+
+class SystemReplicatedSegment(BaseSegment):
+    """A `SYSTEM ... REPLICATED` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_replicated_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "REPLICATED",
+        "SENDS",
+        Ref("TableReferenceSegment", optional=True),
+    )
+
+
+class SystemReplicationSegment(BaseSegment):
+    """A `SYSTEM ... REPLICATION` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_replication_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "REPLICATION",
+        "QUEUES",
+        Ref("TableReferenceSegment", optional=True),
+    )
+
+
+class SystemFetchesSegment(BaseSegment):
+    """A `SYSTEM ... FETCHES` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_fetches_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            "START",
+            "STOP",
+        ),
+        "FETCHES",
+        Ref("TableReferenceSegment", optional=True),
+    )
+
+
+class SystemDistributedSegment(BaseSegment):
+    """A `SYSTEM ... DISTRIBUTED` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_distributed_segment"
+
+    match_grammar = Sequence(
+        OneOf(
+            Sequence(
+                OneOf(
+                    "START",
+                    "STOP",
+                ),
+                "DISTRIBUTED",
+                "SENDS",
+                Ref("TableReferenceSegment"),
+            ),
+            Sequence(
+                "FLUSH",
+                "DISTRIBUTED",
+                Ref("TableReferenceSegment"),
+            ),
+        ),
+        # Ref("TableReferenceSegment"),
+    )
+
+
+class SystemModelSegment(BaseSegment):
+    """A `SYSTEM ... MODEL` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_model_segment"
+
+    match_grammar = Sequence(
+        "RELOAD",
+        OneOf(
+            Sequence(
+                "MODELS",
+                Ref("OnClusterClauseSegment", optional=True),
+            ),
+            Sequence(
+                "MODEL",
+                AnySetOf(
+                    Ref("OnClusterClauseSegment", optional=True),
+                    Ref("PathSegment"),
+                ),
+            ),
+        ),
+    )
+
+
+class SystemFileSegment(BaseSegment):
+    """A `SYSTEM ... FILE` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_file_segment"
+
+    match_grammar = Sequence(
+        "SYNC",
+        "FILE",
+        "CACHE",
+    )
+
+
+class SystemUnfreezeSegment(BaseSegment):
+    """A `SYSTEM ... UNFREEZE` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_unfreeze_segment"
+
+    match_grammar = Sequence(
+        "UNFREEZE",
+        "WITH",
+        "NAME",
+        Ref("ObjectReferenceSegment"),
+    )
+
+
+class SystemStatementSegment(BaseSegment):
+    """A `SYSTEM ...` statement.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/system
+    """
+
+    type = "system_statement"
+
+    match_grammar: Matchable = Sequence(
+        "SYSTEM",
+        OneOf(
+            Ref("SystemMergesSegment"),
+            Ref("SystemTTLMergesSegment"),
+            Ref("SystemMovesSegment"),
+            Ref("SystemReplicaSegment"),
+            Ref("SystemReplicatedSegment"),
+            Ref("SystemReplicationSegment"),
+            Ref("SystemFetchesSegment"),
+            Ref("SystemDistributedSegment"),
+            Ref("SystemFileSegment"),
+            Ref("SystemFilesystemSegment"),
+            Ref("SystemUnfreezeSegment"),
+            Ref("SystemModelSegment"),
+        ),
+    )
+
+
+class ProjectionBodySegment(BaseSegment):
+    """A projection body, can either be a query or an index."""
+
+    type = "projection_body"
+
+    match_grammar: Matchable = OneOf(
+        # Projection query
+        Bracketed(
+            # Common Scalar Expressions are supported in the projection query definition,
+            # even though it is not stated explicitly in the docs.
+            # For more info look here:
+            # https://github.com/ClickHouse/ClickHouse/blob/b3c71468cee00c7bcd7d5dc995eaffa8b0f69a8c/src/Parsers/ParserProjectionSelectQuery.cpp#L34-L42
+            Sequence(
+                "WITH",
+                Delimited(
+                    Sequence(
+                        Ref("ExpressionSegment"),
+                        "AS",
+                        Ref("SingleIdentifierGrammar"),
+                    ),
+                ),
+                optional=True,
+            ),
+            Ref("SelectClauseSegment"),
+            Ref("WhereClauseSegment", optional=True),
+            OneOf(
+                Ref("OrderByClauseSegment"),
+                Ref("GroupByClauseSegment"),
+                optional=True,
+            ),
+        ),
+        # Projection index
+        Sequence(
+            "INDEX",
+            OneOf(
+                Ref("ColumnReferenceSegment"),
+                Ref("ExpressionSegment"),
+            ),
+            "TYPE",
+            Ref("SingleIdentifierGrammar"),
+        ),
+    )
+
+
+class ProjectionDefinitionSegment(BaseSegment):
+    """A Projection definition.
+
+    As specified in
+    https://clickhouse.com/docs/reference/statements/alter/projection
+    https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/mergetree#projections
+    """
+
+    type = "projection_definition"
+
+    match_grammar: Matchable = Sequence(
+        "PROJECTION",
+        Ref("SingleIdentifierGrammar"),
+        Ref("ProjectionBodySegment"),
+        Sequence(
+            "WITH",
+            Ref("ProjectionDefinitionStatementSettingsClauseSegment"),
+            optional=True,
+        ),
+    )
+
+
+class AlterTableAddProjectionDefinitionStatement(ProjectionDefinitionSegment):
+    """A helper projection definition used in ALTER TABLE ... ADD PROJECTION."""
+
+    type = "projection_definition"
+
+    match_grammar: Matchable = ProjectionDefinitionSegment.match_grammar.copy(
+        insert=[Ref("IfNotExistsGrammar", optional=True)],
+        before=Ref("SingleIdentifierGrammar"),
+    ).copy(
+        # https://github.com/ClickHouse/ClickHouse/blob/b3c71468cee00c7bcd7d5dc995eaffa8b0f69a8c/src/Parsers/ParserAlterQuery.cpp#L474-L480
+        insert=[Ref("PositionalPlacementGrammar", optional=True)]
+    )
+
+
+class AlterTableModifyProjectionDefinitionStatement(ProjectionDefinitionSegment):
+    """A helper projection definition used in ALTER TABLE ... MODIFY PROJECTION."""
+
+    type = "projection_definition"
+
+    match_grammar: Matchable = ProjectionDefinitionSegment.match_grammar.copy(
+        insert=[Ref("IfExistsGrammar", optional=True)],
+        before=Ref("SingleIdentifierGrammar"),
+    )
+
+
+class ProjectionDefinitionStatementSettingsClauseSegment(SettingsClauseSegment):
+    """A helper SettingsClauseSegment used in ProjectionDefinitionStatement."""
+
+    type = "settings_clause"
+
+    match_grammar: Matchable = Sequence(
+        "SETTINGS",
+        # Brackets are needed for settings in projections
+        Bracketed(
+            SettingsClauseSegment.match_grammar.copy(remove=[Ref.keyword("SETTINGS")]),
+        ),
+    )
+
+
+class ProjectionDefinitionCreateHypotheticalProjectionSegment(
+    ProjectionDefinitionSegment
+):
+    """A helper projection definition used in CREATE HYPOTHETICAL PROJECTION."""
+
+    type = "projection_definition"
+
+    match_grammar: Matchable = ProjectionDefinitionSegment.match_grammar.copy(
+        insert=[Ref("IfNotExistsGrammar", optional=True)],
+        before=Ref("SingleIdentifierGrammar"),
+    ).copy(
+        insert=[Sequence("ON", Ref("TableReferenceSegment"))],
+        before=Ref("ProjectionBodySegment"),
+    )
+
+
+class CreateHypotheticalProjectionStatementSegment(BaseSegment):
+    """A `CREATE HYPOTHETICAL PROJECTION` statement for ClickHouse.
+
+    As specified in
+    https://clickhouse.com/docs/reference/statements/hypothetical-projection#create-hypothetical-projection
+    """
+
+    type = "create_hypothetical_projection_statement"
+
+    match_grammar: Matchable = Sequence(
+        "CREATE",
+        "HYPOTHETICAL",
+        Ref("ProjectionDefinitionCreateHypotheticalProjectionSegment"),
+    )
+
+
+class DropHypotheticalProjectionStatementSegment(BaseSegment):
+    """A `DROP HYPOTHETICAL PROJECTION` statement for ClickHouse.
+
+    As specified in
+    https://clickhouse.com/docs/reference/statements/hypothetical-projection#drop-hypothetical-projection
+    """
+
+    type = "drop_hypothetical_projection_statement"
+
+    match_grammar: Matchable = Sequence(
+        "DROP",
+        "HYPOTHETICAL",
+        "PROJECTION",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("SingleIdentifierGrammar"),
+        "ON",
+        Ref("TableReferenceSegment"),
+    )
+
+
+class DropAllHypotheticalProjectionsStatementSegment(BaseSegment):
+    """A `DROP ALL HYPOTHETICAL PROJECTIONS` statement for ClickHouse.
+
+    As specified in
+    https://clickhouse.com/docs/reference/statements/hypothetical-projection#drop-all-hypothetical-projections
+    """
+
+    type = "drop_all_hypothetical_projections_statement"
+
+    match_grammar: Matchable = Sequence("DROP", "ALL", "HYPOTHETICAL", "PROJECTIONS")
+
+
+class AlterTableStatementSegment(BaseSegment):
+    """An `ALTER TABLE` statement for ClickHouse.
+
+    As specified in
+    https://clickhouse.com/docs/en/sql-reference/statements/alter/
+    """
+
+    type = "alter_table_statement"
+
+    match_grammar = Sequence(
+        "ALTER",
+        "TABLE",
+        Ref("IfExistsGrammar", optional=True),
+        Ref("TableReferenceSegment"),
+        Ref("OnClusterClauseSegment", optional=True),
+        OneOf(
+            Delimited(
+                OneOf(
+                    # ALTER TABLE ... DROP COLUMN [IF EXISTS] name
+                    Sequence(
+                        "DROP",
+                        "COLUMN",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                    ),
+                    # ALTER TABLE ... ADD COLUMN [IF NOT EXISTS] name [type]
+                    Sequence(
+                        "ADD",
+                        "COLUMN",
+                        Ref("IfNotExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        OneOf(
+                            # Regular column with type
+                            Sequence(
+                                Ref("DatatypeSegment"),  # Data type
+                                Sequence(
+                                    "DEFAULT",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "MATERIALIZED",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "CODEC",
+                                    Bracketed(
+                                        Delimited(
+                                            OneOf(
+                                                Ref("FunctionSegment"),
+                                                Ref("SingleIdentifierGrammar"),
+                                            ),
+                                        ),
+                                    ),
+                                    optional=True,
+                                ),
+                            ),
+                            # Alias column with type
+                            Sequence(
+                                Ref("DatatypeSegment"),  # Data type
+                                "ALIAS",
+                                Ref("ExpressionSegment"),
+                            ),
+                            # Alias column without type
+                            Sequence(
+                                "ALIAS",
+                                Ref("ExpressionSegment"),
+                            ),
+                            # Default could also be used without type
+                            Sequence(
+                                "DEFAULT",
+                                Ref("ExpressionSegment"),
+                            ),
+                            # Materialized could also be used without type
+                            Sequence(
+                                "MATERIALIZED",
+                                Ref("ExpressionSegment"),
+                            ),
+                        ),
+                        Ref("PositionalPlacementGrammar", optional=True),
+                    ),
+                    # ALTER TABLE ... ADD ALIAS name FOR column_name
+                    Sequence(
+                        "ADD",
+                        "ALIAS",
+                        Ref("IfNotExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Alias name
+                        "FOR",
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                    ),
+                    # ALTER TABLE ... RENAME COLUMN [IF EXISTS] name to new_name
+                    Sequence(
+                        "RENAME",
+                        "COLUMN",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        "TO",
+                        Ref("SingleIdentifierGrammar"),  # New column name
+                    ),
+                    # ALTER TABLE ... COMMENT COLUMN [IF EXISTS] name 'Text comment'
+                    Sequence(
+                        "COMMENT",
+                        "COLUMN",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        Ref("QuotedLiteralSegment"),  # Comment text
+                    ),
+                    # ALTER TABLE ... COMMENT 'Text comment'
+                    Sequence(
+                        "COMMENT",
+                        Ref("QuotedLiteralSegment"),  # Comment text
+                    ),
+                    # ALTER TABLE ... MODIFY COMMENT 'Text comment'
+                    Sequence(
+                        "MODIFY",
+                        "COMMENT",
+                        Ref("QuotedLiteralSegment"),  # Comment text
+                    ),
+                    # ALTER TABLE ... MODIFY COLUMN [IF EXISTS] name [TYPE] [type]
+                    Sequence(
+                        "MODIFY",
+                        "COLUMN",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        OneOf(
+                            # Type modification with explicit TYPE keyword
+                            Sequence(
+                                "TYPE",
+                                Ref("DatatypeSegment"),  # Data type
+                                Sequence(
+                                    "DEFAULT",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "MATERIALIZED",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "ALIAS",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "CODEC",
+                                    Bracketed(
+                                        Delimited(
+                                            OneOf(
+                                                Ref("FunctionSegment"),
+                                                Ref("SingleIdentifierGrammar"),
+                                            ),
+                                            delimiter=Ref("CommaSegment"),
+                                        ),
+                                    ),
+                                    optional=True,
+                                ),
+                            ),
+                            # Type modification without TYPE keyword
+                            Sequence(
+                                Ref("DatatypeSegment", optional=True),  # Data type
+                                Sequence(
+                                    "DEFAULT",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "MATERIALIZED",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "ALIAS",
+                                    Ref("ExpressionSegment"),
+                                    optional=True,
+                                ),
+                                Sequence(
+                                    "CODEC",
+                                    Bracketed(
+                                        Delimited(
+                                            OneOf(
+                                                Ref("FunctionSegment"),
+                                                Ref("SingleIdentifierGrammar"),
+                                            ),
+                                            delimiter=Ref("CommaSegment"),
+                                        ),
+                                    ),
+                                    optional=True,
+                                ),
+                            ),
+                            # Alias modification
+                            Sequence(
+                                "ALIAS",
+                                Ref("ExpressionSegment"),
+                            ),
+                            # Remove alias
+                            Sequence(
+                                "REMOVE",
+                                "ALIAS",
+                            ),
+                            # Remove property
+                            Sequence(
+                                "REMOVE",
+                                OneOf(
+                                    "ALIAS",
+                                    "DEFAULT",
+                                    "MATERIALIZED",
+                                    "CODEC",
+                                    "COMMENT",
+                                    "TTL",
+                                ),
+                            ),
+                            # Modify setting
+                            Sequence(
+                                "MODIFY",
+                                "SETTING",
+                                Ref("SingleIdentifierGrammar"),  # Setting name
+                                Ref("EqualsSegment"),
+                                Ref("LiteralGrammar"),  # Setting value
+                            ),
+                            # Reset setting
+                            Sequence(
+                                "RESET",
+                                "SETTING",
+                                Ref("SingleIdentifierGrammar"),  # Setting name
+                            ),
+                            optional=True,
+                        ),
+                        Ref("PositionalPlacementGrammar", optional=True),
+                    ),
+                    # ALTER TABLE ... ALTER COLUMN name [TYPE] [type]
+                    Sequence(
+                        "ALTER",
+                        "COLUMN",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        OneOf(
+                            # With TYPE keyword
+                            Sequence(
+                                "TYPE",
+                                Ref("DatatypeSegment"),  # Data type
+                            ),
+                            # Without TYPE keyword
+                            Ref("DatatypeSegment"),  # Data type
+                        ),
+                        Ref("PositionalPlacementGrammar", optional=True),
+                    ),
+                    # ALTER TABLE ... REMOVE TTL
+                    Sequence(
+                        "REMOVE",
+                        "TTL",
+                    ),
+                    # ALTER TABLE ... MODIFY TTL expression
+                    Sequence(
+                        "MODIFY",
+                        "TTL",
+                        Ref("ExpressionSegment"),
+                    ),
+                    # ALTER TABLE ... MATERIALIZE COLUMN col
+                    Sequence(
+                        "MATERIALIZE",
+                        "COLUMN",
+                        Ref("SingleIdentifierGrammar"),  # Column name
+                        OneOf(
+                            Sequence(
+                                "IN",
+                                "PARTITION",
+                                Ref("SingleIdentifierGrammar"),
+                            ),
+                            Sequence(
+                                "IN",
+                                "PARTITION",
+                                "ID",
+                                Ref("QuotedLiteralSegment"),
+                            ),
+                            optional=True,
+                        ),
+                    ),
+                    # ALTER TABLE ... DROP PARTITION|PART partition_expr
+                    Sequence(
+                        "DROP",
+                        OneOf("PARTITION", "PART"),
+                        Ref("SingleIdentifierGrammar"),
+                    ),
+                    # ALTER TABLE ... REPLACE PARTITION partition_expr FROM table1
+                    Sequence(
+                        "REPLACE",
+                        "PARTITION",
+                        Ref("SingleIdentifierGrammar"),
+                        "FROM",
+                        Ref("TableReferenceSegment"),
+                    ),
+                    # ALTER TABLE ... ADD PROJECTION
+                    Sequence(
+                        "ADD",
+                        Ref("AlterTableAddProjectionDefinitionStatement"),
+                    ),
+                    # ALTER TABLE ... MODIFY PROJECTION
+                    Sequence(
+                        "MODIFY",
+                        Ref("AlterTableModifyProjectionDefinitionStatement"),
+                    ),
+                    # ALTER TABLE ... DROP PROJECTION
+                    Sequence(
+                        "DROP",
+                        "PROJECTION",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),
+                    ),
+                    # ALTER TABLE ... MATERIALIZE PROJECTION
+                    Sequence(
+                        "MATERIALIZE",
+                        "PROJECTION",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),
+                        Sequence(
+                            "IN",
+                            "PARTITION",
+                            Ref("PartitionExpressionGrammar"),
+                            optional=True,
+                        ),
+                    ),
+                    # ALTER TABLE ... CLEAR PROJECTION
+                    Sequence(
+                        "CLEAR",
+                        "PROJECTION",
+                        Ref("IfExistsGrammar", optional=True),
+                        Ref("SingleIdentifierGrammar"),
+                        Sequence(
+                            "IN",
+                            "PARTITION",
+                            Ref("PartitionExpressionGrammar"),
+                            optional=True,
+                        ),
+                    ),
+                ),
+                terminators=[Ref("SettingsClauseSegment")],
+            ),
+            # ALTER TABLE ... MODIFY QUERY select_statement
+            Sequence(
+                "MODIFY",
+                "QUERY",
+                Ref("SelectStatementSegment"),
+            ),
+            # ALTER TABLE ... UPDATE column = expr [, column = expr ...] WHERE condition
+            Sequence(
+                "UPDATE",
+                Delimited(
+                    Sequence(
+                        Ref("SingleIdentifierGrammar"),
+                        Ref("EqualsSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+                Ref("WhereClauseSegment"),
+            ),
+            # ALTER TABLE ... DELETE WHERE condition
+            Sequence(
+                "DELETE",
+                Ref("WhereClauseSegment"),
+            ),
+        ),
+        Ref("SettingsClauseSegment", optional=True),
+    )
+
+
+class StatementSegment(ansi.StatementSegment):
+    """Overriding StatementSegment to allow for additional segment parsing."""
+
+    match_grammar = ansi.StatementSegment.match_grammar.copy(
+        insert=[
+            Ref("CreateUserStatementSegment"),
+            Ref("CreateDictionaryStatementSegment"),
+            Ref("CreateMaterializedViewStatementSegment"),
+            Ref("DropDictionaryStatementSegment"),
+            Ref("DropQuotaStatementSegment"),
+            Ref("DropSettingProfileStatementSegment"),
+            Ref("SystemStatementSegment"),
+            Ref("RenameStatementSegment"),
+            Ref("AlterTableStatementSegment"),
+            Ref("ExchangeTablesStatementSegment"),
+            Ref("ExchangeDictionariesStatementSegment"),
+            Ref("TruncateDatabaseStatementSegment"),
+            Ref("TruncateTablesStatementSegment"),
+            Ref("CreateHypotheticalProjectionStatementSegment"),
+            Ref("DropHypotheticalProjectionStatementSegment"),
+            Ref("DropAllHypotheticalProjectionsStatementSegment"),
+        ]
+    )
+
+
+class LimitClauseComponentSegment(BaseSegment):
+    """A component of a `LIMIT` clause.
+
+    https://clickhouse.com/docs/en/sql-reference/statements/select/limit
+    """
+
+    type = "limit_clause_component"
+
+    match_grammar = OptionallyBracketed(
+        OneOf(
+            # Allow a number by itself OR
+            Ref("NumericLiteralSegment"),
+            # An arbitrary expression
+            Ref("ExpressionSegment"),
+        )
+    )
+
+
+class LimitClauseSegment(ansi.LimitClauseSegment):
+    """Overriding LimitClauseSegment to allow for additional segment parsing."""
+
+    match_grammar: Matchable = Sequence(
+        "LIMIT",
+        Indent,
+        Sequence(
+            Ref("LimitClauseComponentSegment"),
+            OneOf(
+                Sequence(
+                    "OFFSET",
+                    Ref("LimitClauseComponentSegment"),
+                ),
+                Sequence(
+                    # LIMIT 1,2 only accepts constants
+                    # and can't be bracketed like that LIMIT (1, 2)
+                    # but can be bracketed like that LIMIT (1), (2)
+                    Ref("CommaSegment"),
+                    Ref("LimitClauseComponentSegment"),
+                ),
+                optional=True,
+            ),
+            Sequence(
+                "BY",
+                OneOf(
+                    Ref("BracketedColumnReferenceListGrammar"),
+                    # Unbracketed ``LIMIT n BY a, b`` accepts a list of columns.
+                    Delimited(Ref("ColumnReferenceSegment")),
+                ),
+                optional=True,
+            ),
+        ),
+        Dedent,
+    )
+
+
+class FunctionContentsSegment(BaseSegment):
+    """A function contents segment that supports parametric aggregate functions.
+
+    https://clickhouse.com/docs/sql-reference/aggregate-functions/parametric-functions
+    """
+
+    type = "function_contents"
+
+    match_grammar: Matchable = OneOf(
+        # Double parentheses pattern: func(params)(args)
+        Sequence(
+            Bracketed(
+                # The parameter brackets might be empty
+                # i.e. `studentTTestOneSample()(...)`.
+                Ref("FunctionContentsGrammar", optional=True),
+            ),
+            Bracketed(
+                Ref("FunctionContentsGrammar", optional=True),
+            ),
+        ),
+        # Standard ANSI single parentheses
+        ansi.FunctionContentsSegment.match_grammar,
+    )
+
+
+class IntervalExpressionSegment(BaseSegment):
+    """An interval expression segment.
+
+    https://clickhouse.com/docs/en/sql-reference/data-types/special-data-types/interval
+    https://clickhouse.com/docs/en/sql-reference/operators#operator-interval
+    """
+
+    type = "interval_expression"
+    match_grammar: Matchable = Sequence(
+        "INTERVAL",
+        OneOf(
+            # The Numeric Version
+            Sequence(
+                Ref("NumericLiteralSegment"),
+                Ref("DatetimeUnitSegment"),
+            ),
+            # The String version
+            Ref("QuotedLiteralSegment"),
+            # Combine version
+            Sequence(
+                Ref("QuotedLiteralSegment"),
+                Ref("DatetimeUnitSegment"),
+            ),
+            # With expression as value
+            Sequence(
+                Ref("ExpressionSegment"),
+                Ref("DatetimeUnitSegment"),
+            ),
+        ),
+    )
+
+
+class ColumnDefinitionSegment(BaseSegment):
+    """A column definition, e.g. for CREATE TABLE or ALTER TABLE.
+
+    Supports ClickHouse specific options like CODEC, ALIAS, MATERIALIZED, etc.
+    """
+
+    type = "column_definition"
+    match_grammar = Sequence(
+        OneOf(
+            Ref("SingleIdentifierGrammar"),
+            Ref("QuotedIdentifierSegment"),
+        ),
+        Ref("DatatypeSegment"),
+        AnyNumberOf(
+            OneOf(
+                # DEFAULT expression
+                Sequence(
+                    "DEFAULT",
+                    OneOf(
+                        Ref("LiteralGrammar"),
+                        Ref("FunctionSegment"),
+                        Ref("ExpressionSegment"),
+                    ),
+                ),
+                # ALIAS expression
+                Sequence(
+                    "ALIAS",
+                    Ref("ExpressionSegment"),
+                ),
+                # MATERIALIZED expression
+                Sequence(
+                    "MATERIALIZED",
+                    Ref("ExpressionSegment"),
+                ),
+                # CODEC(...)
+                Sequence(
+                    "CODEC",
+                    Bracketed(
+                        Delimited(
+                            OneOf(
+                                Ref("FunctionSegment"),
+                                Ref("SingleIdentifierGrammar"),
+                            ),
+                            delimiter=Ref("CommaSegment"),
+                        ),
+                    ),
+                ),
+                # COMMENT 'text'
+                Sequence(
+                    "COMMENT",
+                    Ref("QuotedLiteralSegment"),
+                ),
+                # Column constraint
+                Ref("ColumnConstraintSegment"),
+            ),
+            optional=True,
+        ),
+    )
+
+
+class ColumnReferenceSegment(ansi.ColumnReferenceSegment):
+    """A reference to a column, including tuple element access like `a.1`."""
+
+    match_grammar: Matchable = OneOf(
+        ansi.ColumnReferenceSegment.match_grammar,
+        # Tuple element access uses dot + numeric literal, but the lexer
+        # tokenizes ".1" as a numeric literal rather than a dot segment.
+        Sequence(
+            Delimited(
+                Ref("SingleIdentifierGrammar"),
+                delimiter=Ref("ObjectReferenceDelimiterGrammar"),
+                allow_gaps=False,
+            ),
+            AnyNumberOf(
+                Ref("NumericLiteralSegment"),
+                min_times=1,
+                allow_gaps=False,
+            ),
+            allow_gaps=False,
+        ),
+    )
+
+
+class TupleElementAccessSegment(BaseSegment):
+    """A tuple element access expression like `(a.1).2`."""
+
+    type = "tuple_element_access"
+    match_grammar: Matchable = Sequence(
+        Bracketed(Ref("ColumnReferenceSegment")),
+        AnyNumberOf(
+            Ref("NumericLiteralSegment"),
+            min_times=1,
+            allow_gaps=False,
+        ),
+        allow_gaps=False,
+    )
+
+
+class TupleElementAccessorSegment(BaseSegment):
+    """A tuple element access postfix like the `.2` in `f(x).2`.
+
+    Used as an accessor (via ``AccessorGrammar``) so tuple element access can
+    follow any ``Expression_D`` base -- a function call, an array subscript, a
+    tuple literal, etc. The lexer tokenizes ``.2`` as a numeric literal rather
+    than a dot followed by an integer, so the postfix is a run of numeric
+    literals that must abut the preceding expression (``allow_gaps=False``).
+    """
+
+    type = "tuple_element_access"
+    match_grammar: Matchable = AnyNumberOf(
+        Ref("NumericLiteralSegment"),
+        min_times=1,
+        allow_gaps=False,
+    )
+
+
+class ExchangeTablesStatementSegment(BaseSegment):
+    """An `EXCHANGE TABLES` statement.
+
+    As specified in
+    https://clickhouse.com/docs/sql-reference/statements/exchange
+    """
+
+    type = "exchange_tables_statement"
+
+    match_grammar: Matchable = Sequence(
+        "EXCHANGE",
+        "TABLES",
+        Delimited(
+            Sequence(
+                Ref("TableReferenceSegment"),
+                "AND",
+                Ref("TableReferenceSegment"),
+            ),
+        ),
+        Ref("OnClusterClauseSegment", optional=True),
+    )
+
+
+class ExchangeDictionariesStatementSegment(BaseSegment):
+    """An `EXCHANGE DICTIONARIES` statement.
+
+    As specified in
+    https://clickhouse.com/docs/sql-reference/statements/exchange
+    """
+
+    type = "exchange_dictionaries_statement"
+
+    match_grammar: Matchable = Sequence(
+        "EXCHANGE",
+        "DICTIONARIES",
+        # It is possible to exchange multiple dictionary pairs in
+        # a single query, even though the documentation states it only
+        # for tables
+        # https://fiddle.clickhouse.com/739c85b0-2f18-4d14-a396-a41ce568d6d9
+        Delimited(
+            Sequence(
+                Ref("ObjectReferenceSegment"),
+                "AND",
+                Ref("ObjectReferenceSegment"),
+            ),
+        ),
+        Ref("OnClusterClauseSegment", optional=True),
+    )

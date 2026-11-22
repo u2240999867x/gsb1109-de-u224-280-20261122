@@ -1,0 +1,230 @@
+-- DROP COLUMN examples
+ALTER TABLE x DROP COLUMN y;
+ALTER TABLE x DROP COLUMN IF EXISTS y;
+ALTER TABLE x ON CLUSTER '{cluster}' DROP COLUMN y;
+ALTER TABLE x ON CLUSTER '{cluster}' DROP COLUMN IF EXISTS y;
+ALTER TABLE visits DROP COLUMN browser;
+
+-- ADD COLUMN examples
+ALTER TABLE x ADD COLUMN y Int32;
+ALTER TABLE x ADD COLUMN y Int32 DEFAULT 1;
+ALTER TABLE x ADD COLUMN IF NOT EXISTS y Int32;
+ALTER TABLE x ADD COLUMN IF NOT EXISTS y Int32 DEFAULT 1;
+
+ALTER TABLE alter_test ADD COLUMN Added1 UInt32 FIRST;
+ALTER TABLE alter_test ADD COLUMN Added2 UInt32 AFTER NestedColumn;
+ALTER TABLE alter_test ADD COLUMN Added3 UInt32 AFTER ToDrop;
+
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN y Int32;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN y Int32 DEFAULT 1;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN IF NOT EXISTS y Int32;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN IF NOT EXISTS y Int32 DEFAULT 1;
+
+-- ADD COLUMN with CODEC and AFTER/FIRST
+ALTER TABLE x ADD COLUMN z Int32 CODEC(ZSTD);
+ALTER TABLE x ADD COLUMN z Int32 AFTER y;
+ALTER TABLE x ADD COLUMN z Int32 FIRST;
+ALTER TABLE x ADD COLUMN z Int32 DEFAULT 0 CODEC(ZSTD) AFTER y;
+
+-- RENAME COLUMN examples
+ALTER TABLE x RENAME COLUMN old_name TO new_name;
+ALTER TABLE x RENAME COLUMN IF EXISTS old_name TO new_name;
+ALTER TABLE x ON CLUSTER '{cluster}' RENAME COLUMN old_name TO new_name;
+ALTER TABLE x ON CLUSTER '{cluster}' RENAME COLUMN IF EXISTS old_name TO new_name;
+ALTER TABLE visits RENAME COLUMN webBrowser TO browser;
+
+-- COMMENT COLUMN examples
+ALTER TABLE x COMMENT COLUMN col_name 'This is a comment';
+ALTER TABLE x COMMENT COLUMN IF EXISTS col_name 'Column description';
+ALTER TABLE x ON CLUSTER '{cluster}' COMMENT COLUMN col_name 'Cluster-wide comment';
+ALTER TABLE x ON CLUSTER '{cluster}' COMMENT COLUMN IF EXISTS col_name 'Cluster-wide description';
+ALTER TABLE visits COMMENT COLUMN browser 'This column shows the browser used for accessing the site.';
+
+-- COMMENT TABLE examples
+ALTER TABLE x COMMENT 'This is a table comment';
+ALTER TABLE x ON CLUSTER '{cluster}' COMMENT 'This is a table comment';
+ALTER TABLE x MODIFY COMMENT '';
+
+-- MODIFY COLUMN examples
+ALTER TABLE x MODIFY COLUMN col_name Int64;
+ALTER TABLE x MODIFY COLUMN IF EXISTS col_name Int64;
+ALTER TABLE x MODIFY COLUMN col_name Int64 DEFAULT 0;
+ALTER TABLE x MODIFY COLUMN col_name Int64 CODEC(ZSTD);
+ALTER TABLE x MODIFY COLUMN col_name Int64 AFTER other_col;
+ALTER TABLE x MODIFY COLUMN col_name Int64 FIRST;
+ALTER TABLE x ON CLUSTER '{cluster}' MODIFY COLUMN col_name Int64 DEFAULT 0 CODEC(ZSTD) AFTER other_col;
+ALTER TABLE visits MODIFY COLUMN browser Array(String);
+ALTER TABLE users MODIFY COLUMN c2 String FIRST;
+ALTER TABLE users MODIFY COLUMN c2 TYPE String AFTER c1;
+
+-- MATERIALIZE COLUMN examples
+ALTER TABLE x MATERIALIZE COLUMN col_name;
+ALTER TABLE x MATERIALIZE COLUMN col_name IN PARTITION partition_name;
+ALTER TABLE x MATERIALIZE COLUMN col_name IN PARTITION ID 'partition_id';
+ALTER TABLE x ON CLUSTER '{cluster}' MATERIALIZE COLUMN col_name;
+ALTER TABLE x ON CLUSTER '{cluster}' MATERIALIZE COLUMN col_name IN PARTITION partition_name;
+ALTER TABLE tmp ADD COLUMN s String MATERIALIZED toString(x);
+ALTER TABLE tmp MODIFY COLUMN s String MATERIALIZED toString(round(100/x));
+ALTER TABLE tmp MATERIALIZE COLUMN s;
+
+-- ALIAS examples
+ALTER TABLE x ADD ALIAS alias_name FOR col_name;
+ALTER TABLE x ADD ALIAS IF NOT EXISTS alias_name FOR col_name;
+ALTER TABLE x ON CLUSTER '{cluster}' MODIFY COLUMN y ALIAS z/10;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD ALIAS alias_name FOR col_name;
+ALTER TABLE x ON CLUSTER '{cluster}' MODIFY COLUMN y REMOVE ALIAS;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN IF NOT EXISTS y Float32 ALIAS z*100;
+
+-- TTL examples
+ALTER TABLE table_with_ttl MODIFY COLUMN column_ttl REMOVE TTL;
+ALTER TABLE table_with_ttl REMOVE TTL;
+ALTER TABLE table_with_ttl ON CLUSTER '{cluster}' REMOVE TTL;
+ALTER TABLE table_name ON CLUSTER '{cluster}' MODIFY TTL event_time + INTERVAL 3 MONTH;
+
+-- ALIAS examples
+ALTER TABLE x ADD COLUMN y Int32 ALIAS z + 10;
+ALTER TABLE x ON CLUSTER '{cluster}' ADD COLUMN IF NOT EXISTS y Float32 ALIAS z * 100;
+ALTER TABLE x MODIFY COLUMN y ALIAS z/10;
+ALTER TABLE x ON CLUSTER '{cluster}' MODIFY COLUMN y REMOVE ALIAS;
+
+-- Basic ALTER TABLE MODIFY QUERY examples
+ALTER TABLE mv MODIFY QUERY SELECT * FROM source_table;
+ALTER TABLE mv MODIFY QUERY SELECT id, name, value FROM source_table WHERE value > 0;
+
+-- With ON CLUSTER clause
+ALTER TABLE mv ON CLUSTER cluster1 MODIFY QUERY SELECT * FROM source_table;
+ALTER TABLE mv ON CLUSTER '{cluster}' MODIFY QUERY SELECT id, name, value FROM source_table WHERE value > 0;
+
+-- With complex SELECT queries
+ALTER TABLE mv MODIFY QUERY
+  SELECT
+    id,
+    name,
+    sum(value) AS total_value
+  FROM source_table
+  GROUP BY id, name
+  HAVING total_value > 100
+  ORDER BY total_value DESC
+  LIMIT 10;
+
+ALTER TABLE mv MODIFY QUERY
+  SELECT
+    t1.id,
+    t1.name,
+    t2.value
+  FROM table1 AS t1
+  JOIN table2 AS t2 ON t1.id = t2.id
+  WHERE t1.active = 1;
+
+-- DROP PARTITION examples
+ALTER TABLE x DROP PARTITION y;
+ALTER TABLE x ON CLUSTER '{cluster}' DROP PARTITION 'y';
+ALTER TABLE x DROP PART 'y';
+ALTER TABLE x ON CLUSTER '{cluster}' DROP PART 'y';
+
+-- REPLACE PARTITION examples
+ALTER TABLE x REPLACE PARTITION 'y' FROM z;
+ALTER TABLE x ON CLUSTER '{cluster}' REPLACE PARTITION 'y' FROM z;
+
+-- ALTER TABLE with Settings
+ALTER TABLE x ADD COLUMN y Int32 ALIAS z + 10 SETTINGS abc=1;
+
+-- UPDATE mutation examples
+ALTER TABLE my_table UPDATE column_name = 'new_value' WHERE condition = true;
+ALTER TABLE my_table UPDATE column_name = 'new_value' WHERE condition = true SETTINGS mutations_sync = 1;
+ALTER TABLE users UPDATE age = age + 1 WHERE id = 100;
+ALTER TABLE users UPDATE status = 'active', last_login = now() WHERE user_id IN (1, 2, 3);
+ALTER TABLE products ON CLUSTER '{cluster}' UPDATE price = price * 1.1 WHERE category = 'electronics';
+ALTER TABLE events UPDATE event_count = event_count + 1 WHERE event_date = today() SETTINGS mutations_sync = 2;
+
+-- DELETE mutation examples
+ALTER TABLE my_table DELETE WHERE condition = true;
+ALTER TABLE my_table DELETE WHERE condition = true SETTINGS mutations_sync = 1;
+ALTER TABLE logs DELETE WHERE log_date < today() - INTERVAL 30 DAY;
+ALTER TABLE users DELETE WHERE deleted = 1 AND last_activity < now() - INTERVAL 1 YEAR;
+ALTER TABLE sessions ON CLUSTER '{cluster}' DELETE WHERE session_id IN (SELECT id FROM expired_sessions);
+ALTER TABLE temp_data DELETE WHERE created_at < '2023-01-01' SETTINGS mutations_sync = 2;
+
+-- https://fiddle.clickhouse.com/53494e62-8e73-401e-a9ed-ea9c203e0052
+ALTER TABLE default.example ADD PROJECTION uid_proj INDEX user_id TYPE basic WITH SETTINGS (
+    index_granularity = 4096,
+    index_granularity_bytes = 1048576
+);
+
+ALTER TABLE default.example ADD PROJECTION region_proj (select region, count(user_id) where region = 'JP' group by region) FIRST;
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS user_proj INDEX trim(cast(user_id as Nullable(String))) TYPE basic
+    WITH SETTINGS (
+    index_granularity = 4096
+) AFTER region_proj;
+
+ALTER TABLE default.example ADD PROJECTION region_proj_3 (select region, user_id where region = 'JP' order by user_id)
+    WITH SETTINGS (
+    index_granularity = 4096
+);
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS region_proj_4 (select region, user_id where region = 'JP' order by user_id);
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS region_proj (with 'JP' as country select region, count(user_id) where region = country group by region) FIRST;
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS region_proj_3 (with (1 = 1) as f1, cast('JP' as String) as country select region, user_id where region = country order by user_id)
+    WITH SETTINGS (
+    index_granularity = 4096
+);
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS region_proj_4 (with 1 = 0 as f1, cast('JP' as String) as country select region, user_id where region = country order by user_id);
+
+ALTER TABLE default.example ADD PROJECTION total_proj (select sum(user_id));
+
+ALTER TABLE default.example ADD PROJECTION IF NOT EXISTS region_proj_5 (select region, user_id where region = 'JP');
+
+ALTER TABLE default.example ADD PROJECTION region_proj_6 (with 'JP' as country select region, user_id where region = country);
+
+ALTER TABLE default.example MODIFY PROJECTION uid_proj INDEX user_id TYPE basic WITH SETTINGS (
+    index_granularity = 4096
+);
+
+ALTER TABLE default.example MODIFY PROJECTION IF EXISTS region_proj (select region, count(user_id) where region = 'JP' group by region);
+
+ALTER TABLE default.example DROP PROJECTION IF EXISTS region_proj ;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION uid_proj ;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION region_proj_4 IN PARTITION 201901;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION region_proj_4 IN PARTITION +201901;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION region_proj_4 IN PARTITION -201901;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION user_proj IN PARTITION ID '201901';
+
+ALTER TABLE default.example MATERIALIZE PROJECTION user_proj IN PARTITION '201901';
+
+ALTER TABLE default.example MATERIALIZE PROJECTION user_proj IN PARTITION TRUE;
+
+ALTER TABLE default.example MATERIALIZE PROJECTION user_proj IN PARTITION tuple(toYYYYMM(toDate('2019-01-25')));
+
+ALTER TABLE default.example2 MATERIALIZE PROJECTION IF EXISTS user_proj IN PARTITION ('JP', 1);
+
+ALTER TABLE default.example CLEAR PROJECTION region_proj_3;
+
+ALTER TABLE default.example CLEAR PROJECTION region_proj_4 IN PARTITION 201901;
+
+ALTER TABLE default.example CLEAR PROJECTION region_proj_4 IN PARTITION +201901;
+
+ALTER TABLE default.example CLEAR PROJECTION region_proj_4 IN PARTITION -201901;
+
+ALTER TABLE default.example CLEAR PROJECTION user_proj IN PARTITION ID '201901';
+
+ALTER TABLE default.example CLEAR PROJECTION user_proj IN PARTITION '201901';
+
+ALTER TABLE default.example CLEAR PROJECTION user_proj IN PARTITION TRUE;
+
+ALTER TABLE default.example CLEAR PROJECTION user_proj IN PARTITION tuple(toYYYYMM(toDate('2019-01-25')));
+
+ALTER TABLE default.example2 CLEAR PROJECTION IF EXISTS user_proj IN PARTITION ('JP', 1);
+
+-- Multiple comma-separated actions (#8707)
+ALTER TABLE example ADD COLUMN a UInt8, ADD COLUMN b UInt8;
+ALTER TABLE example DROP COLUMN a, ADD COLUMN b UInt8, MODIFY COLUMN c String;
+ALTER TABLE example ADD COLUMN a UInt8, ADD COLUMN b UInt8 SETTINGS max_execution_time = 10;

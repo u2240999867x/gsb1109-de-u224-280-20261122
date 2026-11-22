@@ -1,0 +1,498 @@
+"""Implementation of Rule AL05."""
+
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Optional, cast
+
+from sqlfluff.core.dialects.common import (
+    AliasInfo,
+    ObjectReferenceLevel,
+    extract_possible_references,
+    iter_raw_references,
+)
+from sqlfluff.core.parser.segments import BaseSegment
+from sqlfluff.core.rules import (
+    BaseRule,
+    EvalResultType,
+    LintFix,
+    LintResult,
+    RuleContext,
+)
+from sqlfluff.core.rules.crawlers import SegmentSeekerCrawler
+from sqlfluff.utils.analysis.query import Query
+from sqlfluff.utils.analysis.select import get_select_statement_info
+from sqlfluff.utils.functional import Segments, sp
+
+
+@dataclass
+class AL05Query(Query):
+    """Query subclass with custom AL05 info."""
+
+    aliases: list[AliasInfo] = field(default_factory=list)
+    tbl_refs: set[str] = field(default_factory=set)
+    # The ids of the aliases above, with how many aliases there were when
+    # they were built. See `Rule_AL05._alias_ids()`.
+    alias_ids_cache: Optional[tuple[int, set[str]]] = field(default=None, repr=False)
+
+
+class Rule_AL05(BaseRule):
+    """Tables should not be aliased if that alias is not used.
+
+    **Anti-pattern**
+
+    .. code-block:: sql
+
+        SELECT
+            a
+        FROM foo AS zoo
+
+    **Best practice**
+
+    Use the alias or remove it. An unused alias makes code
+    harder to read without changing any functionality.
+
+    .. code-block:: sql
+
+        SELECT
+            zoo.a
+        FROM foo AS zoo
+
+        -- Alternatively...
+
+        SELECT
+            a
+        FROM foo
+
+    """
+
+    name = "aliasing.unused"
+    aliases = ("L025",)
+    groups = ("all", "core", "aliasing")
+    config_keywords = ["alias_case_check"]
+    crawl_behaviour = SegmentSeekerCrawler({"select_statement"})
+    _dialects_requiring_alias_for_values_clause = [
+        "athena",
+        "snowflake",
+        "tsql",
+        "postgres",
+        "mariadb",
+    ]
+    # T-SQL datatype methods that produce a rowset and therefore require a
+    # correlation name in the FROM clause. This is deliberately an allowlist:
+    # most datatype methods (`query`, `value`, spatial and `hierarchyid`
+    # methods, ...) are scalar-valued and are not table expressions, so only
+    # the rowset-producing `nodes` belongs here (issue #6733).
+    _tsql_rowset_datatype_methods = frozenset({"nodes"})
+    # Dialects where a bare table alias can be used as a whole-row/composite
+    # value (e.g. `SELECT to_json(t) FROM tbl AS t`). In these dialects such a
+    # reference is a legitimate use of the alias, so AL05 must not flag it as
+    # unused (issue #7039). In standard SQL this is not generally valid, so the
+    # behaviour stays opt-in per dialect to avoid masking genuinely unused
+    # aliases (see test_ansi_function_not_table_parameter).
+    _dialects_with_row_references = [
+        "postgres",
+        "redshift",
+    ]
+    # Dialects where a column reference of three or more parts can start with a
+    # table alias and go on into the fields of a struct column, e.g. `t.col.field`.
+    # Without a schema, `a.b.c` could be `schema.table.column` or
+    # `alias.column.field`, so the first part is also counted as a possible use
+    # of an alias. Otherwise the fix would delete an alias that the query needs.
+    # https://duckdb.org/docs/stable/sql/data_types/struct#dot-notation-order-of-operations
+    _dialects_with_struct_field_access = [
+        "duckdb",
+    ]
+    is_fix_compatible = True
+
+    # config
+    alias_case_check: str
+
+    def _eval(self, context: RuleContext) -> EvalResultType:
+        violations: list[LintResult] = []
+        assert context.segment.is_type("select_statement")
+        # Exit early if the SELECT does not define any aliases.
+        select_info = get_select_statement_info(context.segment, context.dialect)
+        if not select_info or not select_info.table_aliases:
+            return None
+
+        # Analyze the SELECT.
+        alias: AliasInfo
+        query = cast(
+            AL05Query, AL05Query.from_segment(context.segment, dialect=context.dialect)
+        )
+        # The query's only selectable is this SELECT, which has aliases, so its
+        # full info is what we just built. Don't build it a second time.
+        query.selectables[0].select_info = select_info
+        self._analyze_table_aliases(
+            query,
+            allow_row_references=context.dialect.name
+            in self._dialects_with_row_references,
+            allow_struct_field_access=context.dialect.name
+            in self._dialects_with_struct_field_access,
+        )
+
+        if context.dialect.name in ("redshift", "bigquery"):
+            # Redshift supports un-nesting using aliases.
+            # Detect that situation and ignore.
+            # https://docs.aws.amazon.com/redshift/latest/dg/query-super.html#unnest
+
+            # Do any references refer to aliases in the same list?
+            references = set()
+            aliases = set()
+
+            for alias in query.aliases:
+                aliases.add(alias.ref_str)
+                if alias.segment:
+                    aliases.add(self._cs_str_id(alias.segment))
+                if not alias.object_reference:
+                    continue  # pragma: no cover
+                for seg in alias.object_reference.segments:
+                    if seg.is_type("identifier"):
+                        references.add(self._cs_str_id(seg))
+
+            # If there's any overlap between aliases and reference
+            if aliases.intersection(references):
+                self.logger.debug(
+                    "Overlapping references found. Assuming %s semi-structured.",
+                    context.dialect.name,
+                )
+                return None
+
+        # Get the number of times an object (table/view) is referenced. While some
+        # dialects can handle the same table name reference with different schemas,
+        # we don't want to allow a conflict with AL04's uniqueness rule so we grab
+        # the base table name instead of the fully qualified one to determine naming
+        # collisions.
+        ref_counter = Counter(
+            self._cs_str_id(a.object_reference.segments[-1])
+            for a in query.aliases
+            if a.object_reference and a.object_reference.segments
+        )
+        # ClickHouse requires an alias on every table function in a FROM clause
+        # with more than one table source (a join or a comma list), so collect
+        # the sources of such a FROM clause.
+        multi_source_elements: set[BaseSegment] = set()
+        from_clause = context.segment.get_child("from_clause")
+        if context.dialect.name == "clickhouse" and from_clause:
+            sources = list(
+                from_clause.recursive_crawl(
+                    "from_expression_element", no_recursive_seg_type="select_statement"
+                )
+            )
+            if len(sources) > 1:
+                multi_source_elements = set(sources)
+        for alias in query.aliases:
+            # Skip alias if it's required (some dialects require aliases for
+            # VALUES clauses).
+            if alias.from_expression_element and self._is_alias_required(
+                alias.from_expression_element,
+                context.dialect.name,
+                alias.from_expression_element in multi_source_elements,
+            ):
+                continue
+            # Skip alias if the table is referenced more than once, some dialects
+            # require the referenced table names to be unique even if not returned
+            # by the statement.
+            if (
+                alias.object_reference
+                and alias.object_reference.segments
+                and ref_counter.get(
+                    self._cs_str_id(alias.object_reference.segments[-1]),
+                    0,
+                )
+                > 1
+            ):
+                continue
+            # Redshift requires an alias when a `QUALIFY` statement immediately follows
+            # the `FROM` clause.
+            # https://docs.aws.amazon.com/redshift/latest/dg/r_QUALIFY_clause.html
+            if (
+                context.dialect.name == "redshift"
+                and alias.alias_expression
+                and self._followed_by_qualify(context, alias)
+            ):
+                continue
+            # If the alias is for a _function_ rather than just a table, it's possible
+            # that it's an array function, like `unnest` or `jsonb_array_elements_text`
+            # So if that alias appears as what looks like a _column reference_ then
+            # also skip it.
+            # https://github.com/sqlfluff/sqlfluff/issues/4623
+            _table_expression = alias.from_expression_element.get_child(
+                "table_expression"
+            )
+            if _table_expression and _table_expression.get_child("function"):
+                # Case insensitive match for conservatism
+                if alias.ref_str.strip("\"'`[]").upper() in [
+                    seg.raw_upper.strip("\"'`[]")
+                    for seg in select_info.reference_buffer
+                ]:
+                    self.logger.debug(
+                        f"Alias for function {alias.ref_str} found as apparent "
+                        "column reference in select. Skipping"
+                    )
+                    continue
+
+            if (
+                alias.aliased
+                and alias.segment
+                and self._cs_str_id(alias.segment) not in query.tbl_refs
+            ):
+                # Unused alias. Report and fix.
+                violations.append(self._report_unused_alias(alias))
+        return violations or None
+
+    def _cs_str_id(self, identifier: BaseSegment):
+        _normal_val = identifier.raw_normalized(self.alias_case_check == "dialect")
+        if self.alias_case_check == "case_insensitive":
+            _normal_val = _normal_val.upper()
+        elif self.alias_case_check == "quoted_cs_naked_upper":
+            if identifier.is_type("naked_identifier"):
+                _normal_val = _normal_val.upper()
+        elif self.alias_case_check == "quoted_cs_naked_lower":
+            if identifier.is_type("naked_identifier"):
+                _normal_val = _normal_val.lower()
+        return _normal_val
+
+    def _followed_by_qualify(self, context: RuleContext, alias: AliasInfo) -> bool:
+        curr_from_seen = False
+        assert alias.alias_expression
+        for seg in context.segment.segments:
+            if alias.alias_expression.get_end_loc() == seg.get_end_loc():
+                curr_from_seen = True
+            elif curr_from_seen and not seg.is_code:
+                continue
+            elif curr_from_seen and seg.is_type("qualify_clause"):
+                return True
+            elif curr_from_seen:
+                return False
+        return False
+
+    def _is_alias_required(
+        self,
+        from_expression_element: BaseSegment,
+        dialect_name: str,
+        in_multi_source_from: bool,
+    ) -> bool:
+        """Given an alias, is it REQUIRED to be present?
+
+        There are a few circumstances where an alias is either required by the
+        dialect, or recommended by SQLFluff:
+
+        * Aliases are required in SOME, but not all dialects when there's a
+          VALUES clause.
+
+        * In the case of a nested SELECT, all dialect checked (MySQL, Postgres,
+          T-SQL) require an alias.
+
+        * ClickHouse requires an alias on a table function when the FROM
+          clause has more than one table source (``in_multi_source_from`` is
+          only set for ClickHouse).
+        """
+        # Look for a table_expression (i.e. VALUES clause) as a descendant of
+        # the FROM expression, potentially nested inside brackets. The reason we
+        # allow nesting in brackets is that in some dialects (e.g. TSQL), this
+        # is actually *required* in order for SQL Server to parse it.
+        for segment in from_expression_element.iter_segments(expanding=("bracketed",)):
+            if segment.is_type("table_expression"):
+                if dialect_name == "tsql":
+                    openrowset = segment.get_child("openrowset_segment")
+                    if openrowset and any(
+                        seg.raw_upper == "BULK"
+                        for seg in openrowset.recursive_crawl("keyword")
+                    ):
+                        return True
+                    # A rowset-producing datatype method such as
+                    # `@x.nodes('...')` must be given a correlation name in
+                    # T-SQL; removing the alias produces invalid syntax, so the
+                    # alias is required even when it is not otherwise referenced
+                    # (issue #6733).
+                    for method in segment.recursive_crawl("datatype_method"):
+                        name = method.get_child("datatype_method_name_identifier")
+                        if (
+                            name is not None
+                            and name.raw.lower() in self._tsql_rowset_datatype_methods
+                        ):
+                            return True
+                # ClickHouse rejects a table function without an alias on
+                # either side of a join, or in a comma list, while the
+                # `joined_subquery_requires_alias` setting is on (the default).
+                # The rule cannot see server settings, so it assumes the default.
+                if in_multi_source_from and segment.get_child("function"):
+                    return True
+                # Found a table expression. Does it have a VALUES clause?
+                if segment.get_child("values_clause"):
+                    # Found a VALUES clause. Is this a dialect that requires
+                    # VALUE clauses to be aliased?
+                    return (
+                        dialect_name in self._dialects_requiring_alias_for_values_clause
+                    )
+                elif any(
+                    seg.is_type(
+                        "select_statement", "set_expression", "with_compound_statement"
+                    )
+                    for seg in segment.iter_segments(expanding=("bracketed",))
+                ):
+                    # The FROM expression is a derived table, i.e. a nested
+                    # SELECT. In this case, the alias is required in every
+                    # dialect we checked (MySQL, Postgres, T-SQL).
+                    # https://pganalyze.com/docs/log-insights/app-errors/U115
+                    return True
+                else:
+                    # None of the special cases above applies, so the alias is
+                    # not required.
+                    return False
+
+        # This should never happen. Return False just to be safe.
+        return False  # pragma: no cover
+
+    def _analyze_table_aliases(
+        self,
+        query: AL05Query,
+        allow_row_references: bool = False,
+        allow_struct_field_access: bool = False,
+    ) -> None:
+        # Get table aliases defined in query.
+        for selectable in query.selectables:
+            select_info = selectable.select_info
+            if select_info:
+                # Record the aliases.
+                query.aliases += select_info.table_aliases
+
+                references: list[BaseSegment] = [
+                    *select_info.reference_buffer,
+                    *select_info.table_reference_buffer,
+                ]
+                # These clauses are not collected by the shared SELECT analysis.
+                # Keep each crawl in this scope; children are analyzed separately.
+                for clause in selectable.selectable.recursive_crawl(
+                    "named_window",
+                    "for_clause",
+                    "connectby_clause",
+                    "lateral_view_clause",
+                    "distribute_by_clause",
+                    "prewhere_clause",
+                    "array_join_clause",
+                    no_recursive_seg_type="select_statement",
+                ):
+                    for ref in clause.recursive_crawl(
+                        "object_reference", no_recursive_seg_type="select_statement"
+                    ):
+                        if ref.is_type("collation_reference"):
+                            continue
+                        parent_info = ref.get_parent()
+                        if parent_info:
+                            parent, index = parent_info
+                            previous = next(
+                                (
+                                    seg
+                                    for seg in reversed(parent.segments[:index])
+                                    if seg.is_code
+                                ),
+                                None,
+                            )
+                            if (
+                                previous
+                                and previous.is_type("keyword")
+                                and previous.raw_upper == "COLLATE"
+                            ):
+                                continue
+                        if clause.is_type("for_clause") and ref.is_type(
+                            "table_reference"
+                        ):
+                            # FOR UPDATE OF names tables, not qualified columns.
+                            for part in extract_possible_references(
+                                ref, ObjectReferenceLevel.OBJECT, query.dialect.name
+                            ):
+                                self._resolve_and_mark_reference(
+                                    query, part.segments[0]
+                                )
+                        else:
+                            references.append(ref)
+
+                # Look at each table reference; if it's an alias reference,
+                # resolve the alias: could be an alias defined in "query"
+                # itself or an "ancestor" query.
+                for r in references:
+                    table_refs = extract_possible_references(
+                        r,
+                        level=ObjectReferenceLevel.TABLE,
+                        dialect_name=query.dialect.name,
+                    )
+                    for tr in table_refs:
+                        # This function walks up the query's parent stack if necessary.
+                        self._resolve_and_mark_reference(query, tr.segments[0])
+                    # A bare, single-part reference (e.g. `t` in `to_json(t)` or
+                    # a whole-row `SELECT t`) yields no TABLE-level parts above.
+                    # In dialects with composite/row references it can still be a
+                    # use of a table alias, so fall back to treating the lone
+                    # identifier as a possible alias reference rather than
+                    # mis-reporting the alias as unused (issue #7039).
+                    if allow_row_references and not table_refs:
+                        ref_segments = [
+                            seg for seg in r.segments if seg.is_type("identifier")
+                        ]
+                        if len(ref_segments) == 1:
+                            self._resolve_and_mark_reference(query, ref_segments[0])
+                    # In `alias.column.field`, the alias is the first part, which
+                    # the TABLE-level parts above don't include.
+                    if allow_struct_field_access and r.is_type("column_reference"):
+                        parts = list(iter_raw_references(r, query.dialect.name))
+                        if len(parts) >= 3:
+                            self._resolve_and_mark_reference(
+                                query, parts[0].segments[0]
+                            )
+
+        # Visit children.
+        for child in query.children:
+            self._analyze_table_aliases(
+                cast(AL05Query, child),
+                allow_row_references=allow_row_references,
+                allow_struct_field_access=allow_struct_field_access,
+            )
+
+    def _alias_ids(self, query: AL05Query) -> set[str]:
+        """Get the ids (see `_cs_str_id()`) of the aliases a query defines.
+
+        Every reference is checked against these, so they're cached on the
+        query. Its alias list only ever grows, so its length identifies the
+        cache.
+        """
+        cached = query.alias_ids_cache
+        if cached is None or cached[0] != len(query.aliases):
+            cached = (
+                len(query.aliases),
+                {self._cs_str_id(a.segment) for a in query.aliases if a.segment},
+            )
+            query.alias_ids_cache = cached
+        return cached[1]
+
+    def _resolve_and_mark_reference(self, query: AL05Query, ref: BaseSegment) -> None:
+        # Does this query define the referenced alias?
+        _ref = self._cs_str_id(ref)
+        if _ref in self._alias_ids(query):
+            # Yes. Record the reference.
+            query.tbl_refs.add(_ref)
+        elif query.parent:
+            # No. Recursively check the query's parent hierarchy.
+            self._resolve_and_mark_reference(query.parent, ref)
+
+    def _report_unused_alias(self, alias: AliasInfo) -> LintResult:
+        fixes = [LintFix.delete(alias.alias_expression)]  # type: ignore
+        # Walk back to remove indents/whitespaces
+        to_delete = (
+            Segments(*alias.from_expression_element.segments)
+            .reversed()
+            .select(
+                start_seg=alias.alias_expression,
+                # Stop once we reach an other, "regular" segment.
+                loop_while=sp.or_(sp.is_whitespace(), sp.is_meta()),
+            )
+        )
+        fixes += [LintFix.delete(seg) for seg in to_delete]
+        return LintResult(
+            anchor=alias.segment,
+            description="Alias {!r} is never used in SELECT statement.".format(
+                alias.ref_str
+            ),
+            fixes=fixes,
+        )

@@ -1,0 +1,63 @@
+# YML test files are auto-generated from SQL files and should not be edited by
+# hand. To help enforce this, the "hash" field in the file must match a hash
+# computed by SQLFluff when running the tests. Please run
+# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+# altering SQL files.
+_hash: 152cfed350d924e9ce4792e8a2bbdd815e519f1e5e42872c7b907602f4ee8fdb
+file:
+- statement:
+    describe_history_statement:
+    - keyword: DESCRIBE
+    - keyword: HISTORY
+    - quoted_literal: "'/data/events/'"
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESCRIBE
+    - keyword: HISTORY
+    - file_reference:
+        keyword: DELTA
+        dot: .
+        quoted_identifier: '`/data/events/`'
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESCRIBE
+    - keyword: HISTORY
+    - quoted_literal: "'/data/events/'"
+    - limit_clause:
+        keyword: LIMIT
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESCRIBE
+    - keyword: HISTORY
+    - table_reference:
+        naked_identifier: EVENTSTABLE
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESC
+    - keyword: HISTORY
+    - table_reference:
+        naked_identifier: EVENTSTABLE
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESC
+    - keyword: HISTORY
+    - quoted_literal: "'/data/events/'"
+    - limit_clause:
+        keyword: LIMIT
+        numeric_literal: '1'
+- statement_terminator: ;
+- statement:
+    describe_history_statement:
+    - keyword: DESC
+    - keyword: HISTORY
+    - file_reference:
+        keyword: DELTA
+        dot: .
+        quoted_identifier: '`/data/events/`'
+- statement_terminator: ;
