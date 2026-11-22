@@ -1,0 +1,57 @@
+[run]
+branch = 1
+cover_pylib = 0
+include=*faust/*
+omit = tests.*
+
+[report]
+omit =
+    */python?.?/*
+    */site-packages/*
+    */pypy/*
+
+    # tested by functional tests
+    */faust/cli/agents.py
+    */faust/cli/livecheck.py
+    */faust/cli/model.py
+    */faust/cli/models.py
+    */faust/cli/reset.py
+    */faust/cli/send.py
+    */faust/cli/tables.py
+    */faust/cli/worker.py
+    */faust/web/apps/*
+    */faust/assignor/*
+    */faust/transport/drivers/memory.py
+
+    # optional driver: only importable/tested with the ckafka extra installed
+    # (faust[ckafka]); not part of the CI test environment.
+    */faust/transport/drivers/confluent.py
+
+    # tested by integration
+    */faust/tables/recovery.py
+
+    # not needed
+    */faust/utils/iso8601.py
+    */faust/utils/tracing.py
+    # opentracing fallback stub: only used when opentracing is NOT installed,
+    # which the CI test env is not (it installs faust[opentracing]).
+    */faust/utils/_opentracing.py
+    # opentracing distributed-tracing sensor: optional, requires opentracing +
+    # a live tracer to exercise; not covered by the CI test suite.
+    */faust/sensors/distributed_tracing.py
+    */faust/types/*
+    */faust/__main__.py
+
+    # deprecated
+    */faust/app/_attached.py
+exclude_lines =
+    # Have to re-enable the standard pragma
+    if\ typing\.TYPE_CHECKING\:
+
+    pragma: no cover
+
+    if sys.platform == 'win32':
+
+    if DEBUG:
+
+    \@abc\.abstractmethod
