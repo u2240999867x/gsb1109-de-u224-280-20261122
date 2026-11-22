@@ -1,0 +1,621 @@
+import decimal
+from unittest import TestCase
+
+from piccolo.columns.column_types import JSON, ForeignKey, Serial, Varchar
+from piccolo.table import Table
+from piccolo.testing.test_case import AsyncTableTest, TableTest
+from tests.base import engine_is
+from tests.example_apps.music.tables import (
+    Band,
+    Concert,
+    Instrument,
+    Manager,
+    RecordingStudio,
+    Signing,
+    Ticket,
+    Venue,
+)
+
+TABLES = [Manager, Band, Venue, Concert]
+
+
+class TestCreateJoin:
+    def test_create_join(self):
+        """
+        A simple test to make sure tables with foreign keys can be created.
+        """
+        for table in TABLES:
+            table.create_table().run_sync()
+
+        for table in reversed(TABLES):
+            table.alter().drop_table().run_sync()
+
+
+class TestJoin(TableTest):
+    tables = [
+        Manager,
+        Band,
+        Venue,
+        Concert,
+        Ticket,
+        Signing,
+        Instrument,
+        RecordingStudio,
+    ]
+
+    def setUp(self):
+        super().setUp()
+
+        manager_1 = Manager(name="Guido")
+        manager_1.save().run_sync()
+
+        band_1 = Band(
+            name="Pythonistas", manager=manager_1.id, popularity=1000
+        )
+        band_1.save().run_sync()
+
+        manager_2 = Manager(name="Graydon")
+        manager_2.save().run_sync()
+
+        band_2 = Band(name="Rustaceans", manager=manager_2.id)
+        band_2.save().run_sync()
+
+        venue = Venue(name="Grand Central", capacity=1000)
+        venue.save().run_sync()
+
+        concert = Concert(band_1=band_1.id, band_2=band_2.id, venue=venue.id)
+        concert.save().run_sync()
+
+        ticket = Ticket(concert=concert, price=decimal.Decimal(50.0))
+        ticket.save().run_sync()
+
+        signing = Signing(with_=band_1)
+        signing.save().run_sync()
+
+        recording_studio = RecordingStudio(facilities={"restaurant": True})
+        recording_studio.save().run_sync()
+
+        instrument = Instrument(
+            name="Piccolo", recording_studio=recording_studio
+        )
+        instrument.save().run_sync()
+
+
+class TestSelectJoin(TestJoin):
+
+    def test_select_join(self):
+        select_query = Concert.select(
+            Concert.band_1.name,
+            Concert.band_2.name,
+            Concert.venue.name,
+            Concert.band_1.manager,
+        )
+        response = select_query.run_sync()
+
+        if engine_is("cockroach"):
+            self.assertEqual(
+                response,
+                [
+                    {
+                        "band_1.name": "Pythonistas",
+                        "band_2.name": "Rustaceans",
+                        "venue.name": "Grand Central",
+                        "band_1.manager": response[0]["band_1.manager"],
+                    }
+                ],
+            )
+        else:
+            self.assertEqual(
+                response,
+                [
+                    {
+                        "band_1.name": "Pythonistas",
+                        "band_2.name": "Rustaceans",
+                        "venue.name": "Grand Central",
+                        "band_1.manager": 1,
+                    }
+                ],
+            )
+
+        # Now make sure that even deeper joins work:
+        select_query = Concert.select(Concert.band_1._.manager._.name)
+        response = select_query.run_sync()
+        self.assertEqual(response, [{"band_1.manager.name": "Guido"}])
+
+    def test_underscore_syntax(self):
+        """
+        Make sure that queries work with the ``._.`` syntax for joins.
+        """
+        response = Concert.select(
+            Concert.band_1._.name,
+            Concert.band_1._.manager._.name,
+            Concert.band_2._.name,
+            Concert.band_2._.manager._.name,
+        ).run_sync()
+
+        self.assertListEqual(
+            response,
+            [
+                {
+                    "band_1.name": "Pythonistas",
+                    "band_1.manager.name": "Guido",
+                    "band_2.name": "Rustaceans",
+                    "band_2.manager.name": "Graydon",
+                }
+            ],
+        )
+
+    def test_select_all_columns(self):
+        """
+        Make sure you can retrieve all columns from a related table, without
+        explicitly specifying them.
+        """
+        result = (
+            Band.select(Band.name, *Band.manager.all_columns())
+            .first()
+            .run_sync()
+        )
+        assert result is not None
+
+        if engine_is("cockroach"):
+            self.assertDictEqual(
+                result,
+                {
+                    "name": "Pythonistas",
+                    "manager.id": result["manager.id"],
+                    "manager.name": "Guido",
+                },
+            )
+        else:
+            self.assertDictEqual(
+                result,
+                {
+                    "name": "Pythonistas",
+                    "manager.id": 1,
+                    "manager.name": "Guido",
+                },
+            )
+
+    def test_select_all_columns_deep(self):
+        """
+        Make sure that ``all_columns`` can be used several layers deep.
+        """
+        result = (
+            Concert.select(
+                *Concert.venue.all_columns(),
+                *Concert.band_1._.manager.all_columns(),
+                *Concert.band_2._.manager.all_columns(),
+            )
+            .first()
+            .run_sync()
+        )
+        assert result is not None
+
+        if engine_is("cockroach"):
+            self.assertDictEqual(
+                result,
+                {
+                    "venue.id": result["venue.id"],
+                    "venue.name": "Grand Central",
+                    "venue.capacity": 1000,
+                    "band_1.manager.id": result["band_1.manager.id"],
+                    "band_1.manager.name": "Guido",
+                    "band_2.manager.id": result["band_2.manager.id"],
+                    "band_2.manager.name": "Graydon",
+                },
+            )
+        else:
+            self.assertDictEqual(
+                result,
+                {
+                    "venue.id": 1,
+                    "venue.name": "Grand Central",
+                    "venue.capacity": 1000,
+                    "band_1.manager.id": 1,
+                    "band_1.manager.name": "Guido",
+                    "band_2.manager.id": 2,
+                    "band_2.manager.name": "Graydon",
+                },
+            )
+
+    def test_select_all_columns_root(self):
+        """
+        Make sure that using ``all_columns`` at the root doesn't interfere
+        with using it for referenced tables.
+        """
+        result = (
+            Band.select(
+                *Band.all_columns(),
+                *Band.manager.all_columns(),
+            )
+            .first()
+            .run_sync()
+        )
+        assert result is not None
+
+        if engine_is("cockroach"):
+            self.assertDictEqual(
+                result,
+                {
+                    "id": result["id"],
+                    "name": "Pythonistas",
+                    "manager": result["manager"],
+                    "popularity": 1000,
+                    "manager.id": result["manager.id"],
+                    "manager.name": "Guido",
+                },
+            )
+        else:
+            self.assertDictEqual(
+                result,
+                {
+                    "id": 1,
+                    "name": "Pythonistas",
+                    "manager": 1,
+                    "popularity": 1000,
+                    "manager.id": 1,
+                    "manager.name": "Guido",
+                },
+            )
+
+    def test_select_all_columns_root_nested(self):
+        """
+        Make sure that using ``all_columns`` at the root doesn't interfere
+        with using it for referenced tables.
+        """
+        result = (
+            Band.select(*Band.all_columns(), *Band.manager.all_columns())
+            .output(nested=True)
+            .first()
+            .run_sync()
+        )
+        assert result is not None
+
+        if engine_is("cockroach"):
+            self.assertDictEqual(
+                result,
+                {
+                    "id": result["id"],
+                    "name": "Pythonistas",
+                    "manager": {
+                        "id": result["manager"]["id"],
+                        "name": "Guido",
+                    },
+                    "popularity": 1000,
+                },
+            )
+        else:
+            self.assertDictEqual(
+                result,
+                {
+                    "id": 1,
+                    "name": "Pythonistas",
+                    "manager": {"id": 1, "name": "Guido"},
+                    "popularity": 1000,
+                },
+            )
+
+    def test_select_all_columns_exclude(self):
+        """
+        Make sure we can get all columns, except the ones we specify.
+        """
+        result = (
+            Band.select(
+                *Band.all_columns(exclude=[Band.id]),
+                *Band.manager.all_columns(exclude=[Band.manager.id]),
+            )
+            .output(nested=True)
+            .first()
+            .run_sync()
+        )
+        assert result is not None
+
+        result_str_args = (
+            Band.select(
+                *Band.all_columns(exclude=["id"]),
+                *Band.manager.all_columns(exclude=["id"]),
+            )
+            .output(nested=True)
+            .first()
+            .run_sync()
+        )
+        assert result_str_args is not None
+
+        for data in (result, result_str_args):
+            self.assertDictEqual(
+                data,
+                {
+                    "name": "Pythonistas",
+                    "manager": {"name": "Guido"},
+                    "popularity": 1000,
+                },
+            )
+
+
+class TestProxyColumns(TestCase):
+    def test_proxy_columns(self):
+        """
+        Make sure that ``proxy_columns`` are set correctly.
+
+        There used to be a bug which meant queries got slower over time:
+
+        https://github.com/piccolo-orm/piccolo/issues/691
+
+        """
+        # We call it multiple times to make sure it doesn't change with time.
+        for _ in range(2):
+            self.assertEqual(
+                len(Concert.band_1._.manager._foreign_key_meta.proxy_columns),
+                2,
+            )
+            self.assertEqual(
+                len(Concert.band_1._foreign_key_meta.proxy_columns), 4
+            )
+
+
+class TestObjectsJoin(TestJoin):
+
+    def test_objects_nested(self):
+        """
+        Make sure the prefetch argument works correctly for objects.
+        """
+        band = Band.objects(Band.manager).first().run_sync()
+        assert band is not None
+        self.assertIsInstance(band.manager, Manager)
+
+    def test_objects__all_related__root(self):
+        """
+        Make sure that ``all_related`` works correctly when called from the
+        root table of the query.
+        """
+        concert = Concert.objects(Concert.all_related()).first().run_sync()
+        assert concert is not None
+        self.assertIsInstance(concert.band_1, Band)
+        self.assertIsInstance(concert.band_2, Band)
+        self.assertIsInstance(concert.venue, Venue)
+
+    def test_objects_nested_deep(self):
+        """
+        Make sure that ``prefetch`` works correctly with deeply nested tables.
+        """
+        ticket = (
+            Ticket.objects(
+                Ticket.concert,
+                Ticket.concert._.band_1,
+                Ticket.concert._.band_2,
+                Ticket.concert._.venue,
+                Ticket.concert._.band_1._.manager,
+                Ticket.concert._.band_2._.manager,
+            )
+            .first()
+            .run_sync()
+        )
+        assert ticket is not None
+
+        self.assertIsInstance(ticket.concert, Concert)
+        self.assertIsInstance(ticket.concert.band_1, Band)
+        self.assertIsInstance(ticket.concert.band_2, Band)
+        self.assertIsInstance(ticket.concert.venue, Venue)
+        self.assertIsInstance(ticket.concert.band_1.manager, Manager)
+        self.assertIsInstance(ticket.concert.band_2.manager, Manager)
+
+    def test_objects__all_related__deep(self):
+        """
+        Make sure that ``all_related`` works correctly when called on a deeply
+        nested table.
+        """
+        ticket = (
+            Ticket.objects(
+                Ticket.all_related(),
+                Ticket.concert.all_related(),
+                Ticket.concert._.band_1.all_related(),
+                Ticket.concert._.band_2.all_related(),
+            )
+            .first()
+            .run_sync()
+        )
+        assert ticket is not None
+
+        self.assertIsInstance(ticket.concert, Concert)
+        self.assertIsInstance(ticket.concert.band_1, Band)
+        self.assertIsInstance(ticket.concert.band_2, Band)
+        self.assertIsInstance(ticket.concert.venue, Venue)
+        self.assertIsInstance(ticket.concert.band_1.manager, Manager)
+        self.assertIsInstance(ticket.concert.band_2.manager, Manager)
+
+    def test_objects_prefetch_clause(self):
+        """
+        Make sure that ``prefetch`` clause works correctly.
+        """
+        ticket = (
+            Ticket.objects()
+            .prefetch(
+                Ticket.all_related(),
+                Ticket.concert.all_related(),
+                Ticket.concert._.band_1.all_related(),
+                Ticket.concert._.band_2.all_related(),
+            )
+            .first()
+            .run_sync()
+        )
+        assert ticket is not None
+
+        self.assertIsInstance(ticket.concert, Concert)
+        self.assertIsInstance(ticket.concert.band_1, Band)
+        self.assertIsInstance(ticket.concert.band_2, Band)
+        self.assertIsInstance(ticket.concert.venue, Venue)
+        self.assertIsInstance(ticket.concert.band_1.manager, Manager)
+        self.assertIsInstance(ticket.concert.band_2.manager, Manager)
+
+    def test_objects_prefetch_intermediate(self):
+        """
+        Make sure when using ``prefetch`` on a deeply nested table, all of the
+        intermediate objects are also retrieved properly.
+        """
+        ticket = (
+            Ticket.objects()
+            .prefetch(
+                Ticket.concert._.band_1._.manager,
+            )
+            .first()
+            .run_sync()
+        )
+        assert ticket is not None
+
+        self.assertIsInstance(ticket.price, decimal.Decimal)
+        self.assertIsInstance(ticket.concert, Concert)
+
+        self.assertIsInstance(ticket.concert.id, int)
+        self.assertIsInstance(ticket.concert.band_1, Band)
+        self.assertIsInstance(ticket.concert.band_2, int)
+        self.assertIsInstance(ticket.concert.venue, int)
+
+        self.assertIsInstance(ticket.concert.band_1.id, int)
+        self.assertIsInstance(ticket.concert.band_1.name, str)
+        self.assertIsInstance(ticket.concert.band_1.manager, Manager)
+
+        self.assertIsInstance(ticket.concert.band_1.manager.id, int)
+        self.assertIsInstance(ticket.concert.band_1.manager.name, str)
+
+    def test_objects_prefetch_multiple_intermediate(self):
+        """
+        Make sure that if we're fetching multiple deeply nested tables, the
+        intermediate tables are still created correctly.
+        """
+        ticket = (
+            Ticket.objects()
+            .prefetch(
+                Ticket.concert._.band_1._.manager,
+                Ticket.concert._.band_2._.manager,
+            )
+            .first()
+            .run_sync()
+        )
+        assert ticket is not None
+
+        self.assertIsInstance(ticket.price, decimal.Decimal)
+        self.assertIsInstance(ticket.concert, Concert)
+
+        self.assertIsInstance(ticket.concert.id, int)
+        self.assertIsInstance(ticket.concert.band_1, Band)
+        self.assertIsInstance(ticket.concert.band_2, Band)
+        self.assertIsInstance(ticket.concert.venue, int)
+
+        self.assertIsInstance(ticket.concert.band_1.id, int)
+        self.assertIsInstance(ticket.concert.band_1.name, str)
+        self.assertIsInstance(ticket.concert.band_1.manager, Manager)
+
+        self.assertIsInstance(ticket.concert.band_1.manager.id, int)
+        self.assertIsInstance(ticket.concert.band_1.manager.name, str)
+
+        self.assertIsInstance(ticket.concert.band_2.id, int)
+        self.assertIsInstance(ticket.concert.band_2.name, str)
+        self.assertIsInstance(ticket.concert.band_2.manager, Manager)
+
+        self.assertIsInstance(ticket.concert.band_2.manager.id, int)
+        self.assertIsInstance(ticket.concert.band_2.manager.name, str)
+
+    def test_objects_prefetch_db_column_name(self):
+        """
+        Make sure that ``prefetch`` works with foreign keys with
+        ``db_column_name`` defined.
+
+        https://github.com/piccolo-orm/piccolo/issues/1107
+
+        """
+        signing = Signing.objects().prefetch(Signing.with_).first().run_sync()
+        assert signing is not None
+        self.assertIsInstance(signing.with_, Band)
+
+
+class TestObjectsNestedLoadJSON(TestJoin):
+    def test_objects_nested_with_load_json(self):
+        """
+        Make sure that nested objects works alongside ``load_json`` (i.e. the
+        JSON on nested objects gets loaded).
+
+        https://github.com/piccolo-orm/piccolo/issues/1383
+
+        """
+        instrument = (
+            Instrument.objects(Instrument.recording_studio)
+            .output(load_json=True)
+            .first()
+            .run_sync()
+        )
+        assert instrument is not None
+        self.assertDictEqual(
+            instrument.recording_studio.facilities,
+            {"restaurant": True},
+        )
+
+    def test_objects_nested_with_load_json_null(self):
+        """
+        Make sure that nested objects works alongside ``load_json``, when
+        the nested object has a null value for a JSON column.
+
+        https://github.com/piccolo-orm/piccolo/issues/1391
+
+        """
+        RecordingStudio.update(
+            {
+                RecordingStudio.facilities: None,
+            },
+            force=True,
+        ).run_sync()
+
+        instrument = (
+            Instrument.objects(Instrument.recording_studio)
+            .output(load_json=True)
+            .first()
+            .run_sync()
+        )
+        assert instrument is not None
+        self.assertIsNone(
+            instrument.recording_studio.facilities,
+        )
+
+
+class TableA(Table):
+    id = Serial(primary_key=True)
+    name = Varchar()
+
+
+class TableB(Table):
+    data = JSON()
+    table_a = ForeignKey(TableA, null=False)
+
+
+class TestObjectsNestedLoadJSONArray(AsyncTableTest):
+    tables = [TableA, TableB]
+
+    async def test_objects_nested_with_load_json_array(self):
+        """
+        Make sure that nested objects works alongside ``load_json``, when
+        the parent object has a JSON column, and it contains an array value.
+
+        https://github.com/piccolo-orm/piccolo/issues/1399#issuecomment-4864444701
+
+        The problem was because we already loaded the JSON string on the top
+        level row, and then were trying to load it again in
+        `make_nested_object`.
+
+        """  # noqa: E501
+        table_a = TableA()
+        await table_a.save()
+
+        data = ["a", "b", "c"]
+        table_b = TableB(data=data, table_a=table_a.id)
+        await table_b.save()
+
+        # Without prefetch:
+        row = await TableB.objects().output(load_json=True).first()
+        assert row
+        assert row.data == data
+
+        # With prefetch:
+        row = (
+            await TableB.objects(TableB.table_a).output(load_json=True).first()
+        )
+        assert row
+        assert row.data == data
