@@ -1,0 +1,95 @@
+[build-system]
+requires = ["flit-core>=3.12.0"]
+build-backend = "flit_core.buildapi"
+
+[dependency-groups]
+dev = [
+    "pytest<10",
+    'click-type-test==1.4.0',
+    "coverage<8",
+    "identify>=2.6.9",
+    "pytest-xdist<4",
+    "responses==0.26.3",
+]
+docs = [
+    "sphinx<10",
+    "sphinx-issues<7",
+    "furo==2025.12.19",
+]
+check-package-metadata = [
+    "build",
+    "twine",
+    "check-sdist",
+]
+
+[project]
+name = "check-jsonschema"
+version = "0.39.0"
+description = "A jsonschema CLI and pre-commit hook"
+authors = [
+    { name = "Stephen Rosen", email = "sirosen0@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ruamel.yaml>=0.18.10,<0.20.0",
+    "jsonschema>=4.18.0,<5.0",
+    "regress>=2024.11.1",
+    "requests<3.0",
+    "click>=8.5,<9",
+]
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[project.urls]
+Homepage = "https://github.com/python-jsonschema/check-jsonschema"
+
+[project.scripts]
+check-jsonschema = "check_jsonschema:main"
+
+[tool.flit.sdist]
+include = [
+    "CHANGELOG.rst",
+    ".github/CONTRIBUTING.md",
+    ".github/AI_POLICY.md",
+    "tests/**/*",
+    # needed as a data file for the tests (several tests check integrity
+    # against this file)
+    ".pre-commit-hooks.yaml",
+    ".flake8",
+    ".coveragerc",
+    "justfile",
+    "tox.ini",
+]
+exclude = ["**/*/.*", "**/*.egg-info", "**/__pycache__", "scripts/*"]
+
+[tool.check-sdist]
+git-only = ["RELEASING.md", ".gitignore", "docs/*"]
+
+[tool.isort]
+profile = "black"
+
+[tool.mypy]
+# strict = true  # TODO: enable
+disallow_any_generics = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+warn_unreachable = true
+warn_no_return = true
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "error",
+    # dateutil has a Python 3.12 compatibility issue.
+    'ignore:datetime\.datetime\.utcfromtimestamp\(\) is deprecated:DeprecationWarning',
+]
+addopts = [
+    "--color=yes",
+]

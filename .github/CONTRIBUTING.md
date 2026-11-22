@@ -1,0 +1,63 @@
+# Contributing Guidelines
+
+Interested in contributing to `check-jsonschema`? That's great!
+
+> [!IMPORTANT]
+>
+> If you use LLMs / generative AI, please read our [_AI Policy_][aipolicy].
+
+## Questions, Feature Requests, Bug Reports, and Feedback...
+
+…should be reported the [Issue Tracker](https://github.com/python-jsonschema/check-jsonschema/issues)_
+
+## Contributing Code
+
+If you want to help work on the code, here are a few tips for getting setup.
+
+### Testing
+
+Testing is done with `tox`. To run the tests, just run
+
+    tox
+
+and a full test run will execute.
+
+### pre-commit linting
+
+`check-jsonschema` lints with [`pre-commit`](pre-commit.com).
+To setup the `pre-commit` integration, first ensure you have it installed
+
+    pipx install pre-commit
+
+Then setup the hooks:
+
+    pre-commit install
+
+### pre-commit hook test cases
+
+There are example files for the various pre-commit hooks defined in
+`tests/example-files/`.
+
+The `positive/` test cases should pass the hook with the matching name, and
+the `negative/` test cases should fail the hook with the matching name.
+
+These files are automatically picked up by the testsuite and checked.
+
+### Adding new hooks
+
+Hooks are defined in `src/check_jsonschema/catalog.py`, and rendered to
+`.pre-commit-hooks.yaml` with the generator script. It can be run with
+
+    just generate-hooks
+
+Schemas are pulled down based on this same config. If you want to update the
+vendored schema copies, run
+
+    just vendor-schemas
+
+## Documentation
+
+All of the features of `check-jsonschema` should be documented in the readme
+and changelog. If you notice missing documentation, that's a bug!
+
+[aipolicy]: https://github.com/python-jsonschema/check-jsonschema/blob/main/.github/AI_POLICY.md

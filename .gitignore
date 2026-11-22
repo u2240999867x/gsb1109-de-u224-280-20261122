@@ -1,0 +1,9 @@
+.venv/
+*.egg-info
+__pycache__/
+build/
+dist/
+.coverage
+.coverage.*
+.tox
+.vscode
