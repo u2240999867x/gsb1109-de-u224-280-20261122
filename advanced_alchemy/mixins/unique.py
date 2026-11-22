@@ -1,0 +1,163 @@
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
+
+from sqlalchemy import ColumnElement, select
+from typing_extensions import Self
+
+from advanced_alchemy.exceptions import wrap_sqlalchemy_exception
+
+if TYPE_CHECKING:
+    from collections.abc import Generator, Hashable
+
+    from sqlalchemy import Select
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio.scoping import async_scoped_session
+    from sqlalchemy.orm import Session
+    from sqlalchemy.orm.scoping import scoped_session
+
+__all__ = ("UniqueMixin",)
+
+
+class UniqueMixin:
+    """Mixin for instantiating objects while ensuring uniqueness on some field(s).
+
+    This is a slightly modified implementation derived from https://github.com/sqlalchemy/sqlalchemy/wiki/UniqueObject
+    """
+
+    @classmethod
+    @contextmanager
+    def _prevent_autoflush(
+        cls,
+        session: "Union[AsyncSession, async_scoped_session[AsyncSession], Session, scoped_session[Session]]",
+    ) -> "Generator[None, None, None]":
+        bind = getattr(session, "bind", None)
+        dialect = getattr(bind, "dialect", None)
+        raw_name = getattr(dialect, "name", None)
+        dialect_name = raw_name if isinstance(raw_name, str) else None
+        with session.no_autoflush, wrap_sqlalchemy_exception(dialect_name=dialect_name):
+            yield
+
+    @classmethod
+    def _check_uniqueness(
+        cls,
+        cache: "Optional[dict[tuple[type[Self], Hashable], Self]]",
+        session: "Union[AsyncSession, async_scoped_session[AsyncSession], Session, scoped_session[Session]]",
+        key: "tuple[type[Self], Hashable]",
+        *args: Any,
+        **kwargs: Any,
+    ) -> "tuple[dict[tuple[type[Self], Hashable], Self], Select[Any], Optional[Self]]":
+        if cache is None:
+            cache = {}
+            setattr(session, "_unique_cache", cache)
+        statement = select(cls).where(cls.unique_filter(*args, **kwargs)).limit(2)
+        return cache, statement, cache.get(key)
+
+    @classmethod
+    async def as_unique_async(
+        cls,
+        session: "Union[AsyncSession, async_scoped_session[AsyncSession]]",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Self:
+        """Instantiate and return a unique object within the provided session based on the given arguments.
+
+        If an object with the same unique identifier already exists in the session, it is returned from the cache.
+
+        Args:
+            session: SQLAlchemy async session
+            *args: Values used to instantiate the instance if no duplicate exists
+            **kwargs: Values used to instantiate the instance if no duplicate exists
+
+        Returns:
+            The unique object instance.
+        """
+        key = cls, cls.unique_hash(*args, **kwargs)
+        cache, statement, obj = cls._check_uniqueness(
+            getattr(session, "_unique_cache", None),
+            session,
+            key,
+            *args,
+            **kwargs,
+        )
+        if obj:
+            return obj
+        with cls._prevent_autoflush(session):
+            if (obj := cast("Optional[Self]", (await session.execute(statement)).scalar_one_or_none())) is None:
+                session.add(obj := cls(*args, **kwargs))
+        cache[key] = obj
+        return obj
+
+    @classmethod
+    def as_unique_sync(
+        cls,
+        session: "Union[Session, scoped_session[Session]]",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Self:
+        """Instantiate and return a unique object within the provided session based on the given arguments.
+
+        If an object with the same unique identifier already exists in the session, it is returned from the cache.
+
+        Args:
+            session: SQLAlchemy sync session
+            *args: Values used to instantiate the instance if no duplicate exists
+            **kwargs: Values used to instantiate the instance if no duplicate exists
+
+        Returns:
+            The unique object instance.
+        """
+        key = cls, cls.unique_hash(*args, **kwargs)
+        cache, statement, obj = cls._check_uniqueness(
+            getattr(session, "_unique_cache", None),
+            session,
+            key,
+            *args,
+            **kwargs,
+        )
+        if obj:
+            return obj
+        with cls._prevent_autoflush(session):
+            if (obj := cast("Optional[Self]", session.execute(statement).scalar_one_or_none())) is None:
+                session.add(obj := cls(*args, **kwargs))
+        cache[key] = obj
+        return obj
+
+    @classmethod
+    def unique_hash(cls, *args: Any, **kwargs: Any) -> "Hashable":
+        """Generate a unique key based on the provided arguments.
+
+        This method should be implemented in the subclass.
+
+
+        Args:
+            *args: Values passed to the alternate classmethod constructors
+            **kwargs: Values passed to the alternate classmethod constructors
+
+        Raises:
+            NotImplementedError: If not implemented in the subclass.
+
+        Returns:
+            Any hashable object.
+        """
+        msg = "Implement this in subclass"
+        raise NotImplementedError(msg)
+
+    @classmethod
+    def unique_filter(cls, *args: Any, **kwargs: Any) -> "ColumnElement[bool]":
+        """Generate a filter condition for ensuring uniqueness.
+
+        This method should be implemented in the subclass.
+
+
+        Args:
+            *args: Values passed to the alternate classmethod constructors
+            **kwargs: Values passed to the alternate classmethod constructors
+
+        Raises:
+            NotImplementedError: If not implemented in the subclass.
+
+        Returns:
+            Filter condition to establish the uniqueness.
+        """
+        msg = "Implement this in subclass"
+        raise NotImplementedError(msg)

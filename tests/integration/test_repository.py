@@ -1,0 +1,1867 @@
+"""Integration tests for the SQLAlchemy Repository implementation using session-based fixtures."""
+
+import asyncio
+import datetime as dt
+from collections.abc import Generator
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union, cast
+from unittest.mock import create_autospec
+from uuid import UUID
+
+import pytest
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import Session
+from time_machine import travel
+
+import advanced_alchemy.repository._async as async_repo_mod
+import advanced_alchemy.repository._sync as sync_repo_mod
+from advanced_alchemy.exceptions import NotFoundError, RepositoryError
+from advanced_alchemy.filters import (
+    BeforeAfterFilter,
+    OrderByFilter,
+    SearchFilter,
+)
+from advanced_alchemy.mixins import BigIntPrimaryKey
+from advanced_alchemy.operations import UpsertStrategy, resolve_upsert_strategy
+from advanced_alchemy.repository import SQLAlchemyAsyncRepository
+from advanced_alchemy.repository._util import DEFAULT_ERROR_MESSAGE_TEMPLATES
+from advanced_alchemy.repository.memory import (
+    SQLAlchemyAsyncMockRepository,
+    SQLAlchemySyncMockRepository,
+)
+from advanced_alchemy.service import SQLAlchemyAsyncRepositoryService
+from tests.helpers import maybe_async
+
+# Python 3.9 compatibility for typing.TypeAlias
+try:  # Python >= 3.10
+    from typing import TypeAlias  # type: ignore[attr-defined]
+except Exception:  # Python 3.9 fallback
+    from typing_extensions import TypeAlias  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from time_machine import Coordinates
+
+pytestmark = [
+    pytest.mark.integration,
+]
+xfail = pytest.mark.xfail
+
+# Type aliases for data and repository/service components
+RawRecordData: TypeAlias = "list[dict[str, Any]]"
+RepositoryPKType = Literal["uuid", "bigint"]
+AnyRepository: TypeAlias = "Union[SQLAlchemyAsyncRepository[Any], SQLAlchemyAsyncMockRepository[Any]]"
+AnyService: TypeAlias = SQLAlchemyAsyncRepositoryService[Any, "AnyRepository"]  # pyright: ignore
+
+mock_engines = {"mock_async_engine", "mock_sync_engine"}
+
+
+# Helper functions for repository creation
+def create_repository(
+    session: "Union[Session, AsyncSession]", model_type: type, repository_class: "Optional[type]" = None
+) -> "Any":
+    """Create a repository instance for the given session and model type."""
+    if repository_class is None:
+        if isinstance(session, AsyncSession):
+            base_repository_class = SQLAlchemyAsyncRepository  # type: ignore[assignment]
+        else:
+            from advanced_alchemy.repository import SQLAlchemySyncRepository
+
+            base_repository_class = SQLAlchemySyncRepository  # type: ignore[assignment]
+    else:
+        base_repository_class = repository_class  # type: ignore[assignment]
+
+    # Create a dynamic repository class with the model_type as a class attribute
+    repository_class_name = f"DynamicRepository_{model_type.__name__}"
+
+    # Add a create method that handles dict data and maps to add for test compatibility
+    async def create(self: Any, data: Any, **kwargs: Any) -> Any:
+        # If data is a dict, convert it to a model instance
+        if isinstance(data, dict):
+            model_instance = model_type(**data)
+        else:
+            model_instance = data
+        return await self.add(model_instance, **kwargs)
+
+    # Add a create_many method that handles list of dict data
+    async def create_many(self: Any, data: "list[Any]", **kwargs: Any) -> "list[Any]":
+        # Convert dict items to model instances
+        model_instances = []
+        for item in data:
+            if isinstance(item, dict):
+                model_instances.append(model_type(**item))
+            else:
+                model_instances.append(item)
+        return await self.add_many(model_instances, **kwargs)  # type: ignore[no-any-return]
+
+    def create_sync(self: Any, data: Any, **kwargs: Any) -> Any:
+        # Sync version for sync repositories
+        if isinstance(data, dict):
+            model_instance = model_type(**data)
+        else:
+            model_instance = data
+        return self.add(model_instance, **kwargs)
+
+    # Sync version of create_many
+    def create_many_sync(self: Any, data: "list[Any]", **kwargs: Any) -> "list[Any]":
+        # Convert dict items to model instances
+        model_instances = []
+        for item in data:
+            if isinstance(item, dict):
+                model_instances.append(model_type(**item))
+            else:
+                model_instances.append(item)
+        return self.add_many(model_instances, **kwargs)  # type: ignore[no-any-return]
+
+    # Choose the right create methods based on repository type
+    create_method = create if isinstance(session, AsyncSession) else create_sync
+    create_many_method = create_many if isinstance(session, AsyncSession) else create_many_sync
+
+    DynamicRepository = type(
+        repository_class_name,
+        (base_repository_class,),
+        {"model_type": model_type, "create": create_method, "create_many": create_many_method},
+    )
+
+    return DynamicRepository(session=session)
+
+
+def create_service(
+    session: "Union[Session, AsyncSession]", model_type: type, service_class: "Optional[type]" = None
+) -> Any:
+    """Create a service instance for the given session and model type."""
+    # Create a repository first, since services operate on repositories
+    repository = create_repository(session, model_type)
+
+    if service_class is None:
+        if isinstance(session, AsyncSession):
+            from advanced_alchemy.service import SQLAlchemyAsyncRepositoryService
+
+            base_service_class = SQLAlchemyAsyncRepositoryService
+        else:
+            from advanced_alchemy.service import SQLAlchemySyncRepositoryService
+
+            base_service_class = SQLAlchemySyncRepositoryService  # type: ignore[assignment]
+    else:
+        base_service_class = service_class  # type: ignore[assignment]
+
+    # Create a dynamic service class that knows about the repository
+    service_class_name = f"DynamicService_{model_type.__name__}"
+
+    # Set the repository_type to the same type as our dynamic repository
+    repository_type = type(repository)
+    DynamicService = type(service_class_name, (base_service_class,), {"repository_type": repository_type})
+
+    # Initialize the service
+    return DynamicService(session=session)
+
+
+# Helper functions for session-based testing
+def get_model_from_session(
+    session_data: "tuple[Union[Session, AsyncSession], dict[str, type]]", model_name: str
+) -> type:
+    """Extract a model type from session data tuple."""
+    _, models = session_data
+    return models[model_name]
+
+
+def get_repository_from_session(
+    session_data: "tuple[Union[Session, AsyncSession], dict[str, type]]", model_name: str
+) -> Any:
+    """Create a repository from session data tuple."""
+    session, models = session_data
+    model_type = models[model_name]
+    return create_repository(session, model_type)
+
+
+def get_service_from_session(
+    session_data: "tuple[Union[Session, AsyncSession], dict[str, type]]", model_name: str
+) -> Any:
+    """Create a service from session data tuple."""
+    session, models = session_data
+    model_type = models[model_name]
+    return create_service(session, model_type)
+
+
+@pytest.fixture(autouse=True)
+def _clear_in_memory_db() -> "Generator[None, None, None]":  # pyright: ignore[reportUnusedFunction]
+    try:
+        yield
+    finally:
+        SQLAlchemyAsyncMockRepository.__database_clear__()
+        SQLAlchemySyncMockRepository.__database_clear__()
+
+
+@pytest.fixture()
+def frozen_datetime() -> "Generator[Coordinates, None, None]":
+    with travel(lambda: dt.datetime.now(dt.timezone.utc), tick=False) as frozen:
+        yield frozen
+
+
+# Test functions using new session-based pattern
+async def test_repo_count_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test SQLAlchemy count."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+    assert await maybe_async(author_repo.count()) == 2
+
+
+async def test_repo_count_method_with_filters(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test SQLAlchemy count with filters."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get the first author name from seeded data
+    if hasattr(session, "bind") and getattr(session.bind, "dialect", {}).name == "mock":
+        # Mock repository handling
+        assert (
+            await maybe_async(
+                author_repo.count(
+                    **{author_repo.model_type.name.key: "Agatha Christie"},
+                ),
+            )
+            == 1
+        )
+    else:
+        # Real repository handling
+        assert (
+            await maybe_async(
+                author_repo.count(
+                    author_repo.model_type.name == "Agatha Christie",
+                ),
+            )
+            == 1
+        )
+
+
+async def test_repo_list_and_count_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test SQLAlchemy list with count in asyncpg."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    data, count = await maybe_async(author_repo.get_many_and_count())
+    assert len(data) == 2
+    assert count == 2
+
+
+async def test_repo_list_and_count_basic_method(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test SQLAlchemy list and count."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    data, count = await maybe_async(author_repo.get_many_and_count())
+    assert len(data) == 2
+    assert count == 2
+
+
+async def test_repo_list_method_with_filters(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test SQLAlchemy list with filters."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Test filtering by name
+    if hasattr(session, "bind") and getattr(session.bind, "dialect", {}).name == "mock":
+        # Mock repository handling
+        data = await maybe_async(author_repo.get_many(**{author_repo.model_type.name.key: "Agatha Christie"}))
+    else:
+        # Real repository handling
+        data = await maybe_async(author_repo.get_many(author_repo.model_type.name == "Agatha Christie"))
+
+    assert len(data) == 1
+    assert data[0].name == "Agatha Christie"
+
+
+async def test_repo_exists_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository exists method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first author ID
+    authors = await maybe_async(author_repo.get_many())
+    first_author_id = authors[0].id
+
+    assert await maybe_async(author_repo.exists(id=first_author_id)) is True
+
+    # Test with non-existent ID
+    non_existent_id = UUID("00000000-0000-0000-0000-000000000000") if hasattr(first_author_id, "hex") else 99999
+    assert await maybe_async(author_repo.exists(id=non_existent_id)) is False
+
+
+async def test_repo_get_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository get method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first author ID
+    authors = await maybe_async(author_repo.get_many())
+    first_author_id = authors[0].id
+
+    author = await maybe_async(author_repo.get(first_author_id))
+    assert author.id == first_author_id
+
+
+async def test_repo_get_one_or_none_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository get_one_or_none method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first author ID
+    authors = await maybe_async(author_repo.get_many())
+    first_author_id = authors[0].id
+
+    author = await maybe_async(author_repo.get_one_or_none(id=first_author_id))
+    assert author is not None
+    assert author.id == first_author_id
+
+    # Test with non-existent ID
+    non_existent_id = UUID("00000000-0000-0000-0000-000000000000") if hasattr(first_author_id, "hex") else 99999
+    author = await maybe_async(author_repo.get_one_or_none(id=non_existent_id))
+    assert author is None
+
+
+async def test_repo_create_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository create method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    new_author_data = {"name": "Test Author", "dob": dt.datetime.now(dt.timezone.utc).date()}
+
+    new_author = await maybe_async(author_repo.create(new_author_data))
+    assert new_author.name == "Test Author"
+    assert new_author.id is not None
+
+    # Verify it was actually created
+    total_count = await maybe_async(author_repo.count())
+    assert total_count == 3
+
+
+async def test_repo_update_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository update method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first author
+    authors = await maybe_async(author_repo.get_many())
+    author = authors[0]
+
+    original_name = author.name
+    original_created_at = author.created_at
+    original_updated_at = author.updated_at
+
+    # Update the author
+    author.name = "Updated Name"
+    updated_author = await maybe_async(author_repo.update(author))
+
+    assert updated_author.name == "Updated Name"
+    assert updated_author.name != original_name
+    assert updated_author.created_at == original_created_at
+    assert updated_author.updated_at > original_updated_at
+
+
+async def test_service_update_with_dict_data_refreshes_timestamp(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+    frozen_datetime: "Coordinates",
+) -> None:
+    """Service update should refresh audit timestamps when supplied with dict payloads."""
+    session, models = seeded_test_session_async
+    author_service = get_service_from_session((session, models), "author")
+
+    authors = await maybe_async(author_service.get_many())
+    author = authors[0]
+
+    original_created_at = author.created_at
+    original_updated_at = author.updated_at
+
+    frozen_datetime.shift(dt.timedelta(seconds=5))
+    update_payload = {"name": "Dict Driven Update"}
+
+    updated_author = await maybe_async(author_service.update(update_payload, item_id=author.id))
+
+    assert updated_author.name == "Dict Driven Update"
+    assert updated_author.created_at == original_created_at
+    assert updated_author.updated_at > original_updated_at
+
+
+async def test_repo_update_many_method_stale_data_fix(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test repository update_many returns refreshed data from database (Issue #1)."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first two authors
+    authors = await maybe_async(author_repo.get_many())
+    authors = authors[:2]
+
+    # Create update data that only updates name, leaving other fields unchanged
+    update_data = [{"id": authors[0].id, "name": "Updated Author 1"}, {"id": authors[1].id, "name": "Updated Author 2"}]
+
+    # Store original created_at/updated_at for comparison
+    original_created_at = authors[0].created_at
+    original_updated_at = authors[0].updated_at
+
+    # Update using update_many
+    updated_authors = await maybe_async(author_repo.update_many(update_data))
+
+    # Critical test: returned objects should have ALL attributes populated from database
+    # This was the bug - returned objects had None for non-updated fields
+    assert len(updated_authors) == 2
+    for updated_author in updated_authors:
+        # These should be updated
+        assert updated_author.name in ["Updated Author 1", "Updated Author 2"]
+
+        # These should still be populated from database (not None)
+        assert updated_author.created_at is not None
+        assert updated_author.updated_at is not None
+        assert updated_author.id is not None
+
+        # updated_at should be newer than before
+        if updated_author.id == authors[0].id:
+            assert updated_author.created_at == original_created_at
+            assert updated_author.updated_at > original_updated_at
+
+
+async def test_repo_update_many_mixed_types(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository update_many with mixed input types (dicts and model instances)."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get authors to update
+    authors = await maybe_async(author_repo.get_many())
+    authors = authors[:2]
+
+    # Test mixed input types: dict and model instance
+    authors[1].name = "Updated via Model Instance"
+    update_data = [
+        {"id": authors[0].id, "name": "Updated via Dict"},  # Dict
+        authors[1],  # Model instance
+    ]
+
+    # This should not raise AttributeError (Issue #3)
+    updated_authors = await maybe_async(author_repo.update_many(update_data))
+
+    assert len(updated_authors) == 2
+    updated_names = {author.name for author in updated_authors}
+    assert "Updated via Dict" in updated_names
+    assert "Updated via Model Instance" in updated_names
+
+
+async def test_repo_delete_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository delete method."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Get first author
+    authors = await maybe_async(author_repo.get_many())
+    author = authors[0]
+    author_id = author.id
+
+    # Delete the author
+    deleted_author = await maybe_async(author_repo.delete(author_id))
+    assert deleted_author.id == author_id
+
+    # Verify it was deleted
+    remaining_authors = await maybe_async(author_repo.get_many())
+    assert len(remaining_authors) == 1
+
+    remaining_ids = [a.id for a in remaining_authors]
+    assert author_id not in remaining_ids
+
+
+async def test_repo_health_check(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository health check."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Health check should not raise an exception - it's a class method that needs session
+    assert await maybe_async(author_repo.check_health(session)) is True
+
+
+# Service tests using new session-based pattern
+async def test_service_count_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service count method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    count = await maybe_async(author_service.count())
+    assert count == 2
+
+
+async def test_service_list_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service list method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    authors = await maybe_async(author_service.get_many())
+    assert len(authors) == 2
+
+
+async def test_service_get_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service get method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Get first author ID
+    authors = await maybe_async(author_service.get_many())
+    first_author_id = authors[0].id
+
+    author = await maybe_async(author_service.get(first_author_id))
+    assert author.id == first_author_id
+
+
+async def test_service_create_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service create method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    new_author_data = {"name": "Service Test Author", "dob": dt.datetime.now(dt.timezone.utc).date()}
+
+    new_author = await maybe_async(author_service.create(new_author_data))
+    assert new_author.name == "Service Test Author"
+    assert new_author.id is not None
+
+
+async def test_service_update_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service update method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Get first author
+    authors = await maybe_async(author_service.get_many())
+    author = authors[0]
+    author_id = author.id
+
+    original_name = author.name
+    original_created_at = author.created_at
+    original_updated_at = author.updated_at
+
+    # Update via service - correct parameter order is (data, item_id)
+    author.name = "Service Updated Name"
+    updated_author = await maybe_async(author_service.update(author, item_id=author_id))
+
+    assert updated_author.name == "Service Updated Name"
+    assert updated_author.name != original_name
+    assert updated_author.created_at == original_created_at
+    assert updated_author.updated_at > original_updated_at
+
+
+async def test_service_delete_method(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service delete method."""
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Get first author
+    authors = await maybe_async(author_service.get_many())
+    author_id = authors[0].id
+
+    # Delete via service
+    deleted_author = await maybe_async(author_service.delete(author_id))
+    assert deleted_author.id == author_id
+
+    # Verify deletion
+    remaining_authors = await maybe_async(author_service.get_many())
+    assert len(remaining_authors) == 1
+
+
+async def test_service_delete_many_accepts_instances(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service delete_many accepts model instances as well as raw primary keys."""
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    authors = await maybe_async(author_service.get_many())
+    assert len(authors) == 2
+
+    deleted = await maybe_async(author_service.delete_many(list(authors)))
+    assert len(deleted) == 2
+    assert {a.id for a in deleted} == {a.id for a in authors}
+
+    remaining = await maybe_async(author_service.get_many())
+    assert len(remaining) == 0
+
+
+async def test_service_delete_many_accepts_mixed_instances_and_ids(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service delete_many accepts a mixed list of model instances and raw primary keys."""
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    authors = await maybe_async(author_service.get_many())
+    assert len(authors) == 2
+
+    mixed = [authors[0], authors[1].id]
+    deleted = await maybe_async(author_service.delete_many(mixed))
+    assert len(deleted) == 2
+    assert {a.id for a in deleted} == {a.id for a in authors}
+
+    remaining = await maybe_async(author_service.get_many())
+    assert len(remaining) == 0
+
+
+# Additional filter tests
+async def test_repo_filter_before_after(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository with BeforeAfterFilter filter."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Test date filtering
+    cutoff_date = dt.datetime(2023, 4, 1, tzinfo=dt.timezone.utc)
+    filter_obj = BeforeAfterFilter(field_name="created_at", before=cutoff_date, after=None)
+
+    authors = await maybe_async(author_repo.get_many(filter_obj))
+    # Should get authors created before April 1, 2023
+    assert len(authors) >= 1  # At least one author should match
+
+
+async def test_repo_filter_search(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository with SearchFilter."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Search for 'Christie' in name
+    search_filter = SearchFilter(field_name="name", value="Christie")
+
+    authors = await maybe_async(author_repo.get_many(search_filter))
+    assert len(authors) == 1
+    assert "Christie" in authors[0].name
+
+
+async def test_repo_filter_order_by(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository with OrderByFilter filter."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Order by name ascending
+    order_filter = OrderByFilter(field_name="name")
+
+    authors = await maybe_async(author_repo.get_many(order_filter))
+    assert len(authors) == 2
+
+    # Verify ordering
+    names = [author.name for author in authors]
+    assert names == sorted(names)
+
+
+# Pagination tests
+async def test_service_paginated_list(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test service paginated list."""
+    from advanced_alchemy.filters import LimitOffsetFilter
+
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Test pagination using LimitOffsetFilter filter with consistent ordering
+    paginated = await maybe_async(
+        author_service.get_many(LimitOffsetFilter(limit=1, offset=0), OrderByFilter(field_name="name"))
+    )
+
+    assert len(paginated) == 1
+
+
+# Error handling tests
+async def test_repo_error_messages(seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]") -> None:
+    """Test repository error handling."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Test NotFoundError for non-existent ID
+    non_existent_id = (
+        UUID("00000000-0000-0000-0000-000000000000")
+        if hasattr(author_repo.model_type.id.type, "python_type") and author_repo.model_type.id.type.python_type == UUID
+        else 99999
+    )
+
+    with pytest.raises(NotFoundError):
+        await maybe_async(author_repo.get(non_existent_id))
+
+
+def _make_mock_session(engine: AsyncEngine) -> AsyncSession:
+    session = cast(AsyncSession, create_autospec(AsyncSession, instance=True))
+    session.bind = engine
+    session.get_bind.return_value = engine
+    return session
+
+
+@pytest.mark.mock_async
+@pytest.mark.xdist_group("mock")
+def test_repo_error_message_overrides_are_isolated(
+    mock_async_engine: AsyncEngine, uuid_models_dba: "dict[str, type]"
+) -> None:
+    author_model = cast(type[Any], uuid_models_dba["author"])
+    default_not_found = DEFAULT_ERROR_MESSAGE_TEMPLATES.get("not_found")
+
+    class BaseRepo(SQLAlchemyAsyncRepository[Any]):
+        model_type = author_model
+
+    class RepoA(BaseRepo):
+        error_messages = {"not_found": "Author A not found"}
+
+    class RepoB(BaseRepo):
+        error_messages = {"not_found": "Author B not found"}
+
+    repo_a_first = RepoA(session=_make_mock_session(mock_async_engine))
+    repo_b = RepoB(session=_make_mock_session(mock_async_engine))
+    repo_a_second = RepoA(session=_make_mock_session(mock_async_engine))
+
+    assert repo_a_first.error_messages is not DEFAULT_ERROR_MESSAGE_TEMPLATES
+    assert repo_a_first.error_messages is not repo_b.error_messages
+    assert repo_a_first.error_messages["not_found"] == "Author A not found"
+    assert repo_b.error_messages["not_found"] == "Author B not found"
+    assert repo_a_second.error_messages["not_found"] == "Author A not found"
+    assert DEFAULT_ERROR_MESSAGE_TEMPLATES["not_found"] == default_not_found
+
+
+@pytest.mark.mock_async
+@pytest.mark.xdist_group("mock")
+def test_mock_repo_error_message_overrides_are_isolated(
+    mock_async_engine: AsyncEngine, uuid_models_dba: "dict[str, type]"
+) -> None:
+    author_model = cast(type[Any], uuid_models_dba["author"])
+
+    class BaseMockRepo(SQLAlchemyAsyncMockRepository[Any]):
+        model_type = author_model
+
+    class RepoA(BaseMockRepo):
+        error_messages = {"not_found": "Mock Author A not found"}
+
+    class RepoB(BaseMockRepo):
+        error_messages = {"not_found": "Mock Author B not found"}
+
+    repo_a = RepoA(session=_make_mock_session(mock_async_engine))
+    repo_b = RepoB(session=_make_mock_session(mock_async_engine))
+
+    assert repo_a.error_messages is not repo_b.error_messages
+    assert repo_a.error_messages["not_found"] == "Mock Author A not found"
+    assert repo_b.error_messages["not_found"] == "Mock Author B not found"
+
+
+# Comprehensive tests for GitHub issue #535 and bug_fix.md issues
+async def test_service_pydantic_partial_update_github_535(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service update with Pydantic models using exclude_unset for partial updates (GitHub Issue #535)."""
+    pydantic = pytest.importorskip("pydantic")
+
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Create an author
+    author = await maybe_async(author_service.create({"name": "Original Name", "dob": dt.date(1990, 1, 1)}))
+    original_dob = author.dob
+
+    # Create a Pydantic model for partial update with optional fields
+    class AuthorUpdateSchema(pydantic.BaseModel):  # type: ignore[name-defined,misc]
+        name: "Optional[str]" = None
+        dob: "Optional[dt.date]" = None
+
+    # Partial update with only name field set (dob is unset)
+    partial_update = AuthorUpdateSchema(name="Updated Name")
+    assert partial_update.name == "Updated Name"
+    assert "dob" not in partial_update.model_fields_set
+
+    # Update via service - should only update name, leave dob unchanged
+    updated_author = await maybe_async(author_service.update(partial_update, item_id=author.id))
+
+    # Verify: name was updated, but dob remains unchanged
+    assert updated_author.name == "Updated Name"
+    assert updated_author.dob == original_dob  # Should be unchanged
+    assert updated_author.id == author.id
+
+
+async def test_service_msgspec_partial_update_github_535(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service update with msgspec structs using UNSET for partial updates (GitHub Issue #535)."""
+    msgspec = pytest.importorskip("msgspec")
+
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Create an author
+    author = await maybe_async(author_service.create({"name": "Original Name", "dob": dt.date(1990, 1, 1)}))
+    original_dob = author.dob
+
+    # Create a msgspec struct for partial update with UNSET field
+    class AuthorUpdateSchema(msgspec.Struct):  # type: ignore[name-defined,misc]
+        name: "str" = msgspec.UNSET
+        dob: "dt.date" = msgspec.UNSET
+
+    # Partial update with only name field set (dob is UNSET)
+    partial_update = AuthorUpdateSchema(name="Updated Name")
+    assert partial_update.name == "Updated Name"
+    assert partial_update.dob is msgspec.UNSET
+
+    # Update via service - should only update name, leave dob unchanged
+    updated_author = await maybe_async(author_service.update(partial_update, item_id=author.id))
+
+    # Verify: name was updated, but dob remains unchanged
+    assert updated_author.name == "Updated Name"
+    assert updated_author.dob == original_dob  # Should be unchanged
+    assert updated_author.id == author.id
+
+
+async def test_service_update_many_schema_types_github_535(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service update_many with different schema types (GitHub Issue #535)."""
+    pydantic = pytest.importorskip("pydantic")
+    msgspec = pytest.importorskip("msgspec")
+
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Create multiple authors
+    author1 = await maybe_async(author_service.create({"name": "Author One", "dob": dt.date(1990, 1, 1)}))
+    author2 = await maybe_async(author_service.create({"name": "Author Two", "dob": dt.date(1991, 2, 2)}))
+
+    original_dob1 = author1.dob
+    original_dob2 = author2.dob
+    original_created_at1 = author1.created_at
+    original_created_at2 = author2.created_at
+    original_updated_at1 = author1.updated_at
+    original_updated_at2 = author2.updated_at
+
+    # Get ID type from model for dynamic schema creation
+    # For Pydantic compatibility, we need to map database-specific types to Python types
+    from uuid import UUID as PythonUUID
+
+    actual_id_type = type(author1.id)
+    if hasattr(actual_id_type, "__name__") and "UUID" in actual_id_type.__name__:
+        id_type = PythonUUID  # Use standard UUID for database UUID types
+    else:
+        id_type = int  # type: ignore[assignment]
+
+    class AuthorUpdateSchema(pydantic.BaseModel):  # type: ignore[name-defined,misc]
+        id: id_type  # type: ignore[valid-type]
+        name: "Optional[str]" = None
+        dob: "Optional[dt.date]" = None
+
+    # Create msgspec schema for partial updates
+    class AuthorUpdateMsgspecSchema(msgspec.Struct):  # type: ignore[name-defined,misc]
+        id: id_type  # type: ignore[valid-type]
+        name: "str" = msgspec.UNSET
+        dob: "dt.date" = msgspec.UNSET
+
+    # Test update_many with mixed schema types (Pydantic, msgspec, dict)
+    update_data = [
+        AuthorUpdateSchema(id=author1.id, name="Updated Author One"),  # Pydantic with UNSET dob
+        AuthorUpdateMsgspecSchema(id=author2.id, name="Updated Author Two"),  # msgspec with UNSET dob
+    ]
+
+    # Sleep to ensure timestamp difference for databases with lower precision
+    await asyncio.sleep(1.1)
+
+    # Update via service - should only update names, leave dobs unchanged
+    updated_authors = await maybe_async(author_service.update_many(update_data))
+
+    # Verify updates
+    assert len(updated_authors) == 2
+
+    # Find updated authors by ID
+    updated_author1 = next(a for a in updated_authors if a.id == author1.id)
+    updated_author2 = next(a for a in updated_authors if a.id == author2.id)
+
+    # Verify: names were updated, but dobs remain unchanged
+    assert updated_author1.name == "Updated Author One"
+    assert updated_author1.dob == original_dob1  # Should be unchanged
+    assert updated_author1.created_at == original_created_at1
+    assert updated_author1.updated_at > original_updated_at1
+
+    assert updated_author2.name == "Updated Author Two"
+    assert updated_author2.dob == original_dob2  # Should be unchanged
+    assert updated_author2.created_at == original_created_at2
+    assert updated_author2.updated_at > original_updated_at2
+
+
+async def test_repo_update_many_non_returning_backend_refresh(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test repository update_many refreshes data on non-RETURNING backends (Issue #1 from bug_fix.md)."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    # Create multiple authors
+    authors = await maybe_async(
+        author_repo.create_many(
+            [
+                {"name": "Author A", "dob": dt.date(1990, 1, 1)},
+                {"name": "Author B", "dob": dt.date(1991, 2, 2)},
+            ]
+        )
+    )
+
+    # Prepare update data with partial changes
+    update_data = [
+        {"id": authors[0].id, "name": "Updated Author A"},  # Only updating name
+        {"id": authors[1].id, "name": "Updated Author B"},  # Only updating name
+    ]
+
+    # Update via repository
+    updated_authors = await maybe_async(author_repo.update_many(update_data))
+
+    # Verify returned objects have ALL attributes populated (not just updated ones)
+    assert len(updated_authors) == 2
+
+    for updated_author in updated_authors:
+        # Verify all attributes are populated from database, not just updated ones
+        assert updated_author.name is not None and "Updated" in updated_author.name
+        assert updated_author.dob is not None  # Should be populated from database, not None
+        assert updated_author.id is not None
+        assert updated_author.created_at is not None  # Audit fields should be populated
+        assert updated_author.updated_at is not None
+
+
+async def test_service_mixed_input_types_update_many(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service update_many with mixed input types (dicts, Pydantic models, msgspec structs)."""
+    pydantic = pytest.importorskip("pydantic")
+    msgspec = pytest.importorskip("msgspec")
+
+    _session, _models = seeded_test_session_async
+    author_service = get_service_from_session(seeded_test_session_async, "author")
+
+    # Create multiple authors
+    authors = await maybe_async(
+        author_service.create_many(
+            [
+                {"name": "Author 1", "dob": dt.date(1990, 1, 1)},
+                {"name": "Author 2", "dob": dt.date(1991, 2, 2)},
+                {"name": "Author 3", "dob": dt.date(1992, 3, 3)},
+            ]
+        )
+    )
+
+    # Get ID type from model for dynamic schema creation
+    # For Pydantic compatibility, we need to map database-specific types to Python types
+    from uuid import UUID as PythonUUID
+
+    actual_id_type = type(authors[0].id)
+    if hasattr(actual_id_type, "__name__") and "UUID" in actual_id_type.__name__:
+        id_type = PythonUUID  # Use standard UUID for database UUID types
+    else:
+        id_type = int  # type: ignore[assignment]
+
+    # Create schema classes
+    class AuthorUpdatePydantic(pydantic.BaseModel):  # type: ignore[name-defined,misc]
+        id: id_type  # type: ignore[valid-type]
+        name: "Optional[str]" = None
+        dob: "Optional[dt.date]" = None
+
+    class AuthorUpdateMsgspec(msgspec.Struct):  # type: ignore[name-defined,misc]
+        id: id_type  # type: ignore[valid-type]
+        name: "str" = msgspec.UNSET
+        dob: "dt.date" = msgspec.UNSET
+
+    # Test with mixed input types
+    mixed_update_data = [
+        {"id": authors[0].id, "name": "Dict Updated"},  # Dictionary
+        AuthorUpdatePydantic(id=authors[1].id, name="Pydantic Updated"),  # Pydantic model
+        AuthorUpdateMsgspec(id=authors[2].id, name="Msgspec Updated"),  # msgspec struct
+    ]
+
+    # Update via service
+    updated_authors = await maybe_async(author_service.update_many(mixed_update_data))
+
+    # Verify all updates worked correctly
+    assert len(updated_authors) == 3
+
+    # Create a mapping by ID for verification
+    updated_by_id = {author.id: author for author in updated_authors}
+
+    # Verify each update matches the expected result
+    assert updated_by_id[authors[0].id].name == "Dict Updated"
+    assert updated_by_id[authors[1].id].name == "Pydantic Updated"
+    assert updated_by_id[authors[2].id].name == "Msgspec Updated"
+
+    # Verify all attributes are properly populated (not stale/None)
+    for author in updated_authors:
+        assert author.dob is not None
+        assert author.created_at is not None
+        assert author.updated_at is not None
+
+
+async def test_repo_update_with_model_instance_partial_fields_github_560(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test repository update with model instances for partial updates (GitHub Issue #560).
+
+    This test verifies that when updating with a model instance where only some fields
+    are explicitly set, the unset fields do not overwrite existing data with None.
+    """
+    _session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = get_repository_from_session(seeded_test_session_async, "author")
+
+    # Create an author with all fields populated
+    author = await maybe_async(author_repo.create({"name": "Original Name", "dob": dt.date(1990, 1, 1)}))
+    original_dob = author.dob
+    original_id = author.id
+
+    # Create a partial update using a model instance with only id and name set
+    # This mimics the pattern: Author(id=1, name="Updated Name")
+    # SQLAlchemy initializes 'dob' to None, but it wasn't explicitly set by the user
+    partial_update = author_model(id=original_id, name="Updated Name")
+
+    # Update via repository - should only update name, leave dob unchanged
+    updated_author = await maybe_async(author_repo.update(partial_update))
+
+    # Verify: name was updated, but dob remains unchanged (not overwritten with None)
+    assert updated_author.name == "Updated Name"
+    assert updated_author.dob == original_dob  # Should be unchanged
+    assert updated_author.id == original_id
+
+
+async def test_repo_update_many_with_model_instances_partial_fields_github_560(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test repository update_many with model instances for partial updates (GitHub Issue #560).
+
+    This test verifies that update_many correctly handles model instances with partially
+    set fields, preventing None values from overwriting existing data.
+    """
+    _session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = get_repository_from_session(seeded_test_session_async, "author")
+
+    # Create multiple authors with all fields populated
+    author1 = await maybe_async(author_repo.create({"name": "Author One", "dob": dt.date(1990, 1, 1)}))
+    author2 = await maybe_async(author_repo.create({"name": "Author Two", "dob": dt.date(1991, 2, 2)}))
+
+    original_dob1 = author1.dob
+    original_dob2 = author2.dob
+
+    # Create partial updates using model instances with only id and name set
+    partial_updates = [
+        author_model(id=author1.id, name="Updated One"),
+        author_model(id=author2.id, name="Updated Two"),
+    ]
+
+    # Update via repository - should only update names, leave dobs unchanged
+    updated_authors = await maybe_async(author_repo.update_many(partial_updates))
+
+    # Verify: names were updated, but dobs remain unchanged
+    assert len(updated_authors) == 2
+    updated_by_id = {author.id: author for author in updated_authors}
+
+    assert updated_by_id[author1.id].name == "Updated One"
+    assert updated_by_id[author1.id].dob == original_dob1  # Should be unchanged
+
+    assert updated_by_id[author2.id].name == "Updated Two"
+    assert updated_by_id[author2.id].dob == original_dob2  # Should be unchanged
+
+
+# =============================================================================
+# Composite Primary Key Tests
+# =============================================================================
+
+
+async def test_composite_pk_get_by_tuple(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test get() with composite primary key using tuple format."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Get using tuple format (user_id, role_id)
+    result = await maybe_async(user_role_repo.get((1, 10)))
+
+    assert result is not None
+    assert result.user_id == 1
+    assert result.role_id == 10
+    assert result.is_active is True
+
+
+async def test_composite_pk_get_by_dict(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test get() with composite primary key using dict format."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Get using dict format
+    result = await maybe_async(user_role_repo.get({"user_id": 1, "role_id": 20}))
+
+    assert result is not None
+    assert result.user_id == 1
+    assert result.role_id == 20
+    assert result.is_active is True
+
+
+async def test_composite_pk_get_not_found(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test get() with composite primary key raises NotFoundError for missing record."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((999, 999)))
+
+
+async def test_composite_pk_delete_by_tuple(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test delete() with composite primary key using tuple format."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Delete using tuple format
+    deleted = await maybe_async(user_role_repo.delete((2, 10)))
+
+    assert deleted is not None
+    assert deleted.user_id == 2
+    assert deleted.role_id == 10
+
+    # Verify it's actually deleted
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((2, 10)))
+
+
+async def test_composite_pk_delete_by_dict(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test delete() with composite primary key using dict format."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Delete using dict format
+    deleted = await maybe_async(user_role_repo.delete({"user_id": 1, "role_id": 20}))
+
+    assert deleted is not None
+    assert deleted.user_id == 1
+    assert deleted.role_id == 20
+
+    # Verify it's actually deleted
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get({"user_id": 1, "role_id": 20}))
+
+
+async def test_composite_pk_delete_many_by_tuples(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test delete_many() with composite primary key using list of tuples."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Delete multiple using tuple format
+    deleted = await maybe_async(
+        user_role_repo.delete_many(
+            [
+                (1, 10),
+                (1, 20),
+            ]
+        )
+    )
+
+    assert len(deleted) == 2
+
+    # Verify they're actually deleted
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((1, 10)))
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((1, 20)))
+
+    # The remaining record should still exist
+    remaining = await maybe_async(user_role_repo.get((2, 10)))
+    assert remaining is not None
+
+
+async def test_composite_pk_delete_many_by_dicts(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test delete_many() with composite primary key using list of dicts."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    # Delete multiple using dict format
+    deleted = await maybe_async(
+        user_role_repo.delete_many(
+            [
+                {"user_id": 1, "role_id": 10},
+                {"user_id": 2, "role_id": 10},
+            ]
+        )
+    )
+
+    assert len(deleted) == 2
+
+    # Verify they're actually deleted
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((1, 10)))
+    with pytest.raises(NotFoundError):
+        await maybe_async(user_role_repo.get((2, 10)))
+
+
+async def test_composite_pk_service_delete_many_accepts_mixed_instances_and_ids(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test service delete_many accepts mixed model instances and raw composite keys."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_service = create_service(session, models["user_role"])
+
+    roles = await maybe_async(user_role_service.get_many())
+    assert len(roles) == 3
+
+    mixed = [roles[0], (roles[1].user_id, roles[1].role_id)]
+    deleted = await maybe_async(user_role_service.delete_many(mixed))
+
+    assert len(deleted) == 2
+    assert {(role.user_id, role.role_id) for role in deleted} == {
+        (roles[0].user_id, roles[0].role_id),
+        (roles[1].user_id, roles[1].role_id),
+    }
+
+
+async def test_composite_pk_count(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test count() works with composite primary key model."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    count = await maybe_async(user_role_repo.count())
+    assert count == 3  # We seeded 3 user_role records
+
+
+async def test_composite_pk_list(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test list() works with composite primary key model."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+
+    results = await maybe_async(user_role_repo.get_many())
+    assert len(results) == 3
+
+
+async def test_single_pk_with_tuple_raises_error(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test that passing a tuple to a single-PK model raises ValueError."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    with pytest.raises(ValueError, match="single primary key"):
+        await maybe_async(author_repo.get((1, 2)))
+
+
+async def test_single_pk_with_dict_raises_error(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test that passing a dict to a single-PK model raises ValueError."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+
+    with pytest.raises(ValueError, match="single primary key"):
+        await maybe_async(author_repo.get({"id": 1}))
+
+
+# =============================================================================
+# Composite Primary Key Tests - Update/Upsert Operations
+# =============================================================================
+
+
+async def test_composite_pk_update(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test update() with composite primary key model."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # Get existing record
+    existing = await maybe_async(user_role_repo.get((1, 10)))
+    assert existing is not None
+    assert existing.is_active is True
+
+    # Update the record (create a new instance with the same PK)
+    updated_role = UserRole(user_id=1, role_id=10, is_active=False)
+    result = await maybe_async(user_role_repo.update(updated_role))
+
+    assert result is not None
+    assert result.user_id == 1
+    assert result.role_id == 10
+    assert result.is_active is False
+
+
+async def test_composite_pk_update_many(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test update_many() with composite primary key model."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # Update multiple records
+    updates = [
+        UserRole(user_id=1, role_id=10, is_active=False),
+        UserRole(user_id=1, role_id=20, is_active=False),
+    ]
+    results = await maybe_async(user_role_repo.update_many(updates))
+
+    assert len(results) == 2
+
+    # Verify the updates were applied
+    role1 = await maybe_async(user_role_repo.get((1, 10)))
+    role2 = await maybe_async(user_role_repo.get((1, 20)))
+    assert role1.is_active is False
+    assert role2.is_active is False
+
+
+async def test_composite_pk_upsert_update(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test upsert() updates existing record with composite primary key."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # Upsert with existing PK should update
+    upserted = UserRole(user_id=1, role_id=10, is_active=False)
+    result = await maybe_async(user_role_repo.upsert(upserted))
+
+    assert result is not None
+    assert result.user_id == 1
+    assert result.role_id == 10
+    assert result.is_active is False
+
+    # Verify via get
+    fetched = await maybe_async(user_role_repo.get((1, 10)))
+    assert fetched.is_active is False
+
+
+async def test_composite_pk_upsert_create(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test upsert() creates new record with composite primary key."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # Upsert with non-existing PK should create
+    new_role = UserRole(user_id=99, role_id=99, is_active=True)
+    result = await maybe_async(user_role_repo.upsert(new_role))
+
+    assert result is not None
+    assert result.user_id == 99
+    assert result.role_id == 99
+    assert result.is_active is True
+
+    # Verify via get
+    fetched = await maybe_async(user_role_repo.get((99, 99)))
+    assert fetched is not None
+    assert fetched.is_active is True
+
+
+async def test_composite_pk_upsert_many_mixed(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test upsert_many() with mix of creates and updates for composite PKs."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # Mix of existing (should update) and new (should create) records
+    data = [
+        UserRole(user_id=1, role_id=10, is_active=False),  # Existing - update
+        UserRole(user_id=88, role_id=88, is_active=True),  # New - create
+    ]
+    results = await maybe_async(user_role_repo.upsert_many(data))
+
+    assert len(results) == 2
+
+    # Verify the existing one was updated
+    updated = await maybe_async(user_role_repo.get((1, 10)))
+    assert updated.is_active is False
+
+    # Verify the new one was created
+    created = await maybe_async(user_role_repo.get((88, 88)))
+    assert created is not None
+    assert created.is_active is True
+
+
+async def test_composite_pk_upsert_many_all_new(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test upsert_many() with all new records for composite PKs."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+
+    # All new records
+    data = [
+        UserRole(user_id=100, role_id=100, is_active=True),
+        UserRole(user_id=101, role_id=101, is_active=False),
+    ]
+    results = await maybe_async(user_role_repo.upsert_many(data))
+
+    assert len(results) == 2
+
+    # Verify both were created
+    for user_id, role_id in [(100, 100), (101, 101)]:
+        created = await maybe_async(user_role_repo.get((user_id, role_id)))
+        assert created is not None
+
+
+async def test_upsert_many_native_path_is_single_statement_per_chunk(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Native dispatch must compile to ONE upsert statement per chunk.
+
+    On a native-capable dialect, the upsert path emits one
+    INSERT...ON CONFLICT / MERGE / INSERT OR UPDATE per chunk plus (when
+    ``supports_returning=False``) at most one re-SELECT for hydration — never
+    the historical 1 SELECT + N add/update sequence.
+    """
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = create_repository(session, author_model)
+    dialect_name = session.bind.dialect.name if session.bind is not None else session.get_bind().dialect.name
+    if dialect_name not in {
+        "postgresql",
+        "cockroachdb",
+        "sqlite",
+        "duckdb",
+        "oracle",
+        "mssql",
+        "spanner+spanner",
+    }:
+        pytest.skip(
+            f"native upsert path with match_fields=['id'] cannot hydrate on {dialect_name!r} (no RETURNING / autoincrement PK)"
+        )
+    if issubclass(author_model, BigIntPrimaryKey):
+        pytest.skip(
+            f"server-generated bigint PK on {dialect_name!r} falls back to ORM-managed inserts; native single-statement assertion does not apply"
+        )
+
+    statements: list[str] = []
+
+    def _record(conn: Any, clauseelement: Any, *args: Any, **kwargs: Any) -> None:
+        _ = args, kwargs
+        try:
+            statements.append(str(clauseelement.compile(dialect=conn.dialect)))
+        except Exception:
+            statements.append(type(clauseelement).__name__)
+
+    bind = session.bind if session.bind is not None else session.get_bind()
+    sync_engine = getattr(bind, "sync_engine", bind)
+    event.listen(sync_engine, "before_execute", _record)
+    try:
+        data = [author_model(name=f"native-upsert-author-{i}", dob=dt.date(1990, 1, 1)) for i in range(5)]
+        results = await maybe_async(author_repo.upsert_many(data, match_fields=["id"]))
+    finally:
+        event.remove(sync_engine, "before_execute", _record)
+
+    assert len(results) == 5
+    upsert_statements = [s for s in statements if "INSERT" in s.upper() or "MERGE" in s.upper()]
+    assert len(upsert_statements) == 1, (
+        f"expected 1 native upsert statement, got {len(upsert_statements)}: {statements}"
+    )
+
+
+async def test_upsert_many_no_merge_forces_fallback(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """``no_merge=True`` must take the SELECT+partition+add/update fallback path.
+
+    All match keys here are ``None`` so the fallback skips the existence probe
+    and inserts every row through the ORM — the statements must be plain
+    INSERTs with no native upsert clause.
+    """
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = create_repository(session, author_model)
+
+    statements: list[str] = []
+
+    def _record(conn: Any, clauseelement: Any, *args: Any, **kwargs: Any) -> None:
+        _ = args, kwargs
+        try:
+            statements.append(str(clauseelement.compile(dialect=conn.dialect)))
+        except Exception:
+            statements.append(type(clauseelement).__name__)
+
+    bind = session.bind if session.bind is not None else session.get_bind()
+    sync_engine = getattr(bind, "sync_engine", bind)
+    event.listen(sync_engine, "before_execute", _record)
+    try:
+        data = [author_model(name=f"fallback-author-{i}", dob=dt.date(1990, 1, 1)) for i in range(3)]
+        results = await maybe_async(author_repo.upsert_many(data, match_fields=["id"], no_merge=True))
+    finally:
+        event.remove(sync_engine, "before_execute", _record)
+
+    assert len(results) == 3
+    saw_insert = any(s.upper().startswith("INSERT") for s in statements)
+    saw_native_upsert = any("ON CONFLICT" in s.upper() or "MERGE" in s.upper() for s in statements)
+    assert saw_insert and not saw_native_upsert, f"fallback expected plain INSERTs, got: {statements}"
+
+
+async def test_upsert_many_chunk_size_emits_multiple_chunks(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """A small parameter cap must produce multiple native statements."""
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = create_repository(session, author_model)
+    dialect_name = session.bind.dialect.name if session.bind is not None else session.get_bind().dialect.name
+    if dialect_name not in {
+        "postgresql",
+        "cockroachdb",
+        "sqlite",
+        "duckdb",
+        "oracle",
+        "mssql",
+        "spanner+spanner",
+    }:
+        pytest.skip(
+            f"native upsert path with match_fields=['id'] cannot hydrate on {dialect_name!r} (no RETURNING / autoincrement PK)"
+        )
+    if issubclass(author_model, BigIntPrimaryKey):
+        pytest.skip(
+            f"server-generated bigint PK on {dialect_name!r} falls back to ORM-managed inserts; native chunking assertion does not apply"
+        )
+
+    statements: list[str] = []
+
+    def _record(conn: Any, clauseelement: Any, *args: Any, **kwargs: Any) -> None:
+        _ = args, kwargs
+        try:
+            statements.append(str(clauseelement.compile(dialect=conn.dialect)))
+        except Exception:
+            statements.append(type(clauseelement).__name__)
+
+    bind = session.bind if session.bind is not None else session.get_bind()
+    sync_engine = getattr(bind, "sync_engine", bind)
+    event.listen(sync_engine, "before_execute", _record)
+    try:
+        data = [author_model(name=f"chunked-author-{i}", dob=dt.date(1990, 1, 1)) for i in range(8)]
+        results = await maybe_async(author_repo.upsert_many(data, match_fields=["id"], chunk_size=4))
+    finally:
+        event.remove(sync_engine, "before_execute", _record)
+
+    assert len(results) == 8
+    upsert_statements = [s for s in statements if "INSERT" in s.upper() or "MERGE" in s.upper()]
+    assert len(upsert_statements) >= 2, f"expected >=2 upsert statements with chunk_size=4, got {upsert_statements}"
+
+
+async def test_upsert_many_duplicate_match_keys_use_fallback(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Duplicate keys must not have backend-dependent native-statement behavior.
+
+    The batch routes through the ORM fallback, which merges both rows onto the
+    same target; a genuine primary-key conflict surfaces as the wrapped
+    repository error rather than a raw ``ValueError``.
+    """
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+    data = [
+        UserRole(user_id=700, role_id=700, is_active=True),
+        UserRole(user_id=700, role_id=700, is_active=False),
+    ]
+
+    with pytest.raises(RepositoryError):
+        await maybe_async(user_role_repo.upsert_many(data))
+
+
+async def test_upsert_many_non_returning_reselect_uses_exact_composite_keys(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hydration must not return the Cartesian product of composite key values."""
+    session, models = seeded_test_session_async
+    if "user_role" not in models:
+        pytest.skip("user_role model not available")
+
+    user_role_repo = create_repository(session, models["user_role"])
+    UserRole = models["user_role"]
+    await maybe_async(
+        user_role_repo.add_many(
+            [
+                UserRole(user_id=710, role_id=710, is_active=True),
+                UserRole(user_id=710, role_id=711, is_active=True),
+                UserRole(user_id=711, role_id=710, is_active=True),
+                UserRole(user_id=711, role_id=711, is_active=True),
+            ]
+        )
+    )
+
+    def _without_returning(*args: Any, **kwargs: Any) -> UpsertStrategy:
+        strategy = resolve_upsert_strategy(*args, **kwargs)
+        return UpsertStrategy(
+            kind=strategy.kind,
+            supports_returning=False,
+            conflict_columns=strategy.conflict_columns,
+            dialect_name=strategy.dialect_name,
+        )
+
+    monkeypatch.setattr(async_repo_mod, "resolve_upsert_strategy", _without_returning)
+    monkeypatch.setattr(sync_repo_mod, "resolve_upsert_strategy", _without_returning)
+    results = await maybe_async(
+        user_role_repo.upsert_many(
+            [
+                UserRole(user_id=710, role_id=711, is_active=False),
+                UserRole(user_id=711, role_id=710, is_active=False),
+            ]
+        )
+    )
+
+    assert {(item.user_id, item.role_id) for item in results} == {(710, 711), (711, 710)}
+
+
+async def test_upsert_many_refreshes_existing_identity_map_rows(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Native RETURNING must overwrite stale state already present in the session."""
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = create_repository(session, author_model)
+    existing_author = (await maybe_async(author_repo.get_many()))[0]
+    replacement_author = author_model(id=existing_author.id, name="Updated by native upsert", dob=existing_author.dob)
+
+    results = await maybe_async(author_repo.upsert_many([replacement_author], match_fields=["id"]))
+
+    assert results[0] is existing_author
+    assert results[0].name == "Updated by native upsert"
+
+
+async def test_upsert_many_preserves_insert_defaults_and_applies_onupdate(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Native upsert must not copy insert-only defaults into existing rows."""
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    author_repo = create_repository(session, author_model)
+    existing_author = (await maybe_async(author_repo.get_many()))[0]
+    original_created_at = existing_author.created_at
+    original_updated_at = existing_author.updated_at
+    replacement_author = author_model(id=existing_author.id, name="Native defaults update", dob=existing_author.dob)
+
+    results = await maybe_async(author_repo.upsert_many([replacement_author], match_fields=["id"]))
+
+    assert results[0].created_at == original_created_at
+    assert results[0].updated_at > original_updated_at
+
+
+async def test_upsert_many_persistent_instance_updates_only_changed_fields(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Loaded state is not equivalent to explicitly supplied update data."""
+    session, models = seeded_test_session_async
+    author_repo = create_repository(session, models["author"])
+    existing_author = (await maybe_async(author_repo.get_many()))[0]
+    original_created_at = existing_author.created_at
+    original_updated_at = existing_author.updated_at
+    existing_author.name = "Persistent native update"
+
+    results = await maybe_async(author_repo.upsert_many([existing_author], match_fields=["id"]))
+
+    assert results[0].created_at == original_created_at
+    assert results[0].updated_at > original_updated_at
+
+
+async def test_repo_update_partial_does_not_clear_relationships_github_684(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test that partial update with a model instance does not clear relationships (GitHub Issue #684).
+
+    When updating with a model instance where only scalar fields are set
+    (e.g., Author(id=..., name="New Name")), the unset relationship fields
+    should NOT overwrite existing relationships with None/[].
+
+    Regression test for: https://github.com/litestar-org/advanced-alchemy/issues/684
+    """
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    book_model = models["book"]
+    author_repo = create_repository(session, author_model)
+    book_repo = create_repository(session, book_model)
+
+    # Create an author with a book using the relationship (so ORM tracks it)
+    author = author_model(name="Alice", dob=dt.date(1980, 1, 1))
+    book = book_model(title="Great Book")
+    author.books = [book]
+    author = await maybe_async(author_repo.add(author))
+    author_id = author.id
+    await session.flush()
+
+    # Expire the session so the next get() does a fresh load with selectin
+    session.expire_all()
+
+    # Verify the relationship is set
+    fetched_author = await maybe_async(author_repo.get(author_id))
+    assert fetched_author.books is not None
+    assert len(fetched_author.books) == 1
+    book_id = fetched_author.books[0].id
+
+    # Expire again to clear the identity map before the update
+    session.expire_all()
+
+    # Partial update: only change name, do NOT touch the books relationship
+    partial_update = author_model(id=author_id, name="Bob")
+    updated_author = await maybe_async(author_repo.update(partial_update))
+
+    # Verify: name was updated
+    assert updated_author.name == "Bob"
+
+    # Expire and re-fetch to verify DB state
+    session.expire_all()
+    refetched = await maybe_async(author_repo.get(author_id))
+    assert refetched.books is not None, "BUG: books relationship was silently cleared during partial update"
+    assert len(refetched.books) == 1, "BUG: books relationship was silently cleared during partial update"
+    assert refetched.books[0].id == book_id
+
+    # Also verify the book still exists and is associated
+    refetched_book = await maybe_async(book_repo.get(book_id))
+    assert refetched_book.author_id == author_id, "BUG: book's author_id was cleared"
+
+
+async def test_repo_update_partial_does_not_crash_non_nullable_fk_github_684(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test that partial update on parent doesn't cause IntegrityError for non-nullable FK children (GitHub #684).
+
+    When a child has a non-nullable FK to a parent, partially updating the parent
+    (without touching the relationship) must not attempt to set the relationship to None,
+    which would violate the NOT NULL constraint.
+
+    Regression test for: https://github.com/litestar-org/advanced-alchemy/issues/684
+    """
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    book_model = models["book"]
+    author_repo = create_repository(session, author_model)
+    book_repo = create_repository(session, book_model)
+
+    # Create an author with a book (book.author_id is non-nullable)
+    author = author_model(name="Charlie", dob=dt.date(1990, 5, 5))
+    book = book_model(title="Non-Nullable FK Book")
+    author.books = [book]
+    author = await maybe_async(author_repo.add(author))
+    author_id = author.id
+    await session.flush()
+    session.expire_all()
+
+    # Fetch the book to get its ID
+    fetched_author = await maybe_async(author_repo.get(author_id))
+    assert len(fetched_author.books) == 1
+    book_id = fetched_author.books[0].id
+    session.expire_all()
+
+    # Partial update of the book: only change title, don't touch author relationship
+    # The book's `author` relationship (with non-nullable FK) should not be cleared
+    partial_book = book_model(id=book_id, title="Updated Title", author_id=author_id)
+    # This should NOT raise IntegrityError
+    updated_book = await maybe_async(book_repo.update(partial_book))
+
+    assert updated_book.title == "Updated Title"
+    assert updated_book.author_id == author_id
+
+
+async def test_repo_update_explicit_relationship_still_works_github_684(
+    seeded_test_session_async: "tuple[AsyncSession, dict[str, type]]",
+) -> None:
+    """Test that explicitly setting a relationship during update still works correctly (GitHub #684).
+
+    The fix for #684 should only skip relationships that were NOT explicitly set.
+    When a relationship IS explicitly set, it should still be updated normally.
+
+    Regression test for: https://github.com/litestar-org/advanced-alchemy/issues/684
+    """
+    session, models = seeded_test_session_async
+    author_model = models["author"]
+    book_model = models["book"]
+    author_repo = create_repository(session, author_model)
+    book_repo = create_repository(session, book_model)
+
+    # Create two authors
+    author1 = await maybe_async(author_repo.add(author_model(name="Author1", dob=dt.date(1980, 1, 1))))
+    author2 = await maybe_async(author_repo.add(author_model(name="Author2", dob=dt.date(1985, 2, 2))))
+    await session.flush()
+
+    # Save IDs before any expire_all() calls to avoid MissingGreenlet
+    author1_id = author1.id
+    author2_id = author2.id
+
+    # Create a book linked to author1 via the relationship
+    book = book_model(title="Transferable Book")
+    book.author = author1
+    book = await maybe_async(book_repo.add(book))
+    book_id = book.id
+    await session.flush()
+    session.expire_all()
+
+    # Verify initial state
+    fetched_book = await maybe_async(book_repo.get(book_id))
+    assert fetched_book.author_id == author1_id
+    session.expire_all()
+
+    # Explicitly update the book's author_id FK column to point to author2
+    # This verifies that explicitly set FK columns (which back relationships)
+    # are still properly applied during update
+    update_book = book_model(id=book_id, title="Transferred Book", author_id=author2_id)
+    updated_book = await maybe_async(book_repo.update(update_book))
+
+    assert updated_book.title == "Transferred Book"
+    assert updated_book.author_id == author2_id
+
+    # Verify in DB
+    session.expire_all()
+    refetched = await maybe_async(book_repo.get(book_id))
+    assert refetched.author_id == author2_id

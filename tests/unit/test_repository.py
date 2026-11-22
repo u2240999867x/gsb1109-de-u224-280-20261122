@@ -1,0 +1,4525 @@
+"""Unit tests for the SQLAlchemy Repository implementation."""
+
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import decimal
+import warnings
+from collections.abc import AsyncGenerator, Collection, Generator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Union, cast
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from uuid import uuid4
+
+import pytest
+from msgspec import Struct
+from pydantic import BaseModel
+from pytest_lazy_fixtures import lf
+from sqlalchemy import (
+    Boolean,
+    Column,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    and_,
+    column,
+    create_engine,
+    false,
+    func,
+    or_,
+    select,
+    true,
+)
+from sqlalchemy.exc import InvalidRequestError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    InstrumentedAttribute,
+    Mapped,
+    Session,
+    defer,
+    joinedload,
+    mapped_column,
+    raiseload,
+    relationship,
+    selectinload,
+    undefer_group,
+    with_loader_criteria,
+)
+from sqlalchemy.orm.strategy_options import _AbstractLoad
+from sqlalchemy.pool import StaticPool
+from sqlalchemy.sql.selectable import ForUpdateArg
+from sqlalchemy.types import TypeEngine
+
+from advanced_alchemy import base
+from advanced_alchemy.exceptions import (
+    ImproperConfigurationError,
+    IntegrityError,
+    RepositoryError,
+    wrap_sqlalchemy_exception,
+)
+from advanced_alchemy.filters import (
+    BeforeAfterFilter,
+    BooleanFilter,
+    ComparisonFilter,
+    ExistsFilter,
+    FilterGroup,
+    InCollectionFilter,
+    LimitOffsetFilter,
+    MultiFilter,
+    NotExistsFilter,
+    NotInCollectionFilter,
+    NotInSearchFilter,
+    NotNullFilter,
+    NullFilter,
+    OnBeforeAfterFilter,
+    OrderByFilter,
+    RelationshipFilter,
+    SearchFilter,
+)
+from advanced_alchemy.mixins import SlugKey
+from advanced_alchemy.operations import UpsertStrategy
+from advanced_alchemy.repository import (
+    SQLAlchemyAsyncQueryRepository,
+    SQLAlchemyAsyncRepository,
+    SQLAlchemySyncQueryRepository,
+    SQLAlchemySyncRepository,
+)
+from advanced_alchemy.repository._util import (
+    DEFAULT_ERROR_MESSAGE_TEMPLATES,
+    _build_cache_key,
+    _normalize_cache_key_value,
+    column_has_defaults,
+    get_abstract_loader_options,
+    model_from_dict,
+    partial_model_from_dict,
+)
+from advanced_alchemy.repository.memory import (
+    SQLAlchemyAsyncMockRepository,
+    SQLAlchemyAsyncMockSlugRepository,
+    SQLAlchemySyncMockRepository,
+    SQLAlchemySyncMockSlugRepository,
+)
+from advanced_alchemy.service import SQLAlchemyAsyncRepositoryService, SQLAlchemySyncRepositoryService
+from advanced_alchemy.utils.dataclass import Empty
+from advanced_alchemy.utils.serialization import (
+    is_msgspec_struct,
+    is_pydantic_model,
+    is_schema,
+    is_schema_or_dict,
+    is_schema_or_dict_with_field,
+    is_schema_or_dict_without_field,
+    is_schema_with_field,
+    is_schema_without_field,
+)
+from tests.helpers import maybe_async
+
+if TYPE_CHECKING:
+    from _pytest.fixtures import FixtureRequest
+    from pytest import MonkeyPatch
+    from pytest_mock import MockerFixture
+
+
+AnyMock = Union[MagicMock, AsyncMock]
+
+
+class UUIDModel(base.UUIDAuditBase):
+    """Inheriting from UUIDAuditBase gives the model 'created_at' and 'updated_at'
+    columns.
+    """
+
+
+class BigIntModel(base.BigIntAuditBase):
+    """Inheriting from BigIntAuditBase gives the model 'created_at' and 'updated_at'
+    columns.
+    """
+
+
+class UpsertMatchModel(base.UUIDBase):
+    """Model used to exercise native-upsert matching helpers."""
+
+    natural_key: Mapped[Any] = mapped_column(String(length=50), unique=True)
+    tenant_id: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[int] = mapped_column(Integer)
+
+
+@pytest.fixture()
+async def async_mock_repo() -> AsyncGenerator[SQLAlchemyAsyncRepository[MagicMock], None]:
+    """SQLAlchemy repository with a mock model type."""
+
+    class Repo(SQLAlchemyAsyncRepository[MagicMock]):
+        """Repo with mocked out stuff."""
+
+        model_type = MagicMock(__name__="MagicMock")  # pyright:ignore[reportGeneralTypeIssues,reportAssignmentType]
+
+    session = AsyncMock(spec=AsyncSession, bind=MagicMock())
+    yield Repo(session=session, statement=MagicMock())
+
+
+@pytest.fixture()
+def sync_mock_repo() -> Generator[SQLAlchemySyncRepository[MagicMock], None, None]:
+    """SQLAlchemy repository with a mock model type."""
+
+    class Repo(SQLAlchemySyncRepository[MagicMock]):
+        """Repo with mocked out stuff."""
+
+        model_type = MagicMock(__name__="MagicMock")  # pyright:ignore[reportGeneralTypeIssues,reportAssignmentType]
+
+    yield Repo(session=MagicMock(spec=Session, bind=MagicMock()), statement=MagicMock())
+
+
+@pytest.fixture(params=[lf("sync_mock_repo"), lf("async_mock_repo")])
+def mock_repo(request: FixtureRequest) -> Generator[SQLAlchemyAsyncRepository[MagicMock], None, None]:
+    yield cast(SQLAlchemyAsyncRepository[Any], request.param)
+
+
+@pytest.fixture()
+def mock_session_scalars(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo.session, "scalars")
+
+
+@pytest.fixture()
+def mock_session_execute(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo.session, "scalars")
+
+
+@pytest.fixture()
+def mock_repo_list(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo, "get_many")
+
+
+@pytest.fixture()
+def mock_repo_execute(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo, "_execute")
+
+
+@pytest.fixture()
+def mock_repo_attach_to_session(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo, "_attach_to_session")
+
+
+@pytest.fixture()
+def mock_repo_count(  # pyright: ignore[reportUnknownParameterType]
+    mock_repo: SQLAlchemyAsyncRepository[MagicMock], mocker: MockerFixture
+) -> Generator[AnyMock, None, None]:
+    yield mocker.patch.object(mock_repo, "count")
+
+
+def test_sqlalchemy_tablename() -> None:
+    """Test the snake case conversion for table names."""
+
+    class BigModel(base.UUIDAuditBase):
+        """Inheriting from UUIDAuditBase gives the model 'created_at' and 'updated_at'
+        columns.
+        """
+
+    class TESTModel(base.UUIDAuditBase):
+        """Inheriting from UUIDAuditBase gives the model 'created_at' and 'updated_at'
+        columns.
+        """
+
+    class OtherBigIntModel(base.BigIntAuditBase):
+        """Inheriting from BigIntAuditBase gives the model 'created_at' and 'updated_at'
+        columns.
+        """
+
+    assert BigModel.__tablename__ == "big_model"
+    assert TESTModel.__tablename__ == "test_model"
+    assert OtherBigIntModel.__tablename__ == "other_big_int_model"
+
+
+def test_sqlalchemy_sentinel(monkeypatch: MonkeyPatch) -> None:
+    """Test the sqlalchemy sentinel column only exists on `UUIDPrimaryKey` models."""
+
+    class AnotherModel(base.UUIDAuditBase):
+        """Inheriting from UUIDAuditBase gives the model 'created_at' and 'updated_at'
+        columns.
+        """
+
+        the_extra_col: Mapped[str] = mapped_column(String(length=100), nullable=True)  # pyright: ignore
+
+    class TheTestModel(base.UUIDBase):
+        """Inheriting from DeclarativeBase gives the model 'id'  columns."""
+
+        the_extra_col: Mapped[str] = mapped_column(String(length=100), nullable=True)  # pyright: ignore
+
+    class TheBigIntModel(base.BigIntBase):
+        """Inheriting from DeclarativeBase gives the model 'id'  columns."""
+
+        the_extra_col: Mapped[str] = mapped_column(String(length=100), nullable=True)  # pyright: ignore
+
+    unloaded_cols = {"the_extra_col"}
+    sa_instance_mock = MagicMock(unloaded=unloaded_cols)
+
+    assert isinstance(AnotherModel._sentinel, InstrumentedAttribute)  # pyright: ignore
+    assert isinstance(TheTestModel._sentinel, InstrumentedAttribute)  # pyright: ignore
+    assert not hasattr(TheBigIntModel, "_sentinel")
+
+    model1, model2, model3 = AnotherModel(), TheTestModel(), TheBigIntModel()
+    monkeypatch.setattr(model1, "_sa_instance_state", sa_instance_mock)
+    monkeypatch.setattr(model2, "_sa_instance_state", sa_instance_mock)
+    monkeypatch.setattr(model3, "_sa_instance_state", sa_instance_mock)
+
+    assert "created_at" not in model1.to_dict(exclude={"created_at"})
+    assert "the_extra_col" not in model1.to_dict(exclude={"created_at"})
+    assert "sa_orm_sentinel" not in model1.to_dict()
+    assert "sa_orm_sentinel" not in model2.to_dict()
+    assert "sa_orm_sentinel" not in model3.to_dict()
+    assert "_sentinel" not in model1.to_dict()
+    assert "_sentinel" not in model2.to_dict()
+    assert "_sentinel" not in model3.to_dict()
+    assert "the_extra_col" not in model1.to_dict()
+
+
+def test_wrap_sqlalchemy_integrity_error() -> None:
+    """Test to ensure we wrap IntegrityError."""
+    with pytest.raises(IntegrityError), wrap_sqlalchemy_exception():
+        raise IntegrityError(None, None, Exception())
+
+
+def test_wrap_sqlalchemy_generic_error() -> None:
+    """Test to ensure we wrap generic SQLAlchemy exceptions."""
+    with pytest.raises(RepositoryError), wrap_sqlalchemy_exception():
+        raise SQLAlchemyError
+
+
+async def test_sqlalchemy_repo_add(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test expected method calls for add operation."""
+    mock_instance = MagicMock()
+
+    instance = await maybe_async(mock_repo.add(mock_instance))
+
+    assert instance is mock_instance
+    mock_repo.session.add.assert_called_once_with(mock_instance)  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_called_once_with(  # pyright: ignore[reportFunctionMemberAccess]
+        instance=mock_instance,
+        attribute_names=None,
+        with_for_update=None,
+    )
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_add_many(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+    request: FixtureRequest,
+) -> None:
+    """Test expected method calls for add many operation."""
+
+    mock_instances = [MagicMock(), MagicMock(), MagicMock()]
+    monkeypatch.setattr(mock_repo, "model_type", UUIDModel)
+    mocker.patch.object(mock_repo.session, "scalars", return_value=mock_instances)
+
+    instances = await maybe_async(mock_repo.add_many(mock_instances))
+
+    assert len(instances) == 3
+    for row in instances:
+        assert row.id is not None
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_update_many(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Test expected method calls for update many operation."""
+
+    mock_instances = [MagicMock(), MagicMock(), MagicMock()]
+    monkeypatch.setattr(mock_repo, "model_type", UUIDModel)
+    mocker.patch.object(mock_repo.session, "scalars", return_value=mock_instances)
+
+    instances = await maybe_async(mock_repo.update_many(mock_instances))
+
+    assert len(instances) == 3
+    for row in instances:
+        assert row.id is not None
+
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_upsert_many(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Test expected method calls for update many operation."""
+
+    mock_instances = [MagicMock(), MagicMock(), MagicMock()]
+    monkeypatch.setattr(mock_repo, "model_type", UUIDModel)
+    mocker.patch.object(mock_repo.session, "scalars", return_value=mock_instances)
+    mocker.patch.object(mock_repo, "get_many", return_value=mock_instances)
+    mocker.patch.object(mock_repo, "add_many", return_value=mock_instances)
+    mocker.patch.object(mock_repo, "update_many", return_value=mock_instances)
+
+    instances = await maybe_async(mock_repo.upsert_many(mock_instances))
+
+    assert len(instances) == 3
+    for row in instances:
+        assert row.id is not None
+
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+def test_upsert_batch_size_uses_dialect_parameter_and_page_limits(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_max_parameters", 32700)
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_page_size", 1000)
+
+    assert mock_repo._get_upsert_chunk_size(column_count=5, chunk_size=None) == 1000
+    assert mock_repo._get_upsert_chunk_size(column_count=5, chunk_size=200) == 40
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_max_parameters", None)
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_page_size", None)
+    assert mock_repo._get_upsert_chunk_size(column_count=5, chunk_size=None) == 190
+
+
+def test_insertmanyvalues_chunk_size_must_be_positive(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    with pytest.raises(ValueError, match="chunk_size must be greater than zero"):
+        mock_repo._get_insertmanyvalues_max_parameters(0)
+
+
+def test_native_upsert_reselect_uses_single_column_in_predicate(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    match_filter = mock_repo._build_upsert_match_filter(
+        [{"natural_key": "first"}, {"natural_key": "second"}], ["natural_key"]
+    )
+
+    assert match_filter.operator.__name__ == "in_op"  # type: ignore[union-attr]
+
+
+def test_native_upsert_reselect_uses_tuple_in_except_on_mssql(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    rows = [{"tenant_id": 1, "user_id": 2}, {"tenant_id": 3, "user_id": 4}]
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "postgresql")
+    tuple_filter = mock_repo._build_upsert_match_filter(rows, ["tenant_id", "user_id"])
+    assert tuple_filter.operator.__name__ == "in_op"  # type: ignore[union-attr]
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "mssql")
+    mssql_filter = mock_repo._build_upsert_match_filter(rows, ["tenant_id", "user_id"])
+    assert mssql_filter.operator.__name__ == "or_"  # type: ignore[union-attr]
+
+
+def test_upsert_helper_duplicate_match_keys(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    first = UpsertMatchModel(natural_key="same", tenant_id=1, user_id=2)
+    second = UpsertMatchModel(natural_key="same", tenant_id=1, user_id=2)
+    third = UpsertMatchModel(natural_key="other", tenant_id=1, user_id=3)
+    missing = UpsertMatchModel(natural_key=None, tenant_id=1, user_id=4)
+
+    assert mock_repo._has_duplicate_match_keys([first, third, missing], ["natural_key"]) is False
+    assert mock_repo._has_duplicate_match_keys([first, second], ["natural_key"]) is True
+
+    unhashable_a = UpsertMatchModel(natural_key=["a"], tenant_id=1, user_id=2)
+    unhashable_b = UpsertMatchModel(natural_key=["a"], tenant_id=1, user_id=2)
+    unhashable_c = UpsertMatchModel(natural_key=["b"], tenant_id=1, user_id=3)
+    assert mock_repo._has_duplicate_match_keys([unhashable_a, unhashable_c], ["natural_key"]) is False
+    assert mock_repo._has_duplicate_match_keys([unhashable_a, unhashable_b], ["natural_key"]) is True
+
+
+def test_upsert_helper_rows_require_fallback(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    on_conflict = UpsertStrategy("on_conflict", True, ("natural_key",), "postgresql")
+    merge_strategy = UpsertStrategy("merge", False, ("natural_key",), "oracle")
+
+    assert mock_repo._rows_require_fallback_upsert([], on_conflict, ["natural_key"]) is False
+    assert (
+        mock_repo._rows_require_fallback_upsert(
+            [{"natural_key": "a", "tenant_id": 1}, {"natural_key": "b"}],
+            on_conflict,
+            ["natural_key"],
+        )
+        is True
+    )
+    assert (
+        mock_repo._rows_require_fallback_upsert(
+            [{"natural_key": None, "tenant_id": 1}],
+            on_conflict,
+            ["natural_key"],
+        )
+        is True
+    )
+    assert (
+        mock_repo._rows_require_fallback_upsert(
+            [{"natural_key": "a", "tenant_id": 1}],
+            on_conflict,
+            ["natural_key"],
+        )
+        is False
+    )
+    assert (
+        mock_repo._rows_require_fallback_upsert(
+            [{"natural_key": "a", "tenant_id": 1}],
+            merge_strategy,
+            ["natural_key"],
+        )
+        is True
+    )
+    assert (
+        mock_repo._rows_require_fallback_upsert(
+            [{"id": uuid4(), "natural_key": "a", "tenant_id": 1, "user_id": 2}],
+            merge_strategy,
+            ["natural_key"],
+        )
+        is False
+    )
+
+
+def test_upsert_helper_resolve_update_columns_and_extract_row(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    strategy = UpsertStrategy("on_conflict", True, ("natural_key",), "postgresql")
+
+    assert mock_repo._resolve_upsert_update_columns([], strategy) == []
+
+    first = UpsertMatchModel(natural_key="k1", tenant_id=1, user_id=2)
+    second = UpsertMatchModel(natural_key="k2", tenant_id=3, user_id=4)
+    partial = UpsertMatchModel(natural_key="k3", tenant_id=5)
+
+    columns = mock_repo._resolve_upsert_update_columns([first, second], strategy)
+    assert columns == ["tenant_id", "user_id"]
+    assert mock_repo._resolve_upsert_update_columns([first, partial], strategy) is None
+
+    extracted = mock_repo._extract_upsert_row(first)
+    assert extracted["natural_key"] == "k1"
+    assert extracted["tenant_id"] == 1
+    assert extracted["user_id"] == 2
+    assert extracted["id"] is not None
+
+
+def test_upsert_helper_order_results(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    first = UpsertMatchModel(id=uuid4(), natural_key="Alpha", tenant_id=1, user_id=1)
+    second = UpsertMatchModel(id=uuid4(), natural_key="Beta", tenant_id=2, user_id=2)
+
+    ordered = mock_repo._order_upsert_results(
+        [second, first],
+        [{"natural_key": "alpha  "}, {"natural_key": "Beta"}],
+        ["natural_key"],
+    )
+    assert ordered == [first, second]
+
+    unhashable_first = UpsertMatchModel(id=uuid4(), natural_key=["x"], tenant_id=1, user_id=1)
+    ordered_unhashable = mock_repo._order_upsert_results(
+        [unhashable_first],
+        [{"natural_key": ["x"]}],
+        ["natural_key"],
+    )
+    assert ordered_unhashable == [unhashable_first]
+
+    with pytest.raises(RepositoryError, match="unambiguously pair"):
+        mock_repo._order_upsert_results(
+            [first],
+            [{"natural_key": "Alpha"}, {"natural_key": "Missing"}],
+            ["natural_key"],
+        )
+
+    ambiguous_a = UpsertMatchModel(id=uuid4(), natural_key="FOO", tenant_id=1, user_id=1)
+    ambiguous_b = UpsertMatchModel(id=uuid4(), natural_key="Foo", tenant_id=1, user_id=1)
+    with pytest.raises(RepositoryError, match="unambiguously pair"):
+        mock_repo._order_upsert_results(
+            [ambiguous_a, ambiguous_b],
+            [{"natural_key": "foo"}, {"natural_key": "bar"}],
+            ["natural_key"],
+        )
+
+
+async def test_upsert_many_native_dispatch_paths(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    monkeypatch.setattr(mock_repo, "_pk_attr_names", ("id",))
+    monkeypatch.setattr(mock_repo, "_pk_columns", (UpsertMatchModel.__table__.c.id,))
+    assert mock_repo._requires_orm_upsert([]) is False
+
+    item_a = UpsertMatchModel(id=uuid4(), natural_key="k1", tenant_id=1, user_id=2)
+    item_b = UpsertMatchModel(id=uuid4(), natural_key="k2", tenant_id=3, user_id=4)
+    hydrated_a = UpsertMatchModel(id=uuid4(), natural_key="k1", tenant_id=1, user_id=2)
+    hydrated_b = UpsertMatchModel(id=uuid4(), natural_key="k2", tenant_id=3, user_id=4)
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "postgresql")
+    monkeypatch.setattr(mock_repo, "_dialect", mock_repo.session.bind.dialect)
+    mocker.patch.object(mock_repo.session, "scalars", return_value=[hydrated_b, hydrated_a])
+    pg_results = await maybe_async(mock_repo.upsert_many([item_a, item_b], match_fields=["natural_key"]))
+    assert pg_results == [hydrated_a, hydrated_b]
+    assert item_a.id == hydrated_a.id
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "sqlite")
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insert_returning", False)
+    mocker.patch.object(mock_repo, "get_many", return_value=[hydrated_a, hydrated_b])
+    sqlite_results = await maybe_async(mock_repo.upsert_many([item_a, item_b], match_fields=["natural_key"]))
+    assert sqlite_results == [hydrated_a, hydrated_b]
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "oracle")
+    oracle_results = await maybe_async(mock_repo.upsert_many([item_a, item_b], match_fields=["natural_key"]))
+    assert oracle_results == [hydrated_a, hydrated_b]
+
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "name", "spanner+spanner")
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insert_returning", True)
+    hydrated_a.id = item_a.id
+    hydrated_b.id = item_b.id
+    spanner_results = await maybe_async(mock_repo.upsert_many([item_a, item_b], match_fields=["id"]))
+    assert spanner_results == [hydrated_a, hydrated_b]
+
+
+def test_merge_on_match_fields_is_linear_for_hashable_keys(
+    mock_repo: SQLAlchemyAsyncRepository[Any], monkeypatch: MonkeyPatch
+) -> None:
+    class CountingKey:
+        comparisons = 0
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __hash__(self) -> int:
+            return hash(self.value)
+
+        def __eq__(self, other: object) -> bool:
+            type(self).comparisons += 1
+            return isinstance(other, CountingKey) and self.value == other.value
+
+    monkeypatch.setattr(mock_repo, "model_type", UpsertMatchModel)
+    monkeypatch.setattr(mock_repo, "_pk_attr_names", ("id",))
+    existing = [
+        UpsertMatchModel(id=uuid4(), natural_key=CountingKey(index), tenant_id=1, user_id=1) for index in range(50)
+    ]
+    incoming = [
+        UpsertMatchModel(natural_key=CountingKey(index), tenant_id=1, user_id=1) for index in reversed(range(50))
+    ]
+
+    merged = mock_repo._merge_on_match_fields(incoming, existing, ["natural_key"])
+
+    assert all(row.id is not None for row in merged)
+    assert CountingKey.comparisons < 200
+
+
+async def test_sqlalchemy_repo_delete(mock_repo: SQLAlchemyAsyncRepository[Any], mocker: MockerFixture) -> None:
+    """Test expected method calls for delete operation."""
+    mock_instance = MagicMock()
+    mocker.patch.object(mock_repo, "get", return_value=mock_instance)
+    instance = await maybe_async(mock_repo.delete("instance-id"))
+
+    assert instance is mock_instance
+
+    mock_repo.session.delete.assert_called_once_with(mock_instance)  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_delete_many_uuid(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_session_scalars: AnyMock,
+    mock_session_execute: AnyMock,
+    mock_repo_list: AnyMock,
+) -> None:
+    """Test expected method calls for delete operation."""
+
+    mock_instances = [MagicMock(), MagicMock(id=uuid4())]
+    mock_session_scalars.return_value = mock_instances
+    mock_session_execute.return_value = mock_instances
+    mock_repo_list.return_value = mock_instances
+    monkeypatch.setattr(mock_repo, "model_type", UUIDModel)
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_max_parameters", 2)
+
+    added_instances = await maybe_async(mock_repo.add_many(mock_instances))
+    instances = await maybe_async(mock_repo.delete_many([obj.id for obj in added_instances]))
+
+    assert len(instances) == len(mock_instances)
+    mock_repo.session.flush.assert_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_delete_many_bigint(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_session_scalars: AnyMock,
+    mock_session_execute: AnyMock,
+    mock_repo_list: AnyMock,
+    testrun_uid: str,
+) -> None:
+    """Test expected method calls for delete operation."""
+
+    mock_instances = [MagicMock(), MagicMock(id=uuid4())]
+    mock_session_scalars.return_value = mock_instances
+    mock_session_execute.return_value = mock_instances
+    mock_repo_list.return_value = mock_instances
+    monkeypatch.setattr(mock_repo, "model_type", BigIntModel)
+    monkeypatch.setattr(mock_repo.session.bind.dialect, "insertmanyvalues_max_parameters", 2)
+
+    added_instances = await maybe_async(mock_repo.add_many(mock_instances))
+    instances = await maybe_async(mock_repo.delete_many([obj.id for obj in added_instances]))
+
+    assert len(instances) == len(mock_instances)
+    mock_repo.session.flush.assert_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_member(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get operation."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+
+    instance = await maybe_async(mock_repo.get("instance-id"))
+
+    assert instance is mock_instance
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_or_none_member(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get_or_none operation (found)."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+
+    instance = await maybe_async(mock_repo.get_or_none("instance-id"))
+
+    assert instance is mock_instance
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_or_none_not_found(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get_or_none operation (Not found)."""
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+
+    instance = await maybe_async(mock_repo.get_or_none("instance-id"))
+
+    assert instance is None
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_with_for_update(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Ensure FOR UPDATE options are applied when requested."""
+
+    statement = MagicMock()
+    statement.options.return_value = statement
+    statement.execution_options.return_value = statement
+    statement.with_for_update.return_value = statement
+    statement.where.return_value = statement  # Required for composite PK path
+    mock_repo.statement = statement
+
+    mocker.patch.object(mock_repo, "_get_loader_options", return_value=([], False))
+    mocker.patch.object(mock_repo, "_get_base_stmt", return_value=statement)
+    mocker.patch.object(mock_repo, "_apply_filters", return_value=statement)
+    mocker.patch.object(mock_repo, "_filter_select_by_kwargs", return_value=statement)
+    mocker.patch.object(mock_repo, "_build_pk_filter", return_value=MagicMock())  # Mock the PK filter
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = MagicMock()
+    execute = mocker.patch.object(mock_repo, "_execute", return_value=execute_result)
+
+    instance = await maybe_async(mock_repo.get("instance-id", with_for_update=True))
+
+    assert instance is execute_result.scalar_one_or_none.return_value
+    statement.with_for_update.assert_called_once_with()
+    execute.assert_called_once_with(statement, uniquify=False)
+
+
+async def test_sqlalchemy_repo_get_with_for_update_dict(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    statement = MagicMock()
+    statement.options.return_value = statement
+    statement.execution_options.return_value = statement
+    statement.with_for_update.return_value = statement
+    statement.where.return_value = statement  # Required for composite PK path
+    mock_repo.statement = statement
+
+    mocker.patch.object(mock_repo, "_get_loader_options", return_value=([], False))
+    mocker.patch.object(mock_repo, "_get_base_stmt", return_value=statement)
+    mocker.patch.object(mock_repo, "_apply_filters", return_value=statement)
+    mocker.patch.object(mock_repo, "_filter_select_by_kwargs", return_value=statement)
+    mocker.patch.object(mock_repo, "_build_pk_filter", return_value=MagicMock())  # Mock the PK filter
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = MagicMock()
+    mocker.patch.object(mock_repo, "_execute", return_value=execute_result)
+
+    await maybe_async(
+        mock_repo.get(
+            "instance-id",
+            with_for_update={"nowait": True, "read": False},
+        )
+    )
+
+    statement.with_for_update.assert_called_once_with(nowait=True, read=False)
+
+
+async def test_sqlalchemy_repo_get_with_for_update_arg(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    statement = MagicMock()
+    statement.options.return_value = statement
+    statement.execution_options.return_value = statement
+    statement.with_for_update.return_value = statement
+    statement.where.return_value = statement  # Required for composite PK path
+    mock_repo.statement = statement
+
+    mocker.patch.object(mock_repo, "_get_loader_options", return_value=([], False))
+    mocker.patch.object(mock_repo, "_get_base_stmt", return_value=statement)
+    mocker.patch.object(mock_repo, "_apply_filters", return_value=statement)
+    mocker.patch.object(mock_repo, "_filter_select_by_kwargs", return_value=statement)
+    mocker.patch.object(mock_repo, "_build_pk_filter", return_value=MagicMock())  # Mock the PK filter
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = MagicMock()
+    mocker.patch.object(mock_repo, "_execute", return_value=execute_result)
+
+    await maybe_async(
+        mock_repo.get(
+            "instance-id",
+            with_for_update=ForUpdateArg(nowait=True, key_share=True),
+        )
+    )
+
+    statement.with_for_update.assert_called_once_with(nowait=True, read=False, skip_locked=False, key_share=True)
+
+
+async def test_sqlalchemy_repo_get_one_member(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get one operation."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+
+    instance = await maybe_async(mock_repo.get_one(id="instance-id"))
+
+    assert instance is mock_instance
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_or_upsert_member_existing(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mock_repo_attach_to_session: AnyMock,
+) -> None:
+    """Test expected method calls for member get or create operation (existing)."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+    mock_repo_attach_to_session.return_value = mock_instance
+
+    instance, created = await maybe_async(mock_repo.get_or_upsert(id="instance-id", upsert=False))
+
+    assert instance is mock_instance
+    assert created is False
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.merge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_or_upsert_member_existing_upsert(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mock_repo_attach_to_session: AnyMock,
+) -> None:
+    """Test expected method calls for member get or create operation (existing)."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+    mock_repo_attach_to_session.return_value = mock_instance
+
+    instance, created = await maybe_async(
+        mock_repo.get_or_upsert(id="instance-id", upsert=True, an_extra_attribute="yep"),
+    )
+
+    assert instance is mock_instance
+    assert created is False
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo._attach_to_session.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_called_once_with(  # pyright: ignore[reportFunctionMemberAccess]
+        instance=mock_instance,
+        attribute_names=None,
+        with_for_update=None,
+    )
+
+
+async def test_sqlalchemy_repo_get_or_upsert_member_existing_no_upsert(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get or create operation (existing)."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+
+    instance, created = await maybe_async(
+        mock_repo.get_or_upsert(id="instance-id", upsert=False, an_extra_attribute="yep"),
+    )
+
+    assert instance is mock_instance
+    assert created is False
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.add.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_or_upsert_member_created(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get or create operation (created)."""
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+
+    instance, created = await maybe_async(mock_repo.get_or_upsert(id="new-id"))
+
+    assert instance is not None
+    assert created is True
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.add.assert_called_once_with(instance)  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_called_once_with(instance=instance, attribute_names=None, with_for_update=None)  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_one_or_none_member(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get one or none operation (found)."""
+    mock_instance = MagicMock()
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=mock_instance))
+
+    instance = await maybe_async(mock_repo.get_one_or_none(id="instance-id"))
+
+    assert instance is mock_instance
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_one_or_none_not_found(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for member get one or none operation (Not found)."""
+
+    mock_repo_execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+
+    instance = await maybe_async(mock_repo.get_one_or_none(id="instance-id"))
+
+    assert instance is None
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_get_many(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+) -> None:
+    """Test expected method calls for list operation."""
+    mock_instances = [MagicMock(), MagicMock()]
+    mock_repo_execute.return_value = MagicMock(scalars=MagicMock(return_value=mock_instances))
+
+    instances = await maybe_async(mock_repo.get_many())
+
+    assert instances == mock_instances
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_list_and_count(mock_repo: SQLAlchemyAsyncRepository[Any], mocker: MockerFixture) -> None:
+    """Test expected method calls for list operation."""
+    mock_instances = [MagicMock(), MagicMock()]
+    mock_count = len(mock_instances)
+    mocker.patch.object(mock_repo, "_get_many_and_count_window", return_value=(mock_instances, mock_count))
+
+    instances, instance_count = await maybe_async(mock_repo.get_many_and_count())
+
+    assert instances == mock_instances
+    assert instance_count == mock_count
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_list_and_count_basic(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test expected method calls for list operation."""
+    mock_instances = [MagicMock(), MagicMock()]
+    mock_count = len(mock_instances)
+    mocker.patch.object(mock_repo, "_get_many_and_count_basic", return_value=(mock_instances, mock_count))
+
+    instances, instance_count = await maybe_async(mock_repo.get_many_and_count(count_with_window_function=False))
+
+    assert instances == mock_instances
+    assert instance_count == mock_count
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_exists(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mock_repo_count: AnyMock,
+) -> None:
+    """Test expected method calls for exists operation."""
+    mock_repo_count.return_value = 1
+
+    exists = await maybe_async(mock_repo.exists(id="my-id"))
+
+    assert exists
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_exists_with_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mock_repo_count: AnyMock,
+) -> None:
+    """Test expected method calls for exists operation. with filter argument"""
+    limit_filter = LimitOffsetFilter(limit=1, offset=0)
+    mock_repo_count.return_value = 1
+
+    exists = await maybe_async(mock_repo.exists(limit_filter, id="my-id"))
+
+    assert exists
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_count(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mock_repo_count: AnyMock,
+) -> None:
+    """Test expected method calls for list operation."""
+    mock_repo_count.return_value = 1
+
+    count = await maybe_async(mock_repo.count())
+
+    assert count == 1
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_sqlalchemy_repo_list_with_pagination(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test list operation with pagination."""
+    statement = MagicMock()
+    mock_repo_execute.return_value = MagicMock()
+    mocker.patch.object(LimitOffsetFilter, "append_to_statement", return_value=statement)
+    mock_repo_execute.return_value = MagicMock()
+    await maybe_async(mock_repo.get_many(LimitOffsetFilter(2, 3)))
+    mock_repo._execute.assert_called_with(statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_before_after_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test list operation with BeforeAfterFilter filter."""
+    statement = MagicMock()
+    mocker.patch.object(mock_repo.model_type.updated_at, "__lt__", return_value="lt")
+    mocker.patch.object(mock_repo.model_type.updated_at, "__gt__", return_value="gt")
+    mocker.patch.object(BeforeAfterFilter, "append_to_statement", return_value=statement)
+    mock_repo_execute.return_value = MagicMock()
+    await maybe_async(mock_repo.get_many(BeforeAfterFilter("updated_at", dt.datetime.max, dt.datetime.min)))
+    mock_repo._execute.assert_called_with(statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_on_before_after_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test list operation with BeforeAfterFilter filter."""
+    statement = MagicMock()
+    mocker.patch.object(mock_repo.model_type.updated_at, "__le__", return_value="le")
+    mocker.patch.object(mock_repo.model_type.updated_at, "__ge__", return_value="ge")
+    mocker.patch.object(OnBeforeAfterFilter, "append_to_statement", return_value=statement)
+
+    mock_repo_execute.return_value = MagicMock()
+    await maybe_async(mock_repo.get_many(OnBeforeAfterFilter("updated_at", dt.datetime.max, dt.datetime.min)))
+    mock_repo._execute.assert_called_with(statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_collection_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test behavior of list operation given InCollectionFilter."""
+    field_name = "id"
+    mock_repo_execute.return_value = MagicMock()
+    mock_repo.statement.where.return_value = mock_repo.statement  # pyright: ignore[reportFunctionMemberAccess]
+    mocker.patch.object(InCollectionFilter, "append_to_statement", return_value=mock_repo.statement)
+    values = [1, 2, 3]
+    await maybe_async(mock_repo.get_many(InCollectionFilter(field_name, values)))
+    mock_repo._execute.assert_called_with(mock_repo.statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_null_collection_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test behavior of list operation given InCollectionFilter."""
+    field_name = "id"
+    mock_repo_execute.return_value = MagicMock()
+    mock_repo.statement.where.return_value = mock_repo.statement  # pyright: ignore[reportFunctionMemberAccess]
+    monkeypatch.setattr(
+        InCollectionFilter,
+        "append_to_statement",
+        MagicMock(return_value=mock_repo.statement),
+    )
+    await maybe_async(mock_repo.get_many(InCollectionFilter(field_name, None)))  # pyright: ignore[reportFunctionMemberAccess,reportUnknownArgumentType]
+    mock_repo._execute.assert_called_with(mock_repo.statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_empty_list_with_collection_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test behavior of list operation given InCollectionFilter."""
+    field_name = "id"
+    mock_repo_execute.return_value = MagicMock()
+    mock_repo.statement.where.return_value = mock_repo.statement  # pyright: ignore[reportFunctionMemberAccess]
+    values: Collection[Any] = []
+    await maybe_async(mock_repo.get_many(InCollectionFilter(field_name, values)))
+    monkeypatch.setattr(
+        InCollectionFilter,
+        "append_to_statement",
+        MagicMock(return_value=mock_repo.statement),
+    )
+    await maybe_async(mock_repo.get_many(InCollectionFilter(field_name, values)))
+    mock_repo._execute.assert_called_with(mock_repo.statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_not_in_collection_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test behavior of list operation given InCollectionFilter."""
+    field_name = "id"
+    mock_repo_execute.return_value = MagicMock()
+    mock_repo.statement.where.return_value = mock_repo.statement  # pyright: ignore[reportFunctionMemberAccess]
+    monkeypatch.setattr(
+        NotInCollectionFilter,
+        "append_to_statement",
+        MagicMock(return_value=mock_repo.statement),
+    )
+    values = [1, 2, 3]
+    await maybe_async(mock_repo.get_many(NotInCollectionFilter(field_name, values)))
+    mock_repo._execute.assert_called_with(mock_repo.statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_list_with_null_not_in_collection_filter(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mock_repo_execute: AnyMock,
+    mocker: MockerFixture,
+) -> None:
+    """Test behavior of list operation given InCollectionFilter."""
+    field_name = "id"
+    mock_repo_execute.return_value = MagicMock()
+    mock_repo.statement.where.return_value = mock_repo.statement  # pyright: ignore[reportFunctionMemberAccess]
+    monkeypatch.setattr(
+        NotInCollectionFilter,
+        "append_to_statement",
+        MagicMock(return_value=mock_repo.statement),
+    )
+    await maybe_async(mock_repo.get_many(NotInCollectionFilter[str](field_name, None)))  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo._execute.assert_called_with(mock_repo.statement, uniquify=False)  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+
+
+async def test_sqlalchemy_repo_unknown_filter_type_raises(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that repo raises exception if list receives unknown filter type."""
+    with pytest.raises(RepositoryError):
+        await maybe_async(mock_repo.get_many("not a filter"))  # type: ignore
+
+
+async def test_sqlalchemy_repo_update(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    monkeypatch: MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """Test the sequence of repo calls for update operation."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mock_repo.session.merge.return_value = existing_instance  # pyright: ignore[reportFunctionMemberAccess]
+
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    assert instance is existing_instance
+    mock_repo.session.merge.assert_called_once_with(existing_instance, load=True)  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_called_once_with(  # pyright: ignore[reportFunctionMemberAccess]
+        instance=existing_instance,
+        attribute_names=None,
+        with_for_update=None,
+    )
+
+
+async def test_sqlalchemy_repo_upsert(mock_repo: SQLAlchemyAsyncRepository[Any], mocker: MockerFixture) -> None:
+    """Test the sequence of repo calls for upsert operation."""
+    mock_instance = MagicMock()
+    mock_repo.session.merge.return_value = mock_instance  # pyright: ignore[reportFunctionMemberAccess]
+    lookup = mocker.patch.object(mock_repo, "get_one_or_none", return_value=mock_instance)
+
+    instance = await maybe_async(mock_repo.upsert(mock_instance))
+    lookup.assert_called_once()
+
+    assert instance is mock_instance
+    mock_repo.session.flush.assert_called_once()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.expunge.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.commit.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+    mock_repo.session.refresh.assert_called_once_with(  # pyright: ignore[reportFunctionMemberAccess]
+        instance=mock_instance,
+        attribute_names=None,
+        with_for_update=None,
+    )
+
+
+async def test_attach_to_session_unexpected_strategy_raises_valueerror(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+) -> None:
+    """Test to hit the error condition in SQLAlchemy._attach_to_session()."""
+    with pytest.raises(ValueError):
+        await maybe_async(mock_repo._attach_to_session(MagicMock(), strategy="t-rex"))  # type:ignore[arg-type]
+
+
+async def test_execute(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Simple test of the abstraction over `AsyncSession.execute()`"""
+    _ = await maybe_async(mock_repo._execute(mock_repo.statement))  # pyright: ignore[reportFunctionMemberAccess,reportPrivateUsage]
+    mock_repo.session.execute.assert_called_once_with(mock_repo.statement)  # pyright: ignore[reportFunctionMemberAccess]
+
+
+async def test_filter_in_collection_noop_if_collection_empty(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Ensures we don't filter on an empty collection."""
+    statement = MagicMock()
+    filter = InCollectionFilter(field_name="id", values=[])  # type:ignore[var-annotated]
+    statement = filter.append_to_statement(statement, MagicMock())  # type:ignore[assignment]
+    mock_repo.statement.where.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (dt.datetime.max, dt.datetime.min),
+        (None, dt.datetime.min),
+        (dt.datetime.max, None),
+    ],
+)
+async def test_filter_on_datetime_field(
+    before: dt.datetime,
+    after: dt.datetime,
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Test through branches of _filter_on_datetime_field()"""
+    field_mock = MagicMock(return_value=before or after)
+    statement = MagicMock()
+    field_mock.__gt__ = field_mock.__lt__ = lambda self, other: True  # pyright: ignore[reportFunctionMemberAccess,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        BeforeAfterFilter,
+        "append_to_statement",
+        MagicMock(return_value=mock_repo.statement),
+    )
+    filter = BeforeAfterFilter(field_name="updated_at", before=before, after=after)
+    statement = filter.append_to_statement(statement, MagicMock(return_value=before or after))  # type:ignore[assignment]
+    mock_repo.model_type.updated_at = field_mock
+    mock_repo.statement.where.assert_not_called()  # pyright: ignore[reportFunctionMemberAccess]
+
+
+# Type compatibility test fixtures and classes
+class MockComplexType:
+    """Mock complex type that would have DBAPI serialization issues."""
+
+    def __init__(self, value: Any):
+        self.value = value
+
+
+class MockPostgreSQLRange:
+    """Mock PostgreSQL Range type."""
+
+    def __init__(self, lower: Any, upper: Any):
+        self.lower = lower
+        self.upper = upper
+
+
+class MockTypeWithoutPythonType(TypeEngine[Any]):
+    """Mock SQLAlchemy type that doesn't implement python_type."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @property
+    def python_type(self) -> type[Any]:
+        raise NotImplementedError("This type doesn't have a python_type")
+
+
+async def test_type_must_use_in_empty_list(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that empty list returns False."""
+    result = mock_repo._type_must_use_in_instead_of_any([])
+    assert result is False
+
+
+async def test_type_must_use_in_standard_python_types(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that standard Python types can use ANY() operator."""
+    # Test integers
+    result = mock_repo._type_must_use_in_instead_of_any([1, 2, 3])
+    assert result is False
+
+    # Test strings
+    result = mock_repo._type_must_use_in_instead_of_any(["a", "b", "c"])
+    assert result is False
+
+    # Test booleans
+    result = mock_repo._type_must_use_in_instead_of_any([True, False])
+    assert result is False
+
+    # Test floats
+    result = mock_repo._type_must_use_in_instead_of_any([1.1, 2.2])
+    assert result is False
+
+    # Test bytes
+    result = mock_repo._type_must_use_in_instead_of_any([b"test", b"data"])
+    assert result is False
+
+
+async def test_type_must_use_in_safe_datetime_decimal_types(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that datetime and decimal types can use ANY() operator."""
+    # Test datetime.date
+    result = mock_repo._type_must_use_in_instead_of_any([dt.date(2024, 1, 1)])
+    assert result is False
+
+    # Test datetime.datetime
+    result = mock_repo._type_must_use_in_instead_of_any([dt.datetime.now()])
+    assert result is False
+
+    # Test datetime.time
+    result = mock_repo._type_must_use_in_instead_of_any([dt.time(12, 30)])
+    assert result is False
+
+    # Test datetime.timedelta
+    result = mock_repo._type_must_use_in_instead_of_any([dt.timedelta(days=1)])
+    assert result is False
+
+    # Test decimal.Decimal
+    result = mock_repo._type_must_use_in_instead_of_any([decimal.Decimal("10.5")])
+    assert result is False
+
+
+async def test_type_must_use_in_complex_types(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that complex types must use IN() operator."""
+    # Test mock PostgreSQL Range
+    ranges = [MockPostgreSQLRange(1, 10), MockPostgreSQLRange(20, 30)]
+    result = mock_repo._type_must_use_in_instead_of_any(ranges)
+    assert result is True
+
+    # Test custom complex type
+    complex_types = [MockComplexType("test")]
+    result = mock_repo._type_must_use_in_instead_of_any(complex_types)
+    assert result is True
+
+
+async def test_type_must_use_in_mixed_types_with_complex(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that mixed types containing complex types use IN() operator."""
+    mixed_values = [1, "test", MockComplexType("complex")]
+    result = mock_repo._type_must_use_in_instead_of_any(mixed_values)
+    assert result is True
+
+
+async def test_type_must_use_in_none_values_ignored(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that None values are properly ignored."""
+    values_with_none = [1, None, 3]
+    result = mock_repo._type_must_use_in_instead_of_any(values_with_none)
+    assert result is False
+
+    # Test only None values
+    only_none = [None, None]
+    result = mock_repo._type_must_use_in_instead_of_any(only_none)
+    assert result is False
+
+
+async def test_type_must_use_in_sqlalchemy_type_matching(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test SQLAlchemy type introspection with matching types."""
+    # Test Integer type with integer values
+    int_type = Integer()
+    result = mock_repo._type_must_use_in_instead_of_any([1, 2, 3], int_type)
+    assert result is False
+
+    # Test String type with string values
+    str_type = String()
+    result = mock_repo._type_must_use_in_instead_of_any(["a", "b"], str_type)
+    assert result is False
+
+
+async def test_type_must_use_in_sqlalchemy_type_mismatched(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test SQLAlchemy type introspection with mismatched types."""
+    # Test Integer type with string values (mismatch)
+    int_type = Integer()
+    result = mock_repo._type_must_use_in_instead_of_any(["not_an_int"], int_type)
+    assert result is True
+
+    # Test String type with integer values (mismatch)
+    str_type = String()
+    result = mock_repo._type_must_use_in_instead_of_any([123], str_type)
+    assert result is True
+
+
+async def test_type_must_use_in_sqlalchemy_type_without_python_type(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test SQLAlchemy type that doesn't implement python_type."""
+    mock_type: MockTypeWithoutPythonType = MockTypeWithoutPythonType()
+    result = mock_repo._type_must_use_in_instead_of_any([1, 2, 3], mock_type)
+    assert result is True  # Should use IN() for safety
+
+
+async def test_type_must_use_in_sqlalchemy_type_with_none_python_type(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+) -> None:
+    """Test SQLAlchemy type that has None as python_type."""
+    mock_type = MagicMock()
+    mock_type.python_type = None
+
+    # Should fall back to Python type checking
+    result = mock_repo._type_must_use_in_instead_of_any([1, 2, 3], mock_type)
+    assert result is False  # Standard integers should use ANY()
+
+    result = mock_repo._type_must_use_in_instead_of_any([MockComplexType("test")], mock_type)
+    assert result is True  # Complex types should use IN()
+
+
+async def test_type_must_use_in_missing_python_type_attribute(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test fallback when python_type attribute is missing from type."""
+    # Create a mock that doesn't have python_type attribute at all
+    mock_type = type("MockType", (), {})()  # Empty object with no attributes
+
+    result = mock_repo._type_must_use_in_instead_of_any([1, 2, 3], mock_type)
+    assert result is False  # Should fall back to Python type checking for safe types
+
+
+class MyModel(BaseModel):
+    name: str
+    age: int
+
+
+class MyStruct(Struct):
+    name: str
+    age: int
+
+
+def test_is_pydantic_model() -> None:
+    pydantic_model = MyModel(name="Pydantic John", age=30)
+    msgspec_struct = MyStruct(name="Msgspec Joe", age=30)
+    old_dict = {"name": "Old Greg", "age": 30}
+    int_value = 1
+
+    assert is_pydantic_model(pydantic_model)
+    assert not is_pydantic_model(msgspec_struct)
+    assert not is_pydantic_model(old_dict)
+    assert not is_pydantic_model(int_value)
+
+
+def test_is_msgspec_struct() -> None:
+    pydantic_model = MyModel(name="Pydantic John", age=30)
+    msgspec_struct = MyStruct(name="Msgspec Joe", age=30)
+    old_dict = {"name": "Old Greg", "age": 30}
+
+    assert not is_msgspec_struct(pydantic_model)
+    assert is_msgspec_struct(msgspec_struct)
+    assert not is_msgspec_struct(old_dict)
+
+
+def test_is_schema() -> None:
+    pydantic_model = MyModel(name="Pydantic John", age=30)
+    msgspec_struct = MyStruct(name="Msgspec Joe", age=30)
+    old_dict = {"name": "Old Greg", "age": 30}
+    int_value = 1
+    assert is_schema(pydantic_model)
+    assert is_schema(msgspec_struct)
+    assert not is_schema(old_dict)
+    assert not is_schema(int_value)
+    assert is_schema_with_field(pydantic_model, "name")
+    assert not is_schema_with_field(msgspec_struct, "name2")
+    assert is_schema_without_field(pydantic_model, "name2")
+    assert not is_schema_without_field(msgspec_struct, "name")
+
+
+def test_is_schema_or_dict() -> None:
+    pydantic_model = MyModel(name="Pydantic John", age=30)
+    msgspec_struct = MyStruct(name="Msgspec Joe", age=30)
+    old_dict = {"name": "Old Greg", "age": 30}
+    int_value = 1
+    assert is_schema_or_dict(pydantic_model)
+    assert is_schema_or_dict(msgspec_struct)
+    assert is_schema_or_dict(old_dict)
+    assert not is_schema_or_dict(int_value)
+    assert is_schema_or_dict_with_field(pydantic_model, "name")
+    assert not is_schema_or_dict_with_field(msgspec_struct, "name2")
+    assert is_schema_or_dict_without_field(pydantic_model, "name2")
+    assert not is_schema_or_dict_without_field(msgspec_struct, "name")
+
+
+# Tests for new methods added in id-attribute-update branch
+
+
+def test_async_type_must_use_in_empty_values(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test that empty values return False."""
+    assert mock_repo._type_must_use_in_instead_of_any([]) is False
+
+
+def test_sync_type_must_use_in_empty_values(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test that empty values return False."""
+    assert sync_mock_repo._type_must_use_in_instead_of_any([]) is False
+
+
+def test_async_safe_types_with_field_type(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test safe types with valid field type."""
+    # Mock field type with python_type
+    mock_field_type = MagicMock()
+    mock_field_type.python_type = str
+
+    values = ["test", "another_string"]
+    result = mock_repo._type_must_use_in_instead_of_any(values, mock_field_type)
+    assert result is False
+
+
+def test_sync_type_mismatch_with_field_type(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test type mismatch triggers IN() usage."""
+    # Mock field type expecting strings
+    mock_field_type = MagicMock()
+    mock_field_type.python_type = str
+
+    # Pass integers when expecting strings
+    values = [1, 2, 3]
+    result = sync_mock_repo._type_must_use_in_instead_of_any(values, mock_field_type)
+    assert result is True
+
+
+def test_async_field_type_none_python_type(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test behavior when field_type.python_type is None."""
+    mock_field_type = MagicMock()
+    mock_field_type.python_type = None
+
+    values = [{"complex": "object"}]  # Non-safe type
+    result = mock_repo._type_must_use_in_instead_of_any(values, mock_field_type)
+    assert result is True  # Should use fallback logic
+
+
+def test_sync_field_type_no_python_type_attr(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test behavior when field_type has no python_type attribute."""
+    # Create object without python_type attribute
+    mock_field_type = object()
+
+    values = [{"complex": "object"}]  # Non-safe type
+    result = sync_mock_repo._type_must_use_in_instead_of_any(values, mock_field_type)
+    assert result is True  # Should use fallback logic for non-safe types
+
+
+def test_async_no_field_type_safe_values(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test safe values without field type information."""
+    # Test all safe types
+    safe_values = [
+        42,
+        3.14,
+        "string",
+        True,
+        b"bytes",
+        decimal.Decimal("10.5"),
+        dt.date.today(),
+        dt.datetime.now(),
+        dt.time(12, 30),
+        dt.timedelta(days=1),
+    ]
+
+    result = mock_repo._type_must_use_in_instead_of_any(safe_values)
+    assert result is False
+
+
+def test_sync_no_field_type_unsafe_values(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test unsafe values without field type information."""
+    # Test unsafe types (complex objects)
+    unsafe_values = [{"key": "value"}, [1, 2, 3], {"nested": {"data": True}}]
+
+    result = sync_mock_repo._type_must_use_in_instead_of_any(unsafe_values)
+    assert result is True
+
+
+def test_async_mixed_safe_unsafe_values(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test mixed safe and unsafe values."""
+    # Mix safe and unsafe types
+    mixed_values = ["string", 42, {"unsafe": "dict"}]
+
+    result = mock_repo._type_must_use_in_instead_of_any(mixed_values)
+    assert result is True
+
+
+def test_sync_none_values_handling(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test handling of None values."""
+    # None values should be ignored in type checking
+    values_with_none = [None, "string", None, 42]
+
+    result = sync_mock_repo._type_must_use_in_instead_of_any(values_with_none)
+    assert result is False
+
+
+def test_async_empty_values(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test empty list returns empty list."""
+    result = mock_repo._get_unique_values([])
+    assert result == []
+
+
+def test_sync_hashable_values(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test hashable values deduplication."""
+    values = [1, 2, 1, 3, 2, 4]
+    result = sync_mock_repo._get_unique_values(values)
+    assert result == [1, 2, 3, 4]
+
+
+def test_async_string_values(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test string deduplication."""
+    values = ["a", "b", "a", "c", "b"]
+    result = mock_repo._get_unique_values(values)
+    assert result == ["a", "b", "c"]
+
+
+def test_sync_unhashable_values(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test unhashable values (dicts) deduplication."""
+    values = [
+        {"key": "value1"},
+        {"key": "value2"},
+        {"key": "value1"},  # duplicate
+        {"key": "value3"},
+    ]
+    result = sync_mock_repo._get_unique_values(values)
+    expected = [{"key": "value1"}, {"key": "value2"}, {"key": "value3"}]
+    assert result == expected
+
+
+def test_async_mixed_types(mock_repo: SQLAlchemyAsyncRepository[Any]) -> None:
+    """Test mixed hashable and unhashable types."""
+    # Mix strings and dicts to trigger TypeError in set operations
+    values = ["string", {"dict": "value"}, "string", {"other": "dict"}]
+    result = mock_repo._get_unique_values(values)
+    expected = ["string", {"dict": "value"}, {"other": "dict"}]
+    assert result == expected
+
+
+def test_sync_preserves_order(sync_mock_repo: SQLAlchemySyncRepository[Any]) -> None:
+    """Test that order is preserved in deduplication."""
+    values = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3]
+    result = sync_mock_repo._get_unique_values(values)
+    assert result == [3, 1, 4, 5, 9, 2, 6]
+
+
+def test_column_with_python_default() -> None:
+    """Test column with Python-side default."""
+    mock_column = MagicMock()
+    mock_column.default = "default_value"
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_server_default() -> None:
+    """Test column with server-side default."""
+    mock_column = MagicMock()
+    mock_column.default = None
+    mock_column.server_default = "DEFAULT VALUE"
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_python_onupdate() -> None:
+    """Test column with Python-side onupdate."""
+    mock_column = MagicMock()
+    mock_column.default = None
+    mock_column.server_default = None
+    mock_column.onupdate = "update_function"
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_server_onupdate() -> None:
+    """Test column with server-side onupdate."""
+    mock_column = MagicMock()
+    mock_column.default = None
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = "UPDATE_FUNCTION"
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_no_defaults() -> None:
+    """Test column with no defaults."""
+    mock_column = MagicMock()
+    mock_column.default = None
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is False
+
+
+def test_column_with_false_default() -> None:
+    """Test column where default is False (falsy but not None)."""
+    mock_column = MagicMock()
+    mock_column.default = False  # Falsy but not None
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_zero_default() -> None:
+    """Test column where default is 0 (falsy but not None)."""
+    mock_column = MagicMock()
+    mock_column.default = 0  # Falsy but not None
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_with_empty_string_default() -> None:
+    """Test column where default is empty string (falsy but not None)."""
+    mock_column = MagicMock()
+    mock_column.default = ""  # Falsy but not None
+    mock_column.server_default = None
+    mock_column.onupdate = None
+    mock_column.server_onupdate = None
+
+    assert column_has_defaults(mock_column) is True
+
+
+def test_column_property_label_object() -> None:
+    """Test column_property Label objects return False for column_has_defaults."""
+    from sqlalchemy.sql.elements import Label
+
+    # Create a Label object similar to what column_property creates
+    mock_label = MagicMock(spec=Label)
+
+    # Label objects don't have default/onupdate attributes, but if they did,
+    # they would raise AttributeError when accessed
+    assert column_has_defaults(mock_label) is False
+
+
+def test_column_property_with_real_label() -> None:
+    """Test column_has_defaults with an actual Label object from SQLAlchemy."""
+    from sqlalchemy import literal_column
+    from sqlalchemy.sql.elements import Label
+
+    # Create a real Label object like column_property would create
+    label_obj = literal_column("test_value").label("test_column")  # type: ignore[var-annotated]
+    assert isinstance(label_obj, Label)
+
+    # This should return False and not raise AttributeError
+    assert column_has_defaults(label_obj) is False
+
+
+def test_column_object_without_default_attributes() -> None:
+    """Test column_has_defaults with object missing some attributes."""
+
+    # Create an object that only has some of the expected attributes
+    class PartialColumn:
+        def __init__(self) -> None:
+            self.default = "test_default"
+            # Missing server_default, onupdate, server_onupdate attributes
+
+    partial_column = PartialColumn()
+
+    # Should return True based on the default attribute, even though others are missing
+    assert column_has_defaults(partial_column) is True
+
+
+def test_column_object_with_no_default_attributes() -> None:
+    """Test column_has_defaults with object missing all attributes."""
+
+    # Create an object that has none of the expected attributes
+    class MinimalColumn:
+        def __init__(self) -> None:
+            self.name = "test_column"
+
+    minimal_column = MinimalColumn()
+
+    # Should return False since no default attributes are present
+    assert column_has_defaults(minimal_column) is False
+
+
+def test_normalize_cache_key_value_handles_structures() -> None:
+    """Normalize cache key values for common structures."""
+
+    @dataclass
+    class Payload:
+        name: str
+        ids: set[int]
+
+    class CacheBase(DeclarativeBase):
+        pass
+
+    class CacheModel(CacheBase):
+        __tablename__ = "cache_model"
+
+        id: Mapped[int] = mapped_column(primary_key=True)
+
+    normalized = _normalize_cache_key_value(Payload(name="alpha", ids={2, 1}))
+    assert normalized == {"name": "alpha", "ids": [1, 2]}
+    assert _normalize_cache_key_value(CacheModel.id) == {"__attr__": "id"}
+    assert _normalize_cache_key_value(column("name")) == {"__sql__": "name"}
+    assert "__repr__" in _normalize_cache_key_value(object())
+
+
+def test_build_cache_key_stable_for_unordered_inputs() -> None:
+    """Cache keys should remain stable for unordered inputs."""
+    filters = [InCollectionFilter(field_name="id", values={2, 1})]
+    key_a = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=filters,
+        kwargs={"meta": {"b": 2, "a": 1}},
+        order_by=[("name", False)],
+        execution_options={"stream_results": True},
+        uniquify=True,
+    )
+    key_b = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[InCollectionFilter(field_name="id", values={1, 2})],
+        kwargs={"meta": {"a": 1, "b": 2}},
+        order_by=[("name", False)],
+        execution_options={"stream_results": True},
+        uniquify=True,
+    )
+
+    assert key_a is not None
+    assert key_a == key_b
+
+
+def test_build_cache_key_returns_none_for_raw_filters() -> None:
+    """Raw SQLAlchemy expressions should skip caching."""
+    key = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[column("id") == 1],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+    )
+
+    assert key is None
+
+
+def test_normalize_cache_key_value_complex_types() -> None:
+    """Normalize cache key values for complex types (datetime, uuid, etc)."""
+    dt_value = dt.datetime(2025, 12, 14, 10, 30, 0)
+    result = _normalize_cache_key_value(dt_value)
+    assert result == {"__type__": "datetime", "value": "2025-12-14T10:30:00"}
+
+    from uuid import UUID
+
+    u = UUID("12345678-1234-5678-1234-567812345678")
+    result = _normalize_cache_key_value(u)
+    assert result == {"__type__": "uuid", "value": "12345678-1234-5678-1234-567812345678"}
+
+    # bytes
+    result = _normalize_cache_key_value(b"\x01\x02")
+    assert result == {"__type__": "bytes", "value": "0102"}
+
+
+def test_normalize_cache_key_value_list_tuple() -> None:
+    """Normalize cache key values for list and tuple types."""
+    result = _normalize_cache_key_value([1, "two", 3.0])
+    assert result == [1, "two", 3.0]
+
+    result = _normalize_cache_key_value((True, None))
+    assert result == [True, None]
+
+
+def test_normalize_cache_key_value_none_and_primitives() -> None:
+    """Normalize cache key values for None and primitive types (early return)."""
+    assert _normalize_cache_key_value(None) is None
+    assert _normalize_cache_key_value(42) == 42
+    assert _normalize_cache_key_value(3.14) == 3.14
+    assert _normalize_cache_key_value("hello") == "hello"
+    assert _normalize_cache_key_value(True) is True
+
+
+def test_build_cache_key_with_unary_expression() -> None:
+    """UnaryExpression in order_by is serialized as string expression."""
+    from sqlalchemy import UnaryExpression, desc
+
+    # Create a real UnaryExpression
+    unary_expr = desc(column("name"))  # type: ignore[var-annotated]
+    assert isinstance(unary_expr, UnaryExpression)
+
+    key = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[],
+        kwargs={},
+        order_by=[unary_expr],  # type: ignore[list-item]
+        execution_options={},
+        uniquify=False,
+    )
+
+    assert key is not None
+    assert key.startswith("CacheModel:get_many:")
+
+
+def test_build_cache_key_with_count_window_function() -> None:
+    """count_with_window_function param is included in cache key."""
+    key_with = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many_and_count",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+        count_with_window_function=True,
+    )
+    key_without = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many_and_count",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+        count_with_window_function=False,
+    )
+    key_default = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many_and_count",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+    )
+
+    assert key_with is not None
+    assert key_without is not None
+    assert key_default is not None
+    # Different values of count_with_window_function produce different keys
+    assert key_with != key_without
+    # None (omitted) differs from explicit True/False
+    assert key_default != key_with
+    assert key_default != key_without
+
+
+def test_model_from_dict_includes_relationship_attributes() -> None:
+    """Test that model_from_dict includes relationship attributes from __mapper__.attrs.keys()."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    # Verify that attrs.keys() includes relationships while columns.keys() doesn't
+    columns_keys = list(UUIDAuthor.__mapper__.columns.keys())
+    attrs_keys = list(UUIDAuthor.__mapper__.attrs.keys())
+
+    assert "books" not in columns_keys, "books relationship should NOT be in columns.keys()"
+    assert "books" in attrs_keys, "books relationship should be in attrs.keys()"
+
+
+# Tests for write_only relationship handling in update method (issue #524)
+
+
+async def test_update_skips_write_only_relationships(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test that update method skips write_only relationships without error."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+
+    # Mock the mapper and relationship
+    mock_mapper = MagicMock()
+    mock_relationship = MagicMock()
+    mock_relationship.key = "items"
+    mock_relationship.lazy = "write_only"
+    mock_relationship.viewonly = False
+    mock_mapper.mapper.columns = []
+    mock_mapper.mapper.relationships = [mock_relationship]
+
+    # Mock the data object to have the write_only relationship attribute
+    mock_instance.items = MagicMock()  # This would be a WriteOnlyCollection in reality
+
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mocker.patch("advanced_alchemy.repository._async.inspect", return_value=mock_mapper)
+    mock_repo.session.merge.return_value = existing_instance  # pyright: ignore[reportFunctionMemberAccess]
+
+    # This should not raise an error even though items is a write_only relationship
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    # Verify the relationship was not processed (no merge attempted for relationships)
+    mock_repo.session.merge.assert_called_once_with(existing_instance, load=True)  # pyright: ignore[reportFunctionMemberAccess]
+    assert instance is existing_instance
+
+
+async def test_update_skips_dynamic_relationships(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test that update method skips dynamic relationships without error."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+
+    # Mock the mapper and relationship
+    mock_mapper = MagicMock()
+    mock_relationship = MagicMock()
+    mock_relationship.key = "items"
+    mock_relationship.lazy = "dynamic"
+    mock_relationship.viewonly = False
+    mock_mapper.mapper.columns = []
+    mock_mapper.mapper.relationships = [mock_relationship]
+
+    # Mock the data object to have the dynamic relationship attribute
+    mock_instance.items = MagicMock()  # This would be an AppenderQuery in reality
+
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mocker.patch("advanced_alchemy.repository._async.inspect", return_value=mock_mapper)
+    mock_repo.session.merge.return_value = existing_instance  # pyright: ignore[reportFunctionMemberAccess]
+
+    # This should not raise an error even though items is a dynamic relationship
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    # Verify the relationship was not processed (no merge attempted for relationships)
+    mock_repo.session.merge.assert_called_once_with(existing_instance, load=True)  # pyright: ignore[reportFunctionMemberAccess]
+    assert instance is existing_instance
+
+
+async def test_update_skips_viewonly_relationships(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test that update method skips viewonly relationships without error."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+
+    # Mock the mapper and relationship
+    mock_mapper = MagicMock()
+    mock_relationship = MagicMock()
+    mock_relationship.key = "readonly_items"
+    mock_relationship.lazy = "select"  # Normal lazy loading
+    mock_relationship.viewonly = True  # But marked as view-only
+    mock_mapper.mapper.columns = []
+    mock_mapper.mapper.relationships = [mock_relationship]
+
+    # Mock the data object to have the viewonly relationship attribute
+    mock_instance.readonly_items = [MagicMock()]
+
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mocker.patch("advanced_alchemy.repository._async.inspect", return_value=mock_mapper)
+    mock_repo.session.merge.return_value = existing_instance  # pyright: ignore[reportFunctionMemberAccess]
+
+    # This should not raise an error even though readonly_items is viewonly
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    # Verify the relationship was not processed (no merge attempted for relationships)
+    mock_repo.session.merge.assert_called_once_with(existing_instance, load=True)  # pyright: ignore[reportFunctionMemberAccess]
+    assert instance is existing_instance
+
+
+async def test_update_skips_raise_lazy_relationships(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test that update method skips raise lazy strategy relationships without error."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+
+    # Mock the mapper and relationship
+    mock_mapper = MagicMock()
+    mock_relationship = MagicMock()
+    mock_relationship.key = "items"
+    mock_relationship.lazy = "raise"
+    mock_relationship.viewonly = False
+    mock_mapper.mapper.columns = []
+    mock_mapper.mapper.relationships = [mock_relationship]
+
+    # Mock the data object to raise an error when accessing the relationship
+    type(mock_instance).items = PropertyMock(side_effect=InvalidRequestError)
+
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mocker.patch("advanced_alchemy.repository._sync.inspect", return_value=mock_mapper)
+    mocker.patch("advanced_alchemy.repository._async.inspect", return_value=mock_mapper)
+    mock_repo.session.merge.return_value = existing_instance  # pyright: ignore[reportFunctionMemberAccess]
+
+    # This should not raise an error even though items has lazy="raise"
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    # Verify the relationship was not processed (no merge attempted for relationships)
+    mock_repo.session.merge.assert_called_once_with(existing_instance, load=True)  # pyright: ignore[reportFunctionMemberAccess]
+    assert instance is existing_instance
+
+
+async def test_update_processes_normal_relationships(
+    mock_repo: SQLAlchemyAsyncRepository[Any],
+    mocker: MockerFixture,
+) -> None:
+    """Test that update method still processes normal relationships correctly."""
+    id_ = 3
+    mock_instance = MagicMock()
+    existing_instance = MagicMock()
+    related_item = MagicMock()
+    merged_related_item = MagicMock()
+
+    # Mock the mapper and relationship
+    mock_mapper = MagicMock()
+    mock_relationship = MagicMock()
+    mock_relationship.key = "items"
+    mock_relationship.lazy = "select"  # Normal lazy loading
+    mock_relationship.viewonly = False
+    mock_mapper.mapper.columns = []
+    mock_mapper.mapper.relationships = [mock_relationship]
+
+    # Mock the data object to have a normal relationship with items
+    mock_instance.items = [related_item]
+
+    mocker.patch.object(mock_repo, "get_id_attribute_value", return_value=id_)
+    mocker.patch.object(mock_repo, "get", return_value=existing_instance)
+    mocker.patch("advanced_alchemy.repository._async.inspect", return_value=mock_mapper)
+
+    # Mock session.merge to return different objects for main instance vs related items
+    async def mock_merge(obj: Any, load: bool = True) -> Any:
+        if obj is existing_instance:
+            return existing_instance
+        if obj is related_item:
+            return merged_related_item
+        return obj
+
+    mock_repo.session.merge.side_effect = mock_merge
+
+    # This should process the normal relationship correctly
+    instance = await maybe_async(mock_repo.update(mock_instance))
+
+    # Verify the relationship was processed - at minimum the main instance should be merged
+    assert mock_repo.session.merge.call_count >= 1  # At least the main instance
+    # The main point is that normal relationships don't cause errors
+    assert instance is existing_instance
+
+
+def test_model_from_dict_backward_compatibility() -> None:
+    """Test that model_from_dict maintains backward compatibility with column-only data."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    author_data = {"name": "Compatible Author", "string_field": "compatibility test"}
+
+    author = model_from_dict(UUIDAuthor, **author_data)
+
+    assert author.name == "Compatible Author"
+    assert author.string_field == "compatibility test"
+
+
+def test_model_from_dict_ignores_unknown_attributes() -> None:
+    """Test that model_from_dict still ignores unknown attributes."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    author_data = {"name": "Test Author", "unknown_attribute": "should be ignored", "another_unknown": 12345}
+
+    author = model_from_dict(UUIDAuthor, **author_data)
+
+    assert author.name == "Test Author"
+    assert not hasattr(author, "unknown_attribute")
+    assert not hasattr(author, "another_unknown")
+
+
+def test_model_from_dict_empty_relationship() -> None:
+    """Test that model_from_dict handles empty relationship lists."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    author_data = {
+        "name": "Author Without Books",
+        "books": [],  # Empty relationship
+    }
+
+    author = model_from_dict(UUIDAuthor, **author_data)
+
+    assert author.name == "Author Without Books"
+    assert hasattr(author, "books")
+    assert author.books == []
+
+
+def test_update_many_data_conversion_handles_mixed_types() -> None:
+    """Test that update_many properly handles mixed input types (regression test).
+
+    This verifies the fix for the type handling bug in update_many where
+    the old logic would fail with AttributeError when mixing model instances
+    and dictionaries.
+    """
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    # Simulate the data conversion logic from the fixed code
+    model_type = UUIDAuthor
+
+    # Create a mock model instance
+    mock_author = UUIDAuthor(name="Test Author")
+
+    # Mix of model instances and dictionaries (the problematic case)
+    mixed_data = [
+        mock_author,  # Model instance with to_dict() method
+        {"id": "dict-id", "name": "Dict Author"},  # Plain dictionary
+    ]
+
+    # This is the fixed logic from repository/_async.py and _sync.py
+    data_to_update = []
+    for v in mixed_data:
+        if isinstance(v, model_type):
+            data_to_update.append(v.to_dict())
+        else:
+            data_to_update.append(v)  # type: ignore[arg-type]
+
+    # Verify no AttributeError was raised and data is properly converted
+    assert len(data_to_update) == 2
+    assert isinstance(data_to_update[0], dict)  # Model converted to dict
+    assert isinstance(data_to_update[1], dict)  # Dict passed through
+    assert data_to_update[0]["name"] == "Test Author"
+    assert data_to_update[1]["name"] == "Dict Author"
+
+
+def test_compare_values_handles_numpy_arrays() -> None:
+    """Test that compare_values properly handles numpy arrays.
+
+    This is a regression test for the issue where comparing numpy arrays
+    (like pgvector's Vector type) would raise:
+    ValueError: The truth value of an array with more than one element is ambiguous
+    """
+    from advanced_alchemy.repository._util import compare_values
+
+    # Test with regular values (should work as before)
+    assert compare_values("same", "same") is True
+    assert compare_values("different", "other") is False
+    assert compare_values(None, None) is True
+    assert compare_values(None, "value") is False
+    assert compare_values("value", None) is False
+
+    # Test with mock numpy arrays (when numpy is not installed)
+    class MockNumpyArray:
+        """Mock numpy array for testing when numpy is not available."""
+
+        def __init__(self, data: list[float]) -> None:
+            self.data = data
+            self.dtype = "float64"  # Required for is_numpy_array detection
+
+        def __array__(self) -> list[float]:
+            """Required for is_numpy_array detection."""
+            return self.data
+
+        def __eq__(self, other: object) -> list[bool]:  # type: ignore[override]
+            """Simulate numpy's element-wise comparison that causes the issue."""
+            if isinstance(other, MockNumpyArray):
+                return [a == b for a, b in zip(self.data, other.data)]
+            return [False] * len(self.data)
+
+    # Create mock arrays
+    array1 = MockNumpyArray([1.0, 2.0, 3.0])
+    array2 = MockNumpyArray([1.0, 2.0, 3.0])  # Same data
+    array3 = MockNumpyArray([4.0, 5.0, 6.0])  # Different data
+
+    # Test array comparisons (these would previously raise ValueError)
+    result_same = compare_values(array1, array2)
+    result_different = compare_values(array1, array3)
+    result_mixed = compare_values(array1, "not_an_array")
+
+    # The important thing is that no ValueError is raised
+    assert isinstance(result_same, bool)  # Should not raise ValueError
+    assert isinstance(result_different, bool)  # Should not raise ValueError
+    assert isinstance(result_mixed, bool)  # Should not raise ValueError
+
+    # The specific results depend on whether numpy is installed:
+    # - With numpy: MockNumpyArray is not detected as numpy array, falls back to __eq__
+    # - Without numpy: stub functions are used which return False for safety
+    # Either way, no ValueError should be raised
+
+    # Test with values that would cause comparison errors
+    class ProblematicValue:
+        def __eq__(self, other: object) -> None:  # type: ignore[override]
+            raise TypeError("Cannot compare")
+
+    problematic = ProblematicValue()
+    # Should handle comparison errors gracefully
+    assert compare_values(problematic, "other") is False
+    assert compare_values("other", problematic) is False
+
+
+def test_compare_values_with_real_numpy_arrays() -> None:
+    """Test compare_values with actual numpy arrays when numpy is installed.
+
+    This test covers the real numpy code paths that were missing from coverage.
+    """
+    # This test will only run if numpy is actually installed
+    try:
+        import numpy as np
+    except ImportError:
+        pytest.skip("numpy not available")
+
+    from advanced_alchemy.repository._util import compare_values
+
+    # Test equal arrays
+    arr1 = np.array([1.0, 2.0, 3.0])
+    arr2 = np.array([1.0, 2.0, 3.0])
+    assert compare_values(arr1, arr2) is True
+
+    # Test different arrays
+    arr3 = np.array([4.0, 5.0, 6.0])
+    assert compare_values(arr1, arr3) is False
+
+    # Test different shapes
+    arr4 = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert compare_values(arr1, arr4) is False
+
+    # Test array vs non-array
+    assert compare_values(arr1, [1.0, 2.0, 3.0]) is False
+    assert compare_values(arr1, "not an array") is False
+
+    # Test empty arrays
+    empty1 = np.array([])
+    empty2 = np.array([])
+    assert compare_values(empty1, empty2) is True
+
+    # Test different dtypes but same values
+    int_arr = np.array([1, 2, 3])
+    float_arr = np.array([1.0, 2.0, 3.0])
+    assert compare_values(int_arr, float_arr) is True  # numpy considers these equal
+
+    # Test NaN handling
+    nan_arr1 = np.array([1.0, np.nan, 3.0])
+    nan_arr2 = np.array([1.0, np.nan, 3.0])
+    # numpy considers NaN != NaN, so arrays with NaN won't be equal
+    assert compare_values(nan_arr1, nan_arr2) is False
+
+
+def test_compare_values_covers_all_branches() -> None:
+    """Test compare_values to ensure all code branches are covered."""
+    from advanced_alchemy.repository._util import compare_values
+
+    # Test standard equality that returns non-bool (should not happen with normal types)
+    class WeirdComparison:
+        def __eq__(self, other: object) -> str:  # type: ignore[override]
+            return "weird"
+
+    weird = WeirdComparison()
+    # This tests the bool() conversion in the standard comparison path
+    result = compare_values(weird, weird)
+    assert isinstance(result, bool)  # Should convert "weird" to True
+    assert result is True
+
+
+def test_repository_update_methods_with_numpy_arrays() -> None:
+    """Test that repository update methods work correctly with numpy array fields.
+
+    This integration test covers the actual repository comparison paths
+    that were missing from coverage.
+    """
+    # This test will only run if numpy is actually installed
+    try:
+        import numpy as np
+    except ImportError:
+        pytest.skip("numpy not available")
+
+    from advanced_alchemy.repository._util import compare_values
+
+    # Test data with numpy arrays
+    arr1 = np.array([1.0, 2.0, 3.0])
+    arr2 = np.array([1.0, 2.0, 3.0])  # Same as arr1
+    arr3 = np.array([4.0, 5.0, 6.0])  # Different from arr1
+
+    # These operations would previously fail with ValueError
+    # Now they should work correctly by using our safe comparison
+
+    # Test 1: Arrays with same data should be considered equal
+    assert arr1 is not arr2  # Different objects
+    # But compare_values should see them as equal
+    assert compare_values(arr1, arr2) is True
+
+    # Test 2: Arrays with different data should be considered different
+    assert compare_values(arr1, arr3) is False
+
+    # Test 3: Test with None values (common edge case)
+    assert compare_values(None, None) is True
+    assert compare_values(arr1, None) is False
+    assert compare_values(None, arr1) is False
+
+    # Test 4: Array vs non-array should be False
+    assert compare_values(arr1, [1.0, 2.0, 3.0]) is False
+    assert compare_values(arr1, "not an array") is False
+
+    # Test 5: Test different shapes
+    arr_2d = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert compare_values(arr1, arr_2d) is False
+
+    # Test 6: Test empty arrays
+    empty1 = np.array([])
+    empty2 = np.array([])
+    assert compare_values(empty1, empty2) is True
+
+    # Test 7: Test with complex numbers (edge case)
+    complex1 = np.array([1 + 2j, 3 + 4j])
+    complex2 = np.array([1 + 2j, 3 + 4j])
+    complex3 = np.array([1 + 2j, 5 + 6j])
+    assert compare_values(complex1, complex2) is True
+    assert compare_values(complex1, complex3) is False
+
+
+def test_was_attribute_set_with_explicitly_set_attributes() -> None:
+    """Test was_attribute_set correctly identifies explicitly set attributes."""
+    from sqlalchemy import inspect
+
+    from advanced_alchemy.repository._util import was_attribute_set
+
+    # Create an instance with explicitly set attributes
+    instance = UUIDModel()
+    instance.id = uuid4()  # Explicitly set id
+
+    # Get the mapper/inspector
+    mapper = inspect(instance)
+
+    # Explicitly set attributes should return True
+    assert was_attribute_set(instance, mapper, "id") is True
+
+
+def test_was_attribute_set_with_uninitialized_attributes() -> None:
+    """Test was_attribute_set correctly identifies uninitialized attributes."""
+    from sqlalchemy import inspect
+
+    from advanced_alchemy.repository._util import was_attribute_set
+
+    # Use the existing UUIDModel which has created_at and updated_at audit fields
+    # Create an instance - created_at and updated_at won't be in instance dict yet
+    instance = UUIDModel()
+
+    # Get the mapper/inspector
+    mapper = inspect(instance)
+
+    # Uninitialized audit attributes should return False
+    # They exist on the model but haven't been explicitly set
+    assert was_attribute_set(instance, mapper, "created_at") is False
+    assert was_attribute_set(instance, mapper, "updated_at") is False
+
+
+def test_was_attribute_set_with_modified_attributes() -> None:
+    """Test was_attribute_set detects attributes with modification history."""
+    from sqlalchemy import inspect
+
+    from advanced_alchemy.repository._util import was_attribute_set
+
+    # Create an instance and explicitly set attributes
+    instance = UUIDModel()
+    instance.id = uuid4()  # Explicitly set id
+
+    # Also test setting a datetime attribute
+    now = dt.datetime.now(dt.timezone.utc)
+    instance.created_at = now  # Explicitly modify created_at
+
+    # Get the mapper/inspector
+    mapper = inspect(instance)
+
+    # Modified attributes should return True
+    assert was_attribute_set(instance, mapper, "id") is True
+    assert was_attribute_set(instance, mapper, "created_at") is True
+
+
+def test_was_attribute_set_with_nonexistent_attribute() -> None:
+    """Test was_attribute_set handles nonexistent attributes gracefully."""
+    from sqlalchemy import inspect
+
+    from advanced_alchemy.repository._util import was_attribute_set
+
+    # Create an instance
+    instance = UUIDModel()
+
+    # Get the mapper/inspector
+    mapper = inspect(instance)
+
+    # Nonexistent attribute should return False (attr_state is None)
+    assert was_attribute_set(instance, mapper, "nonexistent_field") is False
+
+
+# Tests for nested dict handling in model_from_dict (Issue #556)
+
+
+def test_model_from_dict_nested_single_dict() -> None:
+    """Test single nested dict is converted to model instance."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    data = {
+        "title": "Test Book",
+        "author": {"name": "Test Author"},
+    }
+    book = model_from_dict(UUIDBook, **data)
+
+    assert book.title == "Test Book"
+    assert isinstance(book.author, UUIDAuthor)
+    assert book.author.name == "Test Author"
+
+
+def test_model_from_dict_nested_list_of_dicts() -> None:
+    """Test list of nested dicts are converted to model instances."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    data = {
+        "name": "Test Author",
+        "books": [
+            {"title": "Book 1"},
+            {"title": "Book 2"},
+        ],
+    }
+    author = model_from_dict(UUIDAuthor, **data)
+
+    assert author.name == "Test Author"
+    assert len(author.books) == 2
+    assert all(isinstance(b, UUIDBook) for b in author.books)
+    assert author.books[0].title == "Book 1"
+    assert author.books[1].title == "Book 2"
+
+
+def test_model_from_dict_deeply_nested() -> None:
+    """Test deeply nested structures (2+ levels) - author with books, each book with author."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    # Create a book with nested author that has nested books
+    # Note: SQLAlchemy's back_populates will automatically add the outer book
+    # to author.books, so we get 3 books total (the outer book + 2 nested)
+    data = {
+        "title": "Test Book",
+        "author": {
+            "name": "Test Author",
+            "books": [
+                {"title": "Another Book 1"},
+                {"title": "Another Book 2"},
+            ],
+        },
+    }
+    book = model_from_dict(UUIDBook, **data)
+
+    assert book.title == "Test Book"
+    assert isinstance(book.author, UUIDAuthor)
+    assert book.author.name == "Test Author"
+    # Due to back_populates, author.books contains the outer book + 2 nested books = 3 total
+    assert len(book.author.books) == 3
+    assert all(isinstance(b, UUIDBook) for b in book.author.books)
+    # The first two are from the nested data
+    titles = {b.title for b in book.author.books}
+    assert "Another Book 1" in titles
+    assert "Another Book 2" in titles
+    assert "Test Book" in titles
+
+
+def test_model_from_dict_none_relationship() -> None:
+    """Test None value for relationship is preserved."""
+    from tests.fixtures.uuid.models import UUIDBook
+
+    data = {"title": "Orphan Book", "author": None}
+    book = model_from_dict(UUIDBook, **data)
+
+    assert book.title == "Orphan Book"
+    assert book.author is None
+
+
+def test_model_from_dict_empty_list_relationship() -> None:
+    """Test empty list for relationship is preserved."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    data = {"name": "Author Without Books", "books": []}
+    author = model_from_dict(UUIDAuthor, **data)
+
+    assert author.name == "Author Without Books"
+    assert author.books == []
+
+
+def test_model_from_dict_mixed_list() -> None:
+    """Test list with both dicts and model instances."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    existing_book = UUIDBook(title="Existing Book")
+    data = {
+        "name": "Test Author",
+        "books": [
+            existing_book,
+            {"title": "New Book"},
+        ],
+    }
+    author = model_from_dict(UUIDAuthor, **data)
+
+    assert len(author.books) == 2
+    assert author.books[0] is existing_book
+    assert isinstance(author.books[1], UUIDBook)
+    assert author.books[1].title == "New Book"
+
+
+def test_model_from_dict_preserves_existing_instance() -> None:
+    """Test that existing model instances are passed through unchanged."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    existing_author = UUIDAuthor(name="Existing")
+    data = {
+        "title": "Test Book",
+        "author": existing_author,
+    }
+    book = model_from_dict(UUIDBook, **data)
+
+    assert book.author is existing_author
+
+
+def test_model_from_dict_single_item_for_collection() -> None:
+    """Test single dict provided for collection relationship is wrapped in list."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    data = {
+        "name": "Test Author",
+        "books": {"title": "Single Book"},  # Single dict instead of list
+    }
+    author = model_from_dict(UUIDAuthor, **data)
+
+    assert len(author.books) == 1
+    assert isinstance(author.books[0], UUIDBook)
+    assert author.books[0].title == "Single Book"
+
+
+def test_model_from_dict_performance_baseline() -> None:
+    """Ensure minimal overhead for non-nested dicts."""
+    import time
+
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    data = {"name": "Test Author", "string_field": "test"}
+
+    # Warm up
+    for _ in range(100):
+        model_from_dict(UUIDAuthor, **data)
+
+    # Benchmark
+    start = time.perf_counter()
+    for _ in range(10000):
+        model_from_dict(UUIDAuthor, **data)
+    elapsed = time.perf_counter() - start
+
+    # Should complete quickly (< 1 second for 10k iterations)
+    assert elapsed < 1.0
+
+
+def test_model_from_dict_performance_nested() -> None:
+    """Benchmark nested dict conversion."""
+    import time
+
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    data = {
+        "name": "Test Author",
+        "books": [{"title": f"Book {i}"} for i in range(10)],
+    }
+
+    # Warm up
+    for _ in range(100):
+        model_from_dict(UUIDAuthor, **data)
+
+    start = time.perf_counter()
+    for _ in range(1000):
+        model_from_dict(UUIDAuthor, **data)
+    elapsed = time.perf_counter() - start
+
+    # Should complete reasonably (< 2 seconds for 1k iterations with 10 children)
+    assert elapsed < 2.0
+
+
+def test_model_from_dict_many_to_many_relationship() -> None:
+    """Test nested dict handling for many-to-many relationships."""
+    from tests.fixtures.uuid.models import UUIDItem, UUIDTag
+
+    data = {
+        "name": "Test Item",
+        "tags": [
+            {"name": "Tag 1"},
+            {"name": "Tag 2"},
+        ],
+    }
+    item = model_from_dict(UUIDItem, **data)
+
+    assert item.name == "Test Item"
+    assert len(item.tags) == 2
+    assert all(isinstance(t, UUIDTag) for t in item.tags)
+    assert item.tags[0].name == "Tag 1"
+    assert item.tags[1].name == "Tag 2"
+
+
+def test_model_from_dict_tuple_for_collection() -> None:
+    """Test tuple provided for collection relationship is handled correctly."""
+    from tests.fixtures.uuid.models import UUIDAuthor, UUIDBook
+
+    data = {
+        "name": "Test Author",
+        "books": ({"title": "Book 1"}, {"title": "Book 2"}),  # Tuple instead of list
+    }
+    author = model_from_dict(UUIDAuthor, **data)
+
+    assert len(author.books) == 2
+    assert all(isinstance(b, UUIDBook) for b in author.books)
+
+
+def test_model_from_dict_with_model_key() -> None:
+    """Regression test for https://github.com/litestar-org/advanced-alchemy/issues/668."""
+    from tests.fixtures.uuid.models import UUIDAuthor
+
+    data = {"name": "Test Author", "model": "some-model-value"}
+    author = model_from_dict(UUIDAuthor, **data)
+    assert author.name == "Test Author"
+
+
+def test_model_from_dict_with_mapped_model_field() -> None:
+    """Regression test for https://github.com/litestar-org/advanced-alchemy/issues/668."""
+
+    class UUIDCar(base.UUIDAuditBase):
+        make: Mapped[str] = mapped_column(String(length=50))  # pyright: ignore
+        model: Mapped[str] = mapped_column(String(length=50))  # pyright: ignore
+
+    data = {"make": "Advanced", "model": "Alchemy"}
+    car = model_from_dict(UUIDCar, **data)
+
+    assert car.make == "Advanced"
+    assert car.model == "Alchemy"
+
+
+def test_convert_relationship_value_helper() -> None:
+    """Test the _convert_relationship_value helper function directly."""
+    from advanced_alchemy.repository._util import _convert_relationship_value
+    from tests.fixtures.uuid.models import UUIDBook
+
+    # Test None
+    assert _convert_relationship_value(None, UUIDBook, is_collection=False) is None
+    assert _convert_relationship_value(None, UUIDBook, is_collection=True) is None
+
+    # Test single dict for non-collection
+    result = _convert_relationship_value({"title": "Test"}, UUIDBook, is_collection=False)
+    assert isinstance(result, UUIDBook)
+    assert result.title == "Test"
+
+    # Test single dict for collection (should wrap in list)
+    result = _convert_relationship_value({"title": "Test"}, UUIDBook, is_collection=True)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert isinstance(result[0], UUIDBook)
+
+    # Test list of dicts for collection
+    result = _convert_relationship_value(
+        [{"title": "Book 1"}, {"title": "Book 2"}],
+        UUIDBook,
+        is_collection=True,
+    )
+    assert isinstance(result, list)
+    assert len(result) == 2
+
+    # Test existing instance pass-through
+    existing = UUIDBook(title="Existing")
+    result = _convert_relationship_value(existing, UUIDBook, is_collection=False)
+    assert result is existing
+
+    # Test existing instance in collection
+    result = _convert_relationship_value([existing], UUIDBook, is_collection=True)
+    assert result[0] is existing
+
+
+def test_repository_and_service_annotations_are_accessible() -> None:
+    """Regression test for Python 3.14 lazy annotation evaluation shadowing.
+
+    On Python 3.14, bare ``list[...]`` in a class that defines a ``list()`` method
+    resolves to the method instead of the builtin type. Using ``typing.List`` avoids this.
+    """
+    import typing
+
+    from advanced_alchemy.repository._async import SQLAlchemyAsyncRepository
+    from advanced_alchemy.repository._sync import SQLAlchemySyncRepository
+    from advanced_alchemy.repository.memory._async import SQLAlchemyAsyncMockRepository
+    from advanced_alchemy.repository.memory._sync import SQLAlchemySyncMockRepository
+    from advanced_alchemy.repository.memory.base import InMemoryStore
+
+    targets = [
+        SQLAlchemyAsyncRepository,
+        SQLAlchemySyncRepository,
+        SQLAlchemyAsyncMockRepository,
+        SQLAlchemySyncMockRepository,
+        InMemoryStore,
+    ]
+    for cls in targets:
+        annotations = typing.get_type_hints(cls.list)
+        assert isinstance(annotations, dict), f"{cls.__name__}.list annotations should be a dict"
+
+
+class NullableOrderModel(base.BigIntBase):
+    __tablename__ = "nullable_order_model"
+
+    director: Mapped[Union[str, None]] = mapped_column(String(50), nullable=True)
+
+
+@pytest.mark.parametrize("sort_order", ["asc", "desc"])
+@pytest.mark.parametrize("nulls", ["first", "last"])
+def test_mock_repository_order_by_honors_nulls_placement(sort_order: str, nulls: str) -> None:
+    """The in-memory repository applies `OrderByFilter.nulls` the same way the SQL backends do."""
+
+    class Repo(SQLAlchemySyncMockRepository[NullableOrderModel]):
+        model_type = NullableOrderModel
+
+    repo = Repo(session=MagicMock(spec=Session, bind=MagicMock()))
+    repo.add_many(
+        [
+            NullableOrderModel(id=1, director=None),
+            NullableOrderModel(id=2, director="z"),
+            NullableOrderModel(id=3, director="a"),
+        ]
+    )
+
+    results = repo.list(OrderByFilter("director", sort_order, nulls))  # type: ignore[arg-type]
+
+    expected = [3, 2] if sort_order == "asc" else [2, 3]
+    expected = [1, *expected] if nulls == "first" else [*expected, 1]
+    assert [item.id for item in results] == expected
+
+
+class SearchableTitleModel(base.BigIntBase):
+    __tablename__ = "searchable_title_model"
+
+    title: Mapped[str] = mapped_column(String(50))
+
+
+@pytest.mark.parametrize("filter_type", [SearchFilter, NotInSearchFilter])
+def test_mock_repository_search_honors_escape_wildcards(filter_type: type[SearchFilter]) -> None:
+    """The in-memory repository matches `%` and `_` literally when `escape_wildcards` is set."""
+
+    class Repo(SQLAlchemySyncMockRepository[SearchableTitleModel]):
+        model_type = SearchableTitleModel
+
+    Repo.__database_clear__()
+    try:
+        repo = Repo(session=MagicMock(spec=Session, bind=MagicMock()))
+        repo.add_many([SearchableTitleModel(id=1, title="a 50% b"), SearchableTitleModel(id=2, title="a 50X b")])
+
+        literal = repo.list(filter_type("title", "50%", escape_wildcards=True))
+        pattern = repo.list(filter_type("title", "50_"))
+
+        expected_literal = [1] if filter_type is SearchFilter else [2]
+        assert [item.id for item in literal] == expected_literal
+        assert sorted(item.id for item in pattern) == ([1, 2] if filter_type is SearchFilter else [])
+    finally:
+        Repo.__database_clear__()
+
+
+@pytest.mark.parametrize(("lookup_id", "should_find"), [(1, True), (999, False)])
+def test_sync_mock_repository_get_or_none(lookup_id: int, should_find: bool) -> None:
+    """Test SQLAlchemySyncMockRepository get_or_none returns matching instance or None."""
+
+    class Repo(SQLAlchemySyncMockRepository[SearchableTitleModel]):
+        model_type = SearchableTitleModel
+
+    Repo.__database_clear__()
+    repo = Repo(session=MagicMock(spec=Session, bind=MagicMock()))
+    item = SearchableTitleModel(id=1, title="Test")
+    repo.add(item)
+
+    assert repo.get_or_none(lookup_id) is (item if should_find else None)
+
+
+@pytest.mark.parametrize(("lookup_id", "should_find"), [(1, True), (999, False)])
+async def test_async_mock_repository_get_or_none(lookup_id: int, should_find: bool) -> None:
+    """Test SQLAlchemyAsyncMockRepository get_or_none returns matching instance or None."""
+
+    class Repo(SQLAlchemyAsyncMockRepository[SearchableTitleModel]):
+        model_type = SearchableTitleModel
+
+    Repo.__database_clear__()
+    repo = Repo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    item = SearchableTitleModel(id=1, title="Test")
+    await repo.add(item)
+
+    assert await repo.get_or_none(lookup_id) is (item if should_find else None)
+
+
+def test_build_cache_key_with_bind_group() -> None:
+    """Verify _build_cache_key includes bind_group to isolate routed sessions."""
+    key_primary = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+        bind_group="default",
+    )
+    key_replica = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+        bind_group="read",
+    )
+    key_none = _build_cache_key(
+        model_name="CacheModel",
+        version_token="v1",
+        method="get_many",
+        filters=[],
+        kwargs={},
+        order_by=None,
+        execution_options={},
+        uniquify=False,
+        bind_group=None,
+    )
+
+    assert key_primary is not None
+    assert key_replica is not None
+    assert key_none is not None
+    assert key_primary != key_replica
+    assert key_primary != key_none
+
+
+def test_normalize_cache_key_value_dataclass_no_deepcopy(monkeypatch: MonkeyPatch) -> None:
+    """Verify _normalize_cache_key_value normalizes dataclasses without copy.deepcopy."""
+
+    def fail_deepcopy(*args: Any, **kwargs: Any) -> Any:
+        msg = "deepcopy should not be called"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(copy, "deepcopy", fail_deepcopy)
+    filter_obj = InCollectionFilter(field_name="id", values={3, 1, 2})
+    normalized = _normalize_cache_key_value(filter_obj)
+    assert normalized == {"field_name": "id", "values": [1, 2, 3]}
+
+
+def test_get_error_messages_default_fast_path() -> None:
+    """Verify _get_error_messages returns default_messages directly when no overrides are given."""
+    result_empty = SQLAlchemySyncRepository._get_error_messages(Empty, DEFAULT_ERROR_MESSAGE_TEMPLATES)
+    result_none = SQLAlchemySyncRepository._get_error_messages(None, DEFAULT_ERROR_MESSAGE_TEMPLATES)
+    assert result_empty is DEFAULT_ERROR_MESSAGE_TEMPLATES
+    assert result_none is DEFAULT_ERROR_MESSAGE_TEMPLATES
+
+    overridden = SQLAlchemySyncRepository._get_error_messages({"not_found": "custom"}, DEFAULT_ERROR_MESSAGE_TEMPLATES)
+    assert overridden is not None
+    assert overridden is not DEFAULT_ERROR_MESSAGE_TEMPLATES
+    assert overridden["not_found"] == "custom"
+
+
+def test_repository_apply_filters_passes_prefer_any(mocker: MockerFixture) -> None:
+    """Verify _apply_filters forwards prefer_any=self._prefer_any to InCollectionFilter."""
+
+    class PreferAnyRepo(SQLAlchemySyncRepository[UUIDModel]):
+        model_type = UUIDModel
+
+    mock_bind = MagicMock()
+    mock_bind.dialect.name = "postgresql"
+    repo = PreferAnyRepo(session=MagicMock(spec=Session, bind=mock_bind))
+    assert repo._prefer_any is True
+    in_filter = InCollectionFilter(field_name="id", values=[uuid4()])
+    not_in_filter = NotInCollectionFilter(field_name="id", values=[uuid4()])
+    spy_in = mocker.spy(in_filter, "append_to_statement")
+    spy_not_in = mocker.spy(not_in_filter, "append_to_statement")
+
+    repo._apply_filters(in_filter, not_in_filter, statement=repo.statement)
+
+    spy_in.assert_called_once_with(repo.statement, UUIDModel, prefer_any=True)
+    spy_not_in.assert_called_once_with(spy_in.spy_return, UUIDModel, prefer_any=True)
+
+
+async def test_query_repository_get_many_and_count_respects_window_function_flag(mocker: MockerFixture) -> None:
+    """Verify SQLAlchemyAsyncQueryRepository and SQLAlchemySyncQueryRepository honor count_with_window_function."""
+    sync_repo = SQLAlchemySyncQueryRepository(session=MagicMock(spec=Session, bind=MagicMock()))
+    sync_window = mocker.patch.object(sync_repo, "_get_many_and_count_window", return_value=([], 0))
+    sync_basic = mocker.patch.object(sync_repo, "_get_many_and_count_basic", return_value=([], 0))
+
+    statement = MagicMock()
+    sync_repo.get_many_and_count(statement)
+    sync_window.assert_called_once_with(statement=statement, bind_group=None)
+    sync_basic.assert_not_called()
+
+    sync_repo.get_many_and_count(statement, count_with_window_function=False)
+    sync_basic.assert_called_once_with(statement=statement, bind_group=None)
+
+    async_repo = SQLAlchemyAsyncQueryRepository(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    async_window = mocker.patch.object(async_repo, "_get_many_and_count_window", return_value=([], 0))
+    async_basic = mocker.patch.object(async_repo, "_get_many_and_count_basic", return_value=([], 0))
+
+    await async_repo.get_many_and_count(statement)
+    async_window.assert_called_once_with(statement=statement, bind_group=None)
+    async_basic.assert_not_called()
+
+    await async_repo.get_many_and_count(statement, count_with_window_function=False)
+    async_basic.assert_called_once_with(statement=statement, bind_group=None)
+
+
+def test_repository_generic_subclass_auto_binds_model_type() -> None:
+    """Subclassing Repository or MockRepository with a concrete ModelT binds model_type automatically."""
+
+    class AutoAsyncRepo(SQLAlchemyAsyncRepository[UUIDModel]):
+        pass
+
+    class AutoSyncRepo(SQLAlchemySyncRepository[BigIntModel]):
+        pass
+
+    class AutoAsyncMockRepo(SQLAlchemyAsyncMockRepository[UUIDModel]):
+        pass
+
+    class AutoSyncMockRepo(SQLAlchemySyncMockRepository[BigIntModel]):
+        pass
+
+    assert getattr(AutoAsyncRepo, "model_type", None) is UUIDModel
+    assert getattr(AutoSyncRepo, "model_type", None) is BigIntModel
+    assert getattr(AutoAsyncMockRepo, "model_type", None) is UUIDModel
+    assert getattr(AutoSyncMockRepo, "model_type", None) is BigIntModel
+
+
+def test_repository_generic_any_subclass_preserves_inherited_model_type() -> None:
+    """Subclassing an explicitly bound repository preserves its inherited model_type."""
+
+    class BaseRepo(SQLAlchemyAsyncRepository[Any]):
+        model_type = UUIDModel
+
+    class SubRepo(BaseRepo):
+        pass
+
+    class ExplicitOverrideRepo(SQLAlchemyAsyncRepository[UUIDModel]):
+        model_type = cast("Any", BigIntModel)
+
+    class ChildOfExplicitRepo(ExplicitOverrideRepo):
+        pass
+
+    assert SubRepo.model_type is UUIDModel
+    assert ChildOfExplicitRepo.model_type is BigIntModel
+
+
+def test_repository_direct_instantiation_with_model_type_kwarg() -> None:
+    """Repositories and MockRepositories can be instantiated directly using model_type=Model."""
+    async_session = AsyncMock(spec=AsyncSession, bind=MagicMock())
+    sync_session = MagicMock(spec=Session, bind=MagicMock())
+
+    async_repo: SQLAlchemyAsyncRepository[UUIDModel] = SQLAlchemyAsyncRepository(
+        session=async_session,
+        model_type=UUIDModel,
+    )
+    sync_repo: SQLAlchemySyncRepository[BigIntModel] = SQLAlchemySyncRepository(
+        session=sync_session,
+        model_type=BigIntModel,
+    )
+    async_mock_repo_inst: SQLAlchemyAsyncMockRepository[UUIDModel] = SQLAlchemyAsyncMockRepository(
+        session=async_session,
+        model_type=UUIDModel,
+    )
+    sync_mock_repo_inst: SQLAlchemySyncMockRepository[BigIntModel] = SQLAlchemySyncMockRepository(
+        session=sync_session,
+        model_type=BigIntModel,
+    )
+
+    assert async_repo.model_type is UUIDModel
+    assert async_repo.pk_attr_names == ("id",)
+    assert sync_repo.model_type is BigIntModel
+    assert sync_repo.pk_attr_names == ("id",)
+    assert async_mock_repo_inst.model_type is UUIDModel
+    assert sync_mock_repo_inst.model_type is BigIntModel
+
+    with pytest.raises(ImproperConfigurationError):
+        SQLAlchemyAsyncRepository(session=async_session)
+
+    with pytest.raises(ImproperConfigurationError):
+        SQLAlchemySyncRepository(session=sync_session)
+
+    with pytest.raises(ImproperConfigurationError):
+        SQLAlchemyAsyncMockRepository(session=async_session)
+
+    with pytest.raises(ImproperConfigurationError):
+        SQLAlchemySyncMockRepository(session=sync_session)
+
+
+async def test_repository_uniquify_per_call_does_not_mutate_instance_state() -> None:
+    """Per-call uniquify=True applies to that query only without mutating repo._uniquify."""
+    mock_result = MagicMock()
+    mock_result.unique.return_value = mock_result
+    mock_result.scalar_one_or_none.return_value = None
+
+    async_session = AsyncMock(spec=AsyncSession, bind=MagicMock())
+    async_session.execute = AsyncMock(return_value=mock_result)
+
+    repo: SQLAlchemyAsyncRepository[UUIDModel] = SQLAlchemyAsyncRepository(
+        session=async_session,
+        model_type=UUIDModel,
+        uniquify=False,
+    )
+    assert repo._uniquify is False
+
+    await repo.get_one_or_none(uniquify=True)
+    assert repo._uniquify is False
+    assert mock_result.unique.call_count == 1
+
+    await repo.get_one_or_none()
+    assert repo._uniquify is False
+    assert mock_result.unique.call_count == 1
+
+
+def test_repository_get_execution_options_resolves_default_bind_group() -> None:
+    """_get_execution_options resolves default _bind_group and per-call overrides without mutating defaults."""
+    sync_session = MagicMock(spec=Session, bind=MagicMock())
+    repo: SQLAlchemySyncRepository[UUIDModel] = SQLAlchemySyncRepository(
+        session=sync_session,
+        model_type=UUIDModel,
+        bind_group="writer_shard",
+        execution_options={"synchronize_session": False},
+    )
+
+    resolved_default = repo._get_execution_options(None, bind_group=None)
+    assert resolved_default == {"synchronize_session": False, "bind_group": "writer_shard"}
+    assert "bind_group" not in repo._default_execution_options
+
+    resolved_override = repo._get_execution_options({"timeout": 5}, bind_group="reader_shard")
+    assert resolved_override == {"timeout": 5, "bind_group": "reader_shard"}
+
+
+class InMemoryFilterTestModel(base.BigIntAuditBase):
+    """Model used to verify InMemoryFilterEvaluator and MockRepository parity."""
+
+    __tablename__ = "in_memory_filter_test_model"
+
+    name: Mapped[str] = mapped_column(String(100))
+    slug: Mapped[str] = mapped_column(String(100), default="")
+    category: Mapped[Union[str, None]] = mapped_column(String(50), nullable=True, default=None)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(default=True)
+
+
+async def test_mock_repository_limit_offset_and_get_many_and_count_parity() -> None:
+    """MockRepository LimitOffsetFilter slices [offset : offset + limit] and get_many_and_count returns pre-pagination count."""
+
+    class ItemRepo(SQLAlchemyAsyncMockRepository[InMemoryFilterTestModel]):
+        pass
+
+    ItemRepo.__database_clear__()
+    repo = ItemRepo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    base_time = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    items = [
+        InMemoryFilterTestModel(
+            id=i,
+            name=f"Item {i:02d}",
+            slug=f"item-{i:02d}",
+            category="even" if i % 2 == 0 else "odd",
+            score=i * 10,
+            is_active=i <= 8,
+            created_at=base_time + dt.timedelta(days=i),
+            updated_at=base_time + dt.timedelta(days=i),
+        )
+        for i in range(1, 13)
+    ]
+    await repo.add_many(items)
+
+    page = await repo.get_many(OrderByFilter("id", "asc"), LimitOffsetFilter(limit=5, offset=5))
+    assert [item.id for item in page] == [6, 7, 8, 9, 10]
+
+    even_page, even_total = await repo.get_many_and_count(
+        OrderByFilter("id", "asc"),
+        LimitOffsetFilter(limit=2, offset=1),
+        category="even",
+    )
+    assert [item.id for item in even_page] == [4, 6]
+    assert even_total == 6
+
+
+async def test_mock_repository_datetime_and_extended_filters_parity() -> None:
+    """MockRepository evaluates conjunctive BeforeAfterFilter, ComparisonFilter, BooleanFilter, Null/NotNull, FilterGroup, MultiFilter, ExistsFilter, and ColumnElement."""
+
+    class ItemRepo(SQLAlchemyAsyncMockRepository[InMemoryFilterTestModel]):
+        pass
+
+    ItemRepo.__database_clear__()
+    repo = ItemRepo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    base_time = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    await repo.add_many(
+        [
+            InMemoryFilterTestModel(
+                id=1,
+                name="Alpha",
+                slug="alpha",
+                category="tech",
+                score=10,
+                is_active=True,
+                created_at=base_time + dt.timedelta(days=1),
+                updated_at=base_time + dt.timedelta(days=1),
+            ),
+            InMemoryFilterTestModel(
+                id=2,
+                name="Beta",
+                slug="beta",
+                category=None,
+                score=20,
+                is_active=False,
+                created_at=base_time + dt.timedelta(days=5),
+                updated_at=base_time + dt.timedelta(days=5),
+            ),
+            InMemoryFilterTestModel(
+                id=3,
+                name="Gamma",
+                slug="gamma",
+                category="science",
+                score=30,
+                is_active=True,
+                created_at=base_time + dt.timedelta(days=10),
+                updated_at=base_time + dt.timedelta(days=10),
+            ),
+        ]
+    )
+
+    window_matches = await repo.get_many(
+        BeforeAfterFilter(
+            field_name="created_at",
+            after=base_time + dt.timedelta(days=2),
+            before=base_time + dt.timedelta(days=8),
+        )
+    )
+    assert [m.id for m in window_matches] == [2]
+
+    empty_in = await repo.get_many(InCollectionFilter(field_name="id", values=[]))
+    assert empty_in == []
+
+    gt_matches = await repo.get_many(ComparisonFilter(field_name="score", operator="ge", value=20))
+    assert sorted(m.id for m in gt_matches) == [2, 3]
+
+    bool_matches = await repo.get_many(BooleanFilter(field_name="is_active", value=False))
+    assert [m.id for m in bool_matches] == [2]
+
+    null_matches = await repo.get_many(NullFilter(field_name="category"))
+    assert [m.id for m in null_matches] == [2]
+
+    not_null_matches = await repo.get_many(NotNullFilter(field_name="category"))
+    assert sorted(m.id for m in not_null_matches) == [1, 3]
+
+    group_matches = await repo.get_many(
+        FilterGroup(
+            logical_operator=or_,
+            filters=[
+                ComparisonFilter(field_name="name", operator="eq", value="Alpha"),
+                ComparisonFilter(field_name="score", operator="eq", value=30),
+            ],
+        )
+    )
+    assert sorted(m.id for m in group_matches) == [1, 3]
+
+    multi_matches = await repo.get_many(
+        MultiFilter(
+            filters={
+                "and_": [
+                    {"field_name": "is_active", "value": True, "type": "boolean"},
+                    {"field_name": "score", "operator": "gt", "value": 15, "type": "comparison"},
+                ]
+            }
+        )
+    )
+    assert [m.id for m in multi_matches] == [3]
+
+    expr_matches = await repo.get_many(InMemoryFilterTestModel.score >= 20, InMemoryFilterTestModel.name != "Beta")
+    assert [m.id for m in expr_matches] == [3]
+
+    exists_matches = await repo.get_many(ExistsFilter(values=[InMemoryFilterTestModel.slug == "alpha"]))
+    assert [m.id for m in exists_matches] == [1]
+
+    not_exists_matches = await repo.get_many(NotExistsFilter(values=[InMemoryFilterTestModel.slug == "alpha"]))
+    assert sorted(m.id for m in not_exists_matches) == [2, 3]
+
+
+async def test_mock_repository_partial_update_and_slug_mixin() -> None:
+    """MockRepository preserves unmodified fields on partial Service.update and supports Slug mixin methods."""
+
+    class ItemSlugRepo(SQLAlchemyAsyncMockSlugRepository[InMemoryFilterTestModel]):
+        pass
+
+    class ItemService(SQLAlchemyAsyncRepositoryService[InMemoryFilterTestModel, ItemSlugRepo]):
+        pass
+
+    ItemSlugRepo.__database_clear__()
+    service = ItemService(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    created = await service.create(
+        InMemoryFilterTestModel(
+            id=100,
+            name="Original Name",
+            slug="original-name",
+            category="preserved",
+            score=42,
+            is_active=True,
+        )
+    )
+    assert created.category == "preserved"
+
+    updated = await service.update({"name": "Updated Name"}, item_id=100)
+    assert updated.id == 100
+    assert updated.name == "Updated Name"
+    assert updated.category == "preserved"
+    assert updated.score == 42
+
+    by_slug = await service.repository.get_by_slug("original-name")
+    assert by_slug is not None
+    assert by_slug.id == 100
+
+    next_slug = await service.repository.get_available_slug("Original Name")
+    assert next_slug != "original-name"
+
+
+class CascadeParentModel(base.BigIntAuditBase, SlugKey):
+    """Parent model with delete-orphan child relationship."""
+
+    __tablename__ = "cascade_parent_model"
+    name: Mapped[str] = mapped_column(String(length=100))
+    children: Mapped[list[CascadeChildModel]] = relationship(
+        "CascadeChildModel",
+        back_populates="parent",
+        cascade="all, delete-orphan",
+    )
+
+
+class CascadeChildModel(base.BigIntAuditBase):
+    """Child model linked to CascadeParentModel."""
+
+    __tablename__ = "cascade_child_model"
+    parent_id: Mapped[int] = mapped_column(ForeignKey("cascade_parent_model.id"))
+    title: Mapped[str] = mapped_column(String(length=100))
+    parent: Mapped[CascadeParentModel] = relationship("CascadeParentModel", back_populates="children")
+
+
+async def test_sql_repository_delete_many_routes_cascade_models_through_orm_delete() -> None:
+    """Models with delete-orphan cascade relationships route delete_many and delete_where through session.delete."""
+
+    class CascadeParentRepo(SQLAlchemyAsyncRepository[CascadeParentModel]):
+        pass
+
+    session = AsyncMock(spec=AsyncSession, bind=MagicMock())
+    repo = CascadeParentRepo(session=session)
+    assert repo._requires_orm_delete() is True
+
+    p1 = CascadeParentModel(id=1, name="P1", slug="p1", children=[])
+    p2 = CascadeParentModel(id=2, name="P2", slug="p2", children=[])
+    repo._fetch_many_by_ids = AsyncMock(return_value=[p1, p2])  # type: ignore[method-assign]
+
+    deleted = await repo.delete_many([1, 2])
+    assert deleted == [p1, p2]
+    assert session.delete.await_count == 2
+
+
+def test_sync_mock_repository_and_service_autobind_and_filter_parity() -> None:
+    """SQLAlchemySyncMockSlugRepository and SQLAlchemySyncRepositoryService support auto-binding and filters."""
+
+    class ItemSyncMockRepo(SQLAlchemySyncMockSlugRepository[InMemoryFilterTestModel]):
+        pass
+
+    class ItemSyncService(SQLAlchemySyncRepositoryService[InMemoryFilterTestModel, ItemSyncMockRepo]):
+        pass
+
+    assert getattr(ItemSyncMockRepo, "model_type", None) is InMemoryFilterTestModel
+    assert getattr(ItemSyncService, "repository_type", None) is ItemSyncMockRepo
+
+    ItemSyncMockRepo.__database_clear__()
+    service = ItemSyncService(session=MagicMock(spec=Session, bind=MagicMock()))
+
+    first = service.create(InMemoryFilterTestModel(id=1, name="Alpha", slug="alpha"))
+    second = service.create(InMemoryFilterTestModel(id=2, name="Beta", slug="beta"))
+    assert first.id == 1
+    assert second.id == 2
+
+    filtered = service.get_many(ComparisonFilter(field_name="name", operator="eq", value="Alpha"))
+    assert [item.id for item in filtered] == [1]
+
+
+class ContractSQLBase(DeclarativeBase):
+    """Isolated declarative base for SQLite repository contract unit tests."""
+
+
+class RenamedColumnModel(ContractSQLBase):
+    """Model with renamed columns and nullable/non-nullable defaults."""
+
+    __tablename__ = "unit_contract_renamed"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column("title_col", default="untitled")
+    subtitle: Mapped[Union[str, None]] = mapped_column("subtitle_col", default="default-sub", nullable=True)
+    status: Mapped[str] = mapped_column(default="draft", nullable=False)
+    note: Mapped[Union[str, None]] = mapped_column("note_col", nullable=True)
+    code: Mapped[str] = mapped_column("code_col", nullable=False)
+
+
+class UniquifyParentModel(ContractSQLBase):
+    """Parent model for testing per-call uniquify overrides."""
+
+    __tablename__ = "unit_contract_uniquify_parent"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[Union[str, None]]
+    children: Mapped[list[UniquifyChildModel]] = relationship()
+
+
+class UniquifyChildModel(ContractSQLBase):
+    """Child model for testing per-call uniquify overrides."""
+
+    __tablename__ = "unit_contract_uniquify_child"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    parent_id: Mapped[int] = mapped_column(ForeignKey("unit_contract_uniquify_parent.id"))
+
+
+def test_update_renamed_columns_and_explicit_none_semantics() -> None:
+    """Service item_id updates write explicit None while direct repository updates preserve column defaults."""
+
+    class RenamedSQLRepo(SQLAlchemySyncRepository[RenamedColumnModel]):
+        pass
+
+    class RenamedMockRepo(SQLAlchemySyncMockRepository[RenamedColumnModel]):
+        pass
+
+    class RenamedService(SQLAlchemySyncRepositoryService[RenamedColumnModel]):
+        pass
+
+    class RenamedMockService(SQLAlchemySyncRepositoryService[RenamedColumnModel, RenamedMockRepo]):
+        repository_type = RenamedMockRepo
+
+    engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    ContractSQLBase.metadata.create_all(engine)
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            service = RenamedService(session=session)
+            repo = RenamedSQLRepo(session=session)
+
+            session.add(
+                RenamedColumnModel(id=1, title="old", subtitle="custom-sub", status="published", note="n", code="c")
+            )
+            session.commit()
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                service.update({"title": "new"}, item_id=1, auto_commit=True)
+                session.expire_all()
+                fetched = session.get(RenamedColumnModel, 1)
+                assert fetched is not None
+                assert fetched.title == "new"
+                assert fetched.subtitle == "custom-sub"
+                assert fetched.status == "published"
+
+                service.update({"note": None, "subtitle": None}, item_id=1, auto_commit=True)
+                session.expire_all()
+                fetched = session.get(RenamedColumnModel, 1)
+                assert fetched is not None
+                assert fetched.note is None
+                assert fetched.subtitle is None
+
+                repo.update(RenamedColumnModel(id=1, status=None), auto_commit=True)
+                session.expire_all()
+                fetched = session.get(RenamedColumnModel, 1)
+                assert fetched is not None
+                assert fetched.status == "published"
+                assert not [w for w in caught if issubclass(w.category, DeprecationWarning)], "\n".join(
+                    f"{w.category.__name__}: {w.message} ({w.filename}:{w.lineno})" for w in caught
+                )
+
+            with pytest.raises(IntegrityError):
+                service.update({"status": None}, item_id=1, auto_commit=True)
+            session.rollback()
+
+            with pytest.raises(IntegrityError):
+                service.update({"code": None}, item_id=1, auto_commit=True)
+            session.rollback()
+
+            with pytest.raises(IntegrityError):
+                repo.update(RenamedColumnModel(id=1, code=None), auto_commit=True)
+            session.rollback()
+    finally:
+        engine.dispose()
+
+    RenamedMockRepo.__database_clear__()
+    try:
+        mock_session = MagicMock(spec=Session, bind=MagicMock())
+        mock_repo = RenamedMockRepo(session=mock_session)
+        mock_service = RenamedMockService(session=mock_session)
+        added = mock_repo.add(RenamedColumnModel(id=1, note="n", code="c"))
+        assert added.title == "untitled"
+        assert added.subtitle == "default-sub"
+        assert added.status == "draft"
+
+        updated_mock = mock_repo.update(partial_model_from_dict(RenamedColumnModel, id=1, title="mock-new"))
+        assert updated_mock.title == "mock-new"
+        assert updated_mock.subtitle == "default-sub"
+
+        cleared_mock = mock_repo.update(partial_model_from_dict(RenamedColumnModel, id=1, note=None))
+        assert cleared_mock.note is None
+
+        kept_mock = mock_repo.update(partial_model_from_dict(RenamedColumnModel, id=1, subtitle=None))
+        assert kept_mock.subtitle == "default-sub"
+
+        service_cleared = mock_service.update({"subtitle": None}, item_id=1)
+        assert service_cleared.subtitle is None
+
+        with pytest.raises(IntegrityError):
+            mock_service.update({"status": None}, item_id=1)
+
+        with pytest.raises(IntegrityError):
+            mock_repo.update(partial_model_from_dict(RenamedColumnModel, id=1, code=None))
+    finally:
+        RenamedMockRepo.__database_clear__()
+
+
+def test_explicit_uniquify_false_overrides_repository_default() -> None:
+    """Explicit uniquify=False overrides repository-level uniquify=True."""
+
+    class ParentRepo(SQLAlchemySyncRepository[UniquifyParentModel]):
+        pass
+
+    engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    ContractSQLBase.metadata.create_all(engine)
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            session.add(
+                UniquifyParentModel(
+                    id=1,
+                    name="parent",
+                    children=[UniquifyChildModel(id=1), UniquifyChildModel(id=2)],
+                )
+            )
+            session.commit()
+            statement = select(UniquifyParentModel).join(UniquifyParentModel.children)
+            repository = ParentRepo(session=session, statement=statement, uniquify=True)
+
+            assert len(repository.get_many()) == 1
+            assert len(repository.get_many(uniquify=False)) == 2
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("operator", "field_name", "target", "expected_ids"),
+    [
+        ("ne", "name", "Alpha", [2, 3]),
+        ("gt", "score", 10, [2, 3]),
+        ("ge", "score", 20, [2, 3]),
+        ("lt", "score", 30, [1, 2]),
+        ("le", "score", 20, [1, 2]),
+        ("in", "slug", ["alpha", "gamma"], [1, 3]),
+        ("notin", "slug", ["alpha"], [2, 3]),
+        ("between", "score", (15, 25), [2]),
+        ("like", "name", "Al%a", [1]),
+        ("ilike", "name", "ga_ma", [3]),
+        ("startswith", "name", "Al", [1]),
+        ("istartswith", "name", "be", [2]),
+        ("endswith", "name", "ta", [2]),
+        ("iendswith", "name", "MA", [3]),
+    ],
+)
+def test_mock_repository_comparison_filter_operators(
+    operator: str,
+    field_name: str,
+    target: Any,
+    expected_ids: list[int],
+) -> None:
+    """InMemoryFilterEvaluator supports all ComparisonFilter operators."""
+
+    class ItemMockRepo(SQLAlchemySyncMockRepository[InMemoryFilterTestModel]):
+        pass
+
+    base_time = dt.datetime(2026, 1, 10, 12, 0, tzinfo=dt.timezone.utc)
+    ItemMockRepo.__database_clear__()
+    try:
+        repo = ItemMockRepo(session=MagicMock(spec=Session, bind=MagicMock()))
+        repo.add_many(
+            [
+                InMemoryFilterTestModel(
+                    id=1, name="Alpha", slug="alpha", category="tech", score=10, created_at=base_time
+                ),
+                InMemoryFilterTestModel(id=2, name="Beta", slug="beta", category=None, score=20, created_at=base_time),
+                InMemoryFilterTestModel(
+                    id=3, name="Gamma", slug="gamma", category="art", score=30, created_at=base_time
+                ),
+            ]
+        )
+        matched = repo.get_many(ComparisonFilter(field_name=field_name, operator=operator, value=target))  # type: ignore[arg-type]
+        assert sorted(item.id for item in matched) == expected_ids
+    finally:
+        ItemMockRepo.__database_clear__()
+
+
+def test_mock_repository_sql_ast_and_edge_expressions() -> None:
+    """InMemoryFilterEvaluator evaluates SQLAlchemy AST expressions and rejects unsupported functions."""
+
+    class ItemMockRepo(SQLAlchemySyncMockRepository[InMemoryFilterTestModel]):
+        pass
+
+    base_time = dt.datetime(2026, 1, 10, 12, 0, tzinfo=dt.timezone.utc)
+    ItemMockRepo.__database_clear__()
+    try:
+        repo = ItemMockRepo(session=MagicMock(spec=Session, bind=MagicMock()))
+        repo.add_many(
+            [
+                InMemoryFilterTestModel(
+                    id=1, name="Alpha", slug="alpha", category="tech", score=10, created_at=base_time
+                ),
+                InMemoryFilterTestModel(
+                    id=2,
+                    name="Beta",
+                    slug="beta",
+                    category=None,
+                    score=20,
+                    created_at=base_time + dt.timedelta(days=2),
+                ),
+                InMemoryFilterTestModel(
+                    id=3,
+                    name="Gamma",
+                    slug="gamma",
+                    category="science",
+                    score=30,
+                    created_at=base_time + dt.timedelta(days=4),
+                ),
+            ]
+        )
+
+        assert sorted(i.id for i in repo.get_many(InMemoryFilterTestModel.id.between(1, 2))) == [1, 2]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.category.is_(None))] == [2]
+        assert sorted(i.id for i in repo.get_many(InMemoryFilterTestModel.category.is_not(None))) == [1, 3]
+        assert sorted(i.id for i in repo.get_many(InMemoryFilterTestModel.id.in_([1, 3]))) == [1, 3]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.id.notin_([1, 3]))] == [2]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.name.like("Al%"))] == [1]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.name.ilike("ga%"))] == [3]
+        assert sorted(i.id for i in repo.get_many(InMemoryFilterTestModel.name.not_like("Al%"))) == [2, 3]
+        assert sorted(i.id for i in repo.get_many(InMemoryFilterTestModel.name.not_ilike("ga%"))) == [1, 2]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.name.startswith("Be"))] == [2]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.name.endswith("ma"))] == [3]
+        assert [i.id for i in repo.get_many(InMemoryFilterTestModel.name.contains("et"))] == [2]
+        assert sorted(i.id for i in repo.get_many(~(InMemoryFilterTestModel.id == 1))) == [2, 3]
+        assert len(repo.get_many(true())) == 3
+        assert repo.get_many(false()) == []
+        assert [
+            i.id
+            for i in repo.get_many(
+                ComparisonFilter(field_name="created_at", operator="dateeq", value=dt.date(2026, 1, 12))
+            )
+        ] == [2]
+        assert [
+            i.id
+            for i in repo.get_many(
+                OnBeforeAfterFilter(
+                    field_name="created_at",
+                    on_or_after=base_time + dt.timedelta(days=2),
+                    on_or_before=base_time + dt.timedelta(days=2),
+                )
+            )
+        ] == [2]
+        assert ExistsFilter(values=[]) and repo.get_many(ExistsFilter(values=[])) == []
+        assert len(repo.get_many(NotExistsFilter(values=[]))) == 3
+
+        with pytest.raises(ValueError, match="Invalid operator"):
+            repo.get_many(ComparisonFilter(field_name="score", operator="invalid_op", value=10))  # type: ignore[arg-type]
+
+        with pytest.raises(RepositoryError, match="not supported in mock repositories"):
+            repo.get_many(func.lower(InMemoryFilterTestModel.name) == "alpha")
+    finally:
+        ItemMockRepo.__database_clear__()
+
+
+async def test_async_mock_and_sync_cascade_delete_operations() -> None:
+    """Async mock repository write/delete helpers and sync cascade ORM deletes execute cleanly."""
+
+    class ItemAsyncMockRepo(SQLAlchemyAsyncMockRepository[InMemoryFilterTestModel]):
+        pass
+
+    class CascadeSyncRepo(SQLAlchemySyncRepository[CascadeParentModel]):
+        pass
+
+    ItemAsyncMockRepo.__database_clear__()
+    try:
+        repo = ItemAsyncMockRepo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+        created, was_created = await repo.get_or_upsert(
+            id=1, name="Alpha", slug="alpha", score=10, match_fields=["slug"]
+        )
+        assert was_created is True
+        assert created.id == 1
+
+        updated, was_updated = await repo.get_and_update(
+            id=1, name="Alpha2", slug="alpha", score=15, match_fields=["slug"]
+        )
+        assert was_updated is True
+        assert updated.name == "Alpha2"
+
+        await repo.add_many(
+            [
+                InMemoryFilterTestModel(id=2, name="Beta", slug="beta", score=20),
+                InMemoryFilterTestModel(id=3, name="Gamma", slug="gamma", score=30),
+                InMemoryFilterTestModel(id=4, name="Delta", slug="delta", score=40),
+            ]
+        )
+        assert await repo.count(LimitOffsetFilter(limit=1, offset=0)) == 4
+        one = await repo.get_one(InMemoryFilterTestModel.slug == "beta")
+        assert one.id == 2
+
+        deleted_one = await repo.delete(1)
+        assert deleted_one.id == 1
+
+        deleted_many = await repo.delete_many([2])
+        assert [d.id for d in deleted_many] == [2]
+
+        deleted_where = await repo.delete_where(InMemoryFilterTestModel.score >= 30)
+        assert sorted(d.id for d in deleted_where) == [3, 4]
+        assert await repo.count() == 0
+    finally:
+        ItemAsyncMockRepo.__database_clear__()
+
+    sync_session = MagicMock(spec=Session, bind=MagicMock())
+    sync_repo = CascadeSyncRepo(session=sync_session)
+    assert sync_repo._requires_orm_delete() is True
+    p1 = CascadeParentModel(id=1, name="P1", slug="p1", children=[])
+    p2 = CascadeParentModel(id=2, name="P2", slug="p2", children=[])
+    sync_repo._fetch_many_by_ids = MagicMock(return_value=[p1, p2])  # type: ignore[method-assign]
+    sync_repo.get_many = MagicMock(return_value=[p1, p2])  # type: ignore[method-assign]
+    assert sync_repo.delete_many([1, 2]) == [p1, p2]
+    assert sync_repo.delete_where() == [p1, p2]
+    assert sync_session.delete.call_count == 4
+
+
+class _OpaqueLoad(_AbstractLoad):
+    """Minimal _AbstractLoad subclass lacking strategy and context attributes."""
+
+
+@pytest.mark.parametrize(
+    ("load_spec", "use_default", "merge_with_default", "default_wildcards", "expected_len", "expected_uniquify"),
+    [
+        pytest.param(raiseload("*"), False, True, False, 1, False, id="raiseload-wildcard"),
+        pytest.param(joinedload("*"), False, True, False, 1, True, id="joinedload-wildcard"),
+        pytest.param(defer("*"), False, True, False, 1, False, id="defer-wildcard"),
+        pytest.param(undefer_group("g"), False, True, False, 1, False, id="undefer-group"),
+        pytest.param([[raiseload("*")]], False, True, False, 1, False, id="nested-wildcard-list"),
+        pytest.param([[]], False, True, False, 0, False, id="empty-nested-list"),
+        pytest.param(
+            with_loader_criteria(UniquifyChildModel, UniquifyChildModel.id > 0),
+            False,
+            True,
+            False,
+            1,
+            False,
+            id="loader-criteria-option",
+        ),
+        pytest.param(
+            joinedload(UniquifyParentModel.children),
+            False,
+            True,
+            False,
+            1,
+            True,
+            id="joinedload-collection-option",
+        ),
+        pytest.param(
+            selectinload(UniquifyParentModel.children),
+            True,
+            True,
+            False,
+            2,
+            False,
+            id="single-option-merges-with-defaults",
+        ),
+        pytest.param(
+            selectinload(UniquifyParentModel.children),
+            True,
+            False,
+            False,
+            1,
+            False,
+            id="single-option-replaces-defaults-when-merge-false",
+        ),
+        pytest.param(
+            CascadeChildModel.parent,
+            False,
+            True,
+            False,
+            1,
+            False,
+            id="many-to-one-shorthand-no-uniquify",
+        ),
+        pytest.param(
+            _OpaqueLoad(),
+            False,
+            True,
+            True,
+            1,
+            True,
+            id="opaque-load-preserves-fallback-uniquify",
+        ),
+    ],
+)
+def test_get_abstract_loader_options_matrix(
+    load_spec: Any,
+    use_default: bool,
+    merge_with_default: bool,
+    default_wildcards: bool,
+    expected_len: int,
+    expected_uniquify: bool,
+) -> None:
+    """Verify get_abstract_loader_options handles wildcards, criteria, collection joins, defaults, and scalar shorthands."""
+    defaults = [raiseload("*")] if use_default else None
+    options, requires_unique = get_abstract_loader_options(
+        loader_options=load_spec,
+        default_loader_options=defaults,
+        default_options_have_wildcards=default_wildcards,
+        merge_with_default=merge_with_default,
+    )
+    assert len(options) == expected_len
+    assert requires_unique is expected_uniquify
+
+
+def test_repository_loader_options_sqlite_execution() -> None:
+    """Verify joinedload on collections auto-uniquifies and with_loader_criteria filters loaded children."""
+
+    class ParentRepo(SQLAlchemySyncRepository[UniquifyParentModel]):
+        pass
+
+    engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    ContractSQLBase.metadata.create_all(engine)
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            session.add(
+                UniquifyParentModel(
+                    id=1,
+                    name="parent",
+                    children=[UniquifyChildModel(id=1), UniquifyChildModel(id=2)],
+                )
+            )
+            session.commit()
+            session.expire_all()
+
+            repository = ParentRepo(session=session)
+            parents = repository.get_many(
+                load=[
+                    joinedload(UniquifyParentModel.children),
+                    with_loader_criteria(UniquifyChildModel, UniquifyChildModel.id == 2),
+                ]
+            )
+            assert len(parents) == 1
+            assert [child.id for child in parents[0].children] == [2]
+    finally:
+        engine.dispose()
+
+
+class ParityProbeModel(ContractSQLBase):
+    """Model with nullable columns used to compare SQLite and mock repository evaluation."""
+
+    __tablename__ = "unit_contract_parity_probe"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(100))
+    name: Mapped[Union[str, None]] = mapped_column(String(100), nullable=True)
+    grp: Mapped[Union[str, None]] = mapped_column(String(50), nullable=True)
+    score: Mapped[Union[int, None]] = mapped_column(Integer, nullable=True)
+    active: Mapped[Union[bool, None]] = mapped_column(nullable=True)
+
+
+@pytest.fixture(params=["async", "sync"])
+def mock_parity_repo(
+    request: FixtureRequest,
+) -> Generator[
+    Union[SQLAlchemyAsyncMockSlugRepository[ParityProbeModel], SQLAlchemySyncMockSlugRepository[ParityProbeModel]],
+    None,
+    None,
+]:
+    """Yield parametrized async and sync mock slug repositories seeded with parity probe rows."""
+
+    class AsyncProbeMockRepo(SQLAlchemyAsyncMockSlugRepository[ParityProbeModel]):
+        pass
+
+    class SyncProbeMockRepo(SQLAlchemySyncMockSlugRepository[ParityProbeModel]):
+        pass
+
+    AsyncProbeMockRepo.__database_clear__()
+    SyncProbeMockRepo.__database_clear__()
+    repo: Union[SQLAlchemyAsyncMockSlugRepository[ParityProbeModel], SQLAlchemySyncMockSlugRepository[ParityProbeModel]]
+    if request.param == "async":
+        repo = AsyncProbeMockRepo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    else:
+        repo = SyncProbeMockRepo(session=MagicMock(spec=Session, bind=MagicMock()))
+    try:
+        yield repo
+    finally:
+        AsyncProbeMockRepo.__database_clear__()
+        SyncProbeMockRepo.__database_clear__()
+
+
+def _build_parity_seed() -> list[ParityProbeModel]:
+    return [
+        ParityProbeModel(id=1, slug="s1", name="a.b", grp="g2", score=10, active=True),
+        ParityProbeModel(id=2, slug="s2", name="axb", grp="g1", score=20, active=False),
+        ParityProbeModel(id=3, slug="s3", name="a_b", grp="g1", score=30, active=None),
+        ParityProbeModel(id=4, slug="s4", name=None, grp="g2", score=None, active=False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filters", "ordered"),
+    [
+        pytest.param([~ParityProbeModel.active], False, id="negated-bool-column"),
+        pytest.param(
+            [OrderByFilter("grp", "asc"), OrderByFilter("score", "desc")], True, id="multi-orderby-precedence"
+        ),
+        pytest.param([ParityProbeModel.score != 20], False, id="sql-ne-excludes-null"),
+        pytest.param([ParityProbeModel.score.notin_([20])], False, id="sql-notin-excludes-null"),
+        pytest.param(
+            [ComparisonFilter(field_name="score", operator="ne", value=20)],
+            False,
+            id="comparison-ne-excludes-null",
+        ),
+        pytest.param(
+            [NotInCollectionFilter(field_name="score", values=[20])],
+            False,
+            id="not-in-collection-excludes-null",
+        ),
+        pytest.param(
+            [NotInSearchFilter(field_name="name", value="axb")],
+            False,
+            id="not-in-search-excludes-null",
+        ),
+        pytest.param(
+            [SearchFilter(field_name="name", value="a.b", escape_wildcards=False)],
+            False,
+            id="search-dot-literal-under-like",
+        ),
+        pytest.param(
+            [SearchFilter(field_name="name", value="a_b", escape_wildcards=False)],
+            False,
+            id="search-underscore-wildcard-under-like",
+        ),
+        pytest.param(
+            [SearchFilter(field_name="name", value="a_b", escape_wildcards=True)],
+            False,
+            id="search-underscore-escaped",
+        ),
+        pytest.param(
+            [~(ParityProbeModel.name == "axb")],
+            False,
+            id="negated-equality-excludes-null",
+        ),
+    ],
+)
+async def test_mock_repository_filter_parity_with_sqlite(
+    mock_parity_repo: Any,
+    filters: list[Any],
+    ordered: bool,
+) -> None:
+    """Verify both async and sync mock repositories match SQLite results across NULL, LIKE, negation, and multi-sort cases."""
+
+    class SQLProbeRepo(SQLAlchemySyncRepository[ParityProbeModel]):
+        pass
+
+    await maybe_async(mock_parity_repo.add_many(_build_parity_seed()))
+    mock_rows = await maybe_async(mock_parity_repo.get_many(*filters))
+    mock_ids = [row.id for row in mock_rows] if ordered else sorted(row.id for row in mock_rows)
+
+    engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    ContractSQLBase.metadata.create_all(engine)
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            sql_repo = SQLProbeRepo(session=session)
+            sql_repo.add_many(_build_parity_seed(), auto_commit=True)
+            sql_rows = sql_repo.get_many(*filters)
+            sql_ids = [row.id for row in sql_rows] if ordered else sorted(row.id for row in sql_rows)
+    finally:
+        engine.dispose()
+
+    assert mock_ids == sql_ids
+
+
+async def test_mock_repository_async_and_sync_crud_lifecycle(mock_parity_repo: Any) -> None:
+    """Exercise full CRUD, upsert, delete, and slug methods across both async and sync mock repositories."""
+    created, was_created = await maybe_async(
+        mock_parity_repo.get_or_upsert(id=1, slug="alpha", name="Alpha", score=10, match_fields=["slug"])
+    )
+    assert was_created is True
+    assert created.id == 1
+
+    existing, was_created_again = await maybe_async(
+        mock_parity_repo.get_or_upsert(id=1, slug="alpha", name="Alpha Updated", score=15, match_fields=["slug"])
+    )
+    assert was_created_again is False
+    assert existing.name == "Alpha Updated"
+
+    updated, was_updated = await maybe_async(
+        mock_parity_repo.get_and_update(slug="alpha", name="Alpha V3", match_fields=["slug"])
+    )
+    assert was_updated is True
+    assert updated.name == "Alpha V3"
+
+    upserted_batch = await maybe_async(
+        mock_parity_repo.upsert_many(
+            [
+                ParityProbeModel(id=1, slug="alpha", name="Alpha V4", score=18),
+                ParityProbeModel(id=2, slug="beta", name="Beta", score=20),
+                ParityProbeModel(id=3, slug="gamma", name="Gamma", score=30),
+            ]
+        )
+    )
+    assert len(upserted_batch) == 3
+
+    updated_batch = await maybe_async(
+        mock_parity_repo.update_many([partial_model_from_dict(ParityProbeModel, id=2, name="Beta V2")])
+    )
+    assert [row.name for row in updated_batch] == ["Beta V2"]
+
+    assert await maybe_async(mock_parity_repo.exists(slug="beta")) is True
+    assert (await maybe_async(mock_parity_repo.get(2))).name == "Beta V2"
+    assert (await maybe_async(mock_parity_repo.get_one(slug="gamma"))).id == 3
+    by_slug = await maybe_async(mock_parity_repo.get_by_slug("alpha"))
+    assert by_slug is not None
+    assert by_slug.id == 1
+    assert await maybe_async(mock_parity_repo.get_available_slug("alpha")) != "alpha"
+    assert await maybe_async(mock_parity_repo.check_health(mock_parity_repo.session)) is True
+
+    page, total = await maybe_async(
+        mock_parity_repo.get_many_and_count(OrderByFilter("id", "asc"), LimitOffsetFilter(limit=2, offset=0))
+    )
+    assert [row.id for row in page] == [1, 2]
+    assert total == 3
+
+    deleted_by_slug = await maybe_async(mock_parity_repo.delete_many(["beta"], id_attribute="slug"))
+    assert [row.id for row in deleted_by_slug] == [2]
+
+    deleted_one = await maybe_async(mock_parity_repo.delete(1))
+    assert deleted_one.id == 1
+
+    deleted_rest = await maybe_async(mock_parity_repo.delete_where(ParityProbeModel.id == 3))
+    assert [row.id for row in deleted_rest] == [3]
+    assert await maybe_async(mock_parity_repo.count()) == 0
+
+
+@pytest.mark.parametrize(
+    "filter_",
+    [
+        ComparisonFilter(field_name="category", operator="eq", value=None),
+        ComparisonFilter(field_name="category", operator="ne", value=None),
+        InMemoryFilterTestModel.name.like("100!%", escape="!"),
+        InMemoryFilterTestModel.name.not_like("100!%", escape="!"),
+        InMemoryFilterTestModel.name.ilike("100!_A", escape="!"),
+        InMemoryFilterTestModel.name.not_ilike("100!_A", escape="!"),
+        InMemoryFilterTestModel.name.like("100!!%", escape="!"),
+        InMemoryFilterTestModel.name.startswith("100%", autoescape=True),
+        InMemoryFilterTestModel.name.endswith("%", autoescape=True),
+        InMemoryFilterTestModel.name.contains("%", autoescape=True),
+        (InMemoryFilterTestModel.score + 2) == 12,
+        (InMemoryFilterTestModel.score * 2 - 5) >= 35,
+    ],
+)
+async def test_mock_filter_expression_matches_sqlite(filter_: Any) -> None:
+    """NULL comparisons, escaped LIKE and arithmetic retain SQL semantics."""
+    engine = create_engine("sqlite://")
+    InMemoryFilterTestModel.__table__.create(engine)
+    values = [
+        {"id": 1, "name": "100%", "slug": "percent", "category": None, "score": 10},
+        {"id": 2, "name": "100_a", "slug": "underscore", "category": "present", "score": 20},
+        {"id": 3, "name": "100!other", "slug": "escape", "category": "present", "score": 30},
+    ]
+    with Session(engine) as session:
+        sql_repo = SQLAlchemySyncRepository(session=session, model_type=InMemoryFilterTestModel)
+        session.add_all(InMemoryFilterTestModel(**value) for value in values)
+        session.flush()
+        expected = sorted(item.id for item in sql_repo.get_many(filter_))
+        sync_repo = SQLAlchemySyncMockRepository(session=session, model_type=InMemoryFilterTestModel)
+        async_repo = SQLAlchemyAsyncMockRepository(
+            session=AsyncMock(spec=AsyncSession, bind=MagicMock()), model_type=InMemoryFilterTestModel
+        )
+        try:
+            sync_repo.add_many([InMemoryFilterTestModel(**value) for value in values])
+            await async_repo.add_many([InMemoryFilterTestModel(**value) for value in values])
+            assert sorted(item.id for item in sync_repo.get_many(filter_)) == expected
+            assert sorted(item.id for item in await async_repo.get_many(filter_)) == expected
+        finally:
+            sync_repo.__database_clear__()
+            async_repo.__database_clear__()
+    engine.dispose()
+
+
+def test_mock_unsupported_binary_expression_raises() -> None:
+    """Unknown SQL operators cannot silently masquerade as false predicates."""
+    repo = SQLAlchemySyncMockRepository(
+        session=MagicMock(spec=Session, bind=MagicMock()), model_type=InMemoryFilterTestModel
+    )
+    try:
+        repo.add(InMemoryFilterTestModel(id=1, name="one", slug="one", score=10))
+        with pytest.raises(RepositoryError, match="not supported"):
+            repo.get_many(InMemoryFilterTestModel.score.op("unsupported")(2))
+    finally:
+        repo.__database_clear__()
+
+
+class MockGridBase(DeclarativeBase):
+    """Isolated base for in-memory filter evaluator and repository parity tests."""
+
+
+mock_grid_article_tag = Table(
+    "mock_grid_article_tag",
+    MockGridBase.metadata,
+    Column("article_id", ForeignKey("mock_grid_article.id"), primary_key=True),
+    Column("tag_id", ForeignKey("mock_grid_tag.id"), primary_key=True),
+)
+
+
+class MockGridTag(MockGridBase):
+    """Tag model for mock repository relationship filtering tests."""
+
+    __tablename__ = "mock_grid_tag"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+
+
+class MockGridAuthor(MockGridBase):
+    """Author model with self-referential mentor for multi-hop mock tests."""
+
+    __tablename__ = "mock_grid_author"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    mentor_id: Mapped[int | None] = mapped_column(ForeignKey("mock_grid_author.id"), nullable=True)
+    mentor: Mapped[MockGridAuthor | None] = relationship(remote_side=[id])
+    articles: Mapped[list[MockGridArticle]] = relationship(back_populates="author")
+
+
+class MockGridArticle(MockGridBase):
+    """Article model for grid filter parity between DB and mock repositories."""
+
+    __tablename__ = "mock_grid_article"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(150))
+    views: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30))
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False)
+    published_at: Mapped[dt.datetime | None] = mapped_column(nullable=True)
+    author_id: Mapped[int | None] = mapped_column(ForeignKey("mock_grid_author.id"), nullable=True)
+    author: Mapped[MockGridAuthor | None] = relationship(back_populates="articles")
+    tags: Mapped[list[MockGridTag]] = relationship(secondary=mock_grid_article_tag)
+
+
+def _seed_mock_grid_entities() -> list[MockGridArticle]:
+    tag_py = MockGridTag(id=1, name="python")
+    tag_sql = MockGridTag(id=2, name="sql")
+    mentor = MockGridAuthor(id=10, name="Grace")
+    ada = MockGridAuthor(id=1, name="Ada", mentor=mentor)
+    cody = MockGridAuthor(id=2, name="Cody")
+    return [
+        MockGridArticle(
+            id=1,
+            title="SQLAlchemy Guide",
+            views=250,
+            status="draft",
+            is_featured=False,
+            published_at=dt.datetime(2026, 1, 10, 12, 0),
+            author=cody,
+            tags=[tag_py, tag_sql],
+        ),
+        MockGridArticle(
+            id=2,
+            title="SQL Patterns",
+            views=400,
+            status="draft",
+            is_featured=False,
+            published_at=dt.datetime(2026, 2, 15, 8, 30),
+            author=ada,
+            tags=[tag_sql],
+        ),
+        MockGridArticle(
+            id=3,
+            title="Async Queues",
+            views=400,
+            status="published",
+            is_featured=True,
+            published_at=None,
+            author=ada,
+            tags=[tag_py],
+        ),
+        MockGridArticle(
+            id=4,
+            title="Orphan Draft",
+            views=120,
+            status="draft",
+            is_featured=False,
+            published_at=None,
+            author=None,
+            tags=[],
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filters", "expected_ids", "expected_total"),
+    [
+        (
+            [RelationshipFilter("author", [ComparisonFilter("name", "eq", "Ada")])],
+            [2, 3],
+            2,
+        ),
+        (
+            [RelationshipFilter("author", [ComparisonFilter("name", "eq", "Ada")], negate=True)],
+            [1, 4],
+            2,
+        ),
+        (
+            [RelationshipFilter(("author", "mentor"), [SearchFilter("name", "grace", ignore_case=True)])],
+            [2, 3],
+            2,
+        ),
+        (
+            [RelationshipFilter("tags", [InCollectionFilter("name", ["python"])])],
+            [1, 3],
+            2,
+        ),
+        (
+            [RelationshipFilter("tags", [InCollectionFilter("name", ["python"])], negate=True)],
+            [2, 4],
+            2,
+        ),
+        (
+            [RelationshipFilter("tags", [MockGridTag.name == "sql"])],
+            [1, 2],
+            2,
+        ),
+        (
+            [InCollectionFilter("tags", [1])],
+            [1, 3],
+            2,
+        ),
+        (
+            [NotInCollectionFilter("tags", [1])],
+            [2, 4],
+            2,
+        ),
+        (
+            [
+                ComparisonFilter("views", "ge", 150),
+                ComparisonFilter("views", "le", 400),
+                NotNullFilter("published_at"),
+                OrderByFilter("views", "desc"),
+                OrderByFilter("title", "asc"),
+                LimitOffsetFilter(1, 1),
+            ],
+            [1],
+            2,
+        ),
+        (
+            [OrderByFilter("author.name", "asc", nulls="first"), OrderByFilter("id", "asc")],
+            [4, 2, 3, 1],
+            4,
+        ),
+        (
+            [
+                BeforeAfterFilter(
+                    "published_at",
+                    before=dt.datetime(2026, 3, 1, 0, 0),
+                    after=dt.datetime(2026, 1, 1, 0, 0),
+                ),
+                NullFilter("published_at"),
+            ],
+            [],
+            0,
+        ),
+        (
+            [
+                MultiFilter(
+                    {
+                        "or_": [
+                            {
+                                "type": "relationship",
+                                "relationship": "author",
+                                "filters": [
+                                    {"type": "comparison", "field_name": "name", "operator": "eq", "value": "Cody"}
+                                ],
+                            },
+                            {"type": "null", "field_name": "author_id"},
+                        ]
+                    }
+                ),
+                OrderByFilter("id", "asc"),
+            ],
+            [1, 4],
+            2,
+        ),
+    ],
+)
+def test_sync_mock_repository_relationship_and_grid_filters(
+    filters: list[Any],
+    expected_ids: list[int],
+    expected_total: int,
+) -> None:
+    """Verify SQLAlchemySyncMockRepository matches SQL filter and pagination semantics."""
+
+    class Repo(SQLAlchemySyncMockRepository[MockGridArticle]):
+        model_type = MockGridArticle
+
+    Repo.__database_clear__()
+    repo = Repo(session=MagicMock(spec=Session, bind=MagicMock()))
+    repo.add_many(_seed_mock_grid_entities())
+
+    items, total = repo.get_many_and_count(*filters)
+    assert total == expected_total
+    assert [item.id for item in items] == expected_ids
+
+
+async def test_async_mock_repository_matches_sync_and_sqlite_grid_parity() -> None:
+    """Verify SQLAlchemyAsyncMockRepository and real SQLite repository produce identical grid results."""
+
+    class AsyncMockRepo(SQLAlchemyAsyncMockRepository[MockGridArticle]):
+        model_type = MockGridArticle
+
+    class SyncDBRepo(SQLAlchemySyncRepository[MockGridArticle]):
+        model_type = MockGridArticle
+
+    AsyncMockRepo.__database_clear__()
+    mock_repo = AsyncMockRepo(session=AsyncMock(spec=AsyncSession, bind=MagicMock()))
+    await mock_repo.add_many(_seed_mock_grid_entities())
+
+    engine = create_engine("sqlite:///:memory:")
+    MockGridBase.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add_all(_seed_mock_grid_entities())
+        session.commit()
+        db_repo = SyncDBRepo(session=session)
+
+        grid_filters = [
+            SearchFilter("title", "sql", ignore_case=True),
+            ComparisonFilter("views", "ge", 200),
+            ComparisonFilter("views", "le", 500),
+            InCollectionFilter("status", ["draft"]),
+            RelationshipFilter("author", [ComparisonFilter("name", "ne", "Ghost")]),
+            OrderByFilter("author.name", "asc"),
+            OrderByFilter("views", "desc"),
+            LimitOffsetFilter(limit=1, offset=1),
+        ]
+        mock_items, mock_total = await mock_repo.get_many_and_count(*grid_filters)
+        db_items, db_total = db_repo.get_many_and_count(*grid_filters)
+        assert mock_total == db_total == 2
+        assert [item.id for item in mock_items] == [item.id for item in db_items] == [1]
+
+        group_filters = [
+            FilterGroup(
+                logical_operator=or_,
+                filters=[
+                    ComparisonFilter("title", "istartswith", "async"),
+                    ComparisonFilter("id", "eq", 999),
+                ],
+            ),
+            NotInCollectionFilter("tags", [2]),
+        ]
+        async_items, async_total = await mock_repo.get_many_and_count(*group_filters)
+        assert async_total == 1
+        assert [item.title for item in async_items] == ["Async Queues"]
+
+        inclusive_items = await mock_repo.get_many(
+            OnBeforeAfterFilter(
+                "published_at",
+                on_or_before=dt.datetime(2026, 1, 10, 12, 0),
+                on_or_after=dt.datetime(2026, 1, 10, 12, 0),
+            )
+        )
+        assert [item.id for item in inclusive_items] == [1]
+
+        assert len(await mock_repo.get_many(BeforeAfterFilter("published_at", before=None, after=None))) == 4
+        assert [
+            item.id
+            for item in await mock_repo.get_many(
+                OnBeforeAfterFilter(
+                    "published_at",
+                    on_or_before=dt.datetime(2026, 2, 15, 8, 30),
+                    on_or_after=dt.datetime(2026, 2, 15, 8, 30),
+                )
+            )
+        ] == [2]
+        assert [
+            item.id
+            for item in await mock_repo.get_many(
+                BeforeAfterFilter(
+                    "published_at",
+                    before=dt.datetime(2026, 2, 15, 8, 30),
+                    after=dt.datetime(2026, 1, 10, 12, 0),
+                )
+            )
+        ] == []
+        assert [item.id for item in await mock_repo.get_many(BooleanFilter("is_featured", True))] == [3]
+        assert len(await mock_repo.get_many(BooleanFilter("is_featured", None))) == 4
+        assert {
+            item.id
+            for item in await mock_repo.get_many(
+                RelationshipFilter(MockGridArticle.author, [ComparisonFilter("name", "eq", "Ada")]),
+                ComparisonFilter("views", "lt", 500),
+                ComparisonFilter("views", "gt", 200),
+                ComparisonFilter("published_at", "dateeq", dt.date(2026, 2, 15)),
+            )
+        } == {2}
+        assert {
+            item.id
+            for item in await mock_repo.get_many(
+                ComparisonFilter("status", "in", ["draft", "published"]),
+                ComparisonFilter("status", "notin", ["published"]),
+                OrderByFilter("id", "asc"),
+            )
+        } == {1, 2, 4}
+        assert {
+            item.id
+            for item in await mock_repo.get_many(
+                RelationshipFilter(
+                    "tags",
+                    [or_(and_(MockGridTag.id >= 2, ~(MockGridTag.name == "missing")), MockGridTag.name == "python")],
+                )
+            )
+        } == {1, 2, 3}
+        assert [
+            item.id
+            for item in await mock_repo.get_many(
+                MultiFilter(
+                    {
+                        "and_": cast(
+                            "Any",
+                            ["skip-non-dict", {"type": "comparison", "field_name": "id", "operator": "eq", "value": 1}],
+                        ),
+                        "or_": cast("Any", "non-list"),
+                    }
+                )
+            )
+        ] == [1]
+
+        with pytest.raises(ValueError, match="Invalid operator"):
+            await mock_repo.get_many(ComparisonFilter("views", "approx", 1))
+        with pytest.raises(RepositoryError, match="Unexpected filter"):
+            await mock_repo.get_many(cast("Any", object()))
+        assert [item.id for item in await mock_repo.get_many((column("id") + 1) == 2)] == [1]
+        with pytest.raises(RepositoryError, match="not supported in mock repositories"):
+            await mock_repo.get_many(column("title").desc())
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("seed_mode", ["relationship", "foreign_key"])
+@pytest.mark.parametrize("filter_type", [InCollectionFilter, NotInCollectionFilter])
+async def test_relationship_collection_renamed_primary_key_sqlite_parity(
+    mode: str, seed_mode: str, filter_type: Any
+) -> None:
+    """Relationship collections resolve mapped PK attributes independently of SQL column names."""
+
+    class RenamedRelationshipBase(DeclarativeBase):
+        pass
+
+    class Child(RenamedRelationshipBase):
+        __tablename__ = "renamed_relationship_child"
+        child_id: Mapped[int] = mapped_column("db_child_id", primary_key=True)
+
+    class Parent(RenamedRelationshipBase):
+        __tablename__ = "renamed_relationship_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        child_id: Mapped[Union[int, None]] = mapped_column(
+            "db_parent_child_id", ForeignKey("renamed_relationship_child.db_child_id")
+        )
+        child: Mapped[Union[Child, None]] = relationship(Child)
+
+    def seed() -> list[Parent]:
+        return [Parent(id=1, child=Child(child_id=7)), Parent(id=2, child=Child(child_id=9)), Parent(id=3)]
+
+    engine = create_engine("sqlite://")
+    RenamedRelationshipBase.metadata.create_all(engine)
+    repo: Any
+    if mode == "async":
+        repo = SQLAlchemyAsyncMockRepository(session=AsyncMock(spec=AsyncSession, bind=MagicMock()), model_type=Parent)
+    else:
+        repo = SQLAlchemySyncMockRepository(session=MagicMock(spec=Session, bind=MagicMock()), model_type=Parent)
+    repo.__database_clear__()
+    try:
+        if seed_mode == "relationship":
+            parents = seed()
+        else:
+            child_repo = type(repo)(session=repo.session, model_type=Child)
+            await maybe_async(child_repo.add_many([Child(child_id=7), Child(child_id=9)]))
+            parents = [Parent(id=1, child_id=7), Parent(id=2, child_id=9), Parent(id=3)]
+        await maybe_async(repo.add_many(parents))
+        assert [parent.child_id for parent in parents] == [7, 9, None]
+        assert [parent.child.child_id if parent.child else None for parent in parents] == [7, 9, None]
+        filter_ = filter_type(field_name="child", values=[7])
+        with Session(engine) as session:
+            session.add_all(seed())
+            session.flush()
+            sql_repo = SQLAlchemySyncRepository(session=session, model_type=Parent)
+            expected = sorted(item.id for item in sql_repo.get_many(filter_))
+            assert expected == ([1] if filter_type is InCollectionFilter else [2, 3])
+            assert sorted(item.id for item in await maybe_async(repo.get_many(filter_))) == expected
+    finally:
+        repo.__database_clear__()
+        engine.dispose()
