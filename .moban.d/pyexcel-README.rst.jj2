@@ -1,0 +1,55 @@
+{%extends "BASIC-README.rst.jj2"%}
+
+{%block features%}
+
+Feature Highlights
+===================
+
+{% include "supported-file-list.rst.jj2" %}
+
+.. image:: https://github.com/pyexcel/pyexcel/raw/dev/docs/source/_static/images/architecture.svg
+
+
+1. One application programming interface(API) to handle multiple data sources:
+
+   * physical file
+   * memory file
+   * SQLAlchemy table
+   * Django Model
+   * Python data structures: dictionary, records and array
+
+2. One API to read and write data in various excel file formats.
+3. For large data sets, data streaming are supported. A generator can be returned to you. Check out iget_records, iget_array, isave_as and isave_book_as.
+
+{% endblock %}
+
+{%block usage%}
+
+{%include "one-liners.rst.jj2" %}
+
+Hidden feature: partial read
+===============================================
+
+Most pyexcel users do not know, but other library users were requesting `partial read <https://github.com/jazzband/tablib/issues/467>`_
+
+{%include "partial-data.rst.jj2" %}
+
+{%include "two-liners.rst.jj2" %}
+
+Available Plugins
+=================
+
+{% include "plugins-list.rst.jj2" %}
+
+
+Acknowledgement
+===============
+
+All great work have been done by odf, ezodf, xlrd, xlwt, tabulate and other
+individual developers. This library unites only the data access code.
+
+
+{%endblock%}
+
+{%block development_guide%}
+{%endblock%}

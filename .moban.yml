@@ -1,0 +1,18 @@
+overrides: "git://github.com/pyexcel/pyexcel-mobans!/mobanfile.yaml"
+configuration:
+  configuration: pyexcel.yml
+targets:
+  - setup.py: custom_setup.py.jj2
+  - "docs/source/conf.py": "docs/source/custom_conf.py.jj2"
+  - "docs/source/quickstart.rst": "docs/source/quickstart.rst.jj2"
+  - "docs/source/two-liners.rst": "docs/source/two-liners.rst.jj2"
+  - "docs/source/bigdata.rst": "docs/source/bigdata.rst.jj2"
+  - MANIFEST.in: CUSTOM_MANIFEST.in.jj2
+  - README.rst: pyexcel-README.rst.jj2
+  - "docs/source/guide.rst": "docs/source/guide.rst.jj2"
+  - .gitignore: commons-gitignore.jj2
+  - "pyexcel/__version__.py": version.txt
+  - "docs/source/index.rst": "docs/source/pyexcel-index.rst.jj2"
+  - "tests/requirements.txt": "tests/custom_requirements.txt.jj2"
+  - "min_requirements.txt": "minimum_requirements.txt.jj2"
+
