@@ -1,0 +1,4 @@
+-r requirements-ci.txt
+-r requirements-docs.txt
+
+diff-cover==9.7.2
