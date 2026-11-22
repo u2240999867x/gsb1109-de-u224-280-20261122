@@ -125,6 +125,14 @@ class Target(BaseSingerReader, abc.ABC):
         self._drained_state: dict[str, dict] = {}
         self._sinks_active: dict[str, Sink] = {}
         self._sinks_to_clear: list[Sink] = []
+
+        # Table version tracking for version transitions. The first version
+        # seen for a stream is adopted as its current version. A higher
+        # version seen in RECORD or BATCH messages is considered pending
+        # until an ACTIVATE_VERSION message confirms its delivery is complete.
+        self._stream_versions: dict[str, int] = {}
+        self._pending_versions: dict[str, int] = {}
+        self._confirmed_stream_bookmarks: dict[str, dict] = {}
         self._max_parallelism: int | None = _MAX_PARALLELISM
 
         # Approximated for max record age enforcement
@@ -357,6 +365,8 @@ class Target(BaseSingerReader, abc.ABC):
         self._assert_line_requires(message_dict, requires={"stream", "record"})
 
         stream_name = message_dict["stream"]
+        if (version := message_dict.get("version")) is not None:
+            self._track_data_version(stream_name, version)
         if stream_name not in self.mapper.stream_maps:
             self._assert_sink_exists(stream_name)
 
@@ -471,6 +481,81 @@ class Target(BaseSingerReader, abc.ABC):
             return
         self._latest_state = state
 
+        # Confirm bookmarks for streams that are not in the middle of a table
+        # version transition. Bookmarks for transitioning streams are held
+        # back until the new version is fully delivered and activated.
+        for stream_name, bookmark in state.get("bookmarks", {}).items():
+            if stream_name not in self._pending_versions:
+                self._confirmed_stream_bookmarks[stream_name] = copy.deepcopy(bookmark)
+
+    def _track_data_version(self, stream_name: str, version: int) -> None:
+        """Track a table version seen in RECORD or BATCH data messages.
+
+        The first version seen for a stream is adopted as its current version.
+        Any higher version is considered pending until an ACTIVATE_VERSION
+        message confirms that the version has been fully delivered.
+
+        Args:
+            stream_name: Name of the stream the data belongs to.
+            version: The table version seen in the data message.
+        """
+        current_version = self._stream_versions.get(stream_name)
+        if current_version is None:
+            self._stream_versions[stream_name] = version
+        elif version > current_version:
+            pending_version = self._pending_versions.get(stream_name)
+            if pending_version is None or version > pending_version:
+                self._pending_versions[stream_name] = version
+
+    def _activate_stream_version(self, stream_name: str, version: int) -> None:
+        """Mark a table version as activated.
+
+        If the version covers a pending (not yet fully delivered) version, the
+        version transition is complete and the stream's latest bookmark is
+        confirmed, so subscribers switch from the old version to the new one.
+
+        Args:
+            stream_name: Name of the stream being activated.
+            version: The activated table version.
+        """
+        current_version = self._stream_versions.get(stream_name)
+        if current_version is None or version > current_version:
+            self._stream_versions[stream_name] = version
+
+        pending_version = self._pending_versions.get(stream_name)
+        if pending_version is not None and version >= pending_version:
+            del self._pending_versions[stream_name]
+            bookmark = (self._latest_state or {}).get("bookmarks", {}).get(stream_name)
+            if bookmark is not None:
+                self._confirmed_stream_bookmarks[stream_name] = copy.deepcopy(bookmark)
+
+    def _get_confirmable_state(self, state: dict) -> dict:
+        """Return the state that is safe to emit downstream.
+
+        For streams with a pending table version (a new version whose data has
+        not been fully delivered and activated), the stream's bookmark is
+        rolled back to the last confirmed value, so a restarted tap resumes
+        from the old version's confirmed progress. Bookmarks for all other
+        streams, including incremental-only streams, continue to advance.
+
+        Args:
+            state: The latest state received from the tap.
+
+        Returns:
+            The state with unconfirmed stream bookmarks replaced by their last
+            confirmed values.
+        """
+        result = copy.deepcopy(state)
+        bookmarks = result.get("bookmarks")
+        if isinstance(bookmarks, dict):
+            for stream_name in self._pending_versions:
+                confirmed = self._confirmed_stream_bookmarks.get(stream_name)
+                if confirmed is not None:
+                    bookmarks[stream_name] = copy.deepcopy(confirmed)
+                else:
+                    bookmarks.pop(stream_name, None)
+        return result
+
     @override
     def _process_activate_version_message(self, message_dict: dict) -> None:
         """Handle the optional ACTIVATE_VERSION message extension.
@@ -479,6 +564,8 @@ class Target(BaseSingerReader, abc.ABC):
             message_dict: TODO
         """
         stream_name = message_dict["stream"]
+        version = message_dict["version"]
+        self._activate_stream_version(stream_name, version)
 
         for stream_map in self.mapper.stream_maps[stream_name]:
             sink = self.get_sink(stream_map.stream_alias)
@@ -496,7 +583,10 @@ class Target(BaseSingerReader, abc.ABC):
                     "disabled.",
                     sink.stream_name,
                 )
-            sink.activate_version(message_dict["version"])
+            # Flush any buffered records so the version's data is fully loaded
+            # before the new version is activated.
+            self.drain_one(sink)
+            sink.activate_version(version)
 
     @override
     def _process_batch_message(self, message_dict: dict) -> None:
@@ -507,6 +597,8 @@ class Target(BaseSingerReader, abc.ABC):
         """
         stream_name = message_dict["stream"]
         encoding = BaseBatchFileEncoding.from_dict(message_dict["encoding"])
+        if (version := message_dict.get("version")) is not None:
+            self._track_data_version(stream_name, version)
 
         for stream_map in self.mapper.stream_maps[stream_name]:
             sink = self.get_sink(stream_map.stream_alias)
@@ -539,7 +631,7 @@ class Target(BaseSingerReader, abc.ABC):
                 sink._clean_up()  # ruff:ignore[private-member-access]
 
         if self._latest_state:
-            self._write_state_message(copy.deepcopy(self._latest_state))
+            self._write_state_message(self._get_confirmable_state(self._latest_state))
 
         self._reset_max_record_age()
 

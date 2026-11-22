@@ -4,6 +4,7 @@ import copy
 import datetime as dt
 import decimal
 import io
+import json
 import signal
 import sys
 from contextlib import redirect_stdout
@@ -289,4 +290,298 @@ def test_target_write_state():
         "integer": 42,
         "decimal": decimal.Decimal("3.14"),
         "datetime": "2021-01-01T00:00:00+00:00",
+    }
+
+
+def _schema_message(stream_name: str) -> dict:
+    return {
+        "type": "SCHEMA",
+        "stream": stream_name,
+        "schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+        },
+    }
+
+
+def _process_messages(target: TargetMock, messages: list[dict]) -> None:
+    with redirect_stdout(io.StringIO()):
+        target.process_lines(
+            io.StringIO("\n".join(json.dumps(message) for message in messages)),
+        )
+
+
+def test_target_version_transition_state_gating():
+    """State for a stream mid-version-switch is held back until activation."""
+    target = TargetMock()
+    _process_messages(
+        target,
+        [
+            _schema_message("versioned"),
+            _schema_message("incremental"),
+            # Old version data flows for both streams.
+            {
+                "type": "RECORD",
+                "stream": "versioned",
+                "record": {"id": 1},
+                "version": 100,
+            },
+            {"type": "RECORD", "stream": "incremental", "record": {"id": 1}},
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 1},
+                        "incremental": {"replication_key_value": 1},
+                    },
+                },
+            },
+            # A new table version starts while the old version is still open.
+            {
+                "type": "RECORD",
+                "stream": "versioned",
+                "record": {"id": 2},
+                "version": 200,
+            },
+            {"type": "RECORD", "stream": "incremental", "record": {"id": 2}},
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 2},
+                        "incremental": {"replication_key_value": 2},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    # The new version's STATE is not trusted yet: the versioned stream's
+    # bookmark is rolled back to the old version's confirmed progress, while
+    # the incremental-only stream's bookmark keeps advancing.
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 1},
+            "incremental": {"replication_key_value": 2},
+        },
+    }
+
+    # The new version is fully delivered and activated: subscribers switch
+    # from the old version to the new one.
+    _process_messages(
+        target,
+        [
+            {
+                "type": "ACTIVATE_VERSION",
+                "stream": "versioned",
+                "version": 200,
+            },
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 3},
+                        "incremental": {"replication_key_value": 3},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 3},
+            "incremental": {"replication_key_value": 3},
+        },
+    }
+
+
+def test_target_version_transition_corrupted_batch(tmp_path):
+    """A failed version switch resumes from the old version's confirmed state."""
+    old_batch = tmp_path / "old.jsonl"
+    old_batch.write_text('{"id": 1}\n{"id": 2}\n')
+    new_batch_1 = tmp_path / "new.1.jsonl"
+    new_batch_1.write_text('{"id": 3}\n{"id": 4}\n')
+    new_batch_2 = tmp_path / "new.2.jsonl"
+    new_batch_2.write_text('{"id": 5}\n{"id": 6')
+
+    target = TargetMock()
+    _process_messages(
+        target,
+        [
+            _schema_message("versioned"),
+            _schema_message("incremental"),
+            # Two old-version batches are read and confirmed.
+            {
+                "type": "BATCH",
+                "stream": "versioned",
+                "encoding": {"format": "jsonl"},
+                "manifest": [old_batch.as_uri()],
+                "version": 100,
+            },
+            {"type": "RECORD", "stream": "incremental", "record": {"id": 1}},
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 2},
+                        "incremental": {"replication_key_value": 1},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 2},
+            "incremental": {"replication_key_value": 1},
+        },
+    }
+
+    # The first batch of the new version lands along with the new STATE.
+    _process_messages(
+        target,
+        [
+            {
+                "type": "BATCH",
+                "stream": "versioned",
+                "encoding": {"format": "jsonl"},
+                "manifest": [new_batch_1.as_uri()],
+                "version": 200,
+            },
+            {"type": "RECORD", "stream": "incremental", "record": {"id": 2}},
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 4},
+                        "incremental": {"replication_key_value": 2},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    # The new version's STATE is not adopted just because its first batch
+    # landed. The incremental-only stream's confirmed progress still advances.
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 2},
+            "incremental": {"replication_key_value": 2},
+        },
+    }
+
+    # The second batch of the new version is corrupted: the run fails and the
+    # last emitted state still points at the old version's confirmed progress.
+    with pytest.raises(json.JSONDecodeError), redirect_stdout(io.StringIO()):
+        _process_messages(
+            target,
+            [
+                {
+                    "type": "BATCH",
+                    "stream": "versioned",
+                    "encoding": {"format": "jsonl"},
+                    "manifest": [new_batch_2.as_uri()],
+                    "version": 200,
+                },
+            ],
+        )
+
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 2},
+            "incremental": {"replication_key_value": 2},
+        },
+    }
+
+
+def test_target_activate_version_legacy_flow():
+    """Old-style taps emitting ACTIVATE_VERSION first see no state gating."""
+    target = TargetMock()
+    _process_messages(
+        target,
+        [
+            _schema_message("versioned"),
+            {"type": "ACTIVATE_VERSION", "stream": "versioned", "version": 100},
+            {
+                "type": "RECORD",
+                "stream": "versioned",
+                "record": {"id": 1},
+                "version": 100,
+            },
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 1},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "versioned": {"replication_key_value": 1},
+        },
+    }
+
+
+def test_target_pending_version_without_confirmed_bookmark():
+    """A stream with no confirmed progress is omitted from emitted state."""
+    target = TargetMock()
+    _process_messages(
+        target,
+        [
+            _schema_message("versioned"),
+            _schema_message("incremental"),
+            # The version switch starts before any state was confirmed.
+            {
+                "type": "RECORD",
+                "stream": "versioned",
+                "record": {"id": 1},
+                "version": 100,
+            },
+            {
+                "type": "RECORD",
+                "stream": "versioned",
+                "record": {"id": 2},
+                "version": 200,
+            },
+            {"type": "RECORD", "stream": "incremental", "record": {"id": 1}},
+            {
+                "type": "STATE",
+                "value": {
+                    "bookmarks": {
+                        "versioned": {"replication_key_value": 2},
+                        "incremental": {"replication_key_value": 1},
+                    },
+                },
+            },
+        ],
+    )
+
+    with redirect_stdout(io.StringIO()):
+        target.drain_all()
+
+    assert target.state_messages_written[-1] == {
+        "bookmarks": {
+            "incremental": {"replication_key_value": 1},
+        },
     }
