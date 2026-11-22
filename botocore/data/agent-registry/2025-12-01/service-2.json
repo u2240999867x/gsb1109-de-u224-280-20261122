@@ -1,0 +1,1039 @@
+{
+  "version":"2.0",
+  "metadata":{
+    "apiVersion":"2025-12-01",
+    "auth":[
+      "aws.auth#sigv4",
+      "smithy.api#httpBearerAuth"
+    ],
+    "endpointPrefix":"agent-registry",
+    "protocol":"rest-json",
+    "protocols":["rest-json"],
+    "serviceFullName":"Agent Registry",
+    "serviceId":"Agent Registry",
+    "signatureVersion":"v4",
+    "signingName":"agent-registry",
+    "uid":"agent-registry-2025-12-01"
+  },
+  "operations":{
+    "BatchGetDiscoverableRegistryRecord":{
+      "name":"BatchGetDiscoverableRegistryRecord",
+      "http":{
+        "method":"POST",
+        "requestUri":"/discoverable-records-batch",
+        "responseCode":200
+      },
+      "input":{"shape":"BatchGetDiscoverableRegistryRecordRequest"},
+      "output":{"shape":"BatchGetDiscoverableRegistryRecordResponse"},
+      "errors":[
+        {"shape":"InternalServerException"},
+        {"shape":"AccessDeniedException"},
+        {"shape":"ResourceNotFoundException"},
+        {"shape":"ThrottlingException"},
+        {"shape":"UnauthorizedException"},
+        {"shape":"ValidationException"}
+      ],
+      "documentation":"<p> Retrieves multiple discoverable registry records by ID from a single registry. Records that cannot be retrieved are reported individually in the <code>errors</code> list rather than failing the entire request. For each skill record that has a skill package, the operation also returns <code>artifact</code>. It contains a short-lived download URL and a SHA-256 checksum for the package of the record's latest approved revision. If the registry can't create a download URL for a package, the whole request fails.</p>",
+      "readonly":true
+    },
+    "ListDiscoverableRegistryRecords":{
+      "name":"ListDiscoverableRegistryRecords",
+      "http":{
+        "method":"POST",
+        "requestUri":"/registries/{registryId}/discoverable-records-list",
+        "responseCode":200
+      },
+      "input":{"shape":"ListDiscoverableRegistryRecordsRequest"},
+      "output":{"shape":"ListDiscoverableRegistryRecordsResponse"},
+      "errors":[
+        {"shape":"InternalServerException"},
+        {"shape":"AccessDeniedException"},
+        {"shape":"ResourceNotFoundException"},
+        {"shape":"ThrottlingException"},
+        {"shape":"UnauthorizedException"},
+        {"shape":"ValidationException"}
+      ],
+      "documentation":"<p> Lists the discoverable registry records in a registry. You can optionally filter and paginate the results.</p>",
+      "readonly":true
+    },
+    "SearchDiscoverableRegistryRecords":{
+      "name":"SearchDiscoverableRegistryRecords",
+      "http":{
+        "method":"POST",
+        "requestUri":"/discoverable-records-search",
+        "responseCode":200
+      },
+      "input":{"shape":"SearchDiscoverableRegistryRecordsRequest"},
+      "output":{"shape":"SearchDiscoverableRegistryRecordsResponse"},
+      "errors":[
+        {"shape":"InternalServerException"},
+        {"shape":"AccessDeniedException"},
+        {"shape":"ResourceNotFoundException"},
+        {"shape":"ThrottlingException"},
+        {"shape":"UnauthorizedException"},
+        {"shape":"ValidationException"}
+      ],
+      "documentation":"<p> Searches the discoverable registry records in a registry using a natural language query. Returns metadata for the matching records ordered by relevance.</p> <p> Returns at most 1000 results across all pages when <code>searchType</code> is <code>KEYWORD</code>, and at most 20 results when it is <code>HYBRID</code> or <code>SEMANTIC</code>. To retrieve more records, refine the query or filters, or use <code>ListDiscoverableRegistryRecords</code> to list every record.</p>",
+      "readonly":true
+    }
+  },
+  "shapes":{
+    "A2aAgentCardDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p> The A2A agent card content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p> The schema version of the descriptor payload.</p>"
+        },
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location from which the A2A (Agent-to-Agent) agent card descriptor content was retrieved.</p>"
+        }
+      },
+      "documentation":"<p> Descriptor that defines the content of an A2A (Agent-to-Agent) agent card registry record. The content is validated against the A2A protocol schema.</p>"
+    },
+    "AccessDeniedException":{
+      "type":"structure",
+      "members":{
+        "message":{"shape":"NonBlankString"}
+      },
+      "documentation":"<p>The caller is not authorized to perform the requested action.</p>",
+      "error":{
+        "httpStatusCode":403,
+        "senderFault":true
+      },
+      "exception":true
+    },
+    "AgUiDescriptor":{
+      "type":"structure",
+      "members":{
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location of the AG-UI protocol endpoint.</p>"
+        }
+      },
+      "documentation":"<p> A descriptor for a registry record that exposes an AG-UI protocol endpoint. This descriptor is source-only: it identifies where the endpoint is located and carries no descriptor payload data or schema version.</p>"
+    },
+    "AgentSkillsAdditionalData":{
+      "type":"structure",
+      "members":{
+        "skillMd":{
+          "shape":"AgentSkillsMdDescriptor",
+          "documentation":"<p> The agent skills markdown descriptor associated with the agent skills definition.</p>"
+        }
+      },
+      "documentation":"<p> Additional data for an agent skills definition descriptor.</p>"
+    },
+    "AgentSkillsDefinitionDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p> The agent skills definition content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p> The schema version of the descriptor payload.</p>"
+        },
+        "additionalData":{
+          "shape":"AgentSkillsAdditionalData",
+          "documentation":"<p> Additional data for the agent skills definition, such as the skills markdown descriptor.</p>"
+        }
+      },
+      "documentation":"<p> Descriptor that defines an agent skills registry record and its associated content.</p>"
+    },
+    "AgentSkillsMdDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p> The agent skills markdown content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p> The schema version of the descriptor payload.</p>"
+        },
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location from which the agent skills markdown content was retrieved.</p>"
+        }
+      },
+      "documentation":"<p> Markdown-format descriptor containing an agent skills document.</p>"
+    },
+    "BatchGetDiscoverableRegistryRecordError":{
+      "type":"structure",
+      "required":[
+        "registryId",
+        "recordId",
+        "errorCode"
+      ],
+      "members":{
+        "registryId":{
+          "shape":"RegistryIdentifier",
+          "documentation":"<p> The identifier of the registry the record was requested from, echoed from the request.</p>"
+        },
+        "recordId":{
+          "shape":"RecordIdentifier",
+          "documentation":"<p> The identifier of the record that could not be retrieved, echoed from the request in the same format that you supplied (ARN or record ID).</p>"
+        },
+        "errorCode":{
+          "shape":"BatchGetDiscoverableRegistryRecordErrorCode",
+          "documentation":"<p> The machine-readable reason that the record could not be retrieved.</p>"
+        },
+        "message":{
+          "shape":"String",
+          "documentation":"<p> An optional human-readable detail about the error. Do not parse this value programmatically.</p>"
+        }
+      },
+      "documentation":"<p> Describes why a requested record could not be retrieved.</p>"
+    },
+    "BatchGetDiscoverableRegistryRecordErrorCode":{
+      "type":"string",
+      "enum":[
+        "RESOURCE_NOT_FOUND",
+        "ACCESS_DENIED",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "BatchGetDiscoverableRegistryRecordErrorList":{
+      "type":"list",
+      "member":{"shape":"BatchGetDiscoverableRegistryRecordError"}
+    },
+    "BatchGetDiscoverableRegistryRecordRequest":{
+      "type":"structure",
+      "required":["entries"],
+      "members":{
+        "entries":{
+          "shape":"BatchGetDiscoverableRegistryRecordRequestEntriesList",
+          "documentation":"<p> The registry-scoped groups of record IDs to retrieve. Currently, you can specify exactly one entry.</p>"
+        }
+      }
+    },
+    "BatchGetDiscoverableRegistryRecordRequestEntriesList":{
+      "type":"list",
+      "member":{"shape":"RegistryRecordsEntry"},
+      "max":1,
+      "min":1
+    },
+    "BatchGetDiscoverableRegistryRecordResponse":{
+      "type":"structure",
+      "required":[
+        "registryRecords",
+        "errors"
+      ],
+      "members":{
+        "registryRecords":{
+          "shape":"RegistryRecordSummaryList",
+          "documentation":"<p> The records that were successfully retrieved. Each record correlates to the request by its <code>recordId</code>.</p>"
+        },
+        "errors":{
+          "shape":"BatchGetDiscoverableRegistryRecordErrorList",
+          "documentation":"<p> The per-record errors for records that could not be retrieved. This list is empty when all requested records were returned.</p>"
+        }
+      }
+    },
+    "BotCategory":{
+      "type":"string",
+      "documentation":"<p>The category that describes a web bot's purpose. The categories follow AWS WAF Bot Control bot categories. Valid values:</p> <ul> <li> <p> <code>advertising</code> - Bots used for advertising, such as third-party ad services that access a website programmatically.</p> </li> <li> <p> <code>archiver</code> - Bots that crawl the web and capture content to create archives.</p> </li> <li> <p> <code>content_fetcher</code> - Bots that visit a website on behalf of a user to fetch content, such as RSS feeds, or to verify content.</p> </li> <li> <p> <code>email_client</code> - Bots that check links in emails, such as those run by email providers to flag suspicious emails.</p> </li> <li> <p> <code>http_library</code> - Requests generated by the HTTP libraries of programming languages, such as API clients.</p> </li> <li> <p> <code>link_checker</code> - Bots that check for broken links.</p> </li> <li> <p> <code>miscellaneous</code> - Bots that don't match another category.</p> </li> <li> <p> <code>monitoring</code> - Bots that periodically access a website to monitor performance and uptime.</p> </li> <li> <p> <code>page_preview</code> - Bots that generate page and link previews when content is shared on messaging, social media, or collaboration tools.</p> </li> <li> <p> <code>scraping_framework</code> - Bots from web scraping frameworks that automate crawling and extracting website content.</p> </li> <li> <p> <code>search_engine</code> - Bots that crawl websites to index content for search engine results.</p> </li> <li> <p> <code>security</code> - Bots that scan web applications for vulnerabilities or perform security audits.</p> </li> <li> <p> <code>seo</code> - Bots that crawl a website to help improve its search engine rankings.</p> </li> <li> <p> <code>social_media</code> - Bots that social media platforms use to provide content summaries when users share content.</p> </li> <li> <p> <code>ai_training</code> - AI bots that collect content to train AI models.</p> </li> <li> <p> <code>ai_search</code> - AI bots that retrieve content to answer AI search queries.</p> </li> <li> <p> <code>ai_assistant</code> - AI bots that access content on behalf of a user's AI assistant or agent.</p> </li> <li> <p> <code>ai_content_optimization</code> - AI bots that analyze content to optimize it for AI-generated results.</p> </li> </ul>",
+      "enum":[
+        "advertising",
+        "archiver",
+        "content_fetcher",
+        "email_client",
+        "http_library",
+        "link_checker",
+        "miscellaneous",
+        "monitoring",
+        "page_preview",
+        "scraping_framework",
+        "search_engine",
+        "security",
+        "seo",
+        "social_media",
+        "ai_training",
+        "ai_search",
+        "ai_assistant",
+        "ai_content_optimization"
+      ]
+    },
+    "CustomDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p>The custom descriptor content, serialized as descriptor payload data.</p>"
+        }
+      },
+      "documentation":"<p>Custom descriptor for user-defined content</p>"
+    },
+    "CustomMetadataDocument":{
+      "type":"structure",
+      "members":{},
+      "documentation":"<p>Free-form JSON document representing custom metadata on a registry record. Values may be strings or booleans (native JSON types). Key/value constraints enforced in service code.</p>",
+      "document":true,
+      "sensitive":true
+    },
+    "DataSchemaVersion":{
+      "type":"string",
+      "documentation":"<p>Version of the descriptor type schema</p>",
+      "max":255,
+      "min":1
+    },
+    "DateTimestamp":{
+      "type":"timestamp",
+      "documentation":"<p>Timestamp in ISO 8601 date-time format</p>",
+      "timestampFormat":"iso8601"
+    },
+    "Description":{
+      "type":"string",
+      "documentation":"<p>Description of the Resource</p>",
+      "max":4096,
+      "min":1,
+      "sensitive":true
+    },
+    "DescriptorData":{
+      "type":"string",
+      "documentation":"<p>Descriptor payload data</p>",
+      "max":102400,
+      "min":1,
+      "sensitive":true
+    },
+    "DescriptorSource":{
+      "type":"structure",
+      "members":{
+        "fromUrl":{
+          "shape":"DescriptorSourceFromUrl",
+          "documentation":"<p> The URL-based descriptor source, populated when descriptor content is synchronized from a URL.</p>"
+        }
+      },
+      "documentation":"<p> The source location from which a descriptor's content was retrieved.</p>"
+    },
+    "DescriptorSourceFromUrl":{
+      "type":"structure",
+      "required":["url"],
+      "members":{
+        "url":{
+          "shape":"DescriptorSourceUrl",
+          "documentation":"<p> The URL from which the descriptor content is retrieved. For an agent skill that synchronizes its SKILL.md from GitHub, this is the GitHub folder URL. The data plane doesn't return Amazon S3 (<code>s3://</code>) source URLs.</p>"
+        }
+      },
+      "documentation":"<p> A URL-based descriptor source that identifies where descriptor content is retrieved from.</p>"
+    },
+    "DescriptorSourceUrl":{
+      "type":"string",
+      "documentation":"<p>The URL of a descriptor source, up to 2,048 characters, that starts with <code>https://</code> or <code>s3://</code>. The registry accepts <code>s3://</code> URLs only for agent skill sources, and its discovery operations never return them.</p>",
+      "max":2048,
+      "min":1,
+      "pattern":"(https|s3)://.*"
+    },
+    "DescriptorTypeList":{
+      "type":"list",
+      "member":{"shape":"String"},
+      "max":10,
+      "min":0
+    },
+    "Descriptors":{
+      "type":"structure",
+      "members":{
+        "mcpServer":{
+          "shape":"McpServerDescriptor",
+          "documentation":"<p> The MCP server descriptor, populated when the record type is MCP.</p>"
+        },
+        "a2aAgentCard":{
+          "shape":"A2aAgentCardDescriptor",
+          "documentation":"<p> The A2A agent card descriptor, populated when the record type is AGENT.</p>"
+        },
+        "agentSkillsDefinition":{
+          "shape":"AgentSkillsDefinitionDescriptor",
+          "documentation":"<p> The agent skills definition descriptor, populated when the record type is SKILL.</p>"
+        },
+        "custom":{
+          "shape":"CustomDescriptor",
+          "documentation":"<p> The custom descriptor, populated when the record type is CUSTOM.</p>"
+        },
+        "http":{
+          "shape":"HttpDescriptor",
+          "documentation":"<p> The HTTP descriptor, populated when the record exposes an HTTP endpoint.</p>"
+        },
+        "agui":{
+          "shape":"AgUiDescriptor",
+          "documentation":"<p> The AG-UI descriptor, populated when the record exposes an AG-UI protocol endpoint.</p>"
+        },
+        "signatureAgentCard":{
+          "shape":"SignatureAgentCardDescriptor",
+          "documentation":"<p> The signature agent card descriptor, populated when the record represents a web bot. It identifies the JSON Web Key Set (JWKS) used to verify the bot's HTTP message signatures.</p>"
+        }
+      },
+      "documentation":"<p> The protocol-specific descriptors that describe how to connect to and use the registry record.</p>"
+    },
+    "DiscoverableFilterValues":{
+      "type":"list",
+      "member":{"shape":"FilterValue"},
+      "max":10,
+      "min":1
+    },
+    "DiscoverableRegistryRecordSummary":{
+      "type":"structure",
+      "required":[
+        "registryArn",
+        "recordArn",
+        "recordId",
+        "name",
+        "recordType",
+        "recordVersion",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ],
+      "members":{
+        "registryArn":{
+          "shape":"RegistryArn",
+          "documentation":"<p> The Amazon Resource Name (ARN) of the parent registry that owns the record.</p>"
+        },
+        "recordArn":{
+          "shape":"RegistryRecordArn",
+          "documentation":"<p> The Amazon Resource Name (ARN) of the registry record.</p>"
+        },
+        "recordId":{
+          "shape":"RegistryRecordId",
+          "documentation":"<p> The unique identifier of the registry record.</p>"
+        },
+        "name":{
+          "shape":"RegistryRecordName",
+          "documentation":"<p> The name of the registry record. Names are unique within a registry.</p>"
+        },
+        "description":{
+          "shape":"Description",
+          "documentation":"<p> A human-readable description of the registry record. Use this field to explain the record's purpose or content to consumers discovering it in the registry.</p>"
+        },
+        "displayName":{
+          "shape":"RegistryRecordDisplayName",
+          "documentation":"<p> The human-readable display name of the registry record.</p>"
+        },
+        "recordType":{
+          "shape":"RecordType",
+          "documentation":"<p> The type of the registry record. <code>MCP</code> is a Model Context Protocol server record, <code>AGENT</code> is an Agent-to-Agent (A2A) agent card record, <code>SKILL</code> is an agent skills definition record, and <code>CUSTOM</code> is a record with a custom descriptor.</p>"
+        },
+        "recordVersion":{
+          "shape":"RegistryRecordVersion",
+          "documentation":"<p> The version identifier of the registry record.</p>"
+        },
+        "status":{
+          "shape":"RegistryRecordStatus",
+          "documentation":"<p> The lifecycle status of the registry record. A record is <code>DRAFT</code> before it is submitted, <code>PENDING_APPROVAL</code> while awaiting curator review, and <code>APPROVED</code> once it is approved and discoverable. <code>REJECTED</code> and <code>DEPRECATED</code> records are not discoverable. The <code>CREATING</code>, <code>UPDATING</code>, <code>CREATE_FAILED</code>, and <code>UPDATE_FAILED</code> values reflect the state of an in-progress or failed asynchronous change.</p>"
+        },
+        "createdAt":{
+          "shape":"DateTimestamp",
+          "documentation":"<p> The timestamp when the registry record was created.</p>"
+        },
+        "updatedAt":{
+          "shape":"DateTimestamp",
+          "documentation":"<p> The timestamp when the registry record was last updated.</p>"
+        },
+        "descriptorTypes":{
+          "shape":"DescriptorTypeList",
+          "documentation":"<p> The descriptor types that are present on this registry record. Each value corresponds to a descriptor entry key on the approved record.</p>"
+        }
+      },
+      "documentation":"<p> Summary information about a discoverable registry record returned by <code> ListDiscoverableRegistryRecords</code>. This summary does not include descriptors.</p>"
+    },
+    "DiscoverableRegistryRecordSummaryList":{
+      "type":"list",
+      "member":{"shape":"DiscoverableRegistryRecordSummary"}
+    },
+    "FilterValue":{
+      "type":"string",
+      "documentation":"<p>A single filter value. Constrained by length only; the accepted set of values is filter-specific and validated server-side so enum-style values such as READY or AWS_IAM are accepted.</p>",
+      "max":255,
+      "min":1
+    },
+    "HttpDescriptor":{
+      "type":"structure",
+      "members":{
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location of the HTTP endpoint.</p>"
+        }
+      },
+      "documentation":"<p> A descriptor for a registry record that exposes an HTTP endpoint. This descriptor is source-only: it identifies where the endpoint is located and carries no descriptor payload data or schema version.</p>"
+    },
+    "InternalServerException":{
+      "type":"structure",
+      "members":{
+        "message":{"shape":"NonBlankString"}
+      },
+      "documentation":"<p>The request failed due to an unexpected internal error; the caller may retry.</p>",
+      "error":{"httpStatusCode":500},
+      "exception":true,
+      "fault":true
+    },
+    "ListDiscoverableRegistryRecordsRequest":{
+      "type":"structure",
+      "required":["registryId"],
+      "members":{
+        "registryId":{
+          "shape":"RegistryIdentifier",
+          "documentation":"<p> The identifier of the registry whose discoverable records are listed. You can provide either the full Amazon Resource Name (ARN) or the registry ID.</p>",
+          "location":"uri",
+          "locationName":"registryId"
+        },
+        "maxResults":{
+          "shape":"ListDiscoverableRegistryRecordsRequestMaxResultsInteger",
+          "documentation":"<p> The maximum number of records to return in a single page. Valid values are 1 through 100.</p>"
+        },
+        "nextToken":{
+          "shape":"ListDiscoverableRegistryRecordsRequestNextTokenString",
+          "documentation":"<p> The pagination token returned by a previous request. Use this value to retrieve the next page of results.</p>"
+        },
+        "filters":{
+          "shape":"RegistryRecordFilterList",
+          "documentation":"<p> The filters to apply to the discoverable registry record list.</p>"
+        }
+      }
+    },
+    "ListDiscoverableRegistryRecordsRequestMaxResultsInteger":{
+      "type":"integer",
+      "box":true,
+      "max":100,
+      "min":1
+    },
+    "ListDiscoverableRegistryRecordsRequestNextTokenString":{
+      "type":"string",
+      "max":4096,
+      "min":1
+    },
+    "ListDiscoverableRegistryRecordsResponse":{
+      "type":"structure",
+      "required":["registryRecords"],
+      "members":{
+        "registryRecords":{
+          "shape":"DiscoverableRegistryRecordSummaryList",
+          "documentation":"<p> The page of discoverable registry record summaries.</p>"
+        },
+        "nextToken":{
+          "shape":"String",
+          "documentation":"<p> The pagination token to pass to a subsequent request to retrieve the next page of results. This field is absent when there are no more results.</p>"
+        }
+      }
+    },
+    "McpServerAdditionalData":{
+      "type":"structure",
+      "members":{
+        "tools":{
+          "shape":"McpToolsDescriptor",
+          "documentation":"<p>The MCP tools descriptor that defines the tools exposed by the MCP server.</p>"
+        }
+      },
+      "documentation":"<p>Additional data for an MCP server descriptor</p>"
+    },
+    "McpServerDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p> The MCP server descriptor content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p> The schema version of the descriptor payload.</p>"
+        },
+        "additionalData":{
+          "shape":"McpServerAdditionalData",
+          "documentation":"<p> Additional data associated with the MCP server descriptor, such as tool definitions.</p>"
+        },
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location from which the MCP (Model Context Protocol) server descriptor content was retrieved.</p>"
+        }
+      },
+      "documentation":"<p> Descriptor that defines the content of an MCP (Model Context Protocol) server registry record, including the server definition and its tool definitions. The content is validated against the MCP protocol schema.</p>"
+    },
+    "McpToolsDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p>The MCP tools descriptor content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p>The schema version of the descriptor payload.</p>"
+        }
+      },
+      "documentation":"<p>MCP tools descriptor containing tool definitions</p>"
+    },
+    "MetadataFilterExpression":{
+      "type":"structure",
+      "members":{},
+      "document":true,
+      "sensitive":true
+    },
+    "NonBlankString":{
+      "type":"string",
+      "max":2048,
+      "min":1,
+      "pattern":"[\\s\\S]+"
+    },
+    "PresignedDownloadUrl":{
+      "type":"string",
+      "documentation":"<p>A presigned URL that downloads a stored file until the URL expires. It's a bearer credential. Anyone who has the URL can download the file, so don't log, store, or share it.</p>",
+      "max":4096,
+      "min":1,
+      "sensitive":true
+    },
+    "RecordIdentifier":{
+      "type":"string",
+      "documentation":"<p>Record identifier that accepts either ARN or ID format</p>",
+      "max":2048,
+      "min":1,
+      "pattern":"(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry/[a-zA-Z0-9]{12,16}/record/)?[a-zA-Z0-9]{12}"
+    },
+    "RecordType":{
+      "type":"string",
+      "documentation":"<p>Record type enum for registry record classification</p>",
+      "enum":[
+        "MCP",
+        "AGENT",
+        "CUSTOM",
+        "SKILL",
+        "GATEWAY",
+        "WEB_BOT"
+      ]
+    },
+    "RegistryArn":{
+      "type":"string",
+      "documentation":"<p>Registry Amazon Resource Name</p>",
+      "max":2048,
+      "min":46,
+      "pattern":"arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry/[a-zA-Z0-9]{12,16}"
+    },
+    "RegistryIdentifier":{
+      "type":"string",
+      "documentation":"<p>Registry identifier that accepts either ARN or ID format</p>",
+      "max":2048,
+      "min":1,
+      "pattern":"(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry/)?[a-zA-Z0-9]{12,16}"
+    },
+    "RegistryRecordArn":{
+      "type":"string",
+      "documentation":"<p>Registry Record Amazon Resource Name</p>",
+      "max":2048,
+      "min":1,
+      "pattern":"arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry/[a-zA-Z0-9]{12,16}/record/[a-zA-Z0-9]{12}"
+    },
+    "RegistryRecordArtifactDownload":{
+      "type":"structure",
+      "members":{
+        "sha256":{
+          "shape":"Sha256Hash",
+          "documentation":"<p>The SHA-256 checksum of the package, as 64 lowercase hexadecimal characters. The download response carries no signature that you can check, so compare the checksum of the file that you download with this value before you use the package.</p>"
+        },
+        "downloadUrl":{
+          "shape":"PresignedDownloadUrl",
+          "documentation":"<p>A presigned Amazon S3 URL that downloads the package. The URL is valid for up to 5 minutes, and the response doesn't include its expiry time. To get a new URL, call the operation again. Anyone who has the URL can download the package until it expires, so don't log, store, or share it.</p>"
+        }
+      },
+      "documentation":"<p>The skill package of a registry record, as a short-lived download URL and the package's SHA-256 checksum. Responses never include the package bytes.</p>"
+    },
+    "RegistryRecordDisplayName":{
+      "type":"string",
+      "documentation":"<p>Display name for a registry record</p>",
+      "max":255,
+      "min":1
+    },
+    "RegistryRecordFilter":{
+      "type":"structure",
+      "required":[
+        "name",
+        "values"
+      ],
+      "members":{
+        "name":{
+          "shape":"RegistryRecordFilterName",
+          "documentation":"<p> The attribute to filter on.</p>"
+        },
+        "values":{
+          "shape":"DiscoverableFilterValues",
+          "documentation":"<p> The values to match for the attribute.</p>"
+        }
+      },
+      "documentation":"<p> A single filter applied to a <code>ListDiscoverableRegistryRecords</code> request.</p>"
+    },
+    "RegistryRecordFilterList":{
+      "type":"list",
+      "member":{"shape":"RegistryRecordFilter"},
+      "documentation":"<p> The list of filters applied to a <code>ListDiscoverableRegistryRecords</code> request.</p>",
+      "max":10,
+      "min":0
+    },
+    "RegistryRecordFilterName":{
+      "type":"string",
+      "documentation":"<p> The attribute to filter registry records on.</p>",
+      "enum":[
+        "recordType",
+        "descriptorType"
+      ]
+    },
+    "RegistryRecordId":{
+      "type":"string",
+      "documentation":"<p>Registry Record unique identifier - 12-character alphanumeric string</p>",
+      "max":12,
+      "min":12,
+      "pattern":"[a-zA-Z0-9]{12}"
+    },
+    "RegistryRecordName":{
+      "type":"string",
+      "documentation":"<p>Registry Record name</p>",
+      "max":255,
+      "min":1,
+      "pattern":"[a-zA-Z0-9][a-zA-Z0-9_\\-\\.\\/]*"
+    },
+    "RegistryRecordStatus":{
+      "type":"string",
+      "documentation":"<p>The lifecycle status of a registry record. A record is <code>DRAFT</code> before it is submitted, <code>PENDING_APPROVAL</code> while it awaits curator review, and <code>APPROVED</code> after it is approved and discoverable. Rejecting a newer revision keeps the last approved revision discoverable. A <code>DEPRECATED</code> record isn't discoverable. <code>CREATING</code>, <code>UPDATING</code>, <code>CREATE_FAILED</code>, and <code>UPDATE_FAILED</code> reflect an asynchronous change that is in progress or has failed. <code>CREATE_PENDING_AUTH</code> and <code>UPDATE_PENDING_AUTH</code> mean that the record waits for a GitHub user to authorize access before it synchronizes from its GitHub source.</p>",
+      "enum":[
+        "DRAFT",
+        "PENDING_APPROVAL",
+        "APPROVED",
+        "REJECTED",
+        "DEPRECATED",
+        "CREATING",
+        "UPDATING",
+        "CREATE_FAILED",
+        "UPDATE_FAILED",
+        "CREATE_PENDING_AUTH",
+        "UPDATE_PENDING_AUTH"
+      ]
+    },
+    "RegistryRecordSummary":{
+      "type":"structure",
+      "required":[
+        "registryArn",
+        "recordArn",
+        "recordId",
+        "name",
+        "recordType",
+        "descriptors",
+        "recordVersion",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ],
+      "members":{
+        "registryArn":{
+          "shape":"RegistryArn",
+          "documentation":"<p> The Amazon Resource Name (ARN) of the parent registry that owns the record.</p>"
+        },
+        "recordArn":{
+          "shape":"RegistryRecordArn",
+          "documentation":"<p> The Amazon Resource Name (ARN) of the registry record.</p>"
+        },
+        "recordId":{
+          "shape":"RegistryRecordId",
+          "documentation":"<p> The unique identifier of the registry record.</p>"
+        },
+        "name":{
+          "shape":"RegistryRecordName",
+          "documentation":"<p> The name of the registry record. Names are unique within a registry.</p>"
+        },
+        "description":{
+          "shape":"Description",
+          "documentation":"<p> A human-readable description of the registry record. Use this field to explain the record's purpose or content to consumers discovering it in the registry.</p>"
+        },
+        "displayName":{
+          "shape":"RegistryRecordDisplayName",
+          "documentation":"<p> The human-readable display name of the registry record.</p>"
+        },
+        "recordType":{
+          "shape":"RecordType",
+          "documentation":"<p> The type of the registry record. <code>MCP</code> is a Model Context Protocol server record, <code>AGENT</code> is an Agent-to-Agent (A2A) agent card record, <code>SKILL</code> is an agent skills definition record, and <code>CUSTOM</code> is a record with a custom descriptor.</p>"
+        },
+        "descriptors":{
+          "shape":"Descriptors",
+          "documentation":"<p> The protocol-specific descriptors that describe how to connect to and use the record.</p>"
+        },
+        "recordVersion":{
+          "shape":"RegistryRecordVersion",
+          "documentation":"<p> The version identifier of the registry record.</p>"
+        },
+        "status":{
+          "shape":"RegistryRecordStatus",
+          "documentation":"<p> The lifecycle status of the registry record. A record is <code>DRAFT</code> before it is submitted, <code>PENDING_APPROVAL</code> while awaiting curator review, and <code>APPROVED</code> once it is approved and discoverable. <code>REJECTED</code> and <code>DEPRECATED</code> records are not discoverable. The <code>CREATING</code>, <code>UPDATING</code>, <code>CREATE_FAILED</code>, and <code>UPDATE_FAILED</code> values reflect the state of an in-progress or failed asynchronous change.</p>"
+        },
+        "createdAt":{
+          "shape":"DateTimestamp",
+          "documentation":"<p> The timestamp when the registry record was created.</p>"
+        },
+        "updatedAt":{
+          "shape":"DateTimestamp",
+          "documentation":"<p> The timestamp when the registry record was last updated.</p>"
+        },
+        "customMetadata":{
+          "shape":"CustomMetadataDocument",
+          "documentation":"<p> The custom metadata attached to this registry record. Values are strings (maximum 128 characters) or booleans. This field is only present if the registry has a custom metadata schema configured.</p>"
+        },
+        "artifact":{
+          "shape":"RegistryRecordArtifactDownload",
+          "documentation":"<p> The skill package of the record's latest approved revision, as the package's SHA-256 checksum and a download URL that is valid for up to 5 minutes. Only <code>BatchGetDiscoverableRegistryRecord</code> returns this member, not <code>SearchDiscoverableRegistryRecords</code>. Absent when the record has no skill package.</p>"
+        }
+      },
+      "documentation":"<p> Summary information about a registry record, including its descriptors.</p>"
+    },
+    "RegistryRecordSummaryList":{
+      "type":"list",
+      "member":{"shape":"RegistryRecordSummary"}
+    },
+    "RegistryRecordVersion":{
+      "type":"string",
+      "documentation":"<p>Version of the registry record</p>",
+      "max":255,
+      "min":1,
+      "pattern":"[a-zA-Z0-9.-]+"
+    },
+    "RegistryRecordsEntry":{
+      "type":"structure",
+      "required":[
+        "registryId",
+        "recordIds"
+      ],
+      "members":{
+        "registryId":{
+          "shape":"RegistryIdentifier",
+          "documentation":"<p> The identifier of the registry to retrieve the records from. You can provide either the full Amazon Resource Name (ARN) or the registry ID.</p>"
+        },
+        "recordIds":{
+          "shape":"RegistryRecordsEntryRecordIdsList",
+          "documentation":"<p> The record IDs to retrieve from the registry. You can specify 1 through 100 record IDs.</p>"
+        }
+      },
+      "documentation":"<p> Binds one registry to the record IDs requested from it.</p>"
+    },
+    "RegistryRecordsEntryRecordIdsList":{
+      "type":"list",
+      "member":{"shape":"RecordIdentifier"},
+      "max":100,
+      "min":1
+    },
+    "ResourceNotFoundException":{
+      "type":"structure",
+      "members":{
+        "message":{"shape":"NonBlankString"}
+      },
+      "documentation":"<p>The requested resource was not found.</p>",
+      "error":{
+        "httpStatusCode":404,
+        "senderFault":true
+      },
+      "exception":true
+    },
+    "SearchDiscoverableRegistryRecordsRequest":{
+      "type":"structure",
+      "required":[
+        "searchQuery",
+        "registryIds"
+      ],
+      "members":{
+        "searchQuery":{
+          "shape":"SearchQuery",
+          "documentation":"<p> The natural language query to search for matching registry records. If you specify an empty string, the operation returns the records that match the <code>filters</code>, most recently updated first, up to the result limit for the <code>searchType</code>.</p>"
+        },
+        "registryIds":{
+          "shape":"SearchDiscoverableRegistryRecordsRequestRegistryIdsList",
+          "documentation":"<p> The registry identifiers to search within. Currently, you must specify exactly one registry identifier. You can provide either the full Amazon Web Services Resource Name (ARN) or the registry ID.</p>"
+        },
+        "maxResults":{
+          "shape":"SearchDiscoverableRegistryRecordsRequestMaxResultsInteger",
+          "documentation":"<p> The maximum number of results to return in one page. Valid values are 1 through 50 when <code>searchType</code> is <code>KEYWORD</code>, and 1 through 20 when it is <code>HYBRID</code> or <code>SEMANTIC</code>. The default value is 10.</p>"
+        },
+        "filters":{
+          "shape":"MetadataFilterExpression",
+          "documentation":"<p> An optional structured JSON metadata filter that narrows the search results. Supports the field-level operators <code>$eq</code>, <code>$ne</code>, and <code>$in</code>, and the logical operators <code>$and</code> and <code>$or</code> on filterable fields.</p> <p> Specifies additional filtering on custom metadata fields using the <code>customMetadata.{key}</code> prefix. For example, to filter by a custom metadata field: <code>{\"customMetadata.environment\": {\"$eq\": \"production\"}}</code>. For a Boolean field, you can also use a native JSON boolean value, for example: <code>{\"customMetadata.requiresApproval\": {\"$eq\": true}}</code>.</p>"
+        },
+        "searchType":{
+          "shape":"SearchType",
+          "documentation":"<p> Specifies how the service ranks registry records against the search query. If you omit this parameter, the service uses <code>HYBRID</code> in Amazon Web Services Regions that support semantic search and <code>KEYWORD</code> in Regions that do not. The response reports the search type that the service used. Valid values are the following:</p> <ul> <li> <p> <code>KEYWORD</code> – Ranks records by keyword match between the query terms and the record name, description, descriptors, and custom metadata text values. Available in every Amazon Web Services Region.</p> </li> <li> <p> <code>SEMANTIC</code> – Ranks records by semantic similarity to the query and returns the most similar records, up to <code>maxResults</code>, even when none of them closely matches the query.</p> </li> <li> <p> <code>HYBRID</code> – Combines keyword ranking and semantic ranking.</p> </li> </ul> <p> <code>HYBRID</code> and <code>SEMANTIC</code> are available in a limited number of Regions. If you specify either one in a Region that does not support semantic search, the request fails with a <code>ValidationException</code> that has the reason <code>UnsupportedInRegion</code>.</p>"
+        },
+        "nextToken":{
+          "shape":"SearchDiscoverableRegistryRecordsRequestNextTokenString",
+          "documentation":"<p> The pagination token from a previous response. Use it to retrieve the next page of results, and send the same <code>searchQuery</code>, <code>registryIds</code>, <code>filters</code>, and <code>searchType</code> that you used for the first page. If any of them differ, the request fails with a <code>ValidationException</code>. A pagination token expires 15 minutes after the service returns the first page.</p>"
+        }
+      }
+    },
+    "SearchDiscoverableRegistryRecordsRequestMaxResultsInteger":{
+      "type":"integer",
+      "box":true,
+      "max":50,
+      "min":1
+    },
+    "SearchDiscoverableRegistryRecordsRequestNextTokenString":{
+      "type":"string",
+      "max":4096,
+      "min":1
+    },
+    "SearchDiscoverableRegistryRecordsRequestRegistryIdsList":{
+      "type":"list",
+      "member":{"shape":"RegistryIdentifier"},
+      "max":1,
+      "min":1
+    },
+    "SearchDiscoverableRegistryRecordsResponse":{
+      "type":"structure",
+      "required":["registryRecords"],
+      "members":{
+        "registryRecords":{
+          "shape":"RegistryRecordSummaryList",
+          "documentation":"<p> The registry records that match the search query, ordered by relevance. A page can contain fewer than <code>maxResults</code> records, or none, even when the response includes a <code>nextToken</code>. To retrieve every result, continue until the response has no <code>nextToken</code>.</p>"
+        },
+        "searchType":{
+          "shape":"SearchType",
+          "documentation":"<p> Specifies the search type that the service used to rank the returned records. If you omitted <code>searchType</code> in the request, this is the default for the Amazon Web Services Region: <code>HYBRID</code> where semantic search is supported, and <code>KEYWORD</code> elsewhere.</p>"
+        },
+        "nextToken":{
+          "shape":"String",
+          "documentation":"<p> The pagination token to pass to a subsequent request to retrieve the next page of results. This field is absent when there are no more results, or when the search has returned the maximum number of results for its search type.</p>"
+        }
+      }
+    },
+    "SearchQuery":{
+      "type":"string",
+      "max":256,
+      "min":0,
+      "sensitive":true
+    },
+    "SearchType":{
+      "type":"string",
+      "documentation":"<p> Specifies the ranking method for a search request.</p>",
+      "enum":[
+        "HYBRID",
+        "SEMANTIC",
+        "KEYWORD"
+      ]
+    },
+    "Sha256Hash":{
+      "type":"string",
+      "documentation":"<p>A SHA-256 checksum, as 64 lowercase hexadecimal characters.</p>",
+      "max":64,
+      "min":64,
+      "pattern":"[0-9a-f]{64}"
+    },
+    "SignatureAgentCardAdditionalData":{
+      "type":"structure",
+      "members":{
+        "category":{
+          "shape":"BotCategory",
+          "documentation":"<p>The bot category that describes the purpose of the web bot identified by the signature agent card descriptor.</p>"
+        }
+      },
+      "documentation":"<p>The additional data for a signature agent card descriptor, such as the bot category of the web bot.</p>"
+    },
+    "SignatureAgentCardDescriptor":{
+      "type":"structure",
+      "members":{
+        "data":{
+          "shape":"DescriptorData",
+          "documentation":"<p> The signature agent card descriptor content, serialized as descriptor payload data.</p>"
+        },
+        "dataSchemaVersion":{
+          "shape":"DataSchemaVersion",
+          "documentation":"<p> The schema version of the descriptor payload.</p>"
+        },
+        "source":{
+          "shape":"DescriptorSource",
+          "documentation":"<p> The source location from which the signature agent card descriptor content was retrieved.</p>"
+        },
+        "additionalData":{
+          "shape":"SignatureAgentCardAdditionalData",
+          "documentation":"<p> Additional data for the signature agent card, such as its AWS WAF bot category.</p>"
+        }
+      },
+      "documentation":"<p> Descriptor that defines the content of a signature agent card, which identifies a web bot and references the JSON Web Key Set (JWKS) used to verify its HTTP message signatures.</p>"
+    },
+    "String":{"type":"string"},
+    "ThrottlingException":{
+      "type":"structure",
+      "members":{
+        "message":{"shape":"NonBlankString"}
+      },
+      "documentation":"<p>The request was denied due to request throttling; the caller may retry after a delay.</p>",
+      "error":{
+        "httpStatusCode":429,
+        "senderFault":true
+      },
+      "exception":true
+    },
+    "UnauthorizedException":{
+      "type":"structure",
+      "members":{
+        "message":{"shape":"NonBlankString"}
+      },
+      "documentation":"<p>The request could not be authenticated.</p>",
+      "error":{
+        "httpStatusCode":401,
+        "senderFault":true
+      },
+      "exception":true
+    },
+    "ValidationException":{
+      "type":"structure",
+      "required":[
+        "message",
+        "reason"
+      ],
+      "members":{
+        "message":{"shape":"String"},
+        "reason":{
+          "shape":"ValidationExceptionReason",
+          "documentation":"<p>The reason the request failed validation.</p>"
+        },
+        "fieldList":{
+          "shape":"ValidationExceptionFieldList",
+          "documentation":"<p>The list of input fields that failed validation.</p>"
+        }
+      },
+      "documentation":"<p>The request failed validation of one or more input fields.</p>",
+      "error":{
+        "httpStatusCode":400,
+        "senderFault":true
+      },
+      "exception":true
+    },
+    "ValidationExceptionField":{
+      "type":"structure",
+      "required":[
+        "name",
+        "message"
+      ],
+      "members":{
+        "name":{
+          "shape":"String",
+          "documentation":"<p>The name of the field that failed validation.</p>"
+        },
+        "message":{
+          "shape":"String",
+          "documentation":"<p>A description of why the field failed validation.</p>"
+        }
+      },
+      "documentation":"<p>Describes a single input field that failed validation.</p>"
+    },
+    "ValidationExceptionFieldList":{
+      "type":"list",
+      "member":{"shape":"ValidationExceptionField"}
+    },
+    "ValidationExceptionReason":{
+      "type":"string",
+      "enum":[
+        "CannotParse",
+        "FieldValidationFailed",
+        "IdempotentParameterMismatchException",
+        "EventInOtherSession",
+        "ResourceConflict",
+        "UnsupportedInRegion"
+      ]
+    }
+  },
+  "documentation":"<p>Agent Registry lets callers discover, list, and retrieve approved records published to a registry.</p>"
+}
