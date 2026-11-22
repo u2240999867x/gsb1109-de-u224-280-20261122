@@ -1,0 +1,7 @@
+# Dask
+
+::: {.callout-note}
+## The Dask backend was removed in Ibis version 10.0
+
+See [our blog post](../posts/farewell-pandas/index.qmd) on the topic for more information.
+:::

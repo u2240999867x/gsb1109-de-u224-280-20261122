@@ -1,0 +1,46 @@
+---
+title: Online playground
+format:
+  html:
+    page-layout: full
+---
+
+Try our experimental JupyterLite console with Ibis, using the Palmer
+penguins[^1] dataset loaded into the DuckDB backend!
+
+::: {.callout-warning collapse="true"}
+## Ibis in the browser is experimental.
+
+iOS is known to crash on this page.
+
+Mobile Firefox may also not work (the page won't crash though).
+
+Please [open an issue on GitHub](https://github.com/ibis-project/ibis/issues/new/choose) if you encounter problems.
+:::
+
+```{python}
+#| echo: false
+#| output: asis
+from urllib.parse import urlencode
+
+lines = """
+%pip install 'ibis-framework[duckdb]'
+from ibis.interactive import *
+penguins = ibis.read_csv("penguins.csv")
+penguins
+"""
+
+params = [
+    ("toolbar", "1"),
+    ("theme", "JupyterLab Night"),
+    ("kernel", "python"),
+]
+params.extend(("code", line) for line in lines.splitlines() if line)
+query = urlencode(params)
+
+jupyterlite = f"../../jupyterlite/repl/?{query}"
+iframe = f'<iframe src="{jupyterlite}" class="jupyterlite-console"></iframe>'
+print(iframe)
+```
+
+[^1]: Horst AM, Hill AP, Gorman KB (2020). palmerpenguins: Palmer Archipelago (Antarctica) penguin data. R package version 0.1.0. <https://allisonhorst.github.io/palmerpenguins/>. doi: 10.5281/zenodo.3960218.

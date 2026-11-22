@@ -1,0 +1,115 @@
+{
+  "rangeStrategy": "widen",
+  "extends": ["config:recommended", ":enablePreCommit", ":dependencyDashboard"],
+  "schedule": [
+    "after 10pm every weekday",
+    "every weekend",
+    "before 5am every weekday"
+  ],
+  "semanticCommits": "enabled",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "enabledManagers": [
+    "docker-compose",
+    "dockerfile",
+    "github-actions",
+    "pep621"
+  ],
+  "automerge": false,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["docker-compose", "dockerfile", "github-actions"],
+      "automerge": true,
+      "autoApprove": true
+    },
+    {
+      "matchManagers": ["docker-compose"],
+      "matchCurrentVersion": "/^13\\..+$/",
+      "allowedVersions": "/^13\\..+$/",
+      "matchPackageNames": ["/postgres/"]
+    },
+    {
+      "addLabels": ["pyspark"],
+      "matchPackageNames": ["/spark/"]
+    },
+    {
+      "addLabels": ["clickhouse"],
+      "matchPackageNames": ["/clickhouse/"]
+    },
+    {
+      "addLabels": ["datafusion"],
+      "matchPackageNames": ["/datafusion/"]
+    },
+    {
+      "addLabels": ["bigquery"],
+      "matchPackageNames": [
+        "/db-dtypes/",
+        "/google-cloud-bigquery/",
+        "/google-cloud-bigquery-storage/",
+        "/pydata-google-auth/"
+      ]
+    },
+    {
+      "addLabels": ["duckdb"],
+      "matchPackageNames": ["/duckdb/"]
+    },
+    {
+      "addLabels": ["impala"],
+      "matchPackageNames": ["/impyla/", "/impala/", "/kudu/"]
+    },
+    {
+      "addLabels": ["oracle"],
+      "matchPackageNames": ["/oracledb/", "/oracle-free/"]
+    },
+    {
+      "addLabels": ["polars"],
+      "matchPackageNames": ["/polars/"]
+    },
+    {
+      "addLabels": ["postgres"],
+      "matchPackageNames": ["/psycopg/", "/postgres/"]
+    },
+    {
+      "addLabels": ["druid"],
+      "matchPackageNames": ["/pydruid/", "/zookeeper/", "/druid/"]
+    },
+    {
+      "addLabels": ["mysql"],
+      "matchPackageNames": ["/mysqlclient/", "/mariadb/"]
+    },
+    {
+      "addLabels": ["mssql"],
+      "matchPackageNames": ["/pymssql/", "/mssql/"]
+    },
+    {
+      "addLabels": ["pyspark"],
+      "matchPackageNames": ["/pyspark/"]
+    },
+    {
+      "addLabels": ["risingwave"],
+      "matchPackageNames": ["/psycopg2/", "/risingwave/"]
+    },
+    {
+      "addLabels": ["snowflake"],
+      "matchPackageNames": ["/snowflake-connector-python/"]
+    },
+    {
+      "addLabels": ["trino"],
+      "matchPackageNames": ["/trino/", "/minio/"]
+    },
+    {
+      "matchDepTypes": ["dev"],
+      "addLabels": ["developer-tools"]
+    },
+    {
+      "matchDepTypes": ["test"],
+      "addLabels": ["tests"]
+    },
+    {
+      "matchDepTypes": ["docs"],
+      "addLabels": ["docs"]
+    }
+  ]
+}

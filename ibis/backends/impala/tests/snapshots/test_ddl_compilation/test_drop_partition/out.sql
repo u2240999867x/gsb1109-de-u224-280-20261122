@@ -1,0 +1,1 @@
+ALTER TABLE tbl DROP PARTITION (`year`=2007, `region`='CA')

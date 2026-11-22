@@ -1,0 +1,45 @@
+# Versioning policy
+
+Ibis follows a [Semantic Versioning](https://semver.org/) scheme
+(`MAJOR.MINOR.PATCH`, like `6.1.0`).
+
+- An increase in the `MAJOR` version number will happen when a release contains
+  breaking changes in the public API. This includes anything documented in the
+  [reference documentation](../reference), excluding any
+  features explicitly marked as "experimental". Features not part of the public
+  API (e.g. anything in `ibis.expr.operations` may make breaking changes at any
+  time).
+
+- An increase in the `MINOR` or `PATCH` version number indicate changes to
+  public APIs that should remain compatible with previous Ibis versions with
+  the same `MAJOR` version number.
+
+## Transitive dependencies
+
+Ibis depends on a number of other libraries, for example pyarrow.
+Ibis does not set upper version bounds on it's dependencies
+(unless we *know* that a later version is incompatible).
+This has the benefit that if pyarrow releases a new version,
+you as an application developer will be able to use it without waiting for
+Ibis to release a new version with increased upper bounds.
+However, this has the downside that if the new pyarrow
+release has a change which breaks Ibis, your installation may break.
+To avoid this, we recommend pinning your dependencies with a
+uv.lock/poetry.lock/pdm.lock/requirements.txt/etc file
+(this is good practice anyway).
+
+See https://github.com/ibis-project/ibis/pull/10797 for more information.
+
+## Supported Python versions
+
+Ibis follows [NEP29](https://numpy.org/neps/nep-0029-deprecation_policy.html)
+with respect to supported Python versions.
+
+This has been in-place [since Ibis version 3.0.0](https://github.com/ibis-project/ibis/blob/5015677d78909473014a61725d371b4bf772cdff/docs/blog/Ibis-version-3.0.0-release.md?plain=1#L83).
+
+The [support
+table](https://numpy.org/neps/nep-0029-deprecation_policy.html#support-table)
+shows the schedule for dropping support for Python versions.
+
+The next major release of Ibis that occurs on or after the NEP29 drop date
+removes support for the specified Python version.

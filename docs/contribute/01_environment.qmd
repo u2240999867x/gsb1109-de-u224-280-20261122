@@ -1,0 +1,340 @@
+---
+hide:
+  - toc
+---
+
+# Setting up a development environment
+
+## Required dependencies
+
+- [`git`](https://git-scm.com/)
+
+::: {.panel-tabset}
+
+::: {.callout-note}
+## MacOS users on arm64 CPUs must use a different setup
+If you are working with an `arm64` architecture (Mac M1/M2) refer directly to
+the `conda/mamba` setup and refer to the comment related to `arm64`
+architectures.
+:::
+
+## Conda/Mamba/Pixi
+
+### Support matrix [^conda-callout]
+
+|                                            |   Python 3.10                |   Python 3.11    |   Python 3.12    |
+| -----------------------------------------: | :--------------------------: | :--------------: | :--------------: |
+|                                  **Linux** | {{< fa check >}}[^supported] | {{< fa check >}} | {{< fa check >}} |
+|                         **macOS (x86_64)** | {{< fa check >}}             | {{< fa check >}} | {{< fa check >}} |
+|                        **macOS (aarch64)** | {{< fa check >}}             | {{< fa check >}} | {{< fa check >}} |
+|                                **Windows** | {{< fa check >}}             | {{< fa check >}} | {{< fa check >}} |
+
+::: {.panel-tabset}
+
+```{python}
+#| echo: false
+#| output: asis
+
+managers = {
+    "conda": {
+        "name": "Miniconda",
+        "url": "https://docs.conda.io/en/latest/miniconda.html",
+    },
+    "mamba": {
+        "name": "Mamba",
+        "url": "https://github.com/mamba-org/mamba",
+    },
+    "pixi": {
+        "name": "Pixi",
+        "url": "https://pixi.sh/latest/",
+    },
+}
+
+for manager, params in managers.items():
+    name = params["name"]
+    url = params["url"]
+
+    print(f"## `{manager}`")
+    print()
+    print(f"1. Install [{name}]({url})")
+    print()
+    print(f"1. Install `gh`")
+    print()
+    print("    ```sh")
+    if manager == "conda" or manager == "mamba":
+        print(f"    {manager} install -c conda-forge gh")
+    elif manager == "pixi":
+        print(f"    {manager} global install gh")
+    print("    ```")
+    print()
+    print(f"1. Fork and clone the ibis repository:")
+    print()
+    print("    ```sh")
+    print("    gh repo fork --clone --remote ibis-project/ibis")
+    print("    ```")
+    print()
+    print(f"1. Create a {name} environment using `environment.yml`")
+    print()
+    print("    ```sh")
+    print("    cd ibis")
+    if manager == "conda" or manager == "mamba":
+        print(f"    {manager} env create --file conda/environment.yml")
+    elif manager == "pixi":
+        print(f"    {manager} init --import conda/environment.yml")
+    print("    ```")
+    print()
+    if manager == "pixi":
+        print("    This command will initialize a `pixi.toml` file and also modify ")
+        print("the `.gitignore` to prevent Pixi configuration from being added to ")
+        print("`git`.")
+        print()
+    print(
+        "    If you're using an ARM64 architecture (Mac M1/M2/M3/M4), use "
+        "`conda/environment-arm64.yml` for setting up a dev environment."
+    )
+    print()
+    print(f"1. Activate the environment")
+    print()
+    print("    ```sh")
+    if manager == "conda" or manager == "mamba":
+        print(f"    {manager} activate ibis-dev")
+    elif manager == "pixi":
+        print(f"    {manager} shell")
+    print("    ```")
+    print()
+    print(
+        f"1. Install your local copy of `ibis` into the {manager.capitalize()} environment"
+    )
+    print()
+    print("    ```sh")
+    print("    uv pip install -e .")
+    print("    ```")
+    print()
+```
+
+:::
+
+## Nix
+
+### Support matrix
+
+|                          | Python 3.10                  | Python 3.11        | Python 3.12        | Python 3.13        |
+| -----------------------: | :--------------------------: | :----------------: | :----------------: | :----------------: |
+|       **Linux (x86_64)** | {{< fa check >}}[^supported] | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|        **Linux (arm64)** | {{< fa check >}}             | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|       **macOS (x86_64)** | {{< fa check >}}             | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|  **macOS (arm64/M1/M2)** | {{< fa check >}}             | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|              **Windows** | {{< fa ban >}}[^unlikely]    | {{< fa ban >}}     | {{< fa ban >}}     | {{< fa ban >}}     |
+
+1.  [Install `nix`](https://nixos.org/download.html)
+1.  Configure `nix`
+
+    Edit/create your `nix.conf` file (`$XDG_CONFIG_HOME/nix/nix.conf`) and add the line
+
+    ```sh
+    experimental-features = nix-command flakes
+    ```
+
+1.  Install `gh`:
+
+    ::: {.panel-tabset}
+
+    ## `nix-shell`
+
+    ```sh
+    nix-shell -p gh
+    ```
+
+    ## `nix-env`
+
+    ```sh
+    nix-env -iA gh
+    ```
+
+    :::
+
+1.  Fork and clone the ibis repository:
+
+    ```sh
+    gh repo fork --clone --remote ibis-project/ibis
+    ```
+
+1.  Set up the public `ibis` Cachix cache to pull pre-built dependencies:
+
+    ```sh
+    nix-shell -p cachix --run 'cachix use ibis'
+    ```
+
+1.  Run `nix develop` in the checkout directory:
+
+    ```sh
+    cd ibis
+    nix develop
+    ```
+
+    This will launch a `bash` shell with all of the required dependencies installed.
+    This may take a while due to artifact download from the cache.
+
+## Container (uv)
+
+### Support matrix
+
+|                         | Python 3.10        | Python 3.11        | Python 3.12        | Python 3.13        |
+| ----------------------: | :----------------: | :----------------: | :----------------: | :----------------: |
+|               **Linux** | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|      **macOS (x86_64)** | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+| **macOS (arm64/M1/M2)** | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+|             **Windows** | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   | {{< fa check >}}   |
+
+1. Git clone the project repository.
+
+1. Install `Docker Desktop` for your platform.
+
+1. [Install `VS Code`](https://code.visualstudio.com/)
+
+1. [Install `VS Code Docker Extension`](https://marketplace.visualstudio.com/items?itemName=ms-azuretools.vscode-docker)
+
+1. [Install `VS Code Dev Containers Extension`](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+
+1. If using an Apple Silicon Mac, virtualization may be fastest with Colima.
+    1. [Install `Colima`](https://github.com/abiosoft/colima)
+    2. Verify that the disk allocation to Colima is satisfactory with `colima template --editor code`.
+    3. To use Colima for virtualization, `docker context use colima` or `export DOCKER_CONTEXT=colima`.
+    4. Verify that the Colima context is in effect with `docker context ls` (look for '*').
+    5. Start the Colima VM: `start colima`.
+    6. If you encounter disk resource issues after building images, `colima prune` or `colima delete` may be needed.
+
+    As an alternative to `Colima`, install Rosetta 2.
+
+    ```sh
+    softwareupdate --install-rosetta
+    ```
+
+1. In `VS Code`, open the project directory.
+
+1. Menu options for working with devcontainers are available through the blue `><`
+    button, at the lower left corner of the project window.
+
+    * Use `Reopen the container` to build an image and launch a container.
+    * Press any button to close the automatically launched terminal.
+    * Launch a new `VS Code` terminal from the main menu.
+    * The project will be in the container as an editable install with Ibis library,
+      dev and test dependencies installed, and with the working directory `/app`.
+
+1. Use `uv` commands such `uv pip list` to show the installed packages in the `uv`
+    .venv.
+
+1. Run non-`uv` commands in the virtual environment using `uv run`, for
+    example `uv run pytest -m core`. Standard `git` commands are available without
+    `uv run` because they do not need packages in the .venv to work.
+
+1. To exit a container, click the `Dev Container` button on the lower left of the
+    window and select the last menu option, `Close Remote Connection`.
+
+1. To ensure you have the latest dependencies from the main upstream branch based on
+    `pyproject.toml`:
+
+    * Exit any running container.
+    * Sync your fork.
+    * From your local Git repo, `git pull origin main`.
+    * Reopen the project in a new container.
+    * `Rebuild Container` to copy files from the local Git repo and have the build
+    run `uv sync`.
+
+## uv
+
+::: {.callout-warning}
+## `uv` will not handle installation of system dependencies
+
+`uv` will not install system dependencies needed for some packages such as `psycopg2` and `kerberos`.
+
+For a better development experience see the `conda/mamba` or `nix` setup instructions.
+:::
+
+1. [Install `uv`](https://docs.astral.sh/uv/getting-started/installation/)
+
+1. [Install `gh`](https://cli.github.com/manual/installation)
+
+1. [Install `just`](https://just.systems/man/en/packages.html)
+
+1. Fork and clone the ibis repository:
+
+   ```sh
+   gh repo fork --clone --remote ibis-project/ibis
+   ```
+
+1. Change directory into `ibis`:
+
+   ```sh
+   cd ibis
+   ```
+
+1. Install development dependencies
+
+   This will create a virtual environment at `.venv` and install all dependencies inside.
+   It will also install Ibis in development mode as `ibis-framework`.
+
+   ```sh
+   just sync
+   ```
+
+1. Activate the virtual environment
+
+   ```sh
+   source .venv/bin/activate
+   ```
+
+## pip
+
+::: {.callout-warning}
+## `pip` will not handle installation of system dependencies
+
+`pip` will not install system dependencies needed for some packages such as `psycopg2` and `kerberos`.
+
+For a better development experience see the `conda/mamba` or `nix` setup instructions.
+:::
+
+1. [Install `gh`](https://cli.github.com/manual/installation)
+
+1. Fork and clone the ibis repository:
+
+   ```sh
+   gh repo fork --clone --remote ibis-project/ibis
+   ```
+
+1. Change directory into `ibis`:
+
+   ```sh
+   cd ibis
+   ```
+
+1. Install development dependencies
+
+   This will also install Ibis in development mode as `ibis-framework`.
+
+   ```sh
+   pip install 'uv>=0.4.29'
+   pip install -r requirements-dev.txt
+   ```
+
+:::
+
+## Code style and formatting
+
+Ibis uses several code linters and has a style guide for documentation, please
+checkout the [style and formatting guide](./03_style.qmd) for instructions on how to set things up.
+
+## Building the docs
+
+Install [`just`](https://just.systems/man/en/packages.html) (if you installed
+via `conda/mamba` you are covered) and run
+
+```bash
+just docs-preview
+```
+
+to build and serve the documentation.
+
+[^conda-callout]: Some optional dependencies for Windows and Mac OS are not available through `conda`/`mamba`
+[^supported]: Tested in CI. If this doesn't work for you, please [file an issue](https://github.com/ibis-project/ibis/issues/new).
+[^unlikely]: Unlikely to ever be supported or no upstream support.

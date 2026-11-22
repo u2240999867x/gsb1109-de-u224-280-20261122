@@ -1,0 +1,8 @@
+include = [
+  ".prettierrc.toml",
+  ".streamlit/config.toml",
+  ".taplo.toml",
+  "ibis/examples/pixi.toml",
+  "lychee.toml",
+  "pyproject.toml",
+]
