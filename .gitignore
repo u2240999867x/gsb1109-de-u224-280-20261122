@@ -1,0 +1,13 @@
+__pycache__/
+*.py[co]
+.tox
+.coverage
+/.cache/
+/.venv/
+/build
+/dist
+/docs/build
+/TODO.md
+/htmlcov/
+.mypy_cache
+/.python-version
