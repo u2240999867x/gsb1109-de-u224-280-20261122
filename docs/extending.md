@@ -1,0 +1,196 @@
+# Extensions and Plugins
+
+!!! warning
+
+    The extension mechanism in Narwhals is experimental and under development.
+    If anything is not clear, or doesn't work, please do raise an issue or
+    contact us on Discord (see the link on the README).
+
+If you would like to make a new library Narwhals-compatible, then there are
+three ways to go about it:
+
+- Open a PR to Narwhals. At this point, however, the bar for including new libraries
+  is very high, so please discuss it with us beforehand.
+- Make that library Narwhals-compliant.
+- Make a plugin for that library which makes it Narwhals-compliant.
+
+## Making a library Narwhals-compliant
+
+It's possible to integrate your library with Narwhals with zero code changes
+in Narwhals. To do this, you'll need to make sure that your library complies with
+the Narwhals protocols found in `narwhals/compliant.py`.
+
+For example, you'll need:
+
+- A `LazyFrame` class which implements `__narwhals_lazyframe__`.
+- A `Expr` class which implements `broadcast`.
+- A `Namespace` class which implements `is_native`.
+- ...
+
+Full details can be found by inspecting the protocols in `narwhals/compliant.py`.
+
+## Creating a Plugin
+
+If it's not possible to add extra functions like `__narwhals_namespace__` and others to a dataframe object
+itself, then another option is to write a plugin. Narwhals itself has the necessary utilities to detect and
+handle plugins. For this integration to work, any plugin architecture must contain the following:
+
+  1. an entrypoint defined in a `pyproject.toml` file:
+
+    ```
+    [project.entry-points.'narwhals.plugins']
+    narwhals-<library name> = 'narwhals_<library name>'
+    ```
+    The section name needs to be the same for all plugins; inside it, plugin creators can replace their
+    own library name, for example `narwhals-grizzlies = 'narwhals_grizzlies'`
+
+  2. a top-level `__init__.py` file containing the following:
+
+    - `is_native` and `__narwhals_namespace__` functions.
+    - a string constant `NATIVE_PACKAGE` which holds the name of the library for which the plugin is made.
+
+    `is_native` accepts a native object and returns a boolean indicating whether the native object is
+    a dataframe of the library the plugin was written for.
+
+    `__narwhals_namespace__` takes the Narwhals version and returns a compliant namespace for the library,
+    i.e. one that complies with the CompliantNamespace protocol. This protocol specifies a `from_native`
+    function, whose input parameter is the Narwhals version and which returns a compliant Narwhals LazyFrame
+    which wraps the native dataframe.
+
+    Narwhals caches the namespace returned by `__narwhals_namespace__`, one per plugin and
+    version, and shares it across every call, both `backend=...` and `nw.from_native`.
+    It must therefore be safe to reuse, like Narwhals' own namespaces, which hold nothing
+    but their implementation and version. The hook itself may still be called more than
+    once, e.g. on concurrent first use.
+
+    Take a look at the `Plugin` protocol in `narwhals/plugins.py` for the signatures.
+
+  3. an `_implementation = narwhals.Implementation.UNKNOWN` attribute on every compliant
+    class the plugin exposes (namespace, dataframe, lazyframe, series). This is how Narwhals
+    tells plugin objects apart from those of its built-in backends.
+
+### Expression metadata
+
+Some operations can't be implemented by looking at a single compliant expression in isolation.
+For example, `over` needs to know which function it's being applied to, and `group_by` needs to
+know whether an aggregation is simple enough to dispatch to a native group-by. For this, compliant
+expressions carry an `ExprMetadata` object, available as `_metadata`, which plugins may read.
+Commonly used parts of it are:
+
+- `is_literal`, `is_scalar_like`, `is_elementwise`, `prev`
+- `expansion_kind` (e.g. `expansion_kind.is_multi_output()`)
+- `iter_nodes_reversed()` and `op_nodes_reversed()`, which walk the expression's nodes from
+  last to first
+
+See [Expression Metadata](how_it_works.md#expression-metadata) for what each piece means.
+
+!!! warning
+    `_metadata` is plugin-facing but **not** covered by Narwhals' [backwards-compatibility
+    policy](backcompat.md): it may change between minor releases. Plugins which use it should
+    set a tight lower bound on `narwhals` and test against the minimum version they support.
+    They should also test against Narwhals' `main` branch, and release a new plugin version
+    when `_metadata` changes, as a newer Narwhals release may break an already-released plugin.
+
+Other private modules (e.g. `narwhals._utils`) are not plugin-facing. If you need something
+from them, vendor it into your plugin.
+
+### Custom repr
+
+The repr of a Narwhals `DataFrame`, `LazyFrame` or `Series` wraps the repr of its native object.
+If that isn't informative (e.g. if the native object is a plain `dict`), a compliant dataframe,
+lazyframe or series can define a `native_repr(self) -> str` method, whose result is used instead.
+Every line of it must fit within the terminal width minus 2 (for the box borders), otherwise
+Narwhals shows a placeholder asking the user to call `.to_native()` instead.
+
+## Supporting `backend=...` in Narwhals functions
+
+Functions and constructors which accept a `backend` argument can also dispatch to a
+plugin. Users can pass:
+
+- the plugin's entry point name (e.g. `backend="narwhals-grizzlies"`),
+- the plugin's module name (e.g. `backend="narwhals_grizzlies"`),
+- or the plugin's module itself (e.g. `backend=narwhals_grizzlies`).
+
+All three spellings resolve to the same [cached namespace](#creating-a-plugin), and
+dispatch goes through it:
+
+1. **IO functions** (`read_csv`, `scan_csv`, `read_parquet`, `scan_parquet`): these
+   call same-named methods on the compliant namespace, following the
+   [namespace contract](#io-functions-the-namespace-contract) below. If the plugin's
+   namespace does not implement the required method, an informative
+   [`PluginError`](api-reference/exceptions.md) is raised.
+
+2. **Eager constructors** (`from_dict`, `from_dicts`, `from_numpy`, `from_arrow`,
+   `new_series`, and the `DataFrame.from_*` and `Series.from_*` classmethods) are
+   eager-only. They work with no extra plugin code when the plugin's compliant
+   namespace implements the `EagerNamespace` protocol from `narwhals.compliant`: the
+   `_dataframe` and `_series` properties, whose classes provide the `from_dict`,
+   `from_dicts`, `from_numpy`, `from_arrow` and `from_iterable` constructors (see
+   `EagerDataFrame` and `EagerSeries`). Lazy-only plugins get an informative
+   [`PluginError`](api-reference/exceptions.md) instead.
+
+Methods which internally construct Series (`Series.scatter`, `DataFrame.filter` with a
+list of booleans, or a NumPy array passed to `with_columns`) use the compliant namespace
+of the object they are called on, so they also work for eager plugins.
+
+A method counts as missing when the namespace does not define it, marks it with
+`narwhals._utils.not_implemented()`, or inherits the protocol's empty stub.
+
+!!! tip "Type checking"
+
+    The `backend` parameters of these functions are typed with
+    [`PluginName`](api-reference/plugins.md), a `str`
+    [`NewType`](https://docs.python.org/3/library/typing.html#newtype): plugin names
+    are only known at runtime, so an opaque string does not type check, but an
+    explicitly wrapped one does, e.g.
+    `nw.from_dict(data, backend=PluginName("narwhals-grizzlies"))`.
+    Passing the plain string works at runtime all the same.
+
+### IO functions: the namespace contract
+
+The Narwhals IO functions (`read_csv`, `scan_csv`, `read_parquet`, `scan_parquet`)
+dispatch to same-named methods on the compliant namespace. This is a single mechanism,
+shared by built-in backends and plugins alike: to support these functions, a
+compliant namespace implements (a subset of):
+
+```py
+from narwhals.typing import NormalizedSource
+
+
+def read_csv(
+    self, source: NormalizedSource, *, separator: str = ",", **kwds: Any
+) -> CompliantDataFrame: ...
+
+
+def scan_csv(
+    self, source: NormalizedSource, *, separator: str = ",", **kwds: Any
+) -> CompliantFrame: ...
+
+
+def read_parquet(self, source: NormalizedSource, **kwds: Any) -> CompliantDataFrame: ...
+
+
+def scan_parquet(self, source: NormalizedSource, **kwds: Any) -> CompliantFrame: ...
+```
+
+In all cases:
+
+- `source` is a `NormalizedSource`: either a `NormalizedPath` (a `str`
+  [`NewType`](https://docs.python.org/3/library/typing.html#newtype) tagging that
+  Narwhals has already normalized `Path` and path-like inputs), or a file-like object
+  such as `io.BytesIO` / `io.StringIO`, passed through untouched.
+- A namespace whose native reader cannot take a file-like object should reject it with
+  `TypeError`, via `narwhals._utils.ensure_path_source`.
+- `kwds` are forwarded to the native reader, and it is the namespace's responsibility
+  to translate `separator` into whatever its native CSV reader expects (and to raise if
+  the two conflict).
+- `read_*` methods are eager-only, so they are only ever called on namespaces of eager
+  backends. `scan_*` methods are called for any backend: lazy namespaces return a
+  compliant LazyFrame, while eager ones may simply read eagerly. Namespaces complying
+  with the `EagerNamespace` protocol only need to implement `read_csv` and
+  `read_parquet`, as they inherit `scan_*` default implementations which fall back to
+  the corresponding `read_*` method.
+
+## Can I see an example?
+
+Yes! For a reference plugin, please check out [narwhals-daft](https://github.com/narwhals-dev/narwhals-daft).

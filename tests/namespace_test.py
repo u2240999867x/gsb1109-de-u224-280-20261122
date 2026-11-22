@@ -1,0 +1,336 @@
+from __future__ import annotations
+
+import re
+from collections import deque
+from collections.abc import Callable, Iterable, Sequence
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+from unittest.mock import Mock
+
+import pytest
+
+import narwhals as nw
+from narwhals._namespace import Namespace
+from narwhals._utils import Version
+from narwhals.exceptions import PluginError
+from narwhals.plugins import PluginName
+
+if TYPE_CHECKING:
+    from typing import TypeAlias
+
+    from typing_extensions import Never, assert_type  # noqa: F401
+
+    from narwhals._arrow.namespace import ArrowNamespace  # noqa: F401
+    from narwhals._compliant import CompliantNamespace
+    from narwhals._compliant.typing import CompliantExprAny
+    from narwhals._pandas_like.expr import PandasLikeExpr
+    from narwhals._pandas_like.namespace import PandasLikeNamespace  # noqa: F401
+    from narwhals._polars.namespace import PolarsNamespace  # noqa: F401
+    from narwhals._typing import Backend, BackendName, IntoBackend, _EagerAllowed
+    from narwhals.typing import _2DArray
+    from tests.utils import Constructor
+
+ExprT = TypeVar("ExprT", bound="CompliantExprAny")
+
+IntoIterable: TypeAlias = Callable[[Sequence[Any]], Iterable[Any]]
+
+_EAGER_ALLOWED = "polars", "pandas", "pyarrow", "modin", "cudf"
+_LAZY_ONLY = "dask", "duckdb", "pyspark", "sqlframe"
+_LAZY_ALLOWED = ("polars", *_LAZY_ONLY)
+_BACKENDS = (*_EAGER_ALLOWED, *_LAZY_ONLY)
+
+eager_allowed = pytest.mark.parametrize("backend", _EAGER_ALLOWED)
+lazy_allowed = pytest.mark.parametrize("backend", _LAZY_ALLOWED)
+backends = pytest.mark.parametrize("backend", _BACKENDS)
+
+
+def _compliant_len(ns: CompliantNamespace[Any, ExprT]) -> ExprT:
+    return ns.len()
+
+
+@backends
+def test_preserve_type_var(backend: BackendName) -> None:
+    # If we have multiple *potential* backends and together they don't hit an `@overload`
+    # we should fall back to `Any`.
+    # However when we have a *single* backend, we should be able to yoink it's `TypeVar`s
+    # out for use elsewhere.
+    pytest.importorskip(backend)
+    from_backend = Version.MAIN.namespace.from_backend
+    namespace_any = from_backend(backend).compliant
+    expr_any = _compliant_len(namespace_any)
+    assert expr_any
+    if TYPE_CHECKING:
+        # NOTE: If this `Any` fails due to (future) improved inference in a type-checker,
+        # the detail of this being `Any` can be swapped out for the new type
+        assert_type(expr_any, Any)
+        namespace_pandas = from_backend("pandas").compliant
+        expr_pandas = _compliant_len(namespace_pandas)
+        assert_type(expr_pandas, PandasLikeExpr)
+
+
+@backends
+def test_namespace_from_backend_name(backend: BackendName) -> None:
+    pytest.importorskip(backend)
+    namespace = Namespace.from_backend(backend)
+    assert namespace.implementation.name.lower() == backend
+    assert namespace.version is Version.MAIN
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [PluginName("test-plugin"), PluginName("test_plugin")],
+    ids=["entry-point-name", "module-name"],
+)
+def test_namespace_from_backend_plugin(backend: PluginName) -> None:
+    pytest.importorskip("test_plugin")
+    namespace = Namespace.from_backend(backend)
+    if TYPE_CHECKING:
+        assert_type(namespace, "Namespace[CompliantNamespace[Any, Any]]")
+    assert repr(namespace) == "Namespace[DictNamespace]"
+    assert namespace.implementation is nw.Implementation.UNKNOWN
+    assert namespace.version is Version.MAIN
+
+
+@backends
+def test_namespace_from_backend_cached(backend: BackendName) -> None:
+    pytest.importorskip(backend)
+    implementation = nw.Implementation.from_string(backend)
+    # `from_string` widens to `Implementation`, which no single overload accepts.
+    impl = cast("IntoBackend[Backend]", implementation)
+    compliant = Namespace.from_backend(backend).compliant
+    assert Namespace.from_backend(impl).compliant is compliant
+    assert (
+        Namespace.from_backend(implementation.to_native_namespace()).compliant
+        is compliant
+    )
+    # The `Namespace` wrapper itself stays cheap and unshared.
+    assert Namespace.from_backend(backend) is not Namespace.from_backend(backend)
+
+
+@backends
+def test_namespace_from_backend_cached_per_version(backend: BackendName) -> None:
+    pytest.importorskip(backend)
+    namespaces = {
+        version: version.namespace.from_backend(backend).compliant for version in Version
+    }
+    assert len({id(ns) for ns in namespaces.values()}) == len(Version)
+    for version, ns in namespaces.items():
+        assert ns._version is version
+
+
+def test_namespace_from_backend_plugin_cached() -> None:
+    """A plugin is cached like a built-in: one namespace per plugin, whatever the spelling."""
+    plugin = pytest.importorskip("test_plugin")
+    compliant = Namespace.from_backend(PluginName("test-plugin")).compliant
+    assert Namespace.from_backend(PluginName("test-plugin")).compliant is compliant
+    # Resolving first is what makes the module spellings share the entry point's entry.
+    assert Namespace.from_backend(PluginName("test_plugin")).compliant is compliant
+    assert Namespace.from_backend(plugin).compliant is compliant
+    assert Version.V1.namespace.from_backend(PluginName("test-plugin")).compliant is not (
+        compliant
+    )
+
+
+def test_namespace_plugin_hook_called_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`backend=...` and `nw.from_native` share one cached namespace per version."""
+    plugin = pytest.importorskip("test_plugin")
+    from narwhals import plugins
+
+    hook = Mock(wraps=plugin.__narwhals_namespace__)
+    monkeypatch.setattr(plugins, "_PLUGIN_NAMESPACES", {})
+    monkeypatch.setattr(plugin, "__narwhals_namespace__", hook)
+    for _ in range(2):
+        Namespace.from_backend(PluginName("test-plugin"))
+        nw.from_native({"a": [1]})  # type: ignore[call-overload]
+    hook.assert_called_once_with(version=Version.MAIN)
+
+
+def test_namespace_from_backend_plugin_not_installed() -> None:
+    with pytest.raises(ValueError, match="Unsupported backend: 'not-a-backend'"):
+        Namespace.from_backend(PluginName("not-a-backend"))
+
+
+def test_namespace_from_backend_plugin_invalid() -> None:
+    not_a_plugin = ModuleType("empty_plugin")
+    with pytest.raises(
+        PluginError, match="expected to implement `__narwhals_namespace__`"
+    ):
+        Namespace.from_backend(not_a_plugin)
+
+
+def test_namespace_from_native_object(constructor: Constructor) -> None:
+    data = {"a": [1, 2, 3], "b": [4, 5, 6]}
+    frame = constructor(data)
+    namespace = Namespace.from_native_object(frame)
+    nw_frame = nw.from_native(frame)
+    assert namespace.implementation == nw_frame.implementation
+
+
+def test_namespace_from_native_object_plugin() -> None:
+    pytest.importorskip("test_plugin")
+    namespace = Namespace.from_native_object({"a": [1]})  # type: ignore[call-overload]
+    assert namespace.implementation is nw.Implementation.UNKNOWN
+    expected = Namespace.from_backend(PluginName("test-plugin")).compliant
+    assert namespace.compliant is expected
+
+
+def test_namespace_from_native_object_invalid() -> None:
+    with pytest.raises(TypeError, match=r"Unsupported type: 'int'"):
+        Namespace.from_native_object(1)  # type: ignore[call-overload]
+
+
+@eager_allowed
+def test_namespace_from_backend_typing(backend: _EagerAllowed) -> None:
+    pytest.importorskip(backend)
+    namespace = Namespace.from_backend(backend)
+    if TYPE_CHECKING:
+        assert_type(
+            namespace,
+            # pyrefly: `PolarsNamespace` is not assignable to upper bound `CompliantNamespace` of type variable `CompliantNamespaceT_co`
+            "Namespace[PolarsNamespace] | Namespace[PandasLikeNamespace] | Namespace[ArrowNamespace]",  # pyrefly: ignore[bad-specialization]
+        )
+    assert repr(namespace) in {
+        "Namespace[PolarsNamespace]",
+        "Namespace[PandasLikeNamespace]",
+        "Namespace[ArrowNamespace]",
+    }
+
+
+@pytest.mark.parametrize("into_iter", [list, tuple, deque, iter])
+@eager_allowed
+def test_namespace_series_from_iterable(
+    backend: _EagerAllowed, into_iter: IntoIterable
+) -> None:
+    pytest.importorskip(backend)
+    data = 1, 2, 3
+    namespace = Namespace.from_backend(backend)
+    compliant = namespace.compliant
+    iterable = into_iter(data)
+    compliant_series = compliant._series.from_iterable(
+        iterable, context=compliant, name="hello"
+    )
+    series = nw.from_native(compliant_series, series_only=True)
+    assert isinstance(series, nw.Series)
+    assert series.to_list() == list(data)
+
+
+def test_namespace_from_numpy_polars() -> None:
+    pytest.importorskip("polars")
+    pytest.importorskip("numpy")
+    import numpy as np
+    import polars as pl
+
+    arr: _2DArray = cast("_2DArray", np.array([[5, 2, 0, 1], [1, 4, 7, 8], [1, 2, 3, 9]]))
+    columns = ["a", "b", "c", "d"]
+    frame = Namespace.from_backend("polars").compliant.from_numpy(arr, columns).native
+    if TYPE_CHECKING:
+        assert_type(frame, pl.DataFrame)
+
+    assert isinstance(frame, pl.DataFrame)
+    assert frame.columns == list(columns)
+
+
+def test_import_namespace() -> None:
+    pytest.importorskip("pandas")
+    pytest.importorskip("polars")
+    import pandas as pd
+
+    data = {"a": [1, 2, 3]}
+    native = pd.DataFrame(data)
+    ns = Version.V1.namespace.from_native_object(native)
+    assert ns.version is Version.V1
+    assert ns.implementation.is_pandas()
+
+    ns = Version.MAIN.namespace.from_native_object(native)
+    assert ns.version is Version.MAIN
+    assert ns.implementation.is_pandas()
+
+    compliant = ns.compliant._dataframe.from_dict(data, context=ns.compliant, schema=None)
+    ns_pl = ns.compliant._version.namespace.from_native_object(compliant.to_polars())
+    assert ns_pl.version is Version.MAIN
+    assert ns_pl.implementation.is_polars()
+
+
+def test_namespace_init_subclass() -> None:
+    pytest.importorskip("polars")
+
+    class NamespaceV1Any(Namespace[Any], version=Version.V1): ...
+
+    ns_any = NamespaceV1Any.from_backend("polars")
+    assert ns_any.version is Version.V1
+
+    class NamespaceV1NoTypeVar(Namespace, version=Version.V1): ...  # type: ignore[type-arg]
+
+    ns_no_type_var = NamespaceV1NoTypeVar.from_backend("polars")
+    assert ns_no_type_var.version is Version.V1
+
+    with pytest.raises(
+        TypeError, match=re.compile(r"missing.+required.+argument.+version")
+    ):
+
+        class NamespaceNoVersion(Namespace): ...  # type: ignore[call-arg, type-arg]
+
+    with pytest.raises(TypeError, match=re.compile(r"Expected.+Version.+but got.+str")):
+
+        class NamespaceBadVersion(Namespace, version="invalid version"): ...  # type: ignore[arg-type, type-arg]
+
+
+def test_namespace_is_native() -> None:
+    pytest.importorskip("polars")
+    import polars as pl
+
+    unrelated: list[int] = [1, 2, 3]
+    native_1 = pl.Series(unrelated)
+    native_2 = pl.DataFrame({"a": unrelated})
+
+    maybe_native: list[pl.Series | list[int]] = [native_1, unrelated]
+    always_native = list["pl.DataFrame | pl.Series"]((native_2, native_1))
+    never_native = [unrelated, 50]
+
+    expected_maybe = [True, False]
+    expected_always = [True, True]
+    expected_never = [False, False]
+
+    ns = Namespace.from_backend("polars").compliant
+    assert [ns.is_native(el) for el in maybe_native] == expected_maybe
+    assert [ns.is_native(el) for el in always_native] == expected_always
+    assert [ns.is_native(el) for el in never_native] == expected_never
+
+    if TYPE_CHECKING:
+        if ns.is_native(native_1):
+            assert_type(native_1, "pl.Series")
+        if not ns.is_native(native_1):
+            assert_type(native_1, "Never")
+
+        if ns.is_native(unrelated):
+            # NOTE: We can't spell intersections *yet* (https://github.com/python/typing/issues/213)
+            # Would be:
+            # `<subclass of list[int] and DataFrame> | <subclass of list[int] and LazyFrame> | <subclass of list[int] and Series>``
+            assert_type(unrelated, "Never")  # pyright: ignore[reportAssertTypeFailure] # pyrefly: ignore[assert-type]
+        else:
+            assert_type(unrelated, "list[int]")
+
+        maybe_item = maybe_native[0]
+        assert_type(maybe_item, "pl.Series | list[int]")
+        if ns.is_native(maybe_item):
+            assert_type(maybe_item, "pl.Series")
+        else:
+            assert_type(maybe_item, "list[int]")
+
+        if ns.is_native(native_2):
+            assert_type(native_2, "pl.DataFrame")
+        else:
+            assert_type(native_2, "Never")
+
+        always_item = always_native[1]
+        assert_type(always_item, "pl.DataFrame | pl.Series")
+        if ns.is_native(always_item):
+            assert_type(always_item, "pl.DataFrame | pl.Series")
+            if ns._dataframe._is_native(always_item):
+                assert_type(always_item, "pl.DataFrame")
+            elif ns._series._is_native(always_item):
+                assert_type(always_item, "pl.Series")
+            else:
+                assert_type(always_item, "Never")
+        else:
+            assert_type(always_item, "Never")
