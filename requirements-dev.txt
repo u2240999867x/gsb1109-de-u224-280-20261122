@@ -1,0 +1,5 @@
+pre-commit
+ipdb
+ipython
+tox
+-e .[test]

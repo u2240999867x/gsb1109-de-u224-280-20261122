@@ -1,0 +1,11 @@
+services:
+  mongoengine:
+    build:
+      context: .
+    image: mongoengine:latest
+    ports:
+      - 27017:27017
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
