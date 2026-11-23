@@ -33,6 +33,8 @@ __all__ = [  # noqa: RUF022
     "ConformedNameClashException",
     "MapExpressionError",
     "StreamMapConfigError",
+    "CorrectionMappingError",
+    "StaleRevisionError",
     # Sync — base
     "SyncError",
     # Sync — fatal
@@ -197,6 +199,38 @@ class MapExpressionError(MappingError):
 
 class StreamMapConfigError(MappingError):
     """Raised when a stream map has an invalid configuration."""
+
+
+class CorrectionMappingError(MappingError):
+    """Raised when a correction mapping cannot be applied to a record."""
+
+
+class StaleRevisionError(CorrectionMappingError):
+    """Raised when a record revision is older than the applied revision."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stream: str | None = None,
+        business_id: t.Any | None = None,  # noqa: ANN401
+        incoming_revision: int | None = None,
+        applied_revision: int | None = None,
+    ) -> None:
+        """Initialize the exception.
+
+        Args:
+            message: A message describing the stale revision.
+            stream: Source stream name, if known.
+            business_id: Business identity, if known.
+            incoming_revision: The revision that was rejected.
+            applied_revision: The revision already applied.
+        """
+        super().__init__(message)
+        self.stream = stream
+        self.business_id = business_id
+        self.incoming_revision = incoming_revision
+        self.applied_revision = applied_revision
 
 
 # ---------------------------------------------------------------------------

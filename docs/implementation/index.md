@@ -12,6 +12,7 @@ record_metadata
 metrics
 logging
 state
+correction_mapping
 at_least_once
 errors/index
 ```
