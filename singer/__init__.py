@@ -86,6 +86,22 @@ from singer.exceptions import (
     SingerSyncError,
 )
 
+from singer.source import SourceId
+
+from singer.contracts import (
+    ContractRegistry,
+    FieldContract,
+)
+
+from singer.confluence import (
+    Confluence,
+    ConfluenceError,
+    KeyConflictError,
+    KeyConflictTracker,
+    ManifestValidationError,
+    StreamMapping,
+)
+
 if __name__ == "__main__":
     import doctest
     doctest.testmod()

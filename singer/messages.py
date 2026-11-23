@@ -36,6 +36,11 @@ class RecordMessage(Message):
       * version (optional, int) - For versioned streams, the version
         number. Note that this feature is experimental and most Taps and
         Targets should not need to use versioned streams.
+      * source (optional, string) - For a confluence, the SourceId name
+        of the Tap that produced the record. Absent for single-Tap usage.
+      * contract_version (optional, int) - The FieldContract version the
+        record was emitted under, so a Target can decode it even after the
+        source renames an optional field in a later contract version.
 
     msg = singer.RecordMessage(
         stream='users',
@@ -43,11 +48,14 @@ class RecordMessage(Message):
 
     '''
 
-    def __init__(self, stream, record, version=None, time_extracted=None):
+    def __init__(self, stream, record, version=None, time_extracted=None,
+                 source=None, contract_version=None):
         self.stream = stream
         self.record = record
         self.version = version
         self.time_extracted = time_extracted
+        self.source = source
+        self.contract_version = contract_version
         if time_extracted and not time_extracted.tzinfo:
             raise ValueError("'time_extracted' must be either None " +
                              "or an aware datetime (with a time zone)")
@@ -63,6 +71,10 @@ class RecordMessage(Message):
         if self.time_extracted:
             as_utc = self.time_extracted.astimezone(pytz.utc)
             result['time_extracted'] = u.strftime(as_utc)
+        if self.source is not None:
+            result['source'] = self.source
+        if self.contract_version is not None:
+            result['contract_version'] = self.contract_version
         return result
 
     def __str__(self):
@@ -199,7 +211,9 @@ def parse_message(msg):
         return RecordMessage(stream=_required_key(obj, 'stream'),
                              record=_required_key(obj, 'record'),
                              version=obj.get('version'),
-                             time_extracted=time_extracted)
+                             time_extracted=time_extracted,
+                             source=obj.get('source'),
+                             contract_version=obj.get('contract_version'))
 
 
     elif msg_type == 'SCHEMA':
@@ -232,14 +246,21 @@ def write_message(message, ensure_ascii=True, allow_nan=False):
     sys.stdout.flush()
 
 
-def write_record(stream_name, record, stream_alias=None, time_extracted=None):
+def write_record(stream_name, record, stream_alias=None, time_extracted=None,
+                 source=None, contract_version=None):
     """Write a single record for the given stream.
 
     write_record("users", {"id": 2, "email": "mike@stitchdata.com"})
+
+    In a confluence, pass ``source`` (the SourceId name) and
+    ``contract_version`` so the Target can attribute and decode the record
+    even when another Tap publishes a same-named stream.
     """
     write_message(RecordMessage(stream=(stream_alias or stream_name),
                                 record=record,
-                                time_extracted=time_extracted))
+                                time_extracted=time_extracted,
+                                source=source,
+                                contract_version=contract_version))
 
 
 def write_records(stream_name, records):

@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.10.0
+  * Add the confluence convention for merging same-named streams from independent Taps: `SourceId`, versioned `FieldContract`/`ContractRegistry`, and `Confluence` with a pre-pull checklist, per-source bookmarks, frozen contract versions, and `KeyConflictTracker`
+  * Add optional `source` and `contract_version` fields to RECORD messages (absent and ignored in single-Tap usage)
+
 ## 6.9.0
   * Suppress the `Skipping stream` log when `SINGER_SUPPRESS_SKIPPED_STREAM_LOG=true`
 
