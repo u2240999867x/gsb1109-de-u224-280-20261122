@@ -13,6 +13,7 @@ import pytest
 import time_machine
 
 from singer_sdk import Stream, Tap
+from singer_sdk.exceptions import AbortedSyncPausedException
 
 if sys.version_info >= (3, 12):
     from typing import override  # noqa: ICN003
@@ -778,3 +779,319 @@ def test_ignore_parent_replication_key(
     buf.seek(0)
     snapshot.assert_match(buf.read(), "singer.jsonl")
     snapshot.assert_match(caplog.text, "stderr.log")
+
+
+class Merchants(Stream):
+    """An incremental parent stream of merchants."""
+
+    name = "merchants"
+    schema: t.ClassVar[dict] = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "name": {"type": "string"},
+            "updated_at": {"type": "string", "format": "date-time"},
+        },
+    }
+    replication_key = "updated_at"
+
+    merchants: t.ClassVar[list[dict]] = []
+
+    @override
+    def get_child_context(
+        self,
+        record: Record,
+        context: Context | None,
+    ) -> Context | None:
+        """Create context for children streams."""
+        return {
+            "merchant_id": record["id"],
+            "merchant_name": record["name"],
+        }
+
+    @override
+    def get_records(self, context: Context | None):
+        """Get merchants updated since the previous run."""
+        start = self.get_starting_replication_key_value(context)
+        for merchant in self.merchants:
+            if start is None or merchant["updated_at"] > start:
+                yield merchant
+
+
+class Bills(Stream):
+    """A child stream of bills, synced once per merchant."""
+
+    name = "bills"
+    schema: t.ClassVar[dict] = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "merchant_id": {"type": "integer"},
+            "updated_at": {"type": "string", "format": "date-time"},
+        },
+    }
+    parent_stream_type = Merchants
+    replication_key = "updated_at"
+    state_partitioning_keys = ["merchant_id"]
+
+    bills: t.ClassVar[dict[int, list[dict]]] = {}
+    fail_on_bills: t.ClassVar[set[int]] = set()
+    contexts_seen: t.ClassVar[list[dict]] = []
+
+    @override
+    def get_records(self, context: Context | None):
+        """Get bills for the merchant in the context."""
+        assert context is not None
+        self.contexts_seen.append(dict(context))
+
+        start = self.get_starting_replication_key_value(context)
+        for bill in self.bills[context["merchant_id"]]:
+            if start is not None and bill["updated_at"] <= start:
+                # Bill was already synced by a previous run
+                continue
+            if bill["id"] in self.fail_on_bills:
+                msg = f"Simulated interruption while syncing bill {bill['id']}"
+                raise AbortedSyncPausedException(msg)
+            yield bill
+
+
+class MerchantTap(Tap):
+    """A tap with an incremental parent stream and a per-merchant child."""
+
+    name = "merchant-tap"
+
+    @override
+    def discover_streams(self) -> list[Stream]:
+        """Discover streams."""
+        return [
+            Merchants(self),
+            Bills(self),
+        ]
+
+
+@pytest.fixture
+def merchant_data():
+    """Set up merchant and bill data, and reset stream state after the test."""
+    Merchants.merchants = [
+        {"id": 7, "name": "Old Name", "updated_at": "2026-01-01T00:00:00+00:00"},
+        {"id": 8, "name": "Merchant 8", "updated_at": "2026-01-02T00:00:00+00:00"},
+    ]
+    Bills.bills = {
+        7: [
+            {"id": 701, "merchant_id": 7, "updated_at": "2026-01-01T01:00:00+00:00"},
+            {"id": 702, "merchant_id": 7, "updated_at": "2026-01-01T02:00:00+00:00"},
+        ],
+        8: [
+            {"id": 801, "merchant_id": 8, "updated_at": "2026-01-02T01:00:00+00:00"},
+        ],
+        9: [
+            {"id": 901, "merchant_id": 9, "updated_at": "2026-01-03T01:00:00+00:00"},
+        ],
+    }
+    Bills.fail_on_bills = set()
+    Bills.contexts_seen = []
+    yield
+    Merchants.merchants = []
+    Bills.bills = {}
+    Bills.fail_on_bills = set()
+    Bills.contexts_seen = []
+
+
+def _run_tap(tap: Tap) -> list[dict]:
+    """Run a tap and return the emitted Singer messages."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        tap.sync_all()
+    buf.seek(0)
+    return [json.loads(line) for line in buf.read().splitlines() if line]
+
+
+def _record_ids(messages: list[dict], stream: str) -> list[int]:
+    """Return the IDs of the RECORD messages emitted for a stream."""
+    return [
+        message["record"]["id"]
+        for message in messages
+        if message["type"] == "RECORD" and message["stream"] == stream
+    ]
+
+
+def _final_state(messages: list[dict]) -> dict:
+    """Return the value of the last emitted STATE message."""
+    return [m["value"] for m in messages if m["type"] == "STATE"][-1]
+
+
+def test_resume_unfinished_child_context(merchant_data: None):
+    """Interrupted child contexts are resumed by the parent in a later run.
+
+    The parent stream is incremental, so its bookmark moves past a merchant
+    whose bills were only partially synced. The next run must resume the
+    unfinished child context from its own bookmark - keyed by the stable
+    merchant ID - while also syncing any new merchants.
+    """
+    # First run: the child sync of merchant 7 is interrupted after the first
+    # of its two bills, but the parent bookmark moves on to merchant 8.
+    Bills.fail_on_bills = {702}
+    state = _final_state(_run_tap(MerchantTap()))
+
+    bookmarks = state["bookmarks"]
+    assert bookmarks["merchants"]["replication_key_value"] == (
+        "2026-01-02T00:00:00+00:00"
+    )
+
+    # The interrupted context is bookmarked at the boundary of the first page
+    # of bills, and is tracked as unfinished under the stable merchant ID.
+    (partition_7,) = [
+        partition
+        for partition in bookmarks["bills"]["partitions"]
+        if partition["context"] == {"merchant_id": 7}
+    ]
+    assert partition_7["replication_key_value"] == "2026-01-01T01:00:00+00:00"
+    assert bookmarks["bills"]["unfinished_contexts"] == [{"merchant_id": 7}]
+
+    # Second run: merchant 7 was renamed and no longer appears in the parent's
+    # incremental response, while new merchant 9 does.
+    Merchants.merchants = [
+        {"id": 9, "name": "Merchant 9", "updated_at": "2026-01-03T00:00:00+00:00"},
+    ]
+    Bills.fail_on_bills = set()
+    Bills.contexts_seen = []
+    messages = _run_tap(MerchantTap(state=state))
+
+    # The unfinished context was resumed from the old page boundary, so only
+    # the remaining bill was fetched; the new merchant was synced in the same
+    # run, and the fully synced merchant 8 was not fetched again.
+    assert _record_ids(messages, "bills") == [901, 702]
+
+    # The interrupted context was resumed using only the stable merchant ID,
+    # without the merchant's outdated name.
+    assert {"merchant_id": 7} in Bills.contexts_seen
+
+    # The context was fully synced this time, so it is no longer tracked.
+    final_bookmarks = _final_state(messages)["bookmarks"]
+    assert "unfinished_contexts" not in final_bookmarks["bills"]
+    (partition_7,) = [
+        partition
+        for partition in final_bookmarks["bills"]["partitions"]
+        if partition["context"] == {"merchant_id": 7}
+    ]
+    assert partition_7["replication_key_value"] == "2026-01-01T02:00:00+00:00"
+
+
+def test_resume_unfinished_child_context_from_state(merchant_data: None):
+    """Unfinished contexts in the input state are resumed by the parent.
+
+    Even when the parent stream does not yield any records at all, a child
+    context that was left unfinished by a previous run is still resumed.
+    """
+    state = {
+        "bookmarks": {
+            "merchants": {
+                "replication_key": "updated_at",
+                "replication_key_value": "2026-01-02T00:00:00+00:00",
+            },
+            "bills": {
+                "partitions": [
+                    {
+                        "context": {"merchant_id": 7},
+                        "replication_key": "updated_at",
+                        "replication_key_value": "2026-01-01T01:00:00+00:00",
+                    },
+                ],
+                "unfinished_contexts": [{"merchant_id": 7}],
+            },
+        },
+    }
+
+    # The parent's incremental response contains no updated merchants.
+    Merchants.merchants = []
+
+    messages = _run_tap(MerchantTap(state=state))
+
+    # The unfinished context is resumed from its bookmark even though the
+    # parent did not yield its merchant again.
+    assert _record_ids(messages, "bills") == [702]
+    assert Bills.contexts_seen == [{"merchant_id": 7}]
+
+    final_bookmarks = _final_state(messages)["bookmarks"]
+    assert "unfinished_contexts" not in final_bookmarks["bills"]
+
+
+def test_child_resumes_from_legacy_partitioned_state(merchant_data: None):
+    """Child streams honor existing per-context bookmarks.
+
+    State written before unfinished-context tracking existed contains only
+    per-partition bookmarks. A sync started from such state resumes each
+    merchant from its stored bookmark and tracks no unfinished contexts.
+    """
+    state = {
+        "bookmarks": {
+            "merchants": {
+                "replication_key": "updated_at",
+                "replication_key_value": "2026-01-02T00:00:00+00:00",
+            },
+            "bills": {
+                "partitions": [
+                    {
+                        "context": {"merchant_id": 7},
+                        "replication_key": "updated_at",
+                        "replication_key_value": "2026-01-01T01:00:00+00:00",
+                    },
+                ],
+            },
+        },
+    }
+
+    # Merchant 7 was renamed and updated, so the parent yields it again.
+    Merchants.merchants = [
+        {"id": 7, "name": "New Name", "updated_at": "2026-01-03T00:00:00+00:00"},
+    ]
+
+    messages = _run_tap(MerchantTap(state=state))
+
+    # Only the bill past the stored bookmark is synced, and the renamed
+    # merchant still matches its old bookmark via the stable merchant ID.
+    assert _record_ids(messages, "bills") == [702]
+
+    final_bookmarks = _final_state(messages)["bookmarks"]
+    assert "unfinished_contexts" not in final_bookmarks["bills"]
+
+
+def test_unfinished_context_not_resumed_if_parent_yields_it(merchant_data: None):
+    """Unfinished contexts are not synced twice in the same run.
+
+    If the parent stream yields a merchant whose child context is also
+    tracked as unfinished, the context is synced by the normal parent-child
+    flow and is not resumed a second time.
+    """
+    state = {
+        "bookmarks": {
+            "merchants": {
+                "replication_key": "updated_at",
+                "replication_key_value": "2026-01-02T00:00:00+00:00",
+            },
+            "bills": {
+                "partitions": [
+                    {
+                        "context": {"merchant_id": 7},
+                        "replication_key": "updated_at",
+                        "replication_key_value": "2026-01-01T01:00:00+00:00",
+                    },
+                ],
+                "unfinished_contexts": [{"merchant_id": 7}],
+            },
+        },
+    }
+
+    # Merchant 7 was renamed and updated, so the parent yields it again.
+    Merchants.merchants = [
+        {"id": 7, "name": "New Name", "updated_at": "2026-01-03T00:00:00+00:00"},
+    ]
+
+    messages = _run_tap(MerchantTap(state=state))
+
+    # The context is synced exactly once, by the normal parent-child flow.
+    assert _record_ids(messages, "bills") == [702]
+    assert Bills.contexts_seen == [{"merchant_id": 7, "merchant_name": "New Name"}]
+
+    final_bookmarks = _final_state(messages)["bookmarks"]
+    assert "unfinished_contexts" not in final_bookmarks["bills"]

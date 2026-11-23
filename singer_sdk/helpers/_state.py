@@ -31,6 +31,7 @@ PROGRESS_MARKERS = "progress_markers"
 PROGRESS_MARKER_NOTE = "Note"
 SIGNPOST_MARKER = "replication_key_signpost"
 STARTING_MARKER = "starting_replication_value"
+UNFINISHED_CONTEXTS = "unfinished_contexts"
 
 logger = logging.getLogger("singer_sdk")
 

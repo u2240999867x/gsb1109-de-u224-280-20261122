@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### ✨ New
+
+- Parent streams now resume child stream contexts that were not fully synced in a previous run. Child contexts are tracked in state under an `unfinished_contexts` key - keyed by their stable state partition context - and are synced again at the end of the parent stream's sync, resuming from the context's own bookmark. Existing per-context `partitions` bookmarks are honored as before.
+
 ## v0.54.9 (2026-10-19)
 
 ### 🐛 Fixes

@@ -15,8 +15,10 @@ import typing as t
 
 from singer_sdk.helpers._state import (
     PROGRESS_MARKERS,
+    UNFINISHED_CONTEXTS,
     finalize_state_progress_markers,
     get_starting_replication_value,
+    get_state_if_exists,
     get_state_partitions_list,
     get_writeable_state_dict,
     increment_state,
@@ -265,6 +267,61 @@ class StreamStateManager:
             List of partition state dictionaries, or None.
         """
         return get_state_partitions_list(self.tap_state, self.stream_name)
+
+    def get_unfinished_contexts(self) -> list[types.Context]:
+        """Return contexts whose sync did not run to completion in a previous run.
+
+        A context is tracked as unfinished when a stream (typically a child
+        stream) starts syncing it, and the marker is removed once the context
+        has been fully synced. Any markers still present in the input state
+        therefore belong to contexts that were interrupted before they could
+        be fully synced.
+
+        Returns:
+            A list of state partition contexts that were not fully synced.
+        """
+        stream_state = get_state_if_exists(self.tap_state, self.stream_name) or {}
+        return [dict(context) for context in stream_state.get(UNFINISHED_CONTEXTS, [])]
+
+    def add_unfinished_context(self, context: types.Context) -> None:
+        """Track a context as unfinished, i.e. not yet fully synced.
+
+        The context is stored using its state partition context, so it is
+        keyed by the stream's stable
+        :attr:`~singer_sdk.Stream.state_partitioning_keys` rather than by any
+        mutable context values.
+
+        Args:
+            context: Stream partition or context dictionary.
+        """
+        state_partition_context = self.get_state_partition_context(context)
+        if not state_partition_context:
+            return
+
+        unfinished_contexts = self.stream_state.setdefault(UNFINISHED_CONTEXTS, [])
+        if state_partition_context not in unfinished_contexts:
+            unfinished_contexts.append(dict(state_partition_context))
+
+    def remove_unfinished_context(self, context: types.Context) -> None:
+        """Mark a previously unfinished context as fully synced.
+
+        Args:
+            context: Stream partition or context dictionary.
+        """
+        state_partition_context = self.get_state_partition_context(context)
+        if not state_partition_context:
+            return
+
+        stream_state = get_state_if_exists(self.tap_state, self.stream_name)
+        if not stream_state:
+            return
+
+        unfinished_contexts = stream_state.get(UNFINISHED_CONTEXTS) or []
+        if state_partition_context in unfinished_contexts:
+            unfinished_contexts.remove(state_partition_context)
+
+        if not unfinished_contexts:
+            stream_state.pop(UNFINISHED_CONTEXTS, None)
 
     def get_starting_replication_value(
         self,

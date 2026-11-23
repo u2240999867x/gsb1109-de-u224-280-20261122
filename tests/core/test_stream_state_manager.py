@@ -777,3 +777,90 @@ def test_log_sort_error_includes_partition_info_when_different(
     )
     assert "partition record #5" in caplog.records[0].message
     assert "tenant_id" in caplog.records[0].message
+
+
+# Tests for unfinished context tracking
+
+
+def test_unfinished_contexts_empty_by_default(
+    state_manager: StreamStateManager,
+    tap_state: types.TapState,
+) -> None:
+    """Test that no unfinished contexts exist by default."""
+    assert state_manager.get_unfinished_contexts() == []
+    assert tap_state == {}
+
+
+def test_add_and_get_unfinished_context(
+    state_manager: StreamStateManager,
+    tap_state: types.TapState,
+) -> None:
+    """Test tracking an unfinished context."""
+    state_manager.add_unfinished_context({"merchant_id": 7})
+    assert state_manager.get_unfinished_contexts() == [{"merchant_id": 7}]
+    assert tap_state == {
+        "bookmarks": {
+            "test_stream": {"unfinished_contexts": [{"merchant_id": 7}]},
+        },
+    }
+
+
+def test_add_unfinished_context_is_idempotent(
+    state_manager: StreamStateManager,
+) -> None:
+    """Test that tracking the same context twice does not duplicate it."""
+    state_manager.add_unfinished_context({"merchant_id": 7})
+    state_manager.add_unfinished_context({"merchant_id": 7})
+    assert state_manager.get_unfinished_contexts() == [{"merchant_id": 7}]
+
+
+def test_add_unfinished_context_uses_partitioning_keys(
+    tap_state: types.TapState,
+) -> None:
+    """Test that contexts are tracked by their stable partitioning keys."""
+    manager = StreamStateManager(
+        stream_name="test_stream",
+        tap_state=tap_state,
+        state_partitioning_keys=["merchant_id"],
+    )
+    manager.add_unfinished_context({"merchant_id": 7, "merchant_name": "Old Name"})
+    assert manager.get_unfinished_contexts() == [{"merchant_id": 7}]
+
+
+def test_add_unfinished_context_ignores_empty_partition_context(
+    tap_state: types.TapState,
+) -> None:
+    """Test that no context is tracked when it cannot be isolated in state."""
+    manager = StreamStateManager(
+        stream_name="test_stream",
+        tap_state=tap_state,
+        state_partitioning_keys=[],
+    )
+    manager.add_unfinished_context({"merchant_id": 7})
+    assert manager.get_unfinished_contexts() == []
+    assert tap_state == {}
+
+
+def test_remove_unfinished_context(
+    state_manager: StreamStateManager,
+    tap_state: types.TapState,
+) -> None:
+    """Test that a completed context is no longer tracked."""
+    state_manager.add_unfinished_context({"merchant_id": 7})
+    state_manager.add_unfinished_context({"merchant_id": 8})
+    state_manager.remove_unfinished_context({"merchant_id": 7})
+    assert state_manager.get_unfinished_contexts() == [{"merchant_id": 8}]
+
+    # The state key is cleaned up once no unfinished contexts remain
+    state_manager.remove_unfinished_context({"merchant_id": 8})
+    assert state_manager.get_unfinished_contexts() == []
+    assert tap_state == {"bookmarks": {"test_stream": {}}}
+
+
+def test_remove_unfinished_context_without_state(
+    state_manager: StreamStateManager,
+    tap_state: types.TapState,
+) -> None:
+    """Test that removing an untracked context does not create state."""
+    state_manager.remove_unfinished_context({"merchant_id": 7})
+    assert tap_state == {}

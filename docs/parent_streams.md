@@ -93,3 +93,49 @@ All the keys in the `context` dictionary are added to the child's record, but th
 ## Additional Parent-Child References
 
 - [Singer State in SDK Taps](./implementation/state.md)
+
+## Resuming interrupted child stream contexts
+
+A child stream context is normally re-synced whenever its parent stream yields the
+corresponding parent record again. However, when the parent stream is incremental, its
+bookmark may move past a parent record whose child context was only partially synced -
+for instance, if the run was interrupted while the child stream was still syncing that
+context. Because the parent stream will not yield that record again, the child stream
+would never finish syncing the context.
+
+To prevent this, the SDK tracks each child stream context as _unfinished_ when its sync
+starts, and removes the marker once the context has been fully synced. Unfinished
+contexts are stored in the child stream's state under an `unfinished_contexts` key,
+keyed by their [state partition context](./implementation/state.md#partitioned-state):
+
+```json
+{
+  "bookmarks": {
+    "bills": {
+      "partitions": [
+        {
+          "context": { "merchant_id": 7 },
+          "replication_key": "updated_at",
+          "replication_key_value": "2026-01-01T01:00:00Z"
+        }
+      ],
+      "unfinished_contexts": [{ "merchant_id": 7 }]
+    }
+  }
+}
+```
+
+At the end of each parent stream sync, any unfinished child contexts found in state are
+synced again, resuming from the context's own bookmark. Contexts that were fully synced
+are not fetched again, and newly appearing parent records are still synced as usual in
+the same run.
+
+Because unfinished contexts are keyed by their state partition context, you should set
+[`state_partitioning_keys`](singer_sdk.Stream.state_partitioning_keys) on the child
+stream to the _stable_ identifiers of the parent record (e.g. `["merchant_id"]`). This
+ensures the child context is still matched to its bookmark when mutable values, such as
+the parent record's display name, change between runs.
+
+Existing state files that only contain per-context `partitions` bookmarks keep working
+unchanged: the child stream resumes each context from its stored bookmark, and no
+unfinished contexts are resumed until an interruption is recorded by a run.

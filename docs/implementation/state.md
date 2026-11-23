@@ -85,6 +85,11 @@ under a `partitions` key which exactly matches their `context`.
 For [parent-child streams](../parent_streams.md), the SDK will automatically use the parent's context as the default
 state partition.
 
+Additionally, a stream's state may contain an `unfinished_contexts` key: a list of
+contexts whose sync started but did not run to completion in a previous run. Parent
+streams use this to [resume interrupted child stream contexts](../parent_streams.md#resuming-interrupted-child-stream-contexts)
+even when the parent stream itself does not yield those contexts again.
+
 ## Record Duplication
 
 The Singer Spec promises that each record in the source system will be processed successfully in the target _at least once_. This means that no record will ever be omitted from the stream or go missing, but it _does not_ guarantee that all records will be received _exactly once_.

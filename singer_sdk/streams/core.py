@@ -1317,6 +1317,11 @@ class Stream(abc.ABC):  # noqa: PLR0904
 
         self.context = MappingProxyType(context) if context else None
 
+        # Snapshot any child stream contexts that were left unfinished by a
+        # previous run, so they can be resumed once this stream's own records
+        # have been synced.
+        unfinished_child_contexts = self._get_unfinished_child_contexts()
+
         # Use a replication signpost, if available
         if signpost := self.get_replication_key_signpost(context):
             self._write_replication_key_signpost(context, signpost)
@@ -1333,6 +1338,11 @@ class Stream(abc.ABC):  # noqa: PLR0904
             self._stream_version = self._initialized_at // 1000
             self._write_activate_version_message(self._stream_version)
 
+        # Track this context so that an interrupted sync can be resumed by a
+        # subsequent run, even if the parent stream no longer yields it.
+        if context is not None:
+            self.state_manager.add_unfinished_context(context)
+
         try:
             batch_config = self.get_batch_config(self.config)
             if batch_config:
@@ -1348,6 +1358,15 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 level=logging.ERROR,
             )
             raise
+
+        if context is not None:
+            # The context was fully synced, so it no longer needs to be
+            # resumed by a subsequent run.
+            self.state_manager.remove_unfinished_context(context)
+
+        # Resume any child stream contexts that were left unfinished by a
+        # previous run.
+        self._sync_unfinished_child_contexts(unfinished_child_contexts)
 
     def _sync_children(self, child_context: types.Context | None) -> None:
         if child_context is None:
@@ -1366,6 +1385,59 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 except (AbortedSyncFailedException, AbortedSyncPausedException):
                     # Child stream was interrupted, continue with remaining children
                     continue
+
+    def _get_unfinished_child_contexts(self) -> list[tuple[Stream, types.Context]]:
+        """Get child streams and their contexts that were not fully synced.
+
+        A child stream context is considered unfinished if a previous run was
+        interrupted after the context's sync had started but before it could
+        run to completion. This can leave the parent stream's state bookmark
+        ahead of the child stream's, so the parent may not yield the context
+        again and the child stream would never resume it.
+
+        Returns:
+            A list of `(child_stream, context)` tuples for each selected child
+            stream with contexts that were not fully synced.
+        """
+        result: list[tuple[Stream, types.Context]] = []
+        for child_stream in self.child_streams:
+            if not (child_stream.selected or child_stream.has_selected_descendents):
+                continue
+
+            result.extend(
+                (child_stream, context)
+                for context in child_stream.state_manager.get_unfinished_contexts()
+            )
+
+        return result
+
+    def _sync_unfinished_child_contexts(
+        self,
+        unfinished_child_contexts: list[tuple[Stream, types.Context]],
+    ) -> None:
+        """Sync child streams for contexts that were not fully synced.
+
+        Args:
+            unfinished_child_contexts: A list of `(child_stream, context)`
+                tuples, as returned by :meth:`._get_unfinished_child_contexts`.
+        """
+        for child_stream, context in unfinished_child_contexts:
+            if context not in child_stream.state_manager.get_unfinished_contexts():
+                # The context was fully synced during this run, e.g. because
+                # the parent stream yielded it again.
+                continue
+
+            self.log(
+                "Resuming unfinished context of child stream '%s' "
+                "with context keys: %s",
+                child_stream.name,
+                tuple(sorted(context.keys())),
+            )
+            try:
+                child_stream.sync(context=context)
+            except (AbortedSyncFailedException, AbortedSyncPausedException):
+                # Child stream was interrupted, continue with remaining contexts
+                continue
 
     # Overridable Methods
 
