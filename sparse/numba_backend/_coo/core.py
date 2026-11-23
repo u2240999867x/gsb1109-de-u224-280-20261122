@@ -1154,8 +1154,11 @@ class COO(SparseArray, NDArrayOperatorsMixin):  # lgtm [py/missing-equals]
             raise NotImplementedError("The `order` parameter is not supported")
 
         if -1 in shape:
-            extra = int(self.size / np.prod([d for d in shape if d != -1]))
-            shape = tuple([d if d != -1 else extra for d in shape])
+            # Use exact Python integer division so arrays larger than the
+            # fixed-width integer range still infer the missing dimension.
+            known_size = reduce(operator.mul, (d for d in shape if d != -1), 1)
+            extra = self.size // known_size
+            shape = tuple(d if d != -1 else extra for d in shape)
         if self.shape == shape:
             return self
 
@@ -1173,11 +1176,19 @@ class COO(SparseArray, NDArrayOperatorsMixin):  # lgtm [py/missing-equals]
         idx_dtype = self.coords.dtype
         if shape != () and not can_store(idx_dtype, max(shape)):
             idx_dtype = np.min_scalar_type(max(shape))
-        coords = np.empty((len(shape), self.nnz), dtype=idx_dtype)
-        strides = 1
-        for i, d in enumerate(shape[::-1]):
-            coords[-(i + 1), :] = (linear_loc // strides) % d
-            strides *= d
+
+        if linear_loc.dtype == object:
+            # The total size exceeds the 64-bit limit; unravel using Python
+            # integers and only then cast back to a coordinate-sized dtype.
+            from .common import _unravel_loc_object
+
+            coords = _unravel_loc_object(linear_loc, shape).astype(idx_dtype, copy=False)
+        else:
+            coords = np.empty((len(shape), self.nnz), dtype=idx_dtype)
+            strides = 1
+            for i, d in enumerate(shape[::-1]):
+                coords[-(i + 1), :] = (linear_loc // strides) % d
+                strides *= d
 
         result = COO(
             coords,

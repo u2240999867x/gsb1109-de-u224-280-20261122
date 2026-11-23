@@ -376,6 +376,53 @@ def test_reshape_upcast():
     assert a.reshape(1000).coords.dtype == np.uint16
 
 
+def test_reshape_overflow_64bit_roundtrip():
+    # Total size 2**65 exceeds the intp range, so the linear index cannot be
+    # stored in a fixed-width integer dtype.
+    shape = (2**32, 2**33)
+    coords = np.array([[0, 2**31], [0, 0]], dtype=np.int64)
+    data = np.array([10, 20])
+    s = COO(coords, data, shape=shape, has_duplicates=False, sorted=True)
+
+    reshaped = s.reshape((2**33, -1))
+    assert reshaped.shape == (2**33, 2**32)
+    np.testing.assert_array_equal(reshaped.coords, np.array([[0, 2**32], [0, 0]]))
+    np.testing.assert_array_equal(reshaped.data, data)
+
+    restored = reshaped.reshape(shape)
+    assert restored.shape == shape
+    np.testing.assert_array_equal(restored.coords, coords)
+    np.testing.assert_array_equal(restored.data, data)
+
+
+def test_reshape_overflow_64bit_duplicates():
+    # Unsorted sharded input that reports the second location twice. The
+    # duplicates at that single location are summed while the first stays
+    # independent, matching the ordinary COO construction rules.
+    shape = (2**33, 2**32)
+    coords = np.array([[2**32, 0, 2**32], [0, 0, 0]], dtype=np.int64)
+    data = np.array([20, 10, 5])
+    s = COO(coords, data, shape=shape)
+
+    assert s.nnz == 2
+    np.testing.assert_array_equal(s.coords, np.array([[0, 2**32], [0, 0]]))
+    np.testing.assert_array_equal(s.data, np.array([10, 25]))
+
+    restored = s.reshape((2**32, 2**33))
+    np.testing.assert_array_equal(restored.coords, np.array([[0, 2**31], [0, 0]]))
+    np.testing.assert_array_equal(restored.data, np.array([10, 25]))
+
+
+def test_reshape_overflow_64bit_empty():
+    shape = (2**32, 2**33)
+    s = COO(np.empty((2, 0), dtype=np.int64), np.empty(0, dtype=np.int64), shape=shape)
+
+    reshaped = s.reshape((2**33, -1))
+    assert reshaped.shape == (2**33, 2**32)
+    assert reshaped.nnz == 0
+    assert reshaped.reshape(shape).nnz == 0
+
+
 @pytest.mark.parametrize("format", [COO, DOK])
 def test_reshape_errors(format):
     s = sparse.random((5, 3), density=0.5, format=format)

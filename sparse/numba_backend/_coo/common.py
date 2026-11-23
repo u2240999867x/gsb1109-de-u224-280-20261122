@@ -53,6 +53,36 @@ def asCOO(x, name="asCOO", check=True):
     return x
 
 
+# The largest array size ``np.ravel_multi_index`` can encode; above this the
+# C-order linear index does not fit in a ``np.intp`` and Python integers are
+# required instead.
+_MAX_INTP_SIZE = np.iinfo(np.intp).max
+
+
+def _linear_loc_object(coords, shape):
+    # Object-dtype equivalent of ``np.ravel_multi_index`` for arrays whose
+    # total size exceeds the 64-bit limit. Work is proportional only to the
+    # number of explicitly stored coordinates.
+    nnz = coords.shape[1]
+    linear = np.zeros(nnz, dtype=object)
+    stride = 1
+    for axis in range(len(shape) - 1, -1, -1):
+        linear += coords[axis].astype(object) * stride
+        stride *= shape[axis]
+    return linear
+
+
+def _unravel_loc_object(linear, shape):
+    # Object-dtype inverse of ``_linear_loc_object``; the returned coordinates
+    # fit into ordinary integer dtypes because each axis dimension does.
+    coords = np.empty((len(shape), linear.shape[0]), dtype=object)
+    stride = 1
+    for axis in range(len(shape) - 1, -1, -1):
+        coords[axis] = (linear // stride) % shape[axis]
+        stride *= shape[axis]
+    return coords
+
+
 def linear_loc(coords, shape):
     if shape == () and len(coords) == 0:
         # `np.ravel_multi_index` is not aware of arrays, so cannot produce a
@@ -60,6 +90,9 @@ def linear_loc(coords, shape):
         # Since `coords` is an array and not a sequence, we know the correct
         # dimensions.
         return np.zeros(coords.shape[1:], dtype=np.intp)
+
+    if reduce(operator.mul, shape, 1) > _MAX_INTP_SIZE:
+        return _linear_loc_object(coords, shape)
 
     return np.ravel_multi_index(coords, shape)
 
