@@ -6,3 +6,4 @@
 
    bigtree/workflows/app_todo
    bigtree/workflows/app_calendar
+   bigtree/workflows/lineage

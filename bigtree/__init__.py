@@ -134,6 +134,12 @@ from bigtree.utils.iterators import (
 from bigtree.utils.plot import plot_tree, reingold_tilford
 from bigtree.workflows.app_calendar import Calendar
 from bigtree.workflows.app_todo import AppToDo
+from bigtree.workflows.lineage import (
+    LineageConflictError,
+    LineageReconciler,
+    NodeVersion,
+    reconcile_lineage,
+)
 
 __all__ = [
     "ANSIBorderStyle",
@@ -222,6 +228,9 @@ __all__ = [
     "iprint_tree",
     "levelorder_iter",
     "levelordergroup_iter",
+    "LineageConflictError",
+    "LineageReconciler",
+    "NodeVersion",
     "list_to_binarytree",
     "list_to_dag",
     "list_to_tree",
@@ -238,6 +247,7 @@ __all__ = [
     "print_tree",
     "prune_tree",
     "query_tree",
+    "reconcile_lineage",
     "reingold_tilford",
     "render_tree",
     "replace_logic",
