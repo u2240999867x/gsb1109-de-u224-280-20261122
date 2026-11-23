@@ -54,6 +54,7 @@ nav:
     - Core: api/index.md
     - Registry: api/registry.md
     - Implementations: api/implementations.md
+    - Batch Transfer: api/transfer.md
     - Extensions: api/extensions.md
     - Types: api/types.md
   - Migration Guide: migration.md

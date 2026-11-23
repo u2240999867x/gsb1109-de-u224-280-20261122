@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- upath.transfer: resumable batch transfer of ZIP members into a manifest-gated store, with content-pinned ZIP versions, conditional manifest commits and JSON receipts
+
 ## [0.3.10] - 2026-02-22
 
 ### Fixed
