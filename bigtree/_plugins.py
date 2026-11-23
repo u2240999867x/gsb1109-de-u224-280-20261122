@@ -58,7 +58,15 @@ def register_dag_plugins() -> None:
 
 def register_tree_plugins() -> None:
     """Register plugin for Tree"""
-    from bigtree.tree import construct, export, helper, modify, query, search
+    from bigtree.tree import (
+        construct,
+        export,
+        helper,
+        modify,
+        query,
+        search,
+        subscription,
+    )
     from bigtree.tree.tree import Tree
     from bigtree.utils import iterators
 
@@ -133,6 +141,8 @@ def register_tree_plugins() -> None:
         "find_children": search.find_children,
         "find_child": search.find_child,
         "find_child_by_name": search.find_child_by_name,
+        # Subscription methods
+        "path_subscription": subscription.path_subscription,
     }
     tree_helper_methods = {
         # Helper methods

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added:
 - Dos: Default doctest in github workflows and `pytest` commands.
+- Tree Subscription: `PathRule` and `PathSubscription` to resolve wildcard path rules and report added/exited pages
+  by stable identity across directory changes, with subtree exclusion and atomic batches.
 ### Fixed:
 - Stubs: Signature for tree.query.
 

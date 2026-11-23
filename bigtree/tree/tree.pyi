@@ -16,6 +16,7 @@ from bigtree.utils import constants
 
 if TYPE_CHECKING:
     from bigtree.node import basenode, binarynode, dagnode
+    from bigtree.tree.subscription import PathRule, PathSubscription
 
     BaseNodeT = TypeVar("BaseNodeT", bound=basenode.BaseNode)
     BinaryNodeT = TypeVar("BinaryNodeT", bound=binarynode.BinaryNode)
@@ -562,6 +563,12 @@ class Tree:
         condition: Callable[[BaseNodeT | DAGNodeT], bool],
     ) -> BaseNodeT | DAGNodeT | None: ...
     def find_child_by_name(self, name: str) -> NodeT | DAGNodeT | None: ...
+    def path_subscription(
+        self,
+        rules: Iterable[PathRule] | None = None,
+        id_attr: str = "page_id",
+        identity: str = "attr",
+    ) -> PathSubscription: ...
     def clone(self, node_type: type[BaseNodeT]) -> Tree: ...
     def subtree(
         self,

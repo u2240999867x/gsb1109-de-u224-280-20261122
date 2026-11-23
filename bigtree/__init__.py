@@ -89,6 +89,14 @@ from bigtree.tree.search import (
     find_relative_paths,
     findall,
 )
+from bigtree.tree.subscription import (
+    PathRule,
+    PathSubscription,
+    PathSubscriptionBatch,
+    PathSubscriptionChange,
+    PathSubscriptionTransaction,
+    path_subscription,
+)
 from bigtree.tree.tree import Tree
 from bigtree.utils.constants import (
     ANSIBorderStyle,
@@ -169,6 +177,11 @@ __all__ = [
     "DoubleVPrintStyle",
     "Globals",
     "Node",
+    "PathRule",
+    "PathSubscription",
+    "PathSubscriptionBatch",
+    "PathSubscriptionChange",
+    "PathSubscriptionTransaction",
     "RoundedBorderStyle",
     "RoundedHPrintStyle",
     "RoundedPrintStyle",
@@ -230,6 +243,7 @@ __all__ = [
     "nested_dict_key_to_tree",
     "nested_dict_to_tree",
     "newick_to_tree",
+    "path_subscription",
     "plot_tree",
     "polars_to_tree",
     "polars_to_tree_by_relation",
