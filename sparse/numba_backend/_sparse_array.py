@@ -349,12 +349,48 @@ class SparseArray:
 
         if getattr(ufunc, "nout", 1) > 1:
             # e.g. `divmod`, `modf` or `frexp`: compute each output separately
-            if method != "__call__" or out is not None:
+            if method != "__call__":
                 return NotImplemented
-            results = tuple(elemwise(partial(_ufunc_output, ufunc, i), *inputs, **kwargs) for i in range(ufunc.nout))
-            if any(result is NotImplemented for result in results):
-                return NotImplemented
-            return results
+            where = kwargs.pop("where", None)
+            if out is None:
+                if where is not None:
+                    return NotImplemented
+                results = tuple(
+                    elemwise(partial(_ufunc_output, ufunc, i), *inputs, **kwargs) for i in range(ufunc.nout)
+                )
+                if any(result is NotImplemented for result in results):
+                    return NotImplemented
+                return results
+            if len(out) != ufunc.nout:
+                raise ValueError(f"ufunc {ufunc.__name__} takes {ufunc.nout} output operands, {len(out)} given")
+            # Validate the casting of every output before touching any buffer.
+            test_args = [np.empty((1,), dtype=a.dtype) if hasattr(a, "dtype") else a for a in inputs]
+            test_out = tuple(np.empty((1,), dtype=o.dtype) for o in out)
+            ufunc(*test_args, out=test_out, **kwargs)
+            results = []
+            for i, o in enumerate(out):
+                result = elemwise(partial(_ufunc_output, ufunc, i), *inputs, **kwargs)
+                if result is NotImplemented:
+                    return NotImplemented
+                if o.shape != result.shape:
+                    raise ValueError(
+                        f"non-broadcastable output operand with shape {o.shape} "
+                        f"doesn't match the broadcast shape {result.shape}"
+                    )
+                if result.dtype != o.dtype:
+                    result = result.astype(o.dtype)
+                if where is not None:
+                    # Keep the output's own old values wherever the mask is False.
+                    result = elemwise(np.where, where, result, o)
+                    if type(result) is not type(o):
+                        from ._compressed import GCXS
+
+                        format_kwargs = {"compressed_axes": o.compressed_axes} if isinstance(o, GCXS) else {}
+                        result = result.asformat(type(o), **format_kwargs)
+                results.append(result)
+            for o, result in zip(out, results, strict=True):
+                o._make_shallow_copy_of(result)
+            return tuple(out)
 
         if out is not None:
             test_args = [np.empty((1,), dtype=a.dtype) if hasattr(a, "dtype") else a for a in inputs]

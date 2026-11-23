@@ -149,6 +149,100 @@ def test_elemwise_multiple_outputs(func, args, format):
         assert_eq(a, e)
 
 
+@pytest.mark.parametrize(
+    "func, args",
+    [
+        (np.modf, ()),
+        (np.divmod, (3.0,)),
+    ],
+)
+@pytest.mark.parametrize("format", [COO, GCXS, DOK])
+def test_elemwise_multiple_outputs_out(func, args, format):
+    s = sparse.random((2, 3, 4), density=0.5, format=format, data_rvs=lambda n: np.linspace(-5, 5, n))
+    out1 = COO.from_numpy(np.full((2, 3, 4), 7.5)).asformat(format)
+    out2 = COO.from_numpy(np.full((2, 3, 4), 6.5)).asformat(format)
+
+    x = s.todense()
+    o1 = out1.todense()
+    o2 = out2.todense()
+    expected = func(x, *args, out=(o1, o2))
+
+    actual = func(s, *args, out=(out1, out2))
+
+    assert isinstance(actual, tuple)
+    assert actual[0] is out1
+    assert actual[1] is out2
+    for a, e in zip(actual, expected, strict=True):
+        assert isinstance(a, format)
+        assert_eq(a, e)
+
+
+@pytest.mark.parametrize("format", [COO, GCXS, DOK])
+def test_elemwise_multiple_outputs_out_where(format):
+    # In-place `modf`: the input buffer receives the fractional parts while the
+    # integer parts must still be computed from the original values.
+    s = COO(
+        np.array([[0, 1, 3], [1, 2, 3]]),
+        np.array([-3.75, 1.25, -1.5]),
+        shape=(4, 4),
+        fill_value=2.5,
+    ).asformat(format)
+    out2 = COO(
+        np.array([[0, 1], [0, 2]]),
+        np.array([9.0, 8.0]),
+        shape=(4, 4),
+        fill_value=6.5,
+    ).asformat(format)
+    # Sparse mask: only the stored positions are skipped, everything else is
+    # recomputed.
+    mask = COO(np.array([[1, 3], [2, 3]]), np.array([False, False]), shape=(4, 4), fill_value=True)
+
+    x = s.todense()
+    o = out2.todense()
+    expected = np.modf(x, out=(x, o), where=mask.todense())
+
+    actual = np.modf(s, out=(s, out2), where=mask)
+
+    assert actual[0] is s
+    assert actual[1] is out2
+    assert isinstance(s, format)
+    assert isinstance(out2, format)
+    assert_eq(s, expected[0])
+    assert_eq(out2, expected[1])
+    # The integer part is split off the original -3.75, not the in-place result.
+    assert out2.todense()[0, 1] == -3.0
+    # Masked-out positions keep each buffer's own old values.
+    assert s.todense()[1, 2] == 1.25
+    assert out2.todense()[1, 2] == 8.0
+    assert s.todense()[3, 3] == -1.5
+    assert out2.todense()[3, 3] == 6.5
+
+
+@pytest.mark.parametrize("format", [COO, GCXS, DOK])
+def test_elemwise_multiple_outputs_out_error_untouched(format):
+    s = COO(
+        np.array([[0, 1], [1, 2]]),
+        np.array([-3.75, 1.25]),
+        shape=(3, 3),
+        fill_value=2.5,
+    ).asformat(format)
+    out1 = COO(np.array([[0], [0]]), np.array([9.0]), shape=(3, 3), fill_value=6.5).asformat(format)
+    s_before = s.todense()
+    out1_before = out1.todense()
+
+    bad_shape = COO(np.array([[0], [0]]), np.array([1.0]), shape=(3, 4), fill_value=0.0).asformat(format)
+    with pytest.raises(ValueError, match="non-broadcastable output operand"):
+        np.modf(s, out=(out1, bad_shape))
+    assert_eq(s, s_before)
+    assert_eq(out1, out1_before)
+
+    bad_dtype = COO(np.array([[0], [0]]), np.array([1]), shape=(3, 3), fill_value=0).asformat(format)
+    with pytest.raises(TypeError):
+        np.modf(s, out=(out1, bad_dtype))
+    assert_eq(s, s_before)
+    assert_eq(out1, out1_before)
+
+
 @pytest.mark.parametrize("format", [COO, GCXS, DOK])
 def test_elemwise_mixed_broadcast(format, rng):
     s1 = sparse.random((2, 3, 4), density=0.5, format=format)
