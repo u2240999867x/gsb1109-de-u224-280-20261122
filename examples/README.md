@@ -84,6 +84,7 @@ Either flag is enough on its own. `durable=True` is the usual answer; `exclusive
 | `blocking_consume.py` | Blocking consumer with `basic_consume` and manual ack |
 | `blocking_consumer_generator.py` | Using `BlockingChannel.consume` as a generator |
 | `blocking_delivery_confirmations.py` | Publisher confirms with `BlockingConnection` |
+| `blocking_transaction_recovery.py` | Recoverable two-message transfer in one AMQP transaction |
 | `blocking_publish_mandatory.py` | Mandatory publishing with unroutable message handling |
 | `blocking_consume_recover_multiple_hosts.py` | Connection recovery across multiple brokers |
 | `blocking_consume_recover_multiple_hosts_retry.py` | Multi-host recovery using the `retry` library |
