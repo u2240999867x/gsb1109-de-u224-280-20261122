@@ -7,6 +7,7 @@ import warnings
 from asyncio import gather
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from itertools import starmap
 from logging import getLogger
 from typing import (
@@ -158,7 +159,7 @@ from zarr.registry import (
 )
 from zarr.storage._common import StorePath, make_store_path, resolve_zarr_format
 from zarr.storage._memory import MemoryStore
-from zarr.storage._utils import _relativize_path
+from zarr.storage._utils import _join_paths, _relativize_path
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -178,6 +179,7 @@ if TYPE_CHECKING:
 # Array and AsyncArray are defined in the base `zarr` namespace
 __all__ = [
     "DEFAULT_FILL_VALUE",
+    "ResizeMode",
     "create_codec_pipeline",
     "parse_array_metadata",
 ]
@@ -1744,7 +1746,12 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         [set_mask_selection][zarr.Array.set_mask_selection] for documentation and examples."""
         return AsyncVIndex(self)
 
-    async def resize(self, new_shape: ShapeLike, delete_outside_chunks: bool = True) -> None:
+    async def resize(
+        self,
+        new_shape: ShapeLike,
+        delete_outside_chunks: bool = True,
+        mode: ResizeMode | Literal["delete", "preserve", "tombstone"] | None = None,
+    ) -> None:
         """
         Asynchronously resize the array to a new shape.
 
@@ -1754,8 +1761,15 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             The desired new shape of the array.
 
         delete_outside_chunks : bool, optional
-            If True (default), chunks that fall outside the new shape will be deleted. If False,
-            the data in those chunks will be preserved.
+            Legacy switch: if True (default), chunks that fall outside the new
+            shape will be deleted; if False, the data in those chunks is
+            preserved. Ignored when ``mode`` is given.
+
+        mode : ResizeMode or str, optional
+            Explicit resize mode. :attr:`~zarr.core.array.ResizeMode.tombstone`
+            hides outside chunks through a manifest instead of deleting them and
+            requires a :class:`~zarr.experimental.manifest.ManifestStore`. Takes
+            precedence over ``delete_outside_chunks``.
 
         Returns
         -------
@@ -1766,12 +1780,15 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         ------
         ValueError
             If the new shape is incompatible with the current array's chunking configuration.
+        TypeError
+            If ``mode`` is :attr:`~zarr.core.array.ResizeMode.tombstone` but the
+            array's store is not a :class:`~zarr.experimental.manifest.ManifestStore`.
 
         Notes
         -----
         - This method is asynchronous and should be awaited.
         """
-        return await _resize(self, new_shape, delete_outside_chunks)
+        return await _resize(self, new_shape, delete_outside_chunks, mode=mode)
 
     async def append(self, data: npt.ArrayLike, axis: int = 0) -> tuple[int, ...]:
         """Append `data` to `axis`.
@@ -3937,7 +3954,12 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         examples."""
         return BlockIndex(self)
 
-    def resize(self, new_shape: ShapeLike) -> None:
+    def resize(
+        self,
+        new_shape: ShapeLike,
+        delete_outside_chunks: bool = True,
+        mode: ResizeMode | Literal["delete", "preserve", "tombstone"] | None = None,
+    ) -> None:
         """
         Change the shape of the array by growing or shrinking one or more
         dimensions. This is an in-place operation that modifies the array.
@@ -3946,6 +3968,15 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         ----------
         new_shape : tuple
             New shape of the array.
+        delete_outside_chunks : bool, optional
+            Legacy switch: if True (default), chunks that fall outside the new
+            shape will be deleted; if False, the data in those chunks is
+            preserved. Ignored when ``mode`` is given.
+        mode : ResizeMode or str, optional
+            Explicit resize mode. ``ResizeMode.tombstone`` hides outside chunks
+            through a manifest instead of deleting them and requires a
+            :class:`~zarr.experimental.manifest.ManifestStore`. Takes precedence
+            over ``delete_outside_chunks``.
 
         Notes
         -----
@@ -3973,7 +4004,11 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         #>(50, 50)
         ```
         """
-        sync(self.async_array.resize(new_shape))
+        sync(
+            self.async_array.resize(
+                new_shape, delete_outside_chunks=delete_outside_chunks, mode=mode
+            )
+        )
 
     def append(self, data: npt.ArrayLike, axis: int = 0) -> tuple[int, ...]:
         """Append `data` to `axis`.
@@ -5930,10 +5965,47 @@ def _iter_chunk_coords_to_delete(
         remaining_shape[axis] = new
 
 
+class ResizeMode(StrEnum):
+    """How a shrinking resize treats chunks that fall outside the new shape.
+
+    :attr:`delete`
+        Physically delete the outside chunks from the store. This is the
+        historical behavior and the default.
+    :attr:`preserve`
+        Leave the outside chunks and their bytes untouched.
+    :attr:`tombstone`
+        Hide the outside chunks through a manifest without deleting their
+        bytes. Requires the array's store to be a
+        :class:`~zarr.experimental.manifest.ManifestStore`. Hidden chunks read
+        as missing, so growing the array back over the same coordinates does
+        not resurrect the old bytes; the bytes can be reclaimed later via
+        :meth:`~zarr.experimental.manifest.ManifestStore.reclaim`.
+    """
+
+    delete = "delete"
+    preserve = "preserve"
+    tombstone = "tombstone"
+
+
+def _resolve_resize_mode(
+    mode: ResizeMode | Literal["delete", "preserve", "tombstone"] | None,
+    delete_outside_chunks: bool,
+) -> ResizeMode:
+    """Reconcile the legacy ``delete_outside_chunks`` flag with ``mode``.
+
+    ``mode`` wins when given; otherwise the boolean maps to the historical
+    :attr:`ResizeMode.delete` / :attr:`ResizeMode.preserve` behavior.
+    """
+    if mode is not None:
+        return ResizeMode(mode)
+    return ResizeMode.delete if delete_outside_chunks else ResizeMode.preserve
+
+
 async def _resize(
     array: AsyncArray[ArrayV2Metadata] | AsyncArray[ArrayV3Metadata],
     new_shape: ShapeLike,
     delete_outside_chunks: bool = True,
+    mode: ResizeMode | Literal["delete", "preserve", "tombstone"] | None = None,
 ) -> None:
     """
     Resize an array to a new shape.
@@ -5945,9 +6017,14 @@ async def _resize(
     new_shape : ShapeLike
         The desired new shape of the array.
     delete_outside_chunks : bool, optional
-        If True (default), chunks that fall outside the new shape will be deleted.
-        If False, the data in those chunks will be preserved.
+        Legacy switch kept for compatibility: True (default) deletes chunks
+        outside the new shape, False preserves them. Ignored when ``mode`` is
+        given.
+    mode : ResizeMode or str, optional
+        Explicit resize mode (see :class:`ResizeMode`). Takes precedence over
+        ``delete_outside_chunks``.
     """
+    resize_mode = _resolve_resize_mode(mode, delete_outside_chunks)
     new_shape = parse_shapelike(new_shape)
     if len(new_shape) != len(array.metadata.shape):
         raise ValueError(
@@ -5958,11 +6035,11 @@ async def _resize(
     new_metadata = array.metadata.update_shape(new_shape)
     new_chunk_grid = ChunkGrid.from_metadata(new_metadata)
 
-    # Encode the new metadata before deleting any chunk: metadata that cannot be stored
-    # then fails with the store untouched.
+    # Encode the new metadata before removing any chunk: metadata that cannot be
+    # stored then fails with the store untouched.
     documents = encode_documents(array.store_path, new_metadata)
 
-    if delete_outside_chunks:
+    if resize_mode is not ResizeMode.preserve:
         old_grid_shape = array._chunk_grid.grid_shape
         new_grid_shape = new_chunk_grid.grid_shape
         # Chunks of the old grid outside the box it shares with the new grid.
@@ -5971,21 +6048,36 @@ async def _resize(
             min(old, new) for old, new in zip(old_grid_shape, new_grid_shape, strict=True)
         )
         if n_delete > 0:
+            coords_to_remove = _iter_chunk_coords_to_delete(old_grid_shape, new_grid_shape)
+            if resize_mode is ResizeMode.tombstone:
+                from zarr.experimental.manifest import ManifestStore
 
-            async def _delete_chunk(coords: tuple[int, ...]) -> None:
-                await (array.store_path / array.metadata.encode_chunk_key(coords)).delete()
+                store = array.store_path.store
+                if not isinstance(store, ManifestStore):
+                    raise TypeError(
+                        "ResizeMode.tombstone requires the array's store to be a "
+                        "zarr.experimental.manifest.ManifestStore; got "
+                        f"{type(store).__name__}. Wrap the store in a ManifestStore "
+                        "before opening the array, or use ResizeMode.delete."
+                    )
+                outside_keys = [
+                    _join_paths([array.store_path.path, array.metadata.encode_chunk_key(coords)])
+                    for coords in coords_to_remove
+                ]
+                await store.tombstone(outside_keys)
+            else:
 
-            # `None` lifts the I/O concurrency limit, but the worker pool still
-            # needs a bound; 1000 keeps the pool far smaller than the grid.
-            limit = zarr_config.get("async.concurrency") or 1000
-            await concurrent_foreach(
-                (
-                    (coords,)
-                    for coords in _iter_chunk_coords_to_delete(old_grid_shape, new_grid_shape)
-                ),
-                _delete_chunk,
-                min(limit, n_delete),
-            )
+                async def _delete_chunk(coords: tuple[int, ...]) -> None:
+                    await (array.store_path / array.metadata.encode_chunk_key(coords)).delete()
+
+                # `None` lifts the I/O concurrency limit, but the worker pool still
+                # needs a bound; 1000 keeps the pool far smaller than the grid.
+                limit = zarr_config.get("async.concurrency") or 1000
+                await concurrent_foreach(
+                    ((coords,) for coords in coords_to_remove),
+                    _delete_chunk,
+                    min(limit, n_delete),
+                )
 
     # Write new metadata
     await store_documents(array.store_path, documents)

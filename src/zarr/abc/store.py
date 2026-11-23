@@ -17,15 +17,29 @@ if TYPE_CHECKING:
 __all__ = [
     "ByteGetter",
     "ByteSetter",
+    "ConcurrentUpdateError",
     "Store",
     "SupportsDeleteSync",
     "SupportsGetSync",
     "SupportsSetSync",
     "SupportsSyncStore",
+    "SupportsVersionedReplace",
     "SyncByteGetter",
     "SyncByteSetter",
     "set_or_delete",
+    "versioned_replace",
 ]
+
+
+class ConcurrentUpdateError(RuntimeError):
+    """
+    Raised by a versioned replace when the object at the target key no longer
+    carries the expected version.
+
+    This is a lost-update guard, not a missing-key error: another writer has
+    replaced the object since the version the caller holds was read. Callers
+    typically re-read the object and retry.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,6 +719,59 @@ class SupportsDeleteSync(Protocol):
 @runtime_checkable
 class SupportsSyncStore(SupportsGetSync, SupportsSetSync, SupportsDeleteSync, Protocol):
     """The full store sync surface: `get_sync`, `set_sync`, and `delete_sync`."""
+
+
+@runtime_checkable
+class SupportsVersionedReplace(Protocol):
+    """Store protocol for atomic, compare-and-swap replacement of one object.
+
+    A store implementing this protocol can replace the object at a key only
+    when that object still carries a version the caller previously observed.
+    The version is an opaque token the store mints on every write; callers
+    never inspect it. This is the primitive manifest-backed stores build on
+    to commit a new manifest without racing another writer.
+
+    Implementations must make the version check and the replacement atomic:
+    a lost update raises `ConcurrentUpdateError` instead of silently
+    overwriting the newer object.
+    """
+
+    async def get_version(self, key: str) -> object | None:
+        """Return the current opaque version of the object at `key`, or None
+        if the key is absent."""
+        ...
+
+    async def versioned_replace(
+        self,
+        key: str,
+        value: Buffer,
+        *,
+        expected_version: object | None,
+        new_version: object,
+    ) -> None: ...
+
+
+async def versioned_replace(
+    store: Store,
+    key: str,
+    value: Buffer,
+    *,
+    expected_version: object | None,
+    new_version: object,
+) -> None:
+    """Replace the object at `key` under version control when `store` supports it.
+
+    Stores implementing `SupportsVersionedReplace` get the atomic
+    compare-and-swap semantics of that protocol. Other stores — which cannot
+    detect a lost update — fall back to an unconditional `set`, preserving the
+    pre-existing resize semantics on ordinary storage.
+    """
+    if isinstance(store, SupportsVersionedReplace):
+        await store.versioned_replace(
+            key, value, expected_version=expected_version, new_version=new_version
+        )
+    else:
+        await store.set(key, value)
 
 
 def _store_supports_sync_io(store: object) -> bool:

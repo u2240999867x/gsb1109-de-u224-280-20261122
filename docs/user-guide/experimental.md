@@ -358,3 +358,97 @@ print(f"Cache contains {info['cached_keys']} keys with {info['current_size']} by
 This example shows how the CacheStore can significantly reduce access times for repeated
 data reads, particularly important when working with remote data sources. The dual-store
 architecture allows for flexible cache persistence and management.
+
+## Manifest-backed resize (`ManifestStore`)
+
+Ordinarily, shrinking an array deletes the chunks that fall outside the new shape. That is
+irreversible in one important case: if the array is grown back over the same coordinates, the
+old chunk bytes are gone, which is usually what you want. But a *tombstone* resize hides the
+outside chunks instead of deleting them, recording the hidden keys in a small **manifest**
+object. Hidden chunks read as missing while their bytes remain in storage, so growing the
+array back never resurrects stale data, and a reader that opened the array with the old shape
+can keep reading the retained bytes until the bytes are explicitly reclaimed.
+
+Wrap the store in a [`zarr.experimental.manifest.ManifestStore`][] and resize with
+[`zarr.core.array.ResizeMode.tombstone`][]:
+
+```python exec="true" session="experimental-manifest" source="above" result="ansi"
+import numpy as np
+import zarr
+from zarr.experimental import ManifestStore, VersionedMemoryStore
+from zarr.core.array import ResizeMode
+
+# VersionedMemoryStore is an in-memory store whose manifest commits are atomic
+# compare-and-swap operations. Any ordinary store works too; those without
+# conditional writes fall back to single-writer semantics.
+backing = VersionedMemoryStore()
+array = zarr.create_array(
+    store=ManifestStore(backing), shape=(17,), chunks=(1,), dtype="int32", fill_value=0
+)
+array[:] = np.arange(1, 18, dtype="int32")
+
+# Shrink from 17 frames to 12 without deleting the five trailing chunks.
+array.resize((12,), mode=ResizeMode.tombstone)
+print(array.shape)
+```
+
+The hidden chunk bytes are not deleted; only the manifest makes them read as missing. Growing
+back over the hidden coordinates returns the fill value rather than resurrecting the old bytes:
+
+```python exec="true" session="experimental-manifest" source="above" result="ansi"
+array.resize((17,), mode=ResizeMode.tombstone)
+print(array[12:])
+```
+
+Once the new frames are written, reclaim the bytes left behind by the shrink. Reclamation only
+deletes keys the live manifest still marks as hidden, so it never removes a chunk that was
+written afterwards -- even if reclamation is scheduled later than the regrowth and new writes.
+
+```python exec="true" session="experimental-manifest" source="above" result="ansi"
+array[12] = 130  # the new 13th frame overwrites one previously hidden coordinate
+removed = array.store.reclaim_sync()
+print("reclaimed objects:", removed)
+print(array[:])
+```
+
+A second reclaim with no live tombstones is a no-op:
+
+```python exec="true" session="experimental-manifest" source="above" result="ansi"
+print(array.store.reclaim_sync())
+```
+
+### Archive readers and point-in-time snapshots
+
+A reader that opened the dataset with the old shape, before the shrink, keeps reading the old
+frames when it holds a pinned snapshot. [`ManifestStore.snapshot`][] loads the manifest once and
+never observes later tombstones; the underlying bytes survive until an explicit reclaim.
+
+```python exec="true" session="experimental-manifest-snapshot" source="above" result="ansi"
+import numpy as np
+import zarr
+from zarr.experimental import ManifestStore, VersionedMemoryStore
+from zarr.core.array import ResizeMode
+
+backing = VersionedMemoryStore()
+writer_store = ManifestStore(backing)
+array = zarr.create_array(store=writer_store, shape=(17,), chunks=(1,), dtype="int32")
+array[:] = np.arange(1, 18, dtype="int32")
+
+# Open a pinned reader against the 17-frame shape before shrinking.
+archive = ManifestStore.snapshot_sync(backing)
+reader = zarr.open_array(archive, mode="r")
+
+array.resize((12,), mode=ResizeMode.tombstone)
+print("archive reader still sees", reader.shape, "frames; first value", reader[0])
+```
+
+### Stores with versioned replacement
+
+Manifest commits use an atomic compare-and-swap when the wrapped store implements
+[`zarr.abc.store.SupportsVersionedReplace`][]: `get_version` returns an opaque object version
+and `versioned_replace` writes only if that version is unchanged, raising
+[`zarr.abc.store.ConcurrentUpdateError`][] on a lost update (the manifest layer retries
+automatically). Stores without the protocol still work for a single writer; their commits are
+ordinary writes and the existing delete-based resize semantics on unwrapped stores are
+unchanged.
+
