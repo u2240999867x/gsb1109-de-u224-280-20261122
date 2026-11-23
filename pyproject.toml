@@ -3,7 +3,7 @@ requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["redbird"]
+packages = ["redbird", "redbird.batch", "redbird.repos", "redbird.sql", "redbird.logging", "redbird.utils"]
 
 [project]
 name = "redbird"
