@@ -1313,6 +1313,220 @@ def unique_values(x, /):
     return values
 
 
+class UniqueBitwiseResult(NamedTuple):
+    values: np.ndarray
+    counts: np.ndarray
+    indices: np.ndarray
+    data_codes: np.ndarray
+    fill_code: int | None
+
+
+class MergedUniqueBitwiseResult(NamedTuple):
+    values: np.ndarray
+    counts: np.ndarray
+    code_maps: list
+
+
+def _bitwise_keys(arr):
+    """Views a 1-D array as void scalars so equality is exact bit-pattern identity."""
+    arr = np.ascontiguousarray(arr)
+    return arr.view(f"V{arr.dtype.itemsize}")
+
+
+def unique_counts_bitwise(x, /):
+    """
+    Returns the unique elements of an input array `x` distinguished by exact
+    bit pattern, together with their counts, building a dictionary whose codes
+    are numbered by first occurrence in logical row-major (C) order.
+
+    Unlike [`sparse.unique_counts`][], which deduplicates by value, this
+    function treats elements as raw bit patterns: distinct NaN payloads are
+    distinct dictionary entries, and ``0.0`` and ``-0.0`` are not collapsed
+    into a single code. Bit patterns (including NaN payloads) are preserved
+    verbatim in the output values.
+
+    Parameters
+    ----------
+    x : COO
+        Input COO array. It is scanned in logical row-major order.
+
+    Returns
+    -------
+    out : namedtuple
+        The result containing:
+        * values - The unique bit patterns, in first-occurrence order, viewed
+          back in the input dtype. The code (dictionary number) of an entry is
+          its position in this array.
+        * counts - The corresponding counts for each unique bit pattern.
+        * indices - The linear row-major index of the first occurrence of each
+          unique bit pattern.
+        * data_codes - The dictionary code of each stored element, aligned with
+          ``x.data`` (and ``x.coords``) of the flattened input.
+        * fill_code - The dictionary code shared by all implicit (fill-value)
+          elements, or ``None`` if there are no implicit elements.
+
+    Raises
+    ------
+    ValueError
+        If the input array is in a different format than COO.
+
+    See Also
+    --------
+    - [`sparse.unique_counts`][] : Value-based deduplication.
+    - [`sparse.merge_unique_bitwise`][] : Merges per-slice results.
+
+    Examples
+    --------
+    >>> import sparse
+    >>> x = sparse.COO(coords=[[0, 1, 2, 3]], data=[1.0, 0.0, -0.0, 1.0], shape=(4,))
+    >>> sparse.unique_counts_bitwise(x)
+    UniqueBitwiseResult(values=array([ 1.,  0., -0.]), counts=array([2, 1, 1]), \
+indices=array([0, 1, 2]), data_codes=array([0, 1, 2, 0]), fill_code=None)
+    """
+
+    x = _validate_coo_input(x)
+
+    x = x.flatten()
+    data = x.data
+    nnz = data.shape[0]
+    fill_count = x.size - nnz
+
+    linear = x.coords[0]
+    order = np.argsort(linear, kind="stable")
+    linear = linear[order]
+    sorted_data = data[order]
+
+    data_keys = _bitwise_keys(sorted_data)
+    uniq_keys, inverse, uniq_counts = np.unique(data_keys, return_inverse=True, return_counts=True)
+    n_explicit = uniq_keys.shape[0]
+
+    # First occurrence of each explicit key, as a linear row-major index.
+    first = np.full(n_explicit, np.int64(x.size), dtype=np.int64)
+    np.minimum.at(first, inverse, linear.astype(np.int64, copy=False))
+
+    if fill_count > 0:
+        # First implicit slot in row-major order.
+        stored = np.unique(linear)
+        mismatch = np.nonzero(stored != np.arange(stored.size, dtype=stored.dtype))[0]
+        fill_first = int(mismatch[0]) if mismatch.size else int(stored.size)
+        fill_key = _bitwise_keys(np.array([x.fill_value], dtype=data.dtype))
+        all_keys = np.concatenate([uniq_keys, fill_key])
+        all_first = np.concatenate([first, [fill_first]])
+        all_counts = np.concatenate([uniq_counts, [fill_count]])
+    else:
+        all_keys = uniq_keys
+        all_first = first
+        all_counts = uniq_counts
+
+    # Merge the fill-value key with any identical explicit key (bitwise).
+    code_keys, key_inverse = np.unique(all_keys, return_inverse=True)
+    n_codes = code_keys.shape[0]
+    code_first = np.full(n_codes, np.int64(x.size) + 1, dtype=np.int64)
+    np.minimum.at(code_first, key_inverse, all_first)
+    code_counts = np.zeros(n_codes, dtype=np.int64)
+    np.add.at(code_counts, key_inverse, all_counts)
+
+    # Number codes by first occurrence in row-major order.
+    perm = np.argsort(code_first, kind="stable")
+    remap = np.empty(n_codes, dtype=np.int64)
+    remap[perm] = np.arange(n_codes, dtype=np.int64)
+
+    values = code_keys[perm].view(data.dtype)
+    counts = code_counts[perm]
+    indices = code_first[perm]
+
+    element_codes = remap[key_inverse[:n_explicit]][inverse]
+    data_codes = np.empty(nnz, dtype=np.int64)
+    data_codes[order] = element_codes
+
+    fill_code = int(remap[key_inverse[-1]]) if fill_count > 0 else None
+
+    return UniqueBitwiseResult(values, counts, indices, data_codes, fill_code)
+
+
+def merge_unique_bitwise(results, /):
+    """
+    Merges per-slice [`sparse.unique_counts_bitwise`][] results into a single
+    dictionary, as if the concatenated array had been processed directly.
+
+    The slices must be contiguous blocks in logical row-major order (e.g. a
+    week split along its first axis into day slices) and must be passed in
+    that order. Codes are renumbered by first occurrence across the merged
+    whole, identical bit patterns (including NaN payloads) keep a single code,
+    and counts are summed. Bit patterns are preserved verbatim.
+
+    Parameters
+    ----------
+    results : sequence of UniqueBitwiseResult
+        Per-slice results in row-major slice order. All slices must share the
+        same dtype (and, for the merge to match a direct run, the same
+        fill-value bit pattern).
+
+    Returns
+    -------
+    out : namedtuple
+        The result containing:
+        * values - The merged unique bit patterns, in first-occurrence order.
+        * counts - The merged counts for each unique bit pattern.
+        * code_maps - A list with one array per input result, mapping each
+          slice-local dictionary code to its merged dictionary code. Combined
+          with ``data_codes``/``fill_code`` of a slice, this gives the final
+          code of any picked element.
+
+    Raises
+    ------
+    ValueError
+        If no results are given or the dtypes of the results differ.
+
+    Examples
+    --------
+    >>> import sparse
+    >>> a = sparse.COO(coords=[[0, 1]], data=[1.0, -0.0], shape=(2,))
+    >>> b = sparse.COO(coords=[[0, 1]], data=[-0.0, 2.0], shape=(2,))
+    >>> merged = sparse.merge_unique_bitwise([sparse.unique_counts_bitwise(a), sparse.unique_counts_bitwise(b)])
+    >>> merged.values
+    array([ 1., -0.,  2.])
+    >>> merged.counts
+    array([1, 2, 1])
+    """
+
+    results = list(results)
+    if not results:
+        raise ValueError("Need at least one result to merge.")
+
+    dtype = results[0].values.dtype
+    if any(r.values.dtype != dtype for r in results):
+        raise ValueError("All results must share the same dtype.")
+
+    all_keys = np.concatenate([_bitwise_keys(r.values) for r in results])
+    all_counts = np.concatenate([r.counts for r in results]).astype(np.int64, copy=False)
+
+    code_keys, key_inverse = np.unique(all_keys, return_inverse=True)
+    n_codes = code_keys.shape[0]
+    # Slices are concatenated in row-major order, so the position in the
+    # concatenated sequence orders codes by first occurrence in the whole.
+    code_first = np.full(n_codes, np.int64(all_keys.shape[0]) + 1, dtype=np.int64)
+    np.minimum.at(code_first, key_inverse, np.arange(all_keys.shape[0], dtype=np.int64))
+    code_counts = np.zeros(n_codes, dtype=np.int64)
+    np.add.at(code_counts, key_inverse, all_counts)
+
+    perm = np.argsort(code_first, kind="stable")
+    remap = np.empty(n_codes, dtype=np.int64)
+    remap[perm] = np.arange(n_codes, dtype=np.int64)
+
+    values = code_keys[perm].view(dtype)
+    counts = code_counts[perm]
+
+    code_maps = []
+    offset = 0
+    for r in results:
+        n = r.values.shape[0]
+        code_maps.append(remap[key_inverse[offset : offset + n]])
+        offset += n
+
+    return MergedUniqueBitwiseResult(values, counts, code_maps)
+
+
 def sort(x, /, *, axis=-1, descending=False, stable=False):
     """
     Returns a sorted copy of an input array ``x``.

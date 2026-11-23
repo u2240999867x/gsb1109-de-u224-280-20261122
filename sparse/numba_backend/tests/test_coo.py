@@ -2265,6 +2265,162 @@ class TestUnique:
             func(self.arr)
 
 
+def _float64_from_bits(bits):
+    return np.array([bits], dtype=np.uint64).view(np.float64)[0]
+
+
+NAN_UNSAMPLED = _float64_from_bits(0x7FF8000000000001)
+NAN_OUT_OF_RANGE = _float64_from_bits(0x7FF8000000000002)
+
+
+class TestUniqueBitwise:
+    def test_nan_payloads_distinct(self):
+        # Two quiet NaN payloads must get two distinct codes.
+        arr = sparse.COO(
+            coords=[[0, 1, 2]], data=[NAN_OUT_OF_RANGE, NAN_UNSAMPLED, NAN_OUT_OF_RANGE], shape=(3,), fill_value=1.0
+        )
+        result = sparse.unique_counts_bitwise(arr)
+        assert result.values.shape == (2,)
+        np.testing.assert_equal(result.values.view(np.uint64), [0x7FF8000000000002, 0x7FF8000000000001])
+        np.testing.assert_equal(result.counts, [2, 1])
+        np.testing.assert_equal(result.data_codes, [0, 1, 0])
+        assert result.fill_code is None
+
+    def test_nan_payloads_preserved(self):
+        # The same NaN bit pattern is a single code and is never normalized
+        # to a canonical NaN literal.
+        payload = 0x7FF8123456789ABC
+        nan_val = _float64_from_bits(payload)
+        arr = sparse.COO(coords=[[0, 1]], data=[nan_val, nan_val], shape=(2,), fill_value=1.0)
+        result = sparse.unique_counts_bitwise(arr)
+        assert result.values.shape == (1,)
+        assert result.values.view(np.uint64)[0] == payload
+        np.testing.assert_equal(result.counts, [2])
+
+    def test_signed_zeros_distinct(self):
+        arr = sparse.COO(coords=[[0, 1]], data=[0.0, -0.0], shape=(2,), fill_value=1.0)
+        result = sparse.unique_counts_bitwise(arr)
+        assert result.values.shape == (2,)
+        np.testing.assert_equal(result.values.view(np.uint64), [0x0000000000000000, 0x8000000000000000])
+        np.testing.assert_equal(result.counts, [1, 1])
+
+    def test_first_occurrence_row_major(self):
+        # Codes are numbered by first occurrence in row-major order, not by value.
+        arr = sparse.COO(coords=[[0, 1], [2, 0]], data=[5.0, 1.0], shape=(2, 3), fill_value=0.0)
+        result = sparse.unique_counts_bitwise(arr)
+        np.testing.assert_equal(result.values, [0.0, 5.0, 1.0])
+        np.testing.assert_equal(result.counts, [4, 1, 1])
+        np.testing.assert_equal(result.indices, [0, 2, 3])
+        np.testing.assert_equal(result.data_codes, [1, 2])
+        assert result.fill_code == 0
+
+    def test_fully_implicit_slice(self):
+        # A slice with no stored elements still counts its length under the
+        # fill-value code.
+        arr = sparse.COO(coords=np.empty((1, 0), dtype=np.int64), data=[], shape=(5,), fill_value=NAN_UNSAMPLED)
+        result = sparse.unique_counts_bitwise(arr)
+        assert result.values.shape == (1,)
+        assert result.values.view(np.uint64)[0] == 0x7FF8000000000001
+        np.testing.assert_equal(result.counts, [5])
+        np.testing.assert_equal(result.indices, [0])
+        assert result.data_codes.shape == (0,)
+        assert result.fill_code == 0
+
+    def test_explicit_nan_before_background(self):
+        # The earliest cell is an explicit NaN of another payload; the
+        # background fill only starts at the next cell.
+        arr = sparse.COO(coords=[[0]], data=[NAN_OUT_OF_RANGE], shape=(4,), fill_value=NAN_UNSAMPLED)
+        result = sparse.unique_counts_bitwise(arr)
+        np.testing.assert_equal(result.values.view(np.uint64), [0x7FF8000000000002, 0x7FF8000000000001])
+        np.testing.assert_equal(result.counts, [1, 3])
+        np.testing.assert_equal(result.indices, [0, 1])
+        np.testing.assert_equal(result.data_codes, [0])
+        assert result.fill_code == 1
+
+    def _week(self):
+        # 7 days x 4 slots; background is the "unsampled" NaN payload.
+        coords = np.array([[0, 0], [0, 2], [2, 0], [2, 3], [3, 1], [3, 2], [5, 0]]).T
+        data = np.array([1.5, -0.0, NAN_OUT_OF_RANGE, 0.0, 1.5, NAN_OUT_OF_RANGE, -0.0])
+        return sparse.COO(coords=coords, data=data, shape=(7, 4), fill_value=NAN_UNSAMPLED)
+
+    def _day_slices(self):
+        days = [
+            ([0, 2], [1.5, -0.0]),
+            ([], []),
+            ([0, 3], [NAN_OUT_OF_RANGE, 0.0]),
+            ([1, 2], [1.5, NAN_OUT_OF_RANGE]),
+            ([], []),
+            ([0], [-0.0]),
+            ([], []),
+        ]
+        return [
+            sparse.COO(
+                coords=np.array(coords, dtype=np.int64).reshape(1, -1),
+                data=np.array(data, dtype=np.float64),
+                shape=(4,),
+                fill_value=NAN_UNSAMPLED,
+            )
+            for coords, data in days
+        ]
+
+    def test_merge_matches_direct(self):
+        direct = sparse.unique_counts_bitwise(self._week())
+        slice_results = [sparse.unique_counts_bitwise(day) for day in self._day_slices()]
+        merged = sparse.merge_unique_bitwise(slice_results)
+
+        np.testing.assert_equal(merged.values.view(np.uint64), direct.values.view(np.uint64))
+        np.testing.assert_equal(merged.counts, direct.counts)
+
+        # Expected dictionary, numbered by first occurrence in row-major order.
+        np.testing.assert_equal(
+            direct.values.view(np.uint64),
+            [
+                np.float64(1.5).view(np.uint64),
+                0x7FF8000000000001,  # unsampled background
+                np.float64(-0.0).view(np.uint64),
+                0x7FF8000000000002,  # out of range
+                np.float64(0.0).view(np.uint64),
+            ],
+        )
+        np.testing.assert_equal(direct.counts, [2, 21, 2, 2, 1])
+
+    def test_merge_point_lookup(self):
+        # A picked point's final dictionary code is recoverable from its
+        # slice-local result and the merge code maps.
+        direct = sparse.unique_counts_bitwise(self._week())
+        slice_results = [sparse.unique_counts_bitwise(day) for day in self._day_slices()]
+        merged = sparse.merge_unique_bitwise(slice_results)
+
+        # Day 2: explicit out-of-range NaN at slot 0, background from slot 1.
+        day2 = slice_results[2]
+        assert day2.data_codes[0] == 0  # explicit NaN is the earliest cell
+        assert day2.fill_code == 1  # background starts at the next cell
+
+        picked_explicit = merged.code_maps[2][day2.data_codes[0]]
+        picked_implicit = merged.code_maps[2][day2.fill_code]
+        assert direct.values.view(np.uint64)[picked_explicit] == 0x7FF8000000000002
+        assert direct.values.view(np.uint64)[picked_implicit] == 0x7FF8000000000001
+
+        # A fully implicit day contributes its length to the background code.
+        day1 = slice_results[1]
+        assert day1.fill_code == 0
+        assert merged.counts[merged.code_maps[1][day1.fill_code]] == 21
+
+    def test_merge_dtype_mismatch(self):
+        a = sparse.unique_counts_bitwise(sparse.COO.from_numpy([1.0, 2.0]))
+        b = sparse.unique_counts_bitwise(sparse.COO.from_numpy([1, 2]))
+        with pytest.raises(ValueError, match="same dtype"):
+            sparse.merge_unique_bitwise([a, b])
+
+    def test_merge_empty(self):
+        with pytest.raises(ValueError, match="at least one result"):
+            sparse.merge_unique_bitwise([])
+
+    def test_input_validation(self):
+        with pytest.raises(ValueError, match="Input must be an instance of SparseArray"):
+            sparse.unique_counts_bitwise(np.array([1.0, 2.0]))
+
+
 @pytest.mark.parametrize("axis", [-1, 0, 1, 2, 3])
 def test_expand_dims(axis):
     arr = np.arange(24).reshape((2, 3, 4))

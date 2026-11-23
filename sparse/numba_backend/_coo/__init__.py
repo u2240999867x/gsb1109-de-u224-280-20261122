@@ -11,6 +11,7 @@ from .common import (
     isneginf,
     isposinf,
     kron,
+    merge_unique_bitwise,
     nanmax,
     nanmean,
     nanmin,
@@ -25,6 +26,7 @@ from .common import (
     tril,
     triu,
     unique_counts,
+    unique_counts_bitwise,
     unique_values,
     where,
 )
@@ -45,6 +47,7 @@ __all__ = [
     "isneginf",
     "isposinf",
     "kron",
+    "merge_unique_bitwise",
     "nanmax",
     "nanmean",
     "nanmin",
@@ -59,6 +62,7 @@ __all__ = [
     "tril",
     "triu",
     "unique_counts",
+    "unique_counts_bitwise",
     "unique_values",
     "where",
 ]
