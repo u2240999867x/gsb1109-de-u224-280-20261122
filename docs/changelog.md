@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Add a `dialect` parameter to `msgspec.json.schema` and
+  `msgspec.json.schema_components`. Passing `dialect="draft-07"` generates
+  schemas compatible with JSON Schema draft-07: tuples are represented as
+  `items` arrays with `additionalItems` instead of `prefixItems`, references
+  default to `#/definitions/...` instead of `#/$defs/...`, and
+  `msgspec.json.schema` collects shared components under a top-level
+  `definitions` field. Generating with each dialect produces two
+  self-contained schema packages loadable by validators of either generation.
+- `msgspec.json.schema` and `msgspec.json.schema_components` now raise a
+  `ValueError` identifying any unresolved reference if a `schema_hook` result
+  contains a `$ref` matching `ref_template` that doesn't name a component
+  generated in the same batch.
+
 - Fix `Encoder.encode_into` shrinking the buffer's capacity when passed an
   `offset` inside the buffer. An `offset` past the end of the buffer now fills
   the gap with zeros instead of leaving it uninitialized, and a failed encode no

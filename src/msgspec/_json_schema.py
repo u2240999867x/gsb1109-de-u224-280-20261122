@@ -10,18 +10,60 @@ from . import inspect as mi, to_builtins
 __all__ = ("schema", "schema_components")
 
 _REF_TEMPLATE: Final = "#/$defs/{name}"
+_REF_TEMPLATE_DRAFT_07: Final = "#/definitions/{name}"
+
+
+def _normalize_dialect(dialect: Any) -> str:
+    """Normalize a user-provided JSON Schema dialect.
+
+    Returns either "2020-12" or "draft-07".
+    """
+    key = str(dialect).strip().lower().replace("_", "-").replace(" ", "")
+    if key.startswith("draft-"):
+        key = key[len("draft-") :]
+    elif key.startswith("draft"):
+        key = key[len("draft") :]
+    if key in ("2020-12", "202012"):
+        return "2020-12"
+    elif key in ("7", "07"):
+        return "draft-07"
+    raise ValueError(
+        f"Unsupported JSON Schema dialect {dialect!r}; "
+        "supported dialects are '2020-12' and 'draft-07'"
+    )
+
+
+def _resolve_options(
+    dialect: str | None,
+    draft: str | None,
+    ref_template: str | None,
+) -> tuple[str, str]:
+    """Resolve the ``dialect``/``draft``/``ref_template`` parameters.
+
+    ``draft`` is accepted as an alias for ``dialect``. The default
+    ``ref_template`` depends on the resolved dialect.
+    """
+    if dialect is None:
+        dialect = "2020-12" if draft is None else draft
+    dialect = _normalize_dialect(dialect)
+    if ref_template is None:
+        ref_template = _REF_TEMPLATE if dialect == "2020-12" else _REF_TEMPLATE_DRAFT_07
+    return dialect, ref_template
 
 
 def schema(
     type: Any,
     *,
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
-    ref_template: str = _REF_TEMPLATE,
+    ref_template: str | None = None,
+    dialect: str | None = None,
+    draft: str | None = None,
 ) -> dict[str, Any]:
     """Generate a JSON Schema for a given type.
 
     Any schemas for (potentially) shared components are extracted and stored in
-    a top-level ``"$defs"`` field.
+    a top-level ``"$defs"`` field (``"definitions"`` for the ``"draft-07"``
+    dialect).
 
     If you want to generate schemas for multiple types, or to have more control
     over the generated schema you may want to use ``schema_components`` instead.
@@ -40,7 +82,16 @@ def schema(
         can be useful if you intend to store the ``components`` mapping
         somewhere other than a top-level ``"$defs"`` field. For example, you
         might use ``ref_template="#/components/{name}"`` if generating an
-        OpenAPI schema.
+        OpenAPI schema. Defaults to ``"#/$defs/{name}"`` for the ``"2020-12"``
+        dialect, or ``"#/definitions/{name}"`` for the ``"draft-07"`` dialect.
+    dialect : str, optional
+        The JSON Schema dialect to generate. One of ``"2020-12"`` (default) or
+        ``"draft-07"``. The ``"draft-07"`` dialect represents tuples as
+        ``items`` arrays with ``additionalItems`` rather than ``prefixItems``,
+        and defaults to ``#/definitions/...`` references rather than
+        ``#/$defs/...``.
+    draft : str, optional
+        An alias for ``dialect``.
 
     Returns
     -------
@@ -51,13 +102,15 @@ def schema(
     --------
     schema_components
     """
+    dialect, ref_template = _resolve_options(dialect, draft, ref_template)
     (out,), components = schema_components(
         (type,),
         schema_hook=schema_hook,
         ref_template=ref_template,
+        dialect=dialect,
     )
     if components:
-        out["$defs"] = components
+        out["$defs" if dialect == "2020-12" else "definitions"] = components
     return out
 
 
@@ -65,7 +118,9 @@ def schema_components(
     types: Iterable[Any],
     *,
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
-    ref_template: str = _REF_TEMPLATE,
+    ref_template: str | None = None,
+    dialect: str | None = None,
+    draft: str | None = None,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     """Generate JSON Schemas for one or more types.
 
@@ -86,7 +141,16 @@ def schema_components(
         can be useful if you intend to store the ``components`` mapping
         somewhere other than a top-level ``"$defs"`` field. For example, you
         might use ``ref_template="#/components/{name}"`` if generating an
-        OpenAPI schema.
+        OpenAPI schema. Defaults to ``"#/$defs/{name}"`` for the ``"2020-12"``
+        dialect, or ``"#/definitions/{name}"`` for the ``"draft-07"`` dialect.
+    dialect : str, optional
+        The JSON Schema dialect to generate. One of ``"2020-12"`` (default) or
+        ``"draft-07"``. The ``"draft-07"`` dialect represents tuples as
+        ``items`` arrays with ``additionalItems`` rather than ``prefixItems``,
+        and defaults to ``#/definitions/...`` references rather than
+        ``#/$defs/...``.
+    draft : str, optional
+        An alias for ``dialect``.
 
     Returns
     -------
@@ -96,24 +160,80 @@ def schema_components(
         A mapping of name to schema for any shared components used by
         ``schemas``.
 
+    Raises
+    ------
+    ValueError
+        If a generated schema contains a ``"$ref"`` matching ``ref_template``
+        that doesn't resolve to a component in this batch. This may happen if
+        a ``schema_hook`` result references a component that wasn't provided.
+
     See Also
     --------
     schema
     """
+    dialect, ref_template = _resolve_options(dialect, draft, ref_template)
+
     type_infos = mi.multi_type_info(types)
 
     component_types = _collect_component_types(type_infos)
 
     name_map = _build_name_map(component_types)
 
-    gen = _SchemaGenerator(name_map, schema_hook, ref_template)
+    gen = _SchemaGenerator(name_map, schema_hook, ref_template, dialect)
 
     schemas = tuple(gen.to_schema(t) for t in type_infos)
 
     components = {
         name_map[cls]: gen.to_schema(t, False) for cls, t in component_types.items()
     }
+
+    _check_unresolved_refs(schemas, components, ref_template)
+
     return schemas, components
+
+
+def _check_unresolved_refs(
+    schemas: tuple[dict[str, Any], ...],
+    components: dict[str, Any],
+    ref_template: str,
+) -> None:
+    """Check that all generated ``"$ref"`` fields resolve to a known component.
+
+    A ``schema_hook`` may return schemas containing ``"$ref"`` fields. Any
+    reference matching ``ref_template`` must name a component generated in
+    this batch; references not matching the template (e.g. pointers into
+    documents managed by the caller) are left alone.
+    """
+    pre, sep, post = ref_template.partition("{name}")
+    if not sep:
+        # No `{name}` placeholder, nothing to check against
+        return
+    pattern = re.compile(f"{re.escape(pre)}(?P<name>.*){re.escape(post)}")
+    missing = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                match = pattern.fullmatch(ref)
+                if match is not None and match.group("name") not in components:
+                    missing.add(ref)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    for schema in schemas:
+        visit(schema)
+    for component in components.values():
+        visit(component)
+
+    if missing:
+        raise ValueError(
+            "Generated JSON schemas contain unresolved references: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type]:
@@ -231,10 +351,12 @@ class _SchemaGenerator:
         name_map: dict[Any, str],
         schema_hook: Callable[[type], dict[str, Any]] | None = None,
         ref_template: str = "#/$defs/{name}",
+        dialect: str = "2020-12",
     ):
         self.name_map = name_map
         self.schema_hook = schema_hook
         self.ref_template = ref_template
+        self.dialect = dialect
 
     def to_schema(self, t: mi.Type, check_ref: bool = True) -> dict[str, Any]:
         """Converts a Type to a json-schema."""
@@ -318,8 +440,13 @@ class _SchemaGenerator:
             schema["type"] = "array"
             schema["minItems"] = schema["maxItems"] = len(t.item_types)
             if t.item_types:
-                schema["prefixItems"] = [self.to_schema(i) for i in t.item_types]
-                schema["items"] = False
+                item_schemas = [self.to_schema(i) for i in t.item_types]
+                if self.dialect == "draft-07":
+                    schema["items"] = item_schemas
+                    schema["additionalItems"] = False
+                else:
+                    schema["prefixItems"] = item_schemas
+                    schema["items"] = False
         elif isinstance(t, (mi.DictType, mi.FrozenDictType)):
             schema["type"] = "object"
             # If keys have schema metadata or constraints, include them as propertyNames
@@ -442,7 +569,10 @@ class _SchemaGenerator:
                         break
                     n_trailing_defaults += 1
                 schema["type"] = "array"
-                schema["prefixItems"] = fields
+                if self.dialect == "draft-07":
+                    schema["items"] = fields
+                else:
+                    schema["prefixItems"] = fields
                 schema["minItems"] = len(fields) - n_trailing_defaults
                 if t.forbid_unknown_fields:
                     schema["maxItems"] = len(fields)
@@ -473,7 +603,10 @@ class _SchemaGenerator:
                 fields.append(field_schema)
             if isinstance(t, mi.NamedTupleType):
                 schema["type"] = "array"
-                schema["prefixItems"] = fields
+                if self.dialect == "draft-07":
+                    schema["items"] = fields
+                else:
+                    schema["prefixItems"] = fields
                 schema["minItems"] = len(required)
                 schema["maxItems"] = len(fields)
             else:

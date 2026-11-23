@@ -14,6 +14,19 @@ specifications from msgspec-compatible :doc:`types <supported-types>` and
 The generated schemas are compatible with `JSON Schema`_ 2020-12 and OpenAPI_
 3.1.
 
+Schemas compatible with JSON Schema draft-07 may be generated instead by
+passing ``dialect="draft-07"``. In this dialect tuples are represented as
+``items`` arrays with ``additionalItems`` (rather than ``prefixItems``), and
+references default to ``#/definitions/...`` (rather than ``#/$defs/...``),
+with `msgspec.json.schema` collecting shared components under a top-level
+``"definitions"`` field. Calling `msgspec.json.schema_components` once per
+dialect yields two self-contained packages, each loadable by validators of
+the corresponding generation.
+
+If a ``schema_hook`` result contains a ``"$ref"`` matching the configured
+``ref_template`` that doesn't name a component generated in the same batch, a
+``ValueError`` is raised identifying the unresolved reference.
+
 
 Example
 -------

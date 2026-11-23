@@ -1796,3 +1796,348 @@ def test_multiline_docstring():
             }
         },
     }
+
+
+@pytest.mark.parametrize("dialect", ["draft-07", "draft7", "Draft-7", "DRAFT-07"])
+def test_dialect_draft_07_spellings(dialect):
+    assert msgspec.json.schema(int, dialect=dialect) == {"type": "integer"}
+
+
+def test_dialect_draft_alias():
+    assert msgspec.json.schema(int, draft="draft-07") == {"type": "integer"}
+    assert msgspec.json.schema(int, draft="draft-07") == msgspec.json.schema(
+        int, dialect="draft-07"
+    )
+
+
+def test_dialect_invalid():
+    with pytest.raises(ValueError, match="Unsupported JSON Schema dialect"):
+        msgspec.json.schema(int, dialect="draft-04")
+    with pytest.raises(ValueError, match="Unsupported JSON Schema dialect"):
+        msgspec.json.schema_components([int], dialect="bogus")
+
+
+def test_dialect_draft_07_tuple():
+    assert msgspec.json.schema(Tuple[int, float, str], dialect="draft-07") == {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "additionalItems": False,
+        "items": [
+            {"type": "integer"},
+            {"type": "number"},
+            {"type": "string"},
+        ],
+    }
+
+
+def test_dialect_draft_07_empty_tuple():
+    assert msgspec.json.schema(Tuple[()], dialect="draft-07") == {
+        "type": "array",
+        "minItems": 0,
+        "maxItems": 0,
+    }
+
+
+@pytest.mark.parametrize("forbid_unknown_fields", [False, True])
+def test_dialect_draft_07_struct_array_like(forbid_unknown_fields):
+    class Example(
+        msgspec.Struct, array_like=True, forbid_unknown_fields=forbid_unknown_fields
+    ):
+        a: int
+        b: str
+        c: list[int] = []
+        d: dict[str, int] = {}
+
+    component = {
+        "title": "Example",
+        "type": "array",
+        "items": [
+            {"type": "integer"},
+            {"type": "string"},
+            {"type": "array", "items": {"type": "integer"}, "default": []},
+            {
+                "type": "object",
+                "additionalProperties": {"type": "integer"},
+                "default": {},
+            },
+        ],
+        "minItems": 2,
+    }
+    if forbid_unknown_fields:
+        component["maxItems"] = 4
+
+    assert msgspec.json.schema(Example, dialect="draft-07") == {
+        "$ref": "#/definitions/Example",
+        "definitions": {"Example": component},
+    }
+
+
+def test_dialect_draft_07_namedtuple():
+    class Example(NamedTuple):
+        a: int
+        b: str = "default"
+
+    assert msgspec.json.schema(Example, dialect="draft-07") == {
+        "$ref": "#/definitions/Example",
+        "definitions": {
+            "Example": {
+                "title": "Example",
+                "type": "array",
+                "items": [
+                    {"type": "integer"},
+                    {"type": "string", "default": "default"},
+                ],
+                "minItems": 1,
+                "maxItems": 2,
+            }
+        },
+    }
+
+
+def test_dialect_draft_07_recursive():
+    source = """
+    import msgspec
+    from typing import List, Union
+
+    class Reading(msgspec.Struct, array_like=True, tag="r"):
+        value: float
+        unit: str = "m"
+
+    class Station(msgspec.Struct, array_like=True, tag="s"):
+        id: int
+        readings: List[Union[Reading, "Station"]] = []
+        note: str = ""
+    """
+    with temp_module(source) as mod:
+        modern = msgspec.json.schema(mod.Station)
+        legacy = msgspec.json.schema(mod.Station, dialect="draft-07")
+
+    assert legacy["$ref"] == "#/definitions/Station"
+    assert set(legacy["definitions"]) == {"Station", "Reading"}
+
+    # The legacy schema mirrors the modern one, with tuples and references
+    # translated to their draft-07 representations
+    def translate(node):
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if key == "prefixItems":
+                    out["items"] = translate(value)
+                elif key == "$ref":
+                    out["$ref"] = value.replace("#/$defs/", "#/definitions/")
+                else:
+                    out[key] = translate(value)
+            return out
+        elif isinstance(node, list):
+            return [translate(item) for item in node]
+        return node
+
+    assert legacy == {
+        "$ref": "#/definitions/Station",
+        "definitions": translate(modern["$defs"]),
+    }
+
+    # Recursive references point back at the root component in both dialects
+    station_modern = modern["$defs"]["Station"]
+    station_legacy = legacy["definitions"]["Station"]
+    assert station_modern["prefixItems"][2]["items"]["anyOf"] == [
+        {"$ref": "#/$defs/Reading"},
+        {"$ref": "#/$defs/Station"},
+    ]
+    assert station_legacy["items"][2]["items"]["anyOf"] == [
+        {"$ref": "#/definitions/Reading"},
+        {"$ref": "#/definitions/Station"},
+    ]
+    # Trailing defaults may be omitted, extra items are accepted
+    assert station_modern["minItems"] == station_legacy["minItems"] == 2
+    assert "maxItems" not in station_modern
+    assert "maxItems" not in station_legacy
+
+
+def test_dialect_draft_07_custom_ref_template():
+    class Ex1(msgspec.Struct):
+        a: int
+
+    class Ex2(msgspec.Struct):
+        b: Ex1
+
+    (s1, s2), components = msgspec.json.schema_components(
+        [Ex1, Ex2], dialect="draft-07", ref_template="#/components/{name}"
+    )
+    assert s1 == {"$ref": "#/components/Ex1"}
+    assert s2 == {"$ref": "#/components/Ex2"}
+    assert components["Ex2"]["properties"]["b"] == s1
+
+
+def test_dialect_draft_07_schema_components():
+    class Example(msgspec.Struct):
+        a: int
+
+    (s,), components = msgspec.json.schema_components([Example], dialect="draft-07")
+    assert s == {"$ref": "#/definitions/Example"}
+    assert components == {
+        "Example": {
+            "title": "Example",
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+        }
+    }
+
+
+def test_schema_hook_unresolved_ref():
+    def schema_hook(cls):
+        return {"$ref": "#/$defs/Missing"}
+
+    with pytest.raises(ValueError, match=r"unresolved references.*#/\$defs/Missing"):
+        msgspec.json.schema_components([complex], schema_hook=schema_hook)
+
+    with pytest.raises(ValueError, match=r"unresolved references.*#/\$defs/Missing"):
+        msgspec.json.schema(complex, schema_hook=schema_hook)
+
+
+def test_schema_hook_unresolved_ref_custom_template():
+    def schema_hook(cls):
+        return {"$ref": "#/legal-defs/Missing"}
+
+    with pytest.raises(ValueError, match="unresolved references.*Missing"):
+        msgspec.json.schema_components(
+            [complex],
+            schema_hook=schema_hook,
+            ref_template="#/legal-defs/{name}",
+        )
+
+
+def test_schema_hook_unresolved_ref_nested():
+    class Example(msgspec.Struct):
+        a: complex
+
+    def schema_hook(cls):
+        return {"anyOf": [{"$ref": "#/$defs/Missing"}]}
+
+    with pytest.raises(ValueError, match=r"unresolved references.*#/\$defs/Missing"):
+        msgspec.json.schema(Example, schema_hook=schema_hook)
+
+
+def test_schema_hook_ref_to_component():
+    class Example(msgspec.Struct):
+        a: int
+
+    def schema_hook(cls):
+        return {"$ref": "#/legal-defs/Example"}
+
+    schemas, components = msgspec.json.schema_components(
+        [Example, complex],
+        schema_hook=schema_hook,
+        ref_template="#/legal-defs/{name}",
+    )
+    assert schemas[1] == {"$ref": "#/legal-defs/Example"}
+    assert set(components) == {"Example"}
+
+
+def test_schema_hook_non_template_refs_ignored():
+    def schema_hook(cls):
+        return {
+            "anyOf": [
+                {"$ref": "#/definitions/CallerManaged"},
+                {"$ref": "https://example.com/other.json#/$defs/Thing"},
+            ]
+        }
+
+    (s,), components = msgspec.json.schema_components(
+        [complex], schema_hook=schema_hook
+    )
+    assert s == {
+        "anyOf": [
+            {"$ref": "#/definitions/CallerManaged"},
+            {"$ref": "https://example.com/other.json#/$defs/Thing"},
+        ]
+    }
+    assert components == {}
+
+
+@pytest.mark.parametrize("dialect", ["2020-12", "draft-07"])
+def test_property_named_defs(dialect):
+    Example = TypedDict("Example", {"$defs": int, "other": str})
+
+    schema = msgspec.json.schema(Example, dialect=dialect)
+    defs_key = "$defs" if dialect == "2020-12" else "definitions"
+    ref_prefix = "#/$defs/" if dialect == "2020-12" else "#/definitions/"
+
+    assert schema["$ref"] == f"{ref_prefix}Example"
+    assert schema[defs_key] == {
+        "Example": {
+            "title": "Example",
+            "type": "object",
+            "properties": {
+                "$defs": {"type": "integer"},
+                "other": {"type": "string"},
+            },
+            "required": ["$defs", "other"],
+        }
+    }
+
+    # Roundtrip through both schema entry points
+    (s,), components = msgspec.json.schema_components([Example], dialect=dialect)
+    assert s == {"$ref": f"{ref_prefix}Example"}
+    assert components == schema[defs_key]
+
+
+def test_dialect_validation_consistency():
+    jsonschema = pytest.importorskip("jsonschema")
+
+    source = """
+    import msgspec
+    from typing import List, Union
+
+    class Reading(msgspec.Struct, array_like=True, tag="r"):
+        value: float
+        unit: str = "m"
+
+    class Station(msgspec.Struct, array_like=True, tag="s"):
+        id: int
+        readings: List[Union[Reading, "Station"]] = []
+        note: str = ""
+
+    class Fixed(msgspec.Struct, array_like=True, forbid_unknown_fields=True):
+        a: int
+        b: str = "x"
+    """
+    with temp_module(source) as mod:
+        validators = [
+            jsonschema.Draft202012Validator(msgspec.json.schema(mod.Station)),
+            jsonschema.Draft7Validator(
+                msgspec.json.schema(mod.Station, dialect="draft-07")
+            ),
+        ]
+        fixed_validators = [
+            jsonschema.Draft202012Validator(msgspec.json.schema(mod.Fixed)),
+            jsonschema.Draft7Validator(
+                msgspec.json.schema(mod.Fixed, dialect="draft-07")
+            ),
+        ]
+
+        cases = [
+            (["s", 1], True),  # trailing defaults omitted
+            (["s", 1, [], "note"], True),
+            (["s", 1, [], "note", "extra", 42], True),  # extra items allowed
+            (["s", 1, [["r", 2.5]]], True),  # nested reading
+            (["s", 1, [["s", 2, [["r", 3.0]]]]], True),  # recursive station
+            ([], False),
+            (["s"], False),
+            (["s", "not-an-int"], False),
+            (["s", 1, [["r"]]], False),
+        ]
+        for inst, expected in cases:
+            results = [v.is_valid(inst) for v in validators]
+            assert results == [expected, expected]
+
+        fixed_cases = [
+            ([1], True),
+            ([1, "a"], True),
+            ([1, "a", 3], False),  # extra items forbidden
+        ]
+        for inst, expected in fixed_cases:
+            results = [v.is_valid(inst) for v in fixed_validators]
+            assert results == [expected, expected]

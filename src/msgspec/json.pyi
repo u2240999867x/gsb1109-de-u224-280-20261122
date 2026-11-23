@@ -103,13 +103,17 @@ def schema(
     type: Any,
     *,
     schema_hook: _SchemaHookSig = None,
-    ref_template: str = "#/$defs/{name}",
+    ref_template: str | None = None,
+    dialect: str | None = None,
+    draft: str | None = None,
 ) -> dict[str, Any]: ...
 def schema_components(
     types: Iterable[Any],
     *,
     schema_hook: _SchemaHookSig = None,
-    ref_template: str = "#/$defs/{name}",
+    ref_template: str | None = None,
+    dialect: str | None = None,
+    draft: str | None = None,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]: ...
 @overload
 def format(buf: str, *, indent: int = 2) -> str: ...
