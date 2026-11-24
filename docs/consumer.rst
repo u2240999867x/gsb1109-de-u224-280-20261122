@@ -168,6 +168,63 @@ Here we process a batch of messages per partition and commit not all consumed
 *offsets*, but only for the partition, we processed.
 
 
+Store-acknowledge mode
+^^^^^^^^^^^^^^^^^^^^^^
+
+When records are dispatched concurrently to an external store, a record that
+was dispatched later can finish writing first. The plain auto-commit would
+then happily pass an in-flight or failed record, losing it on restart.
+``enable_store_ack=True`` turns on an optional **store-acknowledge mode** that
+couples commits to explicit store confirmations instead of poll progress::
+
+    consumer = AIOKafkaConsumer(
+        "my_topic",
+        bootstrap_servers='localhost:9092',
+        group_id="my_group",
+        enable_store_ack=True,
+    )
+    await consumer.start()
+
+    async for msg in consumer:
+        await store.write((msg.partition, msg.offset), msg.value)  # idempotent
+        consumer.acknowledge(msg.receipt)
+
+In this mode every record carries a
+:class:`~aiokafka.abc.DeliveryReceipt` on its ``receipt`` attribute. Call
+:meth:`~.AIOKafkaConsumer.acknowledge` once the record durably landed in your
+store. Acknowledgements are tracked per partition:
+
+* Automatic commits (periodic, before :meth:`~.AIOKafkaConsumer.stop` and before
+  a group rebalance) only advance past the **contiguous** prefix of
+  acknowledged records. An out-of-order acknowledgement is remembered and
+  applied as soon as the gap closes.
+* Offsets a complete fetch batch proves empty (aborted transactional data,
+  control records, compacted gaps) are skipped automatically once the records
+  before them are acknowledged.
+* Two boundaries are queryable separately:
+  :meth:`~.AIOKafkaConsumer.position` is where the next fetch happens, while
+  :meth:`~.AIOKafkaConsumer.safe_position` is the highest offset that may be
+  committed. An empty fetch response does not move the safe position.
+
+If a write fails, re-dispatch the back half of a partition from the failed
+record without losing work dispatched before it::
+
+    consumer.reread_partition_from(tp, failed_offset)
+
+Receipts issued for ``failed_offset`` and everything after it are invalidated;
+a late :meth:`~.AIOKafkaConsumer.acknowledge` of an old receipt raises
+:class:`~aiokafka.errors.StaleDeliveryReceiptError`. The re-dispatched records
+arrive with fresh receipts that must be acknowledged instead. Earlier receipts
+stay valid, so work already in flight can still finish. Because records may be
+delivered twice, the store must deduplicate writes by ``(partition, offset)``.
+
+Receipts are also invalidated when the partition is revoked and later
+re-assigned (even back to the same consumer); each assignment gets its own
+generation of receipts. When ``enable_store_ack`` is left at its default of
+``False``, polling and auto-commit behave exactly as before and records carry
+``receipt=None``.
+
+
 Controlling The Consumer's Position
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

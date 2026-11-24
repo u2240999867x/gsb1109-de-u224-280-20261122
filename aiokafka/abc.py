@@ -1,5 +1,67 @@
 import abc
 
+from aiokafka.structs import TopicPartition
+
+
+class DeliveryReceipt:
+    """An opaque credential issued with every record when the consumer runs in
+    store-acknowledge mode (``enable_store_ack=True``).
+
+    The application passes the receipt it received alongside a record back to
+    :meth:`.AIOKafkaConsumer.acknowledge` once the record durably landed in the
+    external store. Only the consumer that issued the receipt may acknowledge
+    it, and only while the current assignment stays valid.
+
+    A receipt stops being valid when:
+
+    * the partition is re-read, for example via
+      :meth:`.AIOKafkaConsumer.reread_partition_from`;
+    * the partition is revoked and later re-assigned (each assignment gets its
+      own generation of receipts).
+
+    Acknowledging an invalidated receipt raises
+    :class:`~aiokafka.errors.StaleDeliveryReceiptError`; the record is
+    re-delivered with a new receipt in that case.
+    """
+
+    __slots__ = ("_epoch", "_offset", "_sequence", "_topic_partition")
+
+    def __init__(
+        self,
+        topic_partition: TopicPartition,
+        offset: int,
+        epoch: int,
+        sequence: int,
+    ) -> None:
+        self._topic_partition = topic_partition
+        self._offset = offset
+        self._epoch = epoch
+        self._sequence = sequence
+
+    @property
+    def topic_partition(self) -> TopicPartition:
+        return self._topic_partition
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    @property
+    def epoch(self) -> int:
+        """Assignment generation the receipt was issued under."""
+        return self._epoch
+
+    @property
+    def sequence(self) -> int:
+        """Monotonic, partition-local sequence of the dispatch."""
+        return self._sequence
+
+    def __repr__(self) -> str:
+        return (
+            f"DeliveryReceipt(tp={self._topic_partition!r}, offset={self._offset},"
+            f" epoch={self._epoch}, sequence={self._sequence})"
+        )
+
 
 class ConsumerRebalanceListener(abc.ABC):
     """
@@ -138,4 +200,5 @@ class AbstractTokenProvider(abc.ABC):
 __all__ = [
     "AbstractTokenProvider",
     "ConsumerRebalanceListener",
+    "DeliveryReceipt",
 ]

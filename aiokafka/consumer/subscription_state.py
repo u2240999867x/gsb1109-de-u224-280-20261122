@@ -9,8 +9,8 @@ from collections.abc import Iterable
 from enum import Enum
 from re import Pattern
 
-from aiokafka.abc import ConsumerRebalanceListener
-from aiokafka.errors import IllegalStateError
+from aiokafka.abc import ConsumerRebalanceListener, DeliveryReceipt
+from aiokafka.errors import IllegalStateError, StaleDeliveryReceiptError
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 from aiokafka.util import create_future, get_running_loop
 
@@ -41,7 +41,7 @@ class SubscriptionState:
     _subscription = None  # type: Subscription
     _listener = None  # type: ConsumerRebalanceListener
 
-    def __init__(self, loop=None):
+    def __init__(self, loop=None, enable_store_ack=False):
         if loop is None:
             loop = get_running_loop()
         self._loop = loop
@@ -52,6 +52,24 @@ class SubscriptionState:
         # Fetch contexts
         self._fetch_count = 0
         self._last_fetch_ended = time.monotonic()
+
+        # Store-acknowledge mode: autocommit only advances past records the
+        # application explicitly acknowledged with a valid DeliveryReceipt.
+        self._enable_store_ack = enable_store_ack
+        # Bumped every time the assignment changes. Receipts issued under a
+        # previous assignment generation are rejected as stale.
+        self._delivery_epoch = 0
+
+    @property
+    def store_ack_enabled(self) -> bool:
+        return self._enable_store_ack
+
+    @property
+    def delivery_epoch(self) -> int:
+        return self._delivery_epoch
+
+    def _bump_delivery_epoch(self):
+        self._delivery_epoch += 1
 
     @property
     def subscription(self) -> Subscription:
@@ -111,6 +129,7 @@ class SubscriptionState:
         if self._subscription is not None:
             self._subscription._unsubscribe()
         self._subscription = subscription
+        self._bump_delivery_epoch()
         self._notify_subscription_waiters()
 
     def _assigned_state(self, tp: TopicPartition) -> TopicPartitionState:
@@ -173,6 +192,8 @@ class SubscriptionState:
         """
         self._set_subscription_type(SubscriptionType.USER_ASSIGNED)
 
+        # ``_change_subscription`` bumps the delivery epoch as the previous
+        # assignment is replaced.
         self._change_subscription(ManualSubscription(partitions, loop=self._loop))
         self._notify_assignment_waiters()
 
@@ -215,6 +236,7 @@ class SubscriptionState:
             SubscriptionType.AUTO_TOPICS,
         ]
 
+        self._bump_delivery_epoch()
         self._subscription._assign(assignment)
         self._notify_assignment_waiters()
 
@@ -237,6 +259,48 @@ class SubscriptionState:
         Affects: TopicPartitionState.position
         """
         self._assigned_state(tp).seek(offset)
+
+    # Store-acknowledge API (enabled with ``enable_store_ack``)
+
+    def issue_receipt(self, tp: TopicPartition, offset: int) -> DeliveryReceipt:
+        """Mint a receipt for a record the Fetcher is about to hand out."""
+        return self._assigned_state(tp).issue_receipt(tp, offset, self._delivery_epoch)
+
+    def acknowledge(self, receipt: DeliveryReceipt) -> int:
+        """Mark the record behind ``receipt`` as durably stored.
+
+        Raises:
+            IllegalStateError: if store-ack mode is disabled.
+            StaleDeliveryReceiptError: if the receipt was invalidated by a
+                re-read or an assignment change.
+        """
+        if not self._enable_store_ack:
+            raise IllegalStateError("Delivery receipts require enable_store_ack=True")
+        tp = receipt.topic_partition
+        tp_state = self._assigned_state(tp)
+        tp_state.acknowledge(receipt, self._delivery_epoch)
+        return tp_state.safe_position
+
+    def safe_consumed_offsets(self) -> dict[TopicPartition, OffsetAndMetadata]:
+        """Offsets safe to commit in store-ack mode, one per assignment."""
+        if self._subscription is None or self._subscription.assignment is None:
+            return {}
+        return self._subscription.assignment.all_safe_offsets()
+
+    def reread(self, tp: TopicPartition, offset: int) -> None:
+        """Rewind ``tp`` to ``offset`` and invalidate every receipt issued for
+        that offset and everything after it, without touching earlier work.
+        """
+        tp_state = self._assigned_state(tp)
+        tp_state.reread_from(offset)
+        self.seek(tp, offset)
+
+    def mark_batch_consumed(self, tp: TopicPartition, last_offset: int) -> None:
+        """Report that a fetch batch for ``tp`` was fully drained, its tail
+        being ``last_offset``. Offsets without a pending receipt in that range
+        are proven empty and may advance the safe position.
+        """
+        self._assigned_state(tp).mark_empty_upto(last_offset)
 
     # Waiters
 
@@ -424,6 +488,18 @@ class Assignment:
                 all_consumed[tp] = OffsetAndMetadata(state.position, "")
         return all_consumed
 
+    def all_safe_offsets(self) -> dict[TopicPartition, OffsetAndMetadata]:
+        """Returns the offsets safe to commit in store-ack mode: the prefix of
+        records that has been explicitly acknowledged, including offsets the
+        broker proved empty (aborted/control batches).
+        """
+        all_safe = {}
+        for tp in self._topic_partitions:
+            state = self.state_value(tp)
+            if state.has_valid_position:
+                all_safe[tp] = OffsetAndMetadata(state.safe_position, "")
+        return all_safe
+
     def requesting_committed(self):
         """Return all partitions that are requesting commit point fetch"""
         requesting = []
@@ -474,6 +550,99 @@ class TopicPartitionState:
 
         self._paused = False
         self._resume_fut = None
+
+        # Store-ack bookkeeping. ``_safe_position`` is the next offset that is
+        # safe to commit: every offset before it was either acknowledged or
+        # proven empty by a fully consumed fetch batch. ``None`` until the
+        # partition gets a valid position.
+        self._safe_position: int | None = None
+        # Exclusive upper bound up to which complete fetch batches were
+        # consumed: every offset below it was either delivered (a receipt was
+        # issued) or proven empty (aborted/control/compacted).
+        self._verified_upto: int = 0
+        # offset -> receipt sequence of the latest valid dispatch for it
+        self._pending_acks: dict[int, int] = {}
+        # offsets acknowledged out of order, waiting for the prefix to catch up
+        self._acked_offsets: set[int] = set()
+        self._next_receipt_sequence: int = 0
+
+    @property
+    def safe_position(self) -> int | None:
+        """Next offset that is safe to commit (``None`` until initialized)."""
+        return self._safe_position
+
+    def issue_receipt(
+        self, tp: TopicPartition, offset: int, epoch: int
+    ) -> DeliveryReceipt:
+        receipt = DeliveryReceipt(tp, offset, epoch, self._next_receipt_sequence)
+        self._next_receipt_sequence += 1
+        self._pending_acks[offset] = receipt.sequence
+        return receipt
+
+    def acknowledge(self, receipt: DeliveryReceipt, current_epoch: int) -> None:
+        if receipt.epoch != current_epoch:
+            raise StaleDeliveryReceiptError(
+                f"Receipt {receipt!r} belongs to a revoked assignment"
+                f" (current epoch {current_epoch})"
+            )
+        active_sequence = self._pending_acks.get(receipt.offset)
+        if active_sequence is None or active_sequence != receipt.sequence:
+            raise StaleDeliveryReceiptError(
+                f"Receipt {receipt!r} was superseded by a re-dispatch"
+            )
+        del self._pending_acks[receipt.offset]
+        self._acked_offsets.add(receipt.offset)
+        self._advance_safe_position()
+
+    def _advance_safe_position(self) -> None:
+        while self._safe_position is not None:
+            if self._safe_position in self._acked_offsets:
+                self._acked_offsets.discard(self._safe_position)
+                self._safe_position += 1
+            elif (
+                self._safe_position not in self._pending_acks
+                and self._safe_position < self._verified_upto
+            ):
+                # Proven empty by a fully consumed fetch batch.
+                self._acked_offsets.discard(self._safe_position)
+                self._safe_position += 1
+            else:
+                break
+
+    def mark_empty_upto(self, offset: int) -> None:
+        """Record that a fetch batch was fully consumed up to ``offset`` (the
+        last record/control offset seen), so offsets without a pending receipt
+        in that range are proven empty and may advance the safe position.
+        """
+        if self._safe_position is None:
+            return
+        self._verified_upto = max(self._verified_upto, offset + 1)
+        self._advance_safe_position()
+
+    def reread_from(self, offset: int) -> None:
+        """Invalidate receipts at ``offset`` and beyond and rewind any out of
+        order acknowledgements there. Work dispatched (and possibly
+        acknowledged) before ``offset`` keeps its receipts and remains valid.
+        """
+        if self._safe_position is None:
+            self._safe_position = offset
+            self._verified_upto = offset
+            return
+        if offset < self._safe_position:
+            raise IllegalStateError(
+                f"Cannot re-read from {offset}: offsets up to"
+                f" {self._safe_position} are already commit-safe"
+            )
+        for stale_offset in [
+            candidate for candidate in self._pending_acks if candidate >= offset
+        ]:
+            del self._pending_acks[stale_offset]
+        self._acked_offsets = {
+            candidate for candidate in self._acked_offsets if candidate < offset
+        }
+        # The re-read range is no longer verified; it will be proven again as
+        # the replacement fetch batches are consumed.
+        self._verified_upto = min(self._verified_upto, offset)
 
     @property
     def paused(self):
@@ -538,6 +707,8 @@ class TopicPartitionState:
         """
         assert self._status == PartitionStatus.AWAITING_RESET
         self._position = position
+        if self._safe_position is None:
+            self._safe_position = position
         self._reset_strategy = None
         self._status = PartitionStatus.CONSUMING
         if not self._position_fut.done():
@@ -546,6 +717,8 @@ class TopicPartitionState:
     def seek(self, position: int):
         """Called by Consumer to force position to a specific offset"""
         self._position = position
+        if self._safe_position is None:
+            self._safe_position = position
         self._reset_strategy = None
         self._status = PartitionStatus.CONSUMING
         if not self._position_fut.done():

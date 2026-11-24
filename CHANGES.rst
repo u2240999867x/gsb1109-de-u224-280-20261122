@@ -10,6 +10,13 @@ New features:
 * Introduce ``ProducerListener`` in ``aiokafka.listeners`` and allow multiple
   producer event listeners through ``listeners=[...]``. Preserve batch callback
   arguments and synchronous delivery (pr #1213 by @Gleb-Shipilov).
+* Add optional store-acknowledge mode (``enable_store_ack=True``) to
+  ``AIOKafkaConsumer``. Records carry a ``DeliveryReceipt`` that must be
+  acknowledged after a durable store write; auto-commit (periodic, pre-close
+  and pre-rebalance) then only advances the contiguous acknowledged prefix,
+  separately queryable through ``safe_position``. ``reread_partition_from``
+  re-dispatches a partition from a failed record while keeping earlier work
+  valid, and stale or revoked receipts raise ``StaleDeliveryReceiptError``.
 
 Bugfixes:
 

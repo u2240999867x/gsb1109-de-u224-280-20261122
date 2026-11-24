@@ -47,6 +47,9 @@ Abstracts
 .. autoclass:: aiokafka.abc.ConsumerRebalanceListener
     :members:
 
+.. autoclass:: aiokafka.abc.DeliveryReceipt
+    :members:
+
 
 .. _ssl_auth:
 

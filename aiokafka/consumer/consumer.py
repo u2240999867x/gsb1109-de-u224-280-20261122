@@ -115,6 +115,19 @@ class AIOKafkaConsumer:
             periodically committed in the background. Default: True.
         auto_commit_interval_ms (int): milliseconds between automatic
             offset commits, if enable_auto_commit is True. Default: 5000.
+        enable_store_ack (bool): Enable the optional store-acknowledge mode.
+            When enabled, every record returned by :meth:`.getone`/:meth:`.getmany`
+            carries a :class:`~aiokafka.abc.DeliveryReceipt` (``record.receipt``).
+            The application must call :meth:`.acknowledge` once the record is
+            durably written to its store. Automatic commits then only advance a
+            partition past the contiguous prefix of acknowledged records
+            (including offsets proven empty by complete fetch batches), so an
+            in-flight or failed record can never be skipped by a commit. Use
+            :meth:`.reread_partition_from` to re-dispatch a partition from a
+            failed record while keeping earlier work valid, and
+            :meth:`.safe_position` to inspect the committable boundary
+            separately from :meth:`.position`. Disabled (the default) keeps the
+            standard poll and auto-commit behaviour unchanged.
         check_crcs (bool): Automatically check the CRC32 of the records
             consumed. This ensures no on-the-wire or on-disk corruption to
             the messages occurred. This check adds some overhead, so it may
@@ -253,6 +266,7 @@ class AIOKafkaConsumer:
         auto_offset_reset="latest",
         enable_auto_commit=True,
         auto_commit_interval_ms=5000,
+        enable_store_ack=False,
         check_crcs=True,
         metadata_max_age_ms=5 * 60 * 1000,
         partition_assignment_strategy=(RoundRobinPartitionAssignor,),
@@ -331,6 +345,7 @@ class AIOKafkaConsumer:
         self._request_timeout_ms = request_timeout_ms
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
+        self._enable_store_ack = enable_store_ack
         self._partition_assignment_strategy = partition_assignment_strategy
         self._key_deserializer = key_deserializer
         self._value_deserializer = value_deserializer
@@ -347,7 +362,9 @@ class AIOKafkaConsumer:
         self._client_rack = client_rack
 
         self._check_crcs = check_crcs
-        self._subscription = SubscriptionState(loop=loop)
+        self._subscription = SubscriptionState(
+            loop=loop, enable_store_ack=enable_store_ack
+        )
         self._fetcher = None
         self._coordinator = None
         self._loop = loop
@@ -405,6 +422,7 @@ class AIOKafkaConsumer:
             auto_offset_reset=self._auto_offset_reset,
             isolation_level=self._isolation_level,
             client_rack=self._client_rack,
+            enable_store_ack=self._enable_store_ack,
         )
 
         if self._group_id is not None:
@@ -423,6 +441,7 @@ class AIOKafkaConsumer:
                 exclude_internal_topics=self._exclude_internal_topics,
                 rebalance_timeout_ms=self._rebalance_timeout_ms,
                 max_poll_interval_ms=self._max_poll_interval_ms,
+                enable_store_ack=self._enable_store_ack,
             )
             if self._subscription.subscription is not None:
                 if self._subscription.partitions_auto_assigned():
@@ -700,6 +719,106 @@ class AIOKafkaConsumer:
                         await self._subscription.wait_for_assignment()
                     continue
             return tp_state.position
+
+    async def safe_position(self, partition):
+        """Get the highest offset that may be safely committed for
+        ``partition`` in store-acknowledge mode.
+
+        Unlike :meth:`.position`, which tracks the next record to fetch, this
+        returns the contiguous prefix that has been acknowledged with
+        :meth:`.acknowledge` or proven empty by complete fetch batches. It only
+        moves forward through acknowledged records and is the boundary used by
+        every automatic commit (periodic, pre-close and pre-rebalance).
+
+        Arguments:
+            partition (TopicPartition): partition to check
+
+        Returns:
+            int: the next safe-to-commit offset
+
+        Raises:
+            IllegalOperation: if store-ack mode is disabled
+            IllegalStateError: partition is not assigned
+        """
+        if not self._enable_store_ack:
+            raise IllegalOperation("Requires enable_store_ack=True")
+        while True:
+            if not self._subscription.is_assigned(partition):
+                raise IllegalStateError(f"Partition {partition} is not assigned")
+
+            assignment = self._subscription.subscription.assignment
+            tp_state = assignment.state_value(partition)
+            if not tp_state.has_valid_position:
+                self._coordinator.check_errors()
+                await asyncio.wait(
+                    [tp_state.wait_for_position(), assignment.unassign_future],
+                    timeout=self._request_timeout_ms / 1000,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not tp_state.has_valid_position:
+                    if self._subscription.subscription is None:
+                        raise IllegalStateError(
+                            f"Partition {partition} is not assigned"
+                        )
+                    if self._subscription.subscription.assignment is None:
+                        self._coordinator.check_errors()
+                        await self._subscription.wait_for_assignment()
+                    continue
+            return tp_state.safe_position
+
+    def acknowledge(self, receipt):
+        """Acknowledge that the record behind ``receipt`` was durably stored.
+
+        The receipt is the one delivered as ``record.receipt``. Only
+        acknowledgements of the contiguous prefix advance the position returned
+        by :meth:`.safe_position`; earlier out-of-order acknowledgements are
+        remembered and applied as soon as the gap closes.
+
+        Arguments:
+            receipt (~aiokafka.abc.DeliveryReceipt): receipt delivered with the
+                record
+
+        Raises:
+            IllegalOperation: if store-ack mode is disabled
+            IllegalStateError: if the receipt's partition is not assigned
+            ~aiokafka.errors.StaleDeliveryReceiptError: if the receipt was
+                invalidated by a re-read or an assignment change
+
+        Returns:
+            int: the new safe-to-commit offset of the receipt's partition
+        """
+        if not self._enable_store_ack:
+            raise IllegalOperation("Requires enable_store_ack=True")
+        return self._subscription.acknowledge(receipt)
+
+    def reread_partition_from(self, partition, offset):
+        """Re-dispatch the back half of a partition starting at ``offset``.
+
+        Records dispatched before ``offset`` keep their receipts and may still
+        be acknowledged. Every receipt issued for ``offset`` and above is
+        invalidated, so a late acknowledgement of the old dispatch raises
+        :class:`~aiokafka.errors.StaleDeliveryReceiptError`; the re-dispatched
+        records arrive with fresh receipts. The store is expected to deduplicate
+        writes by (partition, offset).
+
+        Arguments:
+            partition (TopicPartition): partition to re-read
+            offset (int): first offset to re-dispatch
+
+        Raises:
+            IllegalOperation: if store-ack mode is disabled
+            ValueError: if offset is not a non-negative integer
+            IllegalStateError: partition not assigned, or the offset was already
+                part of the commit-safe prefix
+        """
+        if not self._enable_store_ack:
+            raise IllegalOperation("Requires enable_store_ack=True")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("Offset must be a positive integer")
+        log.debug(
+            "Re-reading partition %s from offset %s (store-ack)", partition, offset
+        )
+        self._fetcher.reread_from(partition, offset)
 
     def highwater(self, partition):
         """Last known highwater offset for a partition.

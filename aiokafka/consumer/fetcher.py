@@ -173,6 +173,8 @@ class PartitionRecords:
         value_deserializer,
         check_crcs,
         isolation_level,
+        receipt_factory=None,
+        on_complete=None,
     ):
         self._tp = tp
         self._records = records
@@ -184,6 +186,12 @@ class PartitionRecords:
         self._value_deserializer = value_deserializer
         self._check_crcs = check_crcs
         self._isolation_level = isolation_level
+        # Store-ack hooks. The factory mints a DeliveryReceipt for every
+        # delivered record; the completion callback reports the boundary once
+        # the whole fetch batch (including skipped control/abort data) was
+        # consumed, proving intermediate offsets empty.
+        self._receipt_factory = receipt_factory
+        self._on_complete = on_complete
 
         # Even without consuming any records we may need to force position to
         # a next offset. In cases like aborted transactions, control batches,
@@ -201,6 +209,8 @@ class PartitionRecords:
         except StopIteration:
             # Break reference cycle just in case
             self._records_iterator = None
+            if self._on_complete is not None:
+                self._on_complete(self._tp, self.next_fetch_offset)
             raise
 
     def _unpack_records(self):
@@ -305,6 +315,10 @@ class PartitionRecords:
         else:
             value = record.value
 
+        receipt = None
+        if self._receipt_factory is not None:
+            receipt = self._receipt_factory(tp, record.offset)
+
         return ConsumerRecord(
             tp.topic,
             tp.partition,
@@ -317,6 +331,7 @@ class PartitionRecords:
             key_size,
             value_size,
             tuple(record.headers),
+            receipt,
         )
 
 
@@ -394,6 +409,7 @@ class Fetcher:
         auto_offset_reset="latest",
         isolation_level="read_uncommitted",
         client_rack=None,
+        enable_store_ack=False,
     ):
         self._client = client
         self._loop = client._loop
@@ -410,6 +426,7 @@ class Fetcher:
         self._subscriptions = subscriptions
         self._default_reset_strategy = OffsetResetStrategy.from_str(auto_offset_reset)
         self._client_rack = client_rack
+        self._enable_store_ack = enable_store_ack
         # KIP-392: cache of preferred read replica per partition.
         # tp -> (node_id, expires_at_monotonic)
         self._preferred_read_replica: dict[TopicPartition, tuple[int, float]] = {}
@@ -828,6 +845,11 @@ class Fetcher:
                             fetch_offset,
                         )
 
+                        receipt_factory = None
+                        on_complete = None
+                        if self._enable_store_ack:
+                            receipt_factory = self._receipt_factory
+                            on_complete = self._on_batch_consumed
                         partition_records = PartitionRecords(
                             tp,
                             records,
@@ -837,6 +859,8 @@ class Fetcher:
                             self._value_deserializer,
                             self._check_crcs,
                             self._isolation_level,
+                            receipt_factory=receipt_factory,
+                            on_complete=on_complete,
                         )
 
                         self._records[tp] = FetchResult(
@@ -1310,3 +1334,24 @@ class Fetcher:
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
         self._notify(self._wait_consume_future)
+
+    def reread_from(self, tp, offset):
+        """Rewind ``tp`` to ``offset`` for store-ack mode, invalidating the
+        receipts of the re-read range while keeping earlier dispatches valid.
+        """
+        if not self._subscriptions.store_ack_enabled:
+            raise Errors.IllegalStateError(
+                "reread_partition_from requires enable_store_ack=True"
+            )
+        self._subscriptions.reread(tp, offset)
+        if tp in self._records:
+            del self._records[tp]
+        self._notify(self._wait_consume_future)
+
+    def _receipt_factory(self, tp, offset):
+        return self._subscriptions.issue_receipt(tp, offset)
+
+    def _on_batch_consumed(self, tp, next_fetch_offset):
+        # The whole fetch batch was drained: offsets up to the batch tail that
+        # never produced a record are proven empty (control/abort/compacted).
+        self._subscriptions.mark_batch_consumed(tp, next_fetch_offset - 1)

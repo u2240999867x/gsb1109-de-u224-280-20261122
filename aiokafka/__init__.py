@@ -1,9 +1,13 @@
 __version__ = "0.15.0"
 
-from .abc import ConsumerRebalanceListener
+from .abc import ConsumerRebalanceListener, DeliveryReceipt
 from .client import AIOKafkaClient
 from .consumer import AIOKafkaConsumer
-from .errors import ConsumerStoppedError, IllegalOperation
+from .errors import (
+    ConsumerStoppedError,
+    IllegalOperation,
+    StaleDeliveryReceiptError,
+)
 from .listeners import ProducerListener
 from .producer import AIOKafkaProducer
 from .structs import (
@@ -22,9 +26,11 @@ __all__ = [  # noqa: RUF022
     "ProducerListener",
     # ABC's
     "ConsumerRebalanceListener",
+    "DeliveryReceipt",
     # Errors
     "ConsumerStoppedError",
     "IllegalOperation",
+    "StaleDeliveryReceiptError",
     # Structs
     "ConsumerRecord",
     "TopicPartition",

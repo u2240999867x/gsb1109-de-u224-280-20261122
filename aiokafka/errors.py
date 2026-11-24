@@ -7,6 +7,7 @@ __all__ = [  # noqa: RUF022
     "NoOffsetForPartitionError",
     "RecordTooLargeError",
     "ProducerClosed",
+    "StaleDeliveryReceiptError",
     # Kafka Python errors
     "KafkaError",
     "IllegalStateError",
@@ -218,6 +219,17 @@ class RecordTooLargeError(KafkaError):
 
 class ProducerClosed(KafkaError):
     pass
+
+
+class StaleDeliveryReceiptError(KafkaError):
+    """Raised when acknowledging a record with a delivery receipt that is no
+    longer valid.
+
+    A receipt is invalidated when the partition it was issued for is re-read
+    (for example via :meth:`.AIOKafkaConsumer.reread_partition_from`) or
+    reassigned to another consumer. The corresponding record will be
+    re-delivered with a fresh receipt, which must be acknowledged instead.
+    """
 
 
 class ProducerFenced(KafkaError):

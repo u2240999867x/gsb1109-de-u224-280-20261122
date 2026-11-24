@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Generic, NamedTuple, TypeVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 
 from aiokafka.errors import KafkaError
+
+if TYPE_CHECKING:
+    from aiokafka.abc import DeliveryReceipt
 
 __all__ = [
     "BrokerMetadata",
@@ -158,6 +161,9 @@ class ConsumerRecord(Generic[KT, VT]):
 
     headers: Sequence[tuple[str, bytes]]
     "The headers"
+
+    receipt: DeliveryReceipt | None = field(default=None, compare=False)
+    "Store-ack delivery receipt; None unless enable_store_ack is enabled"
 
 
 class OffsetAndTimestamp(NamedTuple):

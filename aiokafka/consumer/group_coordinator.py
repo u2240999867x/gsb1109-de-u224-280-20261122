@@ -234,6 +234,7 @@ class GroupCoordinator(BaseCoordinator):
         exclude_internal_topics=True,
         max_poll_interval_ms=300000,
         rebalance_timeout_ms=30000,
+        enable_store_ack=False,
     ):
         """Initialize the coordination manager.
 
@@ -256,6 +257,7 @@ class GroupCoordinator(BaseCoordinator):
         self._assignors = assignors
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
+        self._enable_store_ack = enable_store_ack
 
         self.generation = OffsetCommitRequest.DEFAULT_GENERATION_ID
         self.member_id = JoinGroupRequest.UNKNOWN_MEMBER_ID
@@ -949,6 +951,12 @@ class GroupCoordinator(BaseCoordinator):
         )
         return True
 
+    def _autocommit_offsets(self, assignment):
+        if self._enable_store_ack:
+            # Only commit the contiguous, explicitly acknowledged prefix.
+            return assignment.all_safe_offsets()
+        return assignment.all_consumed_offsets()
+
     async def _maybe_do_autocommit(self, assignment):
         if not self._enable_auto_commit:
             return None
@@ -959,7 +967,7 @@ class GroupCoordinator(BaseCoordinator):
             try:
                 async with self._commit_lock:
                     await self._do_commit_offsets(
-                        assignment, assignment.all_consumed_offsets()
+                        assignment, self._autocommit_offsets(assignment)
                     )
             except Errors.KafkaError as error:
                 log.warning("Auto offset commit failed: %s", error)
@@ -989,7 +997,7 @@ class GroupCoordinator(BaseCoordinator):
     async def _maybe_do_last_autocommit(self, assignment):
         if not self._enable_auto_commit:
             return
-        await self.commit_offsets(assignment, assignment.all_consumed_offsets())
+        await self.commit_offsets(assignment, self._autocommit_offsets(assignment))
 
     async def commit_offsets(self, assignment, offsets):
         """Commit specific offsets
