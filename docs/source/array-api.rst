@@ -202,6 +202,7 @@ Top level functions
    repeat
    reshape
    reshape_blockwise
+   reshape_lazy_frames
    result_type
    right_shift
    rint

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from functools import reduce
 from itertools import product
-from operator import mul
+from operator import index, mul
 
 import numpy as np
 
@@ -11,7 +11,7 @@ from dask._task_spec import Task, TaskRef
 from dask.array.core import Array
 from dask.array.utils import meta_from_array
 from dask.base import tokenize
-from dask.core import flatten
+from dask.core import flatten, quote
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils import M
 
@@ -313,18 +313,28 @@ def reshape(x, shape, merge_chunks=True, limit=None):
     When communication is necessary this algorithm depends on the logic within
     rechunk.  It endeavors to keep chunk sizes roughly the same when possible.
 
+    A 1-D array with an unknown chunk length (for example one produced by
+    :meth:`dask.dataframe.DataFrame.to_dask_array`) can be lazily framed into
+    ``(-1, width)``.  The result keeps one block per input block: a frame is
+    attributed to the block containing its last record, blocks that complete no
+    frame stay empty, and the row counts only become known at execution time.
+    If the total number of records is not divisible by ``width`` an error is
+    raised when the result is computed.  See
+    :func:`dask.array.reshape_lazy_frames` for details.
+
     See :ref:`array-chunks.reshaping` for a discussion the tradeoffs of
     ``merge_chunks``.
 
     See Also
     --------
     dask.array.rechunk
+    dask.array.reshape_lazy_frames
     numpy.reshape
     """
     # Sanitize inputs, look for -1 in shape
     from dask.array.slicing import sanitize_index
 
-    shape = tuple(map(sanitize_index, shape))
+    shape = tuple(sanitize_index(s) for s in shape)
     known_sizes = [s for s in shape if s != -1]
     if len(known_sizes) < len(shape):
         if len(shape) - len(known_sizes) > 1:
@@ -333,6 +343,17 @@ def reshape(x, shape, merge_chunks=True, limit=None):
         # for this case only.
         if len(shape) == 1 and x.ndim == 1:
             return x
+        # Lazy framing of an unknown-length 1-D array into (-1, width):
+        # the number of rows stays unknown until execution, but every output
+        # block can already be mapped to the input block (file) it belongs to.
+        if (
+            len(shape) == 2
+            and x.ndim == 1
+            and shape[0] == -1
+            and not math.isnan(shape[1])
+            and math.isnan(x.shape[0])
+        ):
+            return reshape_lazy_frames(x, index(shape[1]))
         missing_size = sanitize_index(x.size / reduce(mul, known_sizes, 1))
         shape = tuple(missing_size if s == -1 else s for s in shape)
 
@@ -590,3 +611,188 @@ def _convert_to_shape(
         output_shape[v].append(shape[k])
 
     return tuple(map(lambda x: reduce(mul, x), output_shape))
+
+
+def _lazy_frame_local_state(values, width):
+    """Per-file bounded state: ``(record count, last up to width-1 values)``.
+
+    The raw tail is truncated without any frame alignment so that states of
+    adjacent ranges can be combined associatively.
+    """
+    values = np.asarray(values).reshape(-1)
+    tail = values[-(width - 1) :] if width > 1 else values[:0]
+    return int(values.size), tail
+
+
+def _lazy_frame_combine_state(left, right, width):
+    """Associative combine of two bounded ``(count, tail)`` states.
+
+    The merged tail keeps at most ``width - 1`` raw values, so no task ever
+    forwards the full record history.
+    """
+    left_count, left_tail = left
+    right_count, right_tail = right
+    count = left_count + right_count
+    if width == 1:
+        tail = np.empty((0,), dtype=left_tail.dtype)
+    else:
+        tail = np.concatenate([np.asarray(left_tail), np.asarray(right_tail)])[
+            -(width - 1) :
+        ]
+    return int(count), tail
+
+
+def _lazy_frame_validate(prefix_state, width):
+    """Fail at execution time if the batch leaves an incomplete final frame."""
+    total_count = prefix_state[0]
+    if total_count % width:
+        raise ValueError(
+            f"cannot reshape array into shape (-1, {width}): the total number "
+            f"of records ({total_count}) is not divisible by the frame width "
+            f"{width}"
+        )
+    return True
+
+
+def _lazy_frame_block(prefix_state, values, _validated, width):
+    """Build one file's output block from its data and the prefix raw tail.
+
+    ``prefix_state`` is ``(count, tail)`` for all earlier files.  The absolute
+    frame boundary determines how many trailing prefix values belong to the
+    frame that may finish inside this file; every returned frame contains at
+    least one record of this file, so its last record lives here.
+    """
+    prefix_count, prefix_tail = prefix_state
+    values = np.asarray(values).reshape(-1)
+    carry = prefix_count % width
+    aligned_tail = np.asarray(prefix_tail)[-carry:] if carry else prefix_tail[:0]
+    joined = np.concatenate([aligned_tail, values])
+    n_full = joined.size // width
+    return joined[: n_full * width].reshape(n_full, width)
+
+
+def reshape_lazy_frames(x: Array, width: int) -> Array:
+    """Reshape an unknown-length 1-D array into ``(-1, width)`` frames.
+
+    The input is typically produced by ``DataFrame.to_dask_array()`` where each
+    input block corresponds to one file and only its metadata is known.  The
+    result keeps one output block per input block: a completed frame is
+    attributed to the block (file) containing its last record, and blocks that
+    complete no frame remain present as empty blocks.  The block-to-file
+    mapping and the number of blocks are known before execution even though the
+    row count of every block is not.
+
+    Pending records move through a balanced parallel-prefix tree whose depth is
+    ``O(log(number of files))``.  A per-file task only ever sees its own
+    records plus the bounded external tail (fewer than ``width`` values) needed
+    to finish frames crossing file boundaries; the full history is never
+    forwarded.  If the total number of records is not divisible by ``width`` an
+    error is raised at execution time, including when only a subset of blocks
+    is requested, because every output block depends on a shared validation
+    task.
+    """
+    try:
+        width = index(width)
+    except TypeError:
+        raise TypeError("frame width must be a positive integer") from None
+    if width <= 0:
+        raise ValueError("frame width must be a positive integer")
+    if x.ndim != 1:
+        raise ValueError("lazy framing is only supported for 1-D arrays")
+
+    npartitions = x.npartitions
+    meta = meta_from_array(x, 2)
+    token = tokenize(x, width)
+    local_name = "lazy-frame-local-" + token
+    prefix_name = "lazy-frame-prefix-" + token
+    validate_name = "lazy-frame-validate-" + token
+    out_name = "reshape-lazy-" + token
+
+    dsk: dict = {}
+
+    # Per-file bounded states: (record count, raw tail of at most width - 1).
+    local_keys: list[tuple] = []
+    for i in range(npartitions):
+        key = (local_name, i)
+        dsk[key] = Task(
+            key,
+            _lazy_frame_local_state,
+            TaskRef((x.name, i)),
+            quote(width),
+        )
+        local_keys.append(key)
+
+    # Inclusive parallel prefix (Hillis-Steele scan) of the bounded states.
+    # Level d combines states that are 2**d blocks apart, so the dependency
+    # depth is ceil(log2(npartitions)) and every task only touches two states
+    # whose tails are each smaller than width.
+    inclusive_keys = _lazy_frame_prefix_graph(dsk, local_keys, prefix_name, width)
+
+    # The exclusive prefix of block i is the inclusive prefix of block i - 1.
+    exclusive_keys = [None, *inclusive_keys[:-1]]
+
+    # A single shared validation task; every output block depends on it so an
+    # incomplete batch cannot be hidden by selecting a subset of blocks.
+    validate_key = (validate_name, 0)
+    dsk[validate_key] = Task(
+        validate_key,
+        _lazy_frame_validate,
+        TaskRef(inclusive_keys[-1]),
+        quote(width),
+    )
+
+    # One output block per input block (file).  The validation task is a
+    # dependency that contributes no data.
+    empty_state = quote((0, np.empty((0,), dtype=x.dtype)))
+    for i in range(npartitions):
+        key = (out_name, i, 0)
+        prefix_ref = (
+            TaskRef(exclusive_keys[i])
+            if exclusive_keys[i] is not None
+            else empty_state
+        )
+        dsk[key] = Task(
+            key,
+            _lazy_frame_block,
+            prefix_ref,
+            TaskRef((x.name, i)),
+            TaskRef(validate_key),
+            quote(width),
+        )
+
+    out_chunks = (tuple(np.nan for _ in range(npartitions)), (width,))
+    graph = HighLevelGraph.from_collections(out_name, dsk, dependencies=[x])
+    return Array(graph, out_name, out_chunks, meta=meta)
+
+
+def _lazy_frame_prefix_graph(dsk, local_keys, prefix_name, width):
+    """Build an inclusive parallel-prefix tree of bounded states.
+
+    Uses the Hillis-Steele scan: at level ``d`` every state is combined with the
+    state ``2**d`` positions to its left.  The returned keys hold the inclusive
+    prefix states in the original block order, and the dependency depth is
+    ``ceil(log2(len(local_keys)))``.
+    """
+    n = len(local_keys)
+    if n == 1:
+        return list(local_keys)
+
+    current = list(local_keys)
+    step = 1
+    level = 0
+    while step < n:
+        updated = list(current)
+        for i in range(step, n):
+            level += 1
+            key = (prefix_name, level)
+            dsk[key] = Task(
+                key,
+                _lazy_frame_combine_state,
+                TaskRef(current[i - step]),
+                TaskRef(current[i]),
+                quote(width),
+            )
+            updated[i] = key
+        current = updated
+        step *= 2
+    return current

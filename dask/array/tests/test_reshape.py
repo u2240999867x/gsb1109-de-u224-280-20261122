@@ -447,3 +447,173 @@ def test_blockwise_reshape_sanity_checks():
     arr = arr[arr[:, 0] > 0]
     with pytest.raises(ValueError, match="Array chunk size or shape is unknown"):
         reshape_blockwise(arr, (5, 2, 2))
+
+
+def _unknown_1d_array(parts, dtype=np.int64):
+    """Build a 1-D array with one unknown-length block per ``parts`` entry."""
+    from dask import delayed
+
+    def _materialize(values):
+        return np.asarray(values, dtype=dtype)
+
+    blocks = [
+        da.from_delayed(
+            delayed(_materialize)(part),
+            shape=(np.nan,),
+            dtype=dtype,
+        )
+        for part in parts
+    ]
+    return da.concatenate(blocks, axis=0)
+
+
+def test_reshape_lazy_frames_basic():
+    parts = [[0, 1, 2], [], [3], [], [4, 5, 6, 7, 8, 9, 10, 11]]
+    arr = _unknown_1d_array(parts)
+
+    framed = arr.reshape((-1, 4))
+    assert np.isnan(framed.shape[0]) and framed.shape[1] == 4
+    assert len(framed.chunks[0]) == 5
+    assert all(np.isnan(c) for c in framed.chunks[0])
+    assert framed.chunks[1] == (4,)
+    # one output block per input block, selectable before execution
+    assert framed.npartitions == arr.npartitions
+
+    expected = np.arange(12).reshape(-1, 4)
+    assert_eq(framed, expected)
+
+    block_shapes = [framed.blocks[i, 0].compute().shape for i in range(5)]
+    assert block_shapes == [(0, 4), (0, 4), (1, 4), (0, 4), (2, 4)]
+    assert_eq(framed.blocks[2, 0], np.array([[0, 1, 2, 3]]))
+    assert_eq(
+        framed.blocks[4, 0],
+        np.array([[4, 5, 6, 7], [8, 9, 10, 11]]),
+    )
+
+
+def test_reshape_lazy_frames_width_six():
+    parts = [[0, 1, 2], [], [3], [], [4, 5, 6, 7, 8, 9, 10, 11]]
+    arr = _unknown_1d_array(parts)
+
+    framed = arr.reshape((-1, 6))
+    assert np.isnan(framed.shape[0]) and framed.shape[1] == 6
+    # both frames cross multiple files and finish in the last file
+    block_shapes = [framed.blocks[i, 0].compute().shape for i in range(5)]
+    assert block_shapes == [(0, 6), (0, 6), (0, 6), (0, 6), (2, 6)]
+    assert_eq(framed, np.arange(12).reshape(-1, 6))
+
+
+def test_reshape_lazy_frames_row_sums():
+    parts = [[0, 1, 2], [], [3], [], [4, 5, 6, 7, 8, 9, 10, 11]]
+    arr = _unknown_1d_array(parts)
+
+    sums4 = arr.reshape((-1, 4)).sum(axis=1)
+    sums6 = arr.reshape((-1, 6)).sum(axis=1)
+    assert_eq(sums4, np.array([6, 22, 38]))
+    assert_eq(sums6, np.array([15, 51]))
+
+
+@pytest.mark.parametrize(
+    "lengths,width",
+    [
+        ([3, 0, 1, 0, 8], 4),
+        ([7, 0, 3, 11, 2, 0, 7], 5),
+        ([1, 1, 1, 1], 2),
+        ([6], 3),
+        ([0, 0, 6, 0], 3),
+        ([2, 2, 2, 2, 2], 1),
+    ],
+)
+def test_reshape_lazy_frames_matches_numpy(lengths, width):
+    total = sum(lengths)
+    assert total % width == 0
+    values = np.arange(total, dtype=np.int64)
+    parts = []
+    start = 0
+    for length in lengths:
+        parts.append(values[start : start + length])
+        start += length
+
+    framed = _unknown_1d_array(parts).reshape((-1, width))
+    assert_eq(framed, values.reshape(-1, width))
+
+    # frame attribution: frames belong to the block holding their last record
+    expected_counts = []
+    cursor = 0
+    for length in lengths:
+        end = cursor + length
+        expected_counts.append(end // width - cursor // width)
+        cursor = end
+    block_counts = [
+        framed.blocks[i, 0].compute().shape[0] for i in range(len(lengths))
+    ]
+    assert block_counts == expected_counts
+
+
+def test_reshape_lazy_frames_empty_batch():
+    arr = _unknown_1d_array([[], [], []])
+    framed = arr.reshape((-1, 4))
+    assert np.isnan(framed.shape[0]) and framed.shape[1] == 4
+    result = framed.compute()
+    assert result.shape == (0, 4)
+    assert framed.blocks[1, 0].compute().shape == (0, 4)
+    assert_eq(framed.sum(axis=1), np.empty((0,), dtype=np.int64))
+
+
+def test_reshape_lazy_frames_incomplete_batch_raises():
+    # 5 records cannot be framed with width 4
+    arr = _unknown_1d_array([[0, 1, 2], [], [3, 4]])
+    framed = arr.reshape((-1, 4))
+
+    # construction must not raise or run any cleaning
+    with pytest.raises(ValueError, match="not divisible"):
+        framed.compute()
+    # selecting a single block cannot drop the validation
+    with pytest.raises(ValueError, match="not divisible"):
+        framed.blocks[0, 0].compute()
+    with pytest.raises(ValueError, match="not divisible"):
+        framed.sum(axis=1).compute()
+
+
+def test_reshape_lazy_frames_invalid_width():
+    arr = _unknown_1d_array([[1, 2]])
+    with pytest.raises(ValueError, match="positive integer"):
+        arr.reshape((-1, 0))
+    # two unknown dimensions are rejected by the generic reshape rule
+    with pytest.raises(ValueError, match="one unknown dimension"):
+        arr.reshape((-1, -1))
+
+
+def test_reshape_lazy_frames_known_length_unchanged():
+    # arrays with known lengths keep using the ordinary reshape
+    arr = from_array(np.arange(12), chunks=4)
+    result = arr.reshape((-1, 4))
+    assert result.name.startswith("reshape-")
+    assert_eq(result, np.arange(12).reshape(3, 4))
+
+
+def test_reshape_lazy_frames_log_depth_and_bounded_state():
+    import math
+
+    npartitions = 64
+    arr = _unknown_1d_array([[i] for i in range(npartitions)])
+    framed = arr.reshape((-1, 2))
+    layer = framed.dask.layers[framed.name]
+
+    def _depth(graph):
+        depths = {}
+        remaining = set(graph)
+        while remaining:
+            for key in list(remaining):
+                deps = getattr(graph[key], "dependencies", None) or ()
+                if all(dep not in graph or dep in depths for dep in deps):
+                    depths[key] = 1 + max(
+                        (depths[dep] for dep in deps if dep in depths), default=0
+                    )
+                    remaining.discard(key)
+        return max(depths.values())
+
+    # the reshape layer's depth grows logarithmically with the file count
+    assert _depth(dict(layer)) <= math.ceil(math.log2(npartitions)) + 3
+    assert_eq(framed, np.arange(npartitions).reshape(-1, 2))
+

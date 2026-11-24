@@ -156,6 +156,7 @@ __all__ = [
     "var",
     "reshape",
     "reshape_blockwise",
+    "reshape_lazy_frames",
     "allclose",
     "append",
     "apply_along_axis",
@@ -444,7 +445,11 @@ try:
         trace,
         var,
     )
-    from dask.array.reshape import reshape, reshape_blockwise
+    from dask.array.reshape import (
+        reshape,
+        reshape_blockwise,
+        reshape_lazy_frames,
+    )
     from dask.array.routines import (
         allclose,
         append,
