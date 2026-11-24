@@ -35,6 +35,15 @@ class ErrorEscalationEventDefinitionConverter(EventDefinitionConverter):
         return dct
 
 
+class CompensationEventDefinitionConverter(EventDefinitionConverter):
+
+    def to_dict(self, event_definition):
+        dct = super().to_dict(event_definition)
+        dct['activity_ref'] = event_definition.activity_ref
+        dct['wait_for_completion'] = event_definition.wait_for_completion
+        return dct
+
+
 class MessageEventDefinitionConverter(EventDefinitionConverter):
 
     def to_dict(self, event_definition):

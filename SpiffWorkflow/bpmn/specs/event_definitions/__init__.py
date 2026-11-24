@@ -17,7 +17,13 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301  USA
 
-from .simple import NoneEventDefinition, CancelEventDefinition, TerminateEventDefinition
+from .simple import (
+    NoneEventDefinition,
+    CancelEventDefinition,
+    CompensateEventDefinition,
+    CompensationEventDefinition,
+    TerminateEventDefinition,
+)
 from .timer import TimeDateEventDefinition, DurationTimerEventDefinition, CycleTimerEventDefinition
 from .item_aware_event import SignalEventDefinition, EscalationEventDefinition, ErrorEventDefinition
 from .message import MessageEventDefinition

@@ -31,6 +31,7 @@ from SpiffWorkflow.bpmn.specs.event_definitions.multiple import MultipleEventDef
 from SpiffWorkflow.bpmn.util.subworkflow import BpmnBaseWorkflow, BpmnSubWorkflow
 from SpiffWorkflow.bpmn.util.event import EventManager
 
+from .compensation import CompensationManager
 from .script_engine.python_engine import PythonScriptEngine
 
 
@@ -52,6 +53,7 @@ class BpmnWorkflow(BpmnBaseWorkflow):
         self.subprocesses = {}
         self.bpmn_events = []
         self.correlations = {}
+        self.compensation = CompensationManager(self)
         self.event_manager = EventManager(self)
         super().__init__(spec, **kwargs)
 

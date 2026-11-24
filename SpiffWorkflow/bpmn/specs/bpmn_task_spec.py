@@ -35,8 +35,9 @@ class BpmnTaskSpec(TaskSpec):
     easy way of knowing whether a task appearson the diagram.
     """
     def __init__(self, wf_spec, name, lane=None, documentation=None,
-                 data_input_associations=None, data_output_associations=None, 
-                 io_specification=None, **kwargs):
+                 data_input_associations=None, data_output_associations=None,
+                 io_specification=None, compensation_handler=None,
+                 is_for_compensation=False, attached_to=None, **kwargs):
         """
         :param lane: Indicates the name of the lane that this task belongs to
         :param documentation: the contents of the documentation element
@@ -51,8 +52,16 @@ class BpmnTaskSpec(TaskSpec):
         self.data_input_associations = data_input_associations or []
         self.data_output_associations = data_output_associations or []
         self.io_specification = io_specification
+        self.compensation_handler = compensation_handler
+        self.is_for_compensation = is_for_compensation
+        self.attached_to = attached_to
         if self.description is None:
             self.description = 'BPMN Task'
+
+    def test(self):
+        if self.is_for_compensation:
+            return
+        super().test()
 
     def connect_outgoing_if(self, condition, taskspec):
         """
@@ -101,6 +110,10 @@ class BpmnTaskSpec(TaskSpec):
             my_task.data.pop(obj.bpmn_id, None)
 
         super()._on_complete_hook(my_task)
+        top_workflow = getattr(my_task.workflow, 'top_workflow', None) or my_task.workflow
+        compensation = getattr(top_workflow, 'compensation', None)
+        if compensation is not None:
+            compensation.task_completed(my_task)
 
     def task_info(self, my_task):
         # This method can be extended to provide task specific info for different spec types

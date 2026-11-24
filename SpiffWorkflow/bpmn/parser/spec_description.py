@@ -43,6 +43,7 @@ SPEC_DESCRIPTIONS = {
     full_tag('sendTask'): 'Send Task',
     full_tag('eventBasedGateway'): 'Event Based Gateway',
     full_tag('cancelEventDefinition'): 'Cancel',
+    full_tag('compensateEventDefinition'): 'Compensation',
     full_tag('errorEventDefinition'): 'Error',
     full_tag('escalationEventDefinition'): 'Escalation',
     full_tag('terminateEventDefinition'): 'Terminate',

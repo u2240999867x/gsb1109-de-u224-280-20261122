@@ -145,6 +145,9 @@ class TaskSpecConverter(BpmnConverter):
             'data_input_associations': self.registry.convert(spec.data_input_associations),
             'data_output_associations': self.registry.convert(spec.data_output_associations),
             'io_specification': self.registry.convert(spec.io_specification),
+            'compensation_handler': getattr(spec, 'compensation_handler', None),
+            'is_for_compensation': getattr(spec, 'is_for_compensation', False),
+            'attached_to': getattr(spec, 'attached_to', None),
         }
         if hasattr(spec, 'extensions'):
             dct['extensions'] = spec.extensions

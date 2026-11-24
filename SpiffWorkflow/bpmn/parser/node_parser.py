@@ -53,6 +53,7 @@ class NodeParser:
             'documentation': self.parse_documentation(),
             'data_input_associations': self.parse_incoming_data_references(),
             'data_output_associations': self.parse_outgoing_data_references(),
+            'is_for_compensation': self.node.get('isForCompensation', 'false').lower() == 'true',
         }
     
     def get_description(self):

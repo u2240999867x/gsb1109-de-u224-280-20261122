@@ -180,6 +180,8 @@ class BpmnWorkflowConverter(WorkflowConverter):
         dct['subprocess_specs'] = self.mapping_to_dict(workflow.subprocess_specs)
         dct['subprocesses'] = self.mapping_to_dict(workflow.subprocesses)
         dct['bpmn_events'] = self.registry.convert(workflow.bpmn_events)
+        dct['compensation_records'] = self.registry.convert(workflow.compensation.records)
+        dct['compensation_runs'] = self.registry.convert(workflow.compensation.runs)
         return dct
 
     def from_dict(self, dct):
@@ -207,6 +209,8 @@ class BpmnWorkflowConverter(WorkflowConverter):
         # Handle the remaining top workflow attributes
         self.subprocesses_from_dict(dct['subprocesses'], workflow)
         workflow.bpmn_events = self.registry.restore(dct.pop('bpmn_events', []))
+        workflow.compensation.records = self.registry.restore(dct.pop('compensation_records', []))
+        workflow.compensation.runs = self.registry.restore(dct.pop('compensation_runs', {}))
 
         return workflow
 

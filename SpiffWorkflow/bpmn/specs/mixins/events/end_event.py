@@ -53,3 +53,6 @@ class EndEvent(ThrowingEvent):
 
         elif isinstance(self.event_definition, CancelEventDefinition):
             my_task.workflow.cancel()
+            compensation = getattr(my_task.workflow.top_workflow, 'compensation', None)
+            if compensation is not None and my_task.workflow.parent_task_id is not None:
+                compensation.start_cancellation(str(my_task.workflow.parent_task_id))

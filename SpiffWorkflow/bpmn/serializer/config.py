@@ -50,6 +50,7 @@ from SpiffWorkflow.bpmn.specs.defaults import (
 from SpiffWorkflow.bpmn.specs.event_definitions import (
     NoneEventDefinition,
     CancelEventDefinition,
+    CompensateEventDefinition,
     TerminateEventDefinition,
     SignalEventDefinition,
     ErrorEventDefinition,
@@ -103,6 +104,7 @@ from .default.task_spec import (
 from .default.event_definition import (
     TimerConditionalEventDefinitionConverter,
     ErrorEscalationEventDefinitionConverter,
+    CompensationEventDefinitionConverter,
     MessageEventDefinitionConverter,
     MultipleEventDefinitionConverter,
 )
@@ -147,6 +149,7 @@ DEFAULT_CONFIG = {
     ReceiveTask: EventConverter,
     EventBasedGateway: EventConverter,
     CancelEventDefinition: EventDefinitionConverter,
+    CompensateEventDefinition: CompensationEventDefinitionConverter,
     ErrorEventDefinition: ErrorEscalationEventDefinitionConverter,
     EscalationEventDefinition: ErrorEscalationEventDefinitionConverter,
     MessageEventDefinition: MessageEventDefinitionConverter,

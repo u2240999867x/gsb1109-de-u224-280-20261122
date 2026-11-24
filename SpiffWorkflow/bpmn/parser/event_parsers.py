@@ -26,6 +26,7 @@ from .util import first
 from SpiffWorkflow.bpmn.specs.event_definitions.simple import (
     NoneEventDefinition,
     CancelEventDefinition,
+    CompensateEventDefinition,
     TerminateEventDefinition
 )
 from SpiffWorkflow.bpmn.specs.event_definitions.timer import (
@@ -43,6 +44,7 @@ from SpiffWorkflow.bpmn.specs.event_definitions.multiple import MultipleEventDef
 from SpiffWorkflow.bpmn.specs.event_definitions.conditional import ConditionalEventDefinition
 
 CANCEL_EVENT_XPATH = './/bpmn:cancelEventDefinition'
+COMPENSATION_EVENT_XPATH = './/bpmn:compensateEventDefinition'
 CONDITIONAL_EVENT_XPATH = './/bpmn:conditionalEventDefinition'
 ERROR_EVENT_XPATH = './/bpmn:errorEventDefinition'
 ESCALATION_EVENT_XPATH = './/bpmn:escalationEventDefinition'
@@ -75,6 +77,15 @@ class EventDefinitionParser(TaskParser):
 
     def parse_cancel_event(self, event):
         return CancelEventDefinition(description=self.get_event_description(event))
+
+    def parse_compensation_event(self, event):
+        activity_ref = event.get('activityRef')
+        wait_for_completion = event.get('waitForCompletion', 'true').lower() == 'true'
+        return CompensateEventDefinition(
+            activity_ref=activity_ref,
+            wait_for_completion=wait_for_completion,
+            description=self.get_event_description(event),
+        )
 
     def parse_conditional_event(self, event):
         expression = self.xpath('.//bpmn:condition')
@@ -198,6 +209,8 @@ class EventDefinitionParser(TaskParser):
                     event_definitions.append(self.parse_timer_event(event))
                 elif path == CANCEL_EVENT_XPATH:
                     event_definitions.append(self.parse_cancel_event(event))
+                elif path == COMPENSATION_EVENT_XPATH:
+                    event_definitions.append(self.parse_compensation_event(event))
                 elif path == ERROR_EVENT_XPATH:
                     event_definitions.append(self.parse_error_event(event))
                 elif path == ESCALATION_EVENT_XPATH:
@@ -291,11 +304,13 @@ class BoundaryEventParser(EventDefinitionParser):
     def create_task(self):
         cancel_activity = self.node.get('cancelActivity', default='true').lower() == 'true'
         event_definition = self.get_event_definition(
-            [CANCEL_EVENT_XPATH, ERROR_EVENT_XPATH, ESCALATION_EVENT_XPATH,
+            [CANCEL_EVENT_XPATH, COMPENSATION_EVENT_XPATH, ERROR_EVENT_XPATH, ESCALATION_EVENT_XPATH,
             MESSAGE_EVENT_XPATH, SIGNAL_EVENT_XPATH, TIMER_EVENT_XPATH, CONDITIONAL_EVENT_XPATH])
         if isinstance(event_definition, NoneEventDefinition):
             raise NotImplementedError('Unsupported Catch Event: %r', etree.tostring(self.node))
-        return self._create_task(event_definition, cancel_activity)
+        task = self._create_task(event_definition, cancel_activity)
+        task.attached_to = self.node.get('attachedToRef')
+        return task
 
 
 class EventBasedGatewayParser(EventDefinitionParser):

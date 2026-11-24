@@ -24,8 +24,34 @@ class CancelEventDefinition(EventDefinition):
         super().__init__(**kwargs)
 
     def throw(self, my_task, **kwargs):
+        top_workflow = my_task.workflow.top_workflow
+        compensation = getattr(top_workflow, 'compensation', None)
+        if compensation is not None:
+            compensation.prepare_cancellation(my_task)
         event = BpmnEvent(self, target=my_task.workflow.parent_workflow)
+        top_workflow.catch(event)
+
+
+class CompensateEventDefinition(EventDefinition):
+    """Event definition used by compensation boundary and throw events."""
+
+    def __init__(self, activity_ref=None, wait_for_completion=True, **kwargs):
+        super().__init__(**kwargs)
+        self.activity_ref = activity_ref
+        self.wait_for_completion = wait_for_completion
+
+    def throw(self, my_task, **kwargs):
+        event = BpmnEvent(
+            self,
+            target=my_task.workflow,
+            payload={'activity_ref': self.activity_ref},
+        )
         my_task.workflow.top_workflow.catch(event)
+
+
+# BPMN uses the "compensate" event definition, but many APIs name the concept
+# "compensation event".  Expose both spellings for compatibility.
+CompensationEventDefinition = CompensateEventDefinition
 
 
 class TerminateEventDefinition(EventDefinition):

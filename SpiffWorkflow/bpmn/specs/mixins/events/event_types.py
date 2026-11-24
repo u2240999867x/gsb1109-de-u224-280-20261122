@@ -19,7 +19,10 @@
 from SpiffWorkflow.util.task import TaskState
 from SpiffWorkflow.specs.base import TaskSpec
 
-from SpiffWorkflow.bpmn.specs.event_definitions.simple import NoneEventDefinition
+from SpiffWorkflow.bpmn.specs.event_definitions.simple import (
+    NoneEventDefinition,
+    CancelEventDefinition,
+)
 from SpiffWorkflow.bpmn.specs.event_definitions.timer import CycleTimerEventDefinition
 
 
@@ -54,6 +57,10 @@ class CatchingEvent(TaskSpec):
             my_task._set_internal_data(event_fired=True)
 
         if self.event_definition.has_fired(my_task):
+            if isinstance(self.event_definition, CancelEventDefinition):
+                compensation = getattr(my_task.workflow.top_workflow, 'compensation', None)
+                if compensation is not None and not compensation.boundary_allows(my_task):
+                    return False
             return True
         elif my_task.state != TaskState.WAITING:
             my_task._set_state(TaskState.WAITING)

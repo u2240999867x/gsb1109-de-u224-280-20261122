@@ -171,6 +171,60 @@ class ProcessParser(NodeParser):
 
         self.spec.data_stores = self.data_stores
         self.add_tasks()
+        self.add_compensation_handlers()
+        self.resolve_compensation_associations()
+
+    def add_compensation_handlers(self):
+        for node in self.xpath('./*[@isForCompensation="true"]'):
+            node_id = node.get('id')
+            if node_id not in self.spec.task_specs:
+                self.parse_node(node)
+
+    def resolve_compensation_associations(self):
+        for association in self.doc_xpath('//bpmn:association'):
+            first_id = association.get('sourceRef')
+            second_id = association.get('targetRef')
+            if not first_id or not second_id:
+                continue
+
+            boundary_id, handler_id = self._compensation_association_endpoints(first_id, second_id)
+            if boundary_id is None:
+                boundary_id, handler_id = self._compensation_association_endpoints(second_id, first_id)
+            if boundary_id is None or boundary_id not in self.spec.task_specs:
+                continue
+
+            target_node = self.get_node_by_id(handler_id)
+            if target_node is None:
+                continue
+            node_parser, spec_class = self.parser._get_parser_class(target_node.tag)
+            if node_parser is None or spec_class is None:
+                continue
+
+            source_spec = self.spec.task_specs[boundary_id]
+            target_spec = self.spec.task_specs.get(handler_id)
+            if target_spec is None:
+                target_spec = self.parse_node(target_node)
+
+            target_spec.is_for_compensation = True
+            source_spec.compensation_handler = handler_id
+
+            source_node = self.get_node_by_id(boundary_id)
+            attached_to = source_node.get('attachedToRef') if source_node is not None else None
+            activity_spec = self.spec.task_specs.get(attached_to)
+            if activity_spec is not None:
+                activity_spec.compensation_handler = handler_id
+            if hasattr(source_spec, 'event_definition'):
+                source_spec.event_definition.compensation_handler = handler_id
+
+    def _compensation_association_endpoints(self, boundary_id, handler_id):
+        boundary_node = self.get_node_by_id(boundary_id)
+        is_compensation_boundary = (
+            boundary_id in self.spec.task_specs
+            and boundary_node is not None
+            and boundary_node.tag.endswith('boundaryEvent')
+            and len(boundary_node.xpath('.//bpmn:compensateEventDefinition', namespaces=self.nsmap)) > 0
+        )
+        return (boundary_id, handler_id) if is_compensation_boundary else (None, None)
 
     def create_spec(self):
         if not self.process_executable:

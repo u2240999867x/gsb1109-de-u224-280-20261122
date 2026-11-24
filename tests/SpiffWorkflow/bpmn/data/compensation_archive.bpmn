@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="CompensationArchiveDefinitions"
+                  targetNamespace="http://example.com/archive-compensation">
+  <bpmn:process id="ArchiveProcess" isExecutable="true">
+    <bpmn:startEvent id="ArchiveStart"/>
+    <bpmn:sequenceFlow id="FlowStartOther" sourceRef="ArchiveStart" targetRef="OtherBatchTransaction"/>
+
+    <bpmn:transaction id="OtherBatchTransaction" name="Other Batch Transaction">
+      <bpmn:startEvent id="OtherStart"/>
+      <bpmn:sequenceFlow id="FlowOtherStart" sourceRef="OtherStart" targetRef="OtherRegister"/>
+      <bpmn:scriptTask id="OtherRegister" name="Other Batch Registration">
+        <bpmn:script>other_credential = 'other-batch-credential'</bpmn:script>
+      </bpmn:scriptTask>
+      <bpmn:sequenceFlow id="FlowOtherRegisterEnd" sourceRef="OtherRegister" targetRef="OtherEnd"/>
+      <bpmn:endEvent id="OtherEnd"/>
+
+      <bpmn:boundaryEvent id="OtherCompensationBoundary" attachedToRef="OtherRegister" cancelActivity="false">
+        <bpmn:compensateEventDefinition id="OtherCompensationEvent"/>
+      </bpmn:boundaryEvent>
+      <bpmn:scriptTask id="OtherCompensate" isForCompensation="true" name="Other Compensation">
+        <bpmn:script>other_compensation_ran = True</bpmn:script>
+      </bpmn:scriptTask>
+      <bpmn:association id="OtherCompensationAssociation"
+                        sourceRef="OtherCompensationBoundary" targetRef="OtherCompensate"/>
+    </bpmn:transaction>
+
+    <bpmn:sequenceFlow id="FlowOtherToImport" sourceRef="OtherBatchTransaction" targetRef="ImportTransaction"/>
+
+    <bpmn:transaction id="ImportTransaction" name="Archive Import Transaction">
+      <bpmn:startEvent id="ImportStart"/>
+      <bpmn:sequenceFlow id="FlowImportStart" sourceRef="ImportStart" targetRef="RegistrationSplit"/>
+      <bpmn:parallelGateway id="RegistrationSplit"/>
+
+      <bpmn:sequenceFlow id="FlowToA" sourceRef="RegistrationSplit" targetRef="RegistrationA"/>
+      <bpmn:sequenceFlow id="FlowToB" sourceRef="RegistrationSplit" targetRef="RegistrationB"/>
+      <bpmn:sequenceFlow id="FlowToC" sourceRef="RegistrationSplit" targetRef="ActivityC"/>
+      <bpmn:sequenceFlow id="FlowToChoice" sourceRef="RegistrationSplit" targetRef="ChooseOutcome"/>
+
+      <bpmn:callActivity id="RegistrationA" name="Registration A" calledElement="ArchiveRegistration"/>
+      <bpmn:callActivity id="RegistrationB" name="Registration B" calledElement="ArchiveRegistration"/>
+      <bpmn:userTask id="ActivityC" name="Registration C"/>
+      <bpmn:userTask id="ChooseOutcome" name="Choose Cancel Or Success"/>
+
+      <bpmn:sequenceFlow id="FlowAJoin" sourceRef="RegistrationA" targetRef="RegistrationJoin"/>
+      <bpmn:sequenceFlow id="FlowBJoin" sourceRef="RegistrationB" targetRef="RegistrationJoin"/>
+      <bpmn:sequenceFlow id="FlowCJoin" sourceRef="ActivityC" targetRef="RegistrationJoin"/>
+      <bpmn:parallelGateway id="RegistrationJoin"/>
+      <bpmn:sequenceFlow id="FlowJoinNormal" sourceRef="RegistrationJoin" targetRef="ImportNormalEnd"/>
+      <bpmn:endEvent id="ImportNormalEnd" name="Import Complete"/>
+
+      <bpmn:sequenceFlow id="FlowChoiceGateway" sourceRef="ChooseOutcome" targetRef="OutcomeGateway"/>
+      <bpmn:exclusiveGateway id="OutcomeGateway" default="FlowOutcomeSuccess"/>
+      <bpmn:sequenceFlow id="FlowOutcomeCancel" name="cancel" sourceRef="OutcomeGateway" targetRef="ImportCancelEnd">
+        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">action == 'cancel'</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="FlowOutcomeSuccess" sourceRef="OutcomeGateway" targetRef="RegistrationJoin"/>
+      <bpmn:endEvent id="ImportCancelEnd" name="Import Cancel End">
+        <bpmn:cancelEventDefinition id="ImportCancelEvent"/>
+      </bpmn:endEvent>
+    </bpmn:transaction>
+
+    <bpmn:sequenceFlow id="FlowImportNormalEnd" sourceRef="ImportTransaction" targetRef="ArchiveNormalEnd"/>
+    <bpmn:endEvent id="ArchiveNormalEnd"/>
+
+    <bpmn:boundaryEvent id="ImportCancelBoundary" attachedToRef="ImportTransaction">
+      <bpmn:cancelEventDefinition id="ImportCancelBoundaryEvent"/>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="FlowCancelBoundaryTask" sourceRef="ImportCancelBoundary" targetRef="CancelBranchTask"/>
+    <bpmn:scriptTask id="CancelBranchTask" name="Cancel Branch Successor">
+      <bpmn:script>cancel_branch_ran = True</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="FlowCancelBranchEnd" sourceRef="CancelBranchTask" targetRef="ArchiveCancelledEnd"/>
+    <bpmn:endEvent id="ArchiveCancelledEnd"/>
+  </bpmn:process>
+
+  <bpmn:process id="ArchiveRegistration" isExecutable="true">
+    <bpmn:startEvent id="ArchiveRegistrationStart"/>
+    <bpmn:sequenceFlow id="FlowRegistrationStartWork" sourceRef="ArchiveRegistrationStart" targetRef="RegistrationWork"/>
+    <bpmn:userTask id="RegistrationWork" name="Controllable Registration Work"/>
+    <bpmn:sequenceFlow id="FlowRegistrationWorkEnd" sourceRef="RegistrationWork" targetRef="ArchiveRegistrationEnd"/>
+    <bpmn:endEvent id="ArchiveRegistrationEnd"/>
+
+    <bpmn:boundaryEvent id="RegistrationCompensationBoundary"
+                        attachedToRef="RegistrationWork" cancelActivity="false">
+      <bpmn:compensateEventDefinition id="RegistrationCompensationEvent"/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="RegistrationCompensation"
+                   isForCompensation="true" name="Controllable Registration Compensation"/>
+    <bpmn:association id="RegistrationCompensationAssociation"
+                      sourceRef="RegistrationCompensationBoundary"
+                      targetRef="RegistrationCompensation"/>
+  </bpmn:process>
+</bpmn:definitions>
