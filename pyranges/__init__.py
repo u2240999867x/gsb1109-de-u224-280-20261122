@@ -10,7 +10,17 @@ from natsort import natsorted  # type: ignore
 
 import pyranges as pr
 import pyranges.genomicfeatures as gf  # NOQA: F401
-from pyranges import data, statistics
+from pyranges import channels, data, statistics
+from pyranges.channels import (
+    ChannelCapacity,
+    ChannelHandover,
+    ChannelSchedule,
+    ChannelScheduleError,
+    ExecutedWrite,
+    InfeasibleSchedule,
+    Task,
+    schedule_channels,
+)
 from pyranges.get_fasta import get_fasta, get_sequence, get_transcript_sequence
 from pyranges.methods.concat import concat
 from pyranges.multioverlap import count_overlaps

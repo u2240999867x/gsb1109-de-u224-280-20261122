@@ -6051,6 +6051,75 @@ class PyRanges:
 
         return PyRanges(df)
 
+    def schedule_channels(
+        self,
+        capacity=None,
+        handovers=None,
+        executed=None,
+        cutoff=None,
+        *,
+        schedule=None,
+        previous=None,
+        raise_on_infeasible=False,
+    ):
+        """Schedule primary writes and warm-ups for these task intervals.
+
+        This is a convenience wrapper for :func:`pyranges.schedule_channels`.
+        The PyRanges supplies the tasks: ``Chromosome``, ``Start`` and
+        ``End`` define each task window, and optional ``Task``, ``Slots`` and
+        ``Channel`` columns give identifiers, slot counts and allowed start
+        channels.
+
+        Parameters
+        ----------
+        capacity, handovers, executed, cutoff, schedule, previous
+            See :func:`pyranges.schedule_channels`.
+
+        Returns
+        -------
+        ChannelSchedule
+
+        Examples
+        -------------
+
+        >>> tasks = pr.from_dict({
+        ...     "Chromosome": ["north"] * 2,
+        ...     "Start": [0, 7],
+        ...     "End": [12, 10],
+        ...     "Task": ["A", "B"],
+        ...     "Slots": [1, 1],
+        ...     "Channel": ["X", "Y"],
+        ... })
+        >>> capacity = pr.from_dict({
+        ...     "Chromosome": ["north"] * 3,
+        ...     "Start": [0, 6, 6],
+        ...     "End": [8, 12, 12],
+        ...     "Channel": ["X", "Y", "Z"],
+        ...     "Slots": [1, 1, 1],
+        ... })
+        >>> handovers = pr.from_dict({
+        ...     "Task": ["A", "A"],
+        ...     "At": [8, 8],
+        ...     "Source": ["X", "X"],
+        ...     "Target": ["Y", "Z"],
+        ...     "Warmup": [1, 2],
+        ... })
+        >>> tasks.schedule_channels(capacity, handovers).planned
+        """
+
+        from pyranges.channels import schedule_channels
+
+        return schedule_channels(
+            self,
+            capacity,
+            handovers,
+            executed,
+            cutoff,
+            schedule=schedule,
+            previous=previous,
+            raise_on_infeasible=raise_on_infeasible,
+        )
+
     def __getstate__(self):
         return self.dfs
 
