@@ -481,6 +481,8 @@ def open_group(
     meta_array: Any | None = None,  # not used in async api
     attributes: dict[str, JSON] | None = None,
     use_consolidated: bool | str | None = None,
+    codec_contract: Any | None = None,
+    **kwargs: Any,
 ) -> Group:
     """Open a group using file-mode-like semantics.
 
@@ -547,6 +549,8 @@ def open_group(
                 meta_array=meta_array,
                 attributes=attributes,
                 use_consolidated=use_consolidated,
+                codec_contract=codec_contract,
+                **kwargs,
             )
         )
     )

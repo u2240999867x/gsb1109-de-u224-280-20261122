@@ -8,6 +8,27 @@ from collections.abc import Mapping
 from importlib.metadata import entry_points as get_entry_points
 from typing import TYPE_CHECKING, Any
 
+from zarr.core.codec_contract import (
+    CodecContract,
+    CodecContractEntry,
+    CodecContractError,
+    CodecManifest,
+    CodecPolicy,
+    CodecRegistry,
+    CodecResolver,
+    LogicalCodec,
+    PluginSpec,
+    CodecSpec,
+    ScopedCodecRegistry,
+    codec_contract,
+    codec_contract_scope,
+    coerce_codec_contract,
+    get_active_codec_contract,
+    get_codec_contract,
+    pop_codec_contract_kwarg,
+    register_codec_contract,
+    use_codec_contract,
+)
 from zarr.core.config import BadConfigError, config
 from zarr.core.dtype import data_type_registry
 from zarr.errors import UnknownCodecError, URLPipelineError, ZarrUserWarning
@@ -30,18 +51,34 @@ if TYPE_CHECKING:
     from zarr.core.common import JSON, ZarrFormat
 
 __all__ = [
+    "CodecContract",
+    "CodecContractEntry",
+    "CodecContractError",
+    "CodecManifest",
+    "CodecPolicy",
+    "CodecRegistry",
+    "CodecResolver",
+    "CodecSpec",
+    "LogicalCodec",
+    "PluginSpec",
     "Registry",
+    "ScopedCodecRegistry",
+    "codec_contract",
+    "codec_contract_scope",
     "get_buffer_class",
     "get_chunk_key_encoding_class",
     "get_codec_class",
+    "get_codec_contract",
     "get_ndbuffer_class",
     "get_pipeline_class",
     "register_buffer",
     "register_chunk_key_encoding",
     "register_codec",
+    "register_codec_contract",
     "register_ndbuffer",
     "register_pipeline",
     "register_url_adapter",
+    "use_codec_contract",
 ]
 
 _ZARR_CODEC_DOCS_URL = "https://zarr.readthedocs.io/en/stable/user-guide/extending/#custom-codecs"
@@ -370,7 +407,23 @@ def register_chunk_key_encoding(key: str, cls: type) -> None:
     _chunk_key_encoding_registry.register(cls, key)
 
 
-def get_codec_class(key: str, reload_config: bool = False) -> type[Codec]:
+def get_codec_class(
+    key: str,
+    reload_config: bool | Any = False,
+    contract: Any | None = None,
+    **kwargs: Any,
+) -> type[Codec]:
+    # Accept a contract as the second positional argument as well as via the
+    # active context variable. The historical second argument is a bool.
+    if contract is None and reload_config is not None and not isinstance(reload_config, bool):
+        contract = reload_config
+        reload_config = False
+    aliased_contract = pop_codec_contract_kwarg(kwargs)
+    if contract is None:
+        contract = aliased_contract
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(f"get_codec_class() got an unexpected keyword argument {unexpected!r}")
     if reload_config:
         _reload_config()
 
@@ -379,6 +432,14 @@ def get_codec_class(key: str, reload_config: bool = False) -> type[Codec]:
         _codec_registries[key].lazy_load()
 
     codec_classes = _codec_registries[key]
+    scoped_contract = coerce_codec_contract(
+        contract if contract is not None else get_active_codec_contract()
+    )
+    if scoped_contract is not None:
+        selected_codec_cls = scoped_contract.resolve_codec_class(key, codec_classes)
+        if selected_codec_cls is not None:
+            return selected_codec_cls
+
     if not codec_classes:
         raise UnknownCodecError(_missing_codec_message(key, zarr_format=3))
     config_entry = config.get("codecs", {}).get(key)
@@ -404,12 +465,13 @@ def get_codec_class(key: str, reload_config: bool = False) -> type[Codec]:
     return selected_codec_cls
 
 
-def _resolve_codec(data: dict[str, JSON]) -> Codec:
+def _resolve_codec(data: dict[str, JSON], contract: Any | None = None) -> Codec:
     """
     Get a codec instance from a dict representation of that codec.
     """
     # TODO: narrow the type of the input to only those dicts that map on to codec class instances.
-    return get_codec_class(data["name"]).from_dict(data)  # type: ignore[arg-type]
+    codec_cls = get_codec_class(data["name"], contract=contract)
+    return codec_cls.from_dict(data)  # type: ignore[arg-type]
 
 
 def _parse_bytes_bytes_codec(data: dict[str, JSON] | Codec) -> BytesBytesCodec:

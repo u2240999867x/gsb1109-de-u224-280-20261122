@@ -31,6 +31,12 @@ from zarr.core.array import (
 from zarr.core.array_spec import parse_array_config
 from zarr.core.attributes import Attributes
 from zarr.core.buffer import default_buffer_prototype
+from zarr.core.codec_contract import (
+    codec_contract_scope,
+    coerce_codec_contract,
+    get_active_codec_contract,
+    pop_codec_contract_kwarg,
+)
 from zarr.core.common import (
     JSON,
     ZARR_JSON,
@@ -520,6 +526,16 @@ class AsyncGroup:
     metadata: GroupMetadata
     store_path: StorePath
 
+    @property
+    def codec_contract(self) -> Any:
+        """Scoped codec contract bound to this group and its lazy members."""
+        return getattr(self.store_path, "codec_contract", None)
+
+    @property
+    def contract(self) -> Any:
+        """Alias for [`codec_contract`][zarr.AsyncGroup.codec_contract]."""
+        return self.codec_contract
+
     # TODO: make this correct and work
     # TODO: ensure that this can be bound properly to subclass of AsyncGroup
 
@@ -546,6 +562,37 @@ class AsyncGroup:
 
     @classmethod
     async def open(
+        cls,
+        store: StoreLike,
+        zarr_format: ZarrFormat | None = 3,
+        use_consolidated: bool | str | None = None,
+        codec_contract: Any | None = None,
+        **kwargs: Any,
+    ) -> AsyncGroup:
+        contract = pop_codec_contract_kwarg(kwargs)
+        if codec_contract is not None:
+            contract = coerce_codec_contract(codec_contract)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(f"AsyncGroup.open() got an unexpected keyword argument {unexpected!r}")
+        store_path = await make_store_path(store)
+        if contract is not None:
+            store_path.codec_contract = contract
+        else:
+            contract = getattr(store_path, "codec_contract", None)
+        if contract is None:
+            contract = get_active_codec_contract()
+        with codec_contract_scope(contract):
+            group = await cls._open_implementation(
+                store_path,
+                zarr_format=zarr_format,
+                use_consolidated=use_consolidated,
+            )
+        group.store_path.codec_contract = contract
+        return group
+
+    @classmethod
+    async def _open_implementation(
         cls,
         store: StoreLike,
         zarr_format: ZarrFormat | None = 3,
@@ -785,15 +832,23 @@ class AsyncGroup:
         AsyncArray or AsyncGroup
         """
         store_path = self.store_path / key
+        contract = getattr(self.store_path, "codec_contract", None)
         logger.debug("key=%s, store_path=%s", key, store_path)
 
         # Consolidated metadata lets us avoid some I/O operations so try that first.
         if self.metadata.consolidated_metadata is not None:
-            return self._getitem_consolidated(store_path, key, prefix=self.name)
+            node = self._getitem_consolidated(store_path, key, prefix=self.name)
+            node.store_path.codec_contract = contract
+            return node
         try:
-            return await get_node(
-                store=store_path.store, path=store_path.path, zarr_format=self.metadata.zarr_format
-            )
+            with codec_contract_scope(contract):
+                node = await get_node(
+                    store=store_path.store,
+                    path=store_path.path,
+                    zarr_format=self.metadata.zarr_format,
+                )
+            node.store_path.codec_contract = contract
+            return node
         except FileNotFoundError as e:
             raise KeyError(key) from e
 
@@ -835,7 +890,11 @@ class AsyncGroup:
         # update store_path to ensure that AsyncArray/Group.name is correct
         if prefix != "/":
             key = "/".join([prefix.lstrip("/"), key])
-        store_path = StorePath(store=store_path.store, path=key)
+        store_path = StorePath(
+            store=store_path.store,
+            path=key,
+            codec_contract=getattr(self.store_path, "codec_contract", None),
+        )
 
         if isinstance(metadata, GroupMetadata):
             return AsyncGroup(metadata=metadata, store_path=store_path)
@@ -1280,28 +1339,29 @@ class AsyncGroup:
         compressors = _parse_deprecated_compressor(
             compressor, compressors, zarr_format=self.metadata.zarr_format
         )
-        return await create_array(
-            store=self.store_path,
-            name=name,
-            shape=shape,
-            dtype=dtype,
-            data=data,
-            chunks=chunks,
-            shards=shards,
-            filters=filters,
-            compressors=compressors,
-            serializer=serializer,
-            fill_value=fill_value,
-            order=order,
-            zarr_format=self.metadata.zarr_format,
-            attributes=attributes,
-            chunk_key_encoding=chunk_key_encoding,
-            dimension_names=dimension_names,
-            storage_options=storage_options,
-            overwrite=overwrite,
-            config=config,
-            write_data=write_data,
-        )
+        with codec_contract_scope(self.codec_contract):
+            return await create_array(
+                store=self.store_path,
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                data=data,
+                chunks=chunks,
+                shards=shards,
+                filters=filters,
+                compressors=compressors,
+                serializer=serializer,
+                fill_value=fill_value,
+                order=order,
+                zarr_format=self.metadata.zarr_format,
+                attributes=attributes,
+                chunk_key_encoding=chunk_key_encoding,
+                dimension_names=dimension_names,
+                storage_options=storage_options,
+                overwrite=overwrite,
+                config=config,
+                write_data=write_data,
+            )
 
     async def require_array(
         self,
@@ -1955,6 +2015,16 @@ class Group(SyncMixin):
 
     _async_group: AsyncGroup
 
+    @property
+    def codec_contract(self) -> Any:
+        """Scoped codec contract bound to this group and its lazy members."""
+        return self._async_group.codec_contract
+
+    @property
+    def contract(self) -> Any:
+        """Alias for [`codec_contract`][zarr.Group.codec_contract]."""
+        return self.codec_contract
+
     @classmethod
     def from_store(
         cls,
@@ -2005,6 +2075,8 @@ class Group(SyncMixin):
         cls,
         store: StoreLike,
         zarr_format: ZarrFormat | None = 3,
+        codec_contract: Any | None = None,
+        **kwargs: Any,
     ) -> Group:
         """Open a group from an initialized store.
 
@@ -2016,13 +2088,23 @@ class Group(SyncMixin):
             for a description of all valid StoreLike values.
         zarr_format : {2, 3, None}, optional
             Zarr storage format version.
+        codec_contract : object, optional
+            Scoped codec selection contract/manifest for this group and lazy members.
 
         Returns
         -------
         Group
             Group instantiated from the store.
         """
-        obj = sync(AsyncGroup.open(store, zarr_format=zarr_format))
+        contract = pop_codec_contract_kwarg(kwargs)
+        if codec_contract is not None:
+            contract = coerce_codec_contract(codec_contract)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(f"Group.open() got an unexpected keyword argument {unexpected!r}")
+        obj = sync(
+            AsyncGroup.open(store, zarr_format=zarr_format, codec_contract=contract)
+        )
         return cls(obj)
 
     def __getitem__(self, path: str) -> AnyArray | Group:

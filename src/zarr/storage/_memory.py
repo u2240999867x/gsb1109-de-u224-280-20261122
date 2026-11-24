@@ -73,17 +73,35 @@ class MemoryStore(Store):
         store_dict: MutableMapping[str, Buffer] | None = None,
         *,
         read_only: bool = False,
+        codec_contract: Any | None = None,
+        **contract_kwargs: Any,
     ) -> None:
+        from zarr.core.codec_contract import (
+            bind_codec_contract_to_store,
+            pop_codec_contract_kwarg,
+        )
+
+        aliased_contract = pop_codec_contract_kwarg(contract_kwargs)
+        if codec_contract is not None:
+            aliased_contract = codec_contract
+        if contract_kwargs:
+            unexpected = next(iter(contract_kwargs))
+            raise TypeError(
+                f"MemoryStore.__init__() got an unexpected keyword argument {unexpected!r}"
+            )
         super().__init__(read_only=read_only)
         if store_dict is None:
             store_dict = {}
         self._store_dict = store_dict
+        if aliased_contract is not None:
+            bind_codec_contract_to_store(self, aliased_contract)
 
     def with_read_only(self, read_only: bool = False) -> MemoryStore:
         # docstring inherited
         return type(self)(
             store_dict=self._store_dict,
             read_only=read_only,
+            codec_contract=getattr(self, "_zarr_codec_contract", None),
         )
 
     async def clear(self) -> None:

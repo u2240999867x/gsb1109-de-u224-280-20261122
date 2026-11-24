@@ -57,6 +57,12 @@ from zarr.core.chunk_key_encodings import (
     V2ChunkKeyEncoding,
     parse_chunk_key_encoding,
 )
+from zarr.core.codec_contract import (
+    codec_contract_scope,
+    coerce_codec_contract,
+    pop_codec_contract_kwarg,
+    set_path_codec_contract,
+)
 from zarr.core.common import (
     JSON,
     ZARR_JSON,
@@ -420,7 +426,12 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         store_path: StorePath,
         config: ArrayConfigLike | None = None,
     ) -> None:
-        metadata_parsed = parse_array_metadata(metadata, str(store_path))
+        contract = getattr(store_path, "codec_contract", None)
+        if contract is None:
+            metadata_parsed = parse_array_metadata(metadata, str(store_path))
+        else:
+            with codec_contract_scope(contract):
+                metadata_parsed = parse_array_metadata(metadata, str(store_path))
         config_parsed = parse_array_config(config)
 
         object.__setattr__(self, "metadata", metadata_parsed)
@@ -785,6 +796,8 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         zarr_format: ZarrFormat | None = 3,
         *,
         config: ArrayConfigLike | None = None,
+        codec_contract: Any | None = None,
+        **kwargs: Any,
     ) -> AnyAsyncArray:
         """
         Async method to open an existing Zarr array from a given store.
@@ -827,12 +840,30 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         # <AsyncArray memory://... shape=(100, 100) dtype=int32>
         ```
         """
+        contract = pop_codec_contract_kwarg(kwargs)
+        if codec_contract is not None:
+            contract = coerce_codec_contract(codec_contract)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(f"AsyncArray.open() got an unexpected keyword argument {unexpected!r}")
+
         zarr_format = resolve_zarr_format(store, zarr_format)
         store_path = await make_store_path(store)
+        set_path_codec_contract(store_path, contract)
         metadata_dict = await get_array_metadata(store_path, zarr_format=zarr_format)
         # TODO: remove this cast when we have better type hints
         _metadata_dict = cast("ArrayMetadataJSON_V3", metadata_dict)
         return cls(store_path=store_path, metadata=_metadata_dict, config=config)
+
+    @property
+    def codec_contract(self) -> Any:
+        """Scoped codec contract used when this array's metadata was parsed."""
+        return getattr(self.store_path, "codec_contract", None)
+
+    @property
+    def contract(self) -> Any:
+        """Alias for [`codec_contract`][zarr.AsyncArray.codec_contract]."""
+        return self.codec_contract
 
     @property
     def store(self) -> Store:
@@ -2051,6 +2082,8 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         store: StoreLike,
         *,
         config: ArrayConfigLike | None = None,
+        codec_contract: Any | None = None,
+        **kwargs: Any,
     ) -> Self:
         """Opens an existing Array from a store.
 
@@ -2069,8 +2102,24 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         Array
             Array opened from the store.
         """
-        async_array = sync(AsyncArray.open(store, config=config))
+        contract = pop_codec_contract_kwarg(kwargs)
+        if codec_contract is not None:
+            contract = coerce_codec_contract(codec_contract)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(f"Array.open() got an unexpected keyword argument {unexpected!r}")
+        async_array = sync(AsyncArray.open(store, config=config, codec_contract=contract))
         return cls(async_array)
+
+    @property
+    def codec_contract(self) -> Any:
+        """Scoped codec contract bound to this array."""
+        return self._async_array.codec_contract
+
+    @property
+    def contract(self) -> Any:
+        """Alias for [`codec_contract`][zarr.Array.codec_contract]."""
+        return self.codec_contract
 
     @property
     def store(self) -> Store:

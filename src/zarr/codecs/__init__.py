@@ -33,6 +33,18 @@ from zarr.codecs.sharding import ShardingCodec, ShardingCodecIndexLocation, Subc
 from zarr.codecs.transpose import TransposeCodec
 from zarr.codecs.vlen_utf8 import VLenBytesCodec, VLenUTF8Codec
 from zarr.codecs.zstd import ZstdCodec
+from zarr.core.codec_contract import (
+    CodecContract,
+    CodecContractEntry,
+    CodecContractError,
+    CodecManifest,
+    CodecPolicy,
+    CodecRegistry,
+    CodecResolver,
+    ScopedCodecRegistry,
+    codec_contract_scope,
+    use_codec_contract,
+)
 from zarr.registry import register_codec
 
 __all__ = [
@@ -41,10 +53,18 @@ __all__ = [
     "BloscShuffle",
     "BytesCodec",
     "CastValue",
+    "CodecContract",
+    "CodecContractEntry",
+    "CodecContractError",
+    "CodecManifest",
+    "CodecPolicy",
+    "CodecRegistry",
+    "CodecResolver",
     "Crc32cCodec",
     "Endian",
     "GzipCodec",
     "ScaleOffset",
+    "ScopedCodecRegistry",
     "ShardingCodec",
     "ShardingCodecIndexLocation",
     "SubchunkWriteOrder",
@@ -52,6 +72,8 @@ __all__ = [
     "VLenBytesCodec",
     "VLenUTF8Codec",
     "ZstdCodec",
+    "codec_contract_scope",
+    "use_codec_contract",
 ]
 
 register_codec("blosc", BloscCodec)

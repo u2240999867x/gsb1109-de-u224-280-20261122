@@ -4,6 +4,7 @@ __all__ = [
     "BaseZarrError",
     "BoundsCheckError",
     "ChunkNotFoundError",
+    "CodecContractError",
     "ContainsArrayAndGroupError",
     "ContainsArrayError",
     "ContainsGroupError",
@@ -101,6 +102,10 @@ class UnknownCodecError(BaseZarrError):
     """
     Raised when an unknown codec was used.
     """
+
+
+class CodecContractError(BaseZarrError):
+    """Raised when a scoped codec contract cannot select a legal implementation."""
 
 
 class PickleCodecDisabledError(BaseZarrError):

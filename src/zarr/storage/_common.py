@@ -13,6 +13,12 @@ from zarr.abc.store import (
 )
 from zarr.core._json import buffer_to_json_object, get_json
 from zarr.core.buffer import Buffer, default_buffer_prototype
+from zarr.core.codec_contract import (
+    bind_codec_contract_to_store,
+    coerce_codec_contract,
+    get_store_codec_contract,
+    pop_codec_contract_kwarg,
+)
 from zarr.core.common import (
     ANY_ACCESS_MODE,
     ZARR_JSON,
@@ -57,10 +63,29 @@ class StorePath:
 
     store: Store
     path: str
+    codec_contract: Any
 
-    def __init__(self, store: Store, path: str = "") -> None:
+    def __init__(
+        self,
+        store: Store,
+        path: str = "",
+        codec_contract: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
         self.store = store
         self.path = normalize_path(path)
+        aliased_contract = pop_codec_contract_kwarg(kwargs)
+        if codec_contract is None:
+            codec_contract = aliased_contract
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(
+                f"StorePath.__init__() got an unexpected keyword argument {unexpected!r}"
+            )
+        parsed_contract = coerce_codec_contract(codec_contract)
+        if parsed_contract is None:
+            parsed_contract = get_store_codec_contract(store)
+        self.codec_contract = parsed_contract
 
     @property
     def read_only(self) -> bool:
@@ -130,6 +155,9 @@ class StorePath:
                     "Store is not read-only but mode is 'r'. Unable to create a read-only copy of the store. "
                     "Please use a read-only store or a storage class that implements .with_read_only()."
                 ) from e
+            inherited_contract = get_store_codec_contract(store)
+            if inherited_contract is not None:
+                bind_codec_contract_to_store(read_only_store, inherited_contract)
             self = await cls._create_open_instance(read_only_store, path)
         else:
             # writable store and writable mode
@@ -277,7 +305,9 @@ class StorePath:
 
     def __truediv__(self, other: str) -> StorePath:
         """Combine this store path with another path"""
-        return self.__class__(self.store, _join_paths([self.path, other]))
+        result = self.__class__(self.store, _join_paths([self.path, other]))
+        result.codec_contract = self.codec_contract
+        return result
 
     def __str__(self) -> str:
         return _join_paths([str(self.store), self.path])

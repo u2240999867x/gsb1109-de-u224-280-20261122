@@ -20,6 +20,12 @@ from zarr.core.array import (
 )
 from zarr.core.array_spec import ArrayConfigLike, parse_array_config
 from zarr.core.buffer import NDArrayLike
+from zarr.core.codec_contract import (
+    codec_contract_scope,
+    coerce_codec_contract,
+    pop_codec_contract_kwarg,
+    set_path_codec_contract,
+)
 from zarr.core.common import (
     JSON,
     AccessModeLiteral,
@@ -414,7 +420,9 @@ async def open(
         else:
             mode = "a"
     zarr_format = resolve_zarr_format(store, zarr_format)
+    contract = pop_codec_contract_kwarg(kwargs)
     store_path = await make_store_path(store, mode=mode, path=path, storage_options=storage_options)
+    set_path_codec_contract(store_path, contract)
 
     # TODO: the mode check below seems wrong!
     if "shape" not in kwargs and mode in (*_READ_MODES, "w"):
@@ -817,6 +825,8 @@ async def open_group(
     meta_array: Any | None = None,  # not used
     attributes: dict[str, JSON] | None = None,
     use_consolidated: bool | str | None = None,
+    codec_contract: Any | None = None,
+    **kwargs: Any,
 ) -> AsyncGroup:
     """Open a group using file-mode-like semantics.
 
@@ -870,6 +880,15 @@ async def open_group(
         The new group.
     """
 
+    contract = pop_codec_contract_kwarg(kwargs)
+    if codec_contract is not None:
+        contract = coerce_codec_contract(codec_contract)
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"open_group() got an unexpected keyword argument {unexpected!r}"
+        )
+
     _warn_ignored_kwargs(
         {
             "cache_attrs": cache_attrs,
@@ -881,25 +900,33 @@ async def open_group(
 
     zarr_format = resolve_zarr_format(store, zarr_format)
     store_path = await make_store_path(store, mode=mode, storage_options=storage_options, path=path)
+    set_path_codec_contract(store_path, contract)
     if attributes is None:
         attributes = {}
 
     try:
         if mode in _READ_MODES:
-            return await AsyncGroup.open(
-                store_path, zarr_format=zarr_format, use_consolidated=use_consolidated
+            group = await AsyncGroup.open(
+                store_path,
+                zarr_format=zarr_format,
+                use_consolidated=use_consolidated,
+                codec_contract=contract,
             )
+            set_path_codec_contract(group.store_path, contract)
+            return group
     except (KeyError, FileNotFoundError):
         pass
     if mode in _CREATE_MODES:
         overwrite = _infer_overwrite(mode)
         _zarr_format = zarr_format or _default_zarr_format()
-        return await AsyncGroup.from_store(
+        group = await AsyncGroup.from_store(
             store_path,
             zarr_format=_zarr_format,
             overwrite=overwrite,
             attributes=attributes,
         )
+        set_path_codec_contract(group.store_path, contract)
+        return group
     msg = f"No group found in store {store!r} at path {store_path.path!r}"
     raise GroupNotFoundError(msg)
 
@@ -1328,8 +1355,10 @@ async def open_array(
     """
 
     mode = kwargs.pop("mode", None)
+    contract = pop_codec_contract_kwarg(kwargs)
     zarr_format = resolve_zarr_format(store, zarr_format)
     store_path = await make_store_path(store, path=path, mode=mode, storage_options=storage_options)
+    set_path_codec_contract(store_path, contract)
 
     if "write_empty_chunks" in kwargs:
         _warn_write_empty_chunks_kwarg()
@@ -1342,13 +1371,14 @@ async def open_array(
             if store_path.read_only or mode not in _CREATE_MODES:
                 msg = f"No array found in store {store_path.store} at path {store_path.path}"
                 raise ArrayNotFoundError(msg) from err
-    return await create(
-        store=store_path,
-        zarr_format=zarr_format or _default_zarr_format(),
-        overwrite=_infer_overwrite(mode),
-        config=config,
-        **kwargs,
-    )
+    with codec_contract_scope(contract):
+        return await create(
+            store=store_path,
+            zarr_format=zarr_format or _default_zarr_format(),
+            overwrite=_infer_overwrite(mode),
+            config=config,
+            **kwargs,
+        )
 
 
 async def open_like(
