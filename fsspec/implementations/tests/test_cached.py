@@ -1,5 +1,7 @@
 import asyncio
+import gzip
 import json
+import multiprocessing as mp
 import os
 import pathlib
 import shutil
@@ -12,6 +14,7 @@ import pytest
 
 import fsspec
 from fsspec.compression import compr
+from fsspec.core import OpenFile, OpenFiles
 from fsspec.exceptions import BlocksizeMismatchError
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.implementations.cache_mapper import (
@@ -25,7 +28,8 @@ from fsspec.implementations.cached import (
     WholeFileCacheFileSystem,
     _tempfile,
 )
-from fsspec.implementations.local import make_path_posix
+from fsspec.implementations.dirfs import DirFileSystem
+from fsspec.implementations.local import LocalFileSystem, make_path_posix
 from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.implementations.zip import ZipFileSystem
 from fsspec.tests.conftest import win
@@ -2215,3 +2219,312 @@ def test_write_transaction_failed_upload_ends_transaction(
     with fs.transaction:
         fs.pipe("/next-transaction", b"committed")
     assert m.cat("/next-transaction") == b"committed"
+
+
+def _station_source(tmp_path, station, text, encoding):
+    station_dir = tmp_path / "source" / station
+    station_dir.mkdir(parents=True, exist_ok=True)
+    payload = gzip.compress(text.encode(encoding))
+    (station_dir / "feed.csv.gz").write_bytes(payload)
+    return station_dir, payload
+
+
+def _shared_filecache(cache_dir, target=None, **kw):
+    options = dict(
+        fs=target or LocalFileSystem(),
+        cache_storage=str(cache_dir),
+        same_names=True,
+        cache_check=0,
+        check_files=False,
+        expiry_time=False,
+        skip_instance_cache=True,
+    )
+    options.update(kw)
+    return WholeFileCacheFileSystem(**options)
+
+
+def test_open_many_dirfs_same_basename_stays_with_station(tmp_path):
+    # feed.csv.gz exists under each station directory; a same_names filecache
+    # must never resolve one station's relative path against another's cache.
+    # SimpleCache has no metadata, so a basename collision is shared by design
+    # (see BasenameCacheMapper); the disambiguation applies to WholeFileCache.
+    _, north_gz = _station_source(tmp_path, "north", "N,17\r\n", "utf-16")
+    _, south_gz = _station_source(tmp_path, "south", "S,23\r\n", "utf-8")
+    cache_dir = tmp_path / "cache"
+
+    north_fs = DirFileSystem(
+        str(tmp_path / "source" / "north"),
+        fs=WholeFileCacheFileSystem(
+            fs=LocalFileSystem(), cache_storage=str(cache_dir), same_names=True,
+            skip_instance_cache=True,
+        ),
+    )
+    south_fs = DirFileSystem(
+        str(tmp_path / "source" / "south"),
+        fs=WholeFileCacheFileSystem(
+            fs=LocalFileSystem(), cache_storage=str(cache_dir), same_names=True,
+            skip_instance_cache=True,
+        ),
+    )
+
+    files = OpenFiles(
+        [
+            OpenFile(north_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-16"),
+            OpenFile(south_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-8", newline=""),
+        ],
+        mode="rt",
+        fs=north_fs,
+    )
+    with files as streams:
+        assert streams[0].readline() == "N,17\n"
+        assert streams[1].readline() == "S,23\r\n"
+
+    # a fresh process-style instance still maps each station to the right bytes
+    north_fs2 = DirFileSystem(
+        str(tmp_path / "source" / "north"),
+        fs=WholeFileCacheFileSystem(
+            fs=LocalFileSystem(), cache_storage=str(cache_dir), same_names=True,
+            skip_instance_cache=True,
+        ),
+    )
+    with OpenFile(north_fs2, "feed.csv.gz", mode="rb").open() as raw:
+        assert raw.read() == north_gz
+    assert south_gz != north_gz
+
+
+def test_open_many_bad_encoding_closes_every_descriptor(tmp_path, monkeypatch):
+    _station_source(tmp_path, "north", "N,17\r\n", "utf-16")
+    _station_source(tmp_path, "south", "S,23\r\n", "utf-8")
+    cache_dir = tmp_path / "cache"
+
+    north_fs = DirFileSystem(
+        str(tmp_path / "source" / "north"), fs=_shared_filecache(cache_dir)
+    )
+    south_fs = DirFileSystem(
+        str(tmp_path / "source" / "south"),
+        fs=_shared_filecache(cache_dir),
+    )
+
+    import builtins
+
+    real_open = builtins.open
+    opened = []
+
+    def recording_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        if "b" in handle.mode:
+            opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+
+    files = OpenFiles(
+        [
+            OpenFile(north_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-16"),
+            OpenFile(south_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="no-such-codec", newline=""),
+        ],
+        mode="rt",
+        fs=north_fs,
+    )
+    with pytest.raises(LookupError):
+        with files:
+            pass
+
+    assert opened, "expected raw descriptors to have been fetched in the batch"
+    assert all(handle.closed for handle in opened)
+    assert all(not open_file.fobjects for open_file in files)
+
+
+def test_open_many_alias_downloaded_once_with_independent_positions(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    path = source / "feed.csv.gz"
+    path.write_bytes(b"0123456789")
+
+    target = LocalFileSystem()
+    downloads = []
+    original_get_file = target.get_file
+
+    def counting_get_file(rpath, lpath, **kwargs):
+        downloads.append(rpath)
+        return original_get_file(rpath, lpath, **kwargs)
+
+    target.get_file = counting_get_file
+    fs = _shared_filecache(tmp_path / "cache", target=target)
+    target_path = fs._strip_protocol(str(path))
+
+    files = OpenFiles(
+        [OpenFile(fs, target_path, mode="rb"), OpenFile(fs, target_path, mode="rb")],
+        mode="rb",
+        fs=fs,
+    )
+    with files as streams:
+        assert streams[0].read(4) == b"0123"
+        assert streams[0].tell() == 4
+        assert streams[1].tell() == 0
+        assert streams[1].read() == b"0123456789"
+    assert downloads == [target_path]
+
+    # cache hit on retry: nothing is fetched again
+    with files as streams:
+        assert streams[0].read() == b"0123456789"
+    assert downloads == [target_path]
+
+
+def test_open_many_retry_offline_uses_existing_cache_only(tmp_path):
+    _station_source(tmp_path, "north", "N,17\r\n", "utf-16")
+    _station_source(tmp_path, "south", "S,23\r\n", "utf-8")
+    source = tmp_path / "source"
+    cache_dir = tmp_path / "cache"
+
+    north_fs = DirFileSystem(str(source / "north"), fs=_shared_filecache(cache_dir))
+    south_fs = DirFileSystem(str(source / "south"), fs=_shared_filecache(cache_dir))
+    first = OpenFiles(
+        [
+            OpenFile(north_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-16"),
+            OpenFile(south_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-666", newline=""),
+        ],
+        mode="rt",
+        fs=north_fs,
+    )
+    with pytest.raises(LookupError):
+        with first:
+            pass
+
+    # Both files were fully downloaded before the bad encoding failed. Now the
+    # origin goes offline: the target path is unchanged but every fetch raises,
+    # so the retry can only succeed by reusing the complete cache entries.
+    class OfflineLocal(LocalFileSystem):
+        def get_file(self, rpath, lpath=None, **kwargs):
+            raise OSError("origin is offline")
+
+    retry_cache = _shared_filecache(cache_dir, target=OfflineLocal())
+    north_fs2 = DirFileSystem(str(source / "north"), fs=retry_cache)
+    south_fs2 = DirFileSystem(
+        str(source / "south"),
+        fs=_shared_filecache(cache_dir, target=OfflineLocal()),
+    )
+    retry = OpenFiles(
+        [
+            OpenFile(north_fs2, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-16"),
+            OpenFile(south_fs2, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding="utf-8", newline=""),
+        ],
+        mode="rt",
+        fs=north_fs2,
+    )
+    with retry as streams:
+        assert streams[0].readline() == "N,17\n"
+        assert streams[1].readline() == "S,23\r\n"
+
+
+def _concurrent_worker(args):
+    (
+        root,
+        cache_dir,
+        station,
+        want_line,
+        encoding,
+        extra_file,
+        stall_name,
+        stall_token,
+        finished_token,
+    ) = args
+    source = os.path.join(root, "source")
+
+    target = LocalFileSystem()
+    if stall_name is not None:
+        original = target.get_file
+
+        def maybe_stall(rpath, lpath, **kwargs):
+            if stall_name in rpath:
+                while not os.path.exists(stall_token):
+                    time.sleep(0.02)
+            return original(rpath, lpath, **kwargs)
+
+        target.get_file = maybe_stall
+
+    fs = WholeFileCacheFileSystem(
+        fs=target, cache_storage=cache_dir, same_names=True,
+        cache_check=0, check_files=False, expiry_time=False,
+        skip_instance_cache=True,
+    )
+    station_fs = DirFileSystem(os.path.join(source, station), fs=fs)
+    root_fs = WholeFileCacheFileSystem(
+        fs=LocalFileSystem(), cache_storage=cache_dir, same_names=True,
+        cache_check=0, check_files=False, expiry_time=False,
+        skip_instance_cache=True,
+    )
+    batch = OpenFiles(
+        [
+            OpenFile(station_fs, "feed.csv.gz", mode="rt", compression="gzip",
+                     encoding=encoding, newline=""),
+            OpenFile(root_fs, os.path.join(source, extra_file), mode="rb"),
+        ],
+        mode="rt",
+        fs=station_fs,
+    )
+    with batch as streams:
+        line = streams[0].readline()
+        assert line == want_line, line
+        assert streams[1].read() == extra_file.encode()
+    if finished_token is not None:
+        open(finished_token, "w").close()
+
+
+def test_open_many_second_process_not_blocked_by_stalled_download(tmp_path):
+    ctx = mp.get_context("spawn")
+    root = str(tmp_path)
+    cache_dir = str(tmp_path / "cache")
+    _station_source(tmp_path, "north", "N,17\r\n", "utf-16")
+    _station_source(tmp_path, "west", "W,31\r\n", "utf-8")
+    (tmp_path / "source" / "schedule.csv").write_bytes(b"schedule.csv")
+    (tmp_path / "source" / "stations.csv").write_bytes(b"stations.csv")
+
+    stall_token = str(tmp_path / "release-stall")
+    p1_finished = str(tmp_path / "p1-finished")
+    p2_finished = str(tmp_path / "p2-finished")
+
+    # process 1 stalls inside the bulk download of its uncached stations.csv
+    p1 = ctx.Process(
+        target=_concurrent_worker,
+        args=(
+            (
+                root, cache_dir, "north", "N,17\r\n", "utf-16",
+                "stations.csv", "stations.csv", stall_token, p1_finished,
+            ),
+        ),
+    )
+    p2 = ctx.Process(
+        target=_concurrent_worker,
+        args=(
+            (
+                root, cache_dir, "west", "W,31\r\n", "utf-8",
+                "schedule.csv", None, None, p2_finished,
+            ),
+        ),
+    )
+    p1.start()
+    assert not os.path.exists(p1_finished)
+    time.sleep(2)  # let process 1 enter its stalled bulk download
+    p2.start()
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not os.path.exists(p2_finished):
+            time.sleep(0.05)
+        assert os.path.exists(p2_finished), (
+            "second process was blocked by the first process's download"
+        )
+    finally:
+        open(stall_token, "w").close()
+        p1.join(20)
+        p2.join(20)
+    assert p1.exitcode == 0
+    assert p2.exitcode == 0

@@ -545,6 +545,10 @@ class CachingFileSystem(ChainedFileSystem):
             "_check_cache",
             "_makedirs",
             "_mkcache",
+            "_claimed_cache_names",
+            "_disambiguate_cache_name",
+            "_is_complete_cache",
+            "_assign_cache_names",
             "clear_cache",
             "clear_expired_cache",
             "pop_from_cache",
@@ -653,58 +657,151 @@ class WholeFileCacheFileSystem(CachingFileSystem):
     protocol = "filecache"
     local_file = True
 
+    def _claimed_cache_names(self):
+        # Map existing cache filenames back to the source path that owns them,
+        # so a same_names basename collision cannot hand one station's cache to
+        # another station.
+        claimed = {}
+        for cache in self._metadata.cached_files:
+            for source, detail in cache.items():
+                claimed.setdefault(detail["fn"], source)
+        return claimed
+
+    def _disambiguate_cache_name(self, base_name, path):
+        # A basename mapper (same_names=True) gives every feed.csv.gz the same
+        # cache filename. The plain name stays with its original owner and
+        # other sources get a deterministic, path-specific name. The hash makes
+        # the choice stable across processes and retries.
+        suffix = sha256(path.encode()).hexdigest()[:12]
+        return f"{base_name}.{suffix}"
+
+    def _is_complete_cache(self, path):
+        detail = self._check_file(path)
+        return bool(detail) and detail[0].get("blocks") is True
+
+    def _assign_cache_names(self, unique_paths, locks):
+        # Serialize the naming decision per basename and persist it before any
+        # download, so separate cache instances and separate processes sharing
+        # one directory resolve a same_names collision identically. The data
+        # transfer itself happens outside these locks.
+        groups = {}
+        for path in unique_paths:
+            groups.setdefault(self._mapper(path), []).append(path)
+
+        names = {}
+        for base, members in groups.items():
+            with locks(f"name:{base}"):
+                # read whatever a concurrent process/instance just published
+                self.load_cache()
+                stored = self._metadata.cached_files[-1]
+                already_named = {
+                    p: stored[p]["fn"] for p in members if stored.get(p, {}).get("fn")
+                }
+                names.update(already_named)
+                pending = [p for p in members if p not in already_named]
+                if not pending:
+                    continue
+
+                owner = self._claimed_cache_names().get(base)
+                if owner in pending:
+                    # plain name already belongs to one of this batch's sources
+                    plain_owner = owner
+                elif owner is not None:
+                    # plain name is owned by a source outside this batch, so
+                    # nobody here may reuse it
+                    plain_owner = None
+                else:
+                    plain_owner = min(pending)
+                changed = False
+                for path in pending:
+                    cache_name = (
+                        base
+                        if path == plain_owner
+                        else self._disambiguate_cache_name(base, path)
+                    )
+                    names[path] = cache_name
+                    # a claim without data: an empty block set means "nothing
+                    # cached yet"; the bulk download flips it to True on success
+                    self._metadata.update_file(
+                        path,
+                        {
+                            "original": path,
+                            "fn": cache_name,
+                            "blocks": set(),
+                            "time": time.time(),
+                            "uid": None,
+                        },
+                    )
+                    changed = True
+                if changed:
+                    self.save_cache()
+        return names
+
     def open_many(self, open_files, **kwargs):
-        paths = [of.path for of in open_files]
-        if "r" in open_files.mode:
-            self._mkcache()
-        else:
+        # Each member carries its own fs/path pair; the source path is resolved
+        # through that member's chain (e.g. a DirFileSystem root) instead of
+        # reusing one path for the whole batch.
+        source_paths = [self._strip_protocol(of._cache_path()) for of in open_files]
+
+        if "r" not in open_files[0].mode:
             return [
                 LocalTempFile(
                     self.fs,
                     path,
-                    mode=open_files.mode,
+                    mode=of.mode,
                     fn=os.path.join(self.storage[-1], self._mapper(path)),
                     **kwargs,
                 )
-                for path in paths
+                for of, path in zip(open_files, source_paths)
             ]
 
         if self.compression:
             raise NotImplementedError
-        details = [self._check_file(sp) for sp in paths]
-        downpath = [p for p, d in zip(paths, details) if not d]
-        downfn0 = [
-            os.path.join(self.storage[-1], self._mapper(p))
-            for p, d in zip(paths, details)
-        ]  # keep these path names for opening later
-        downfn = [fn for fn, d in zip(downfn0, details) if not d]
-        if downpath:
-            # skip if all files are already cached and up to date
-            _atomic_get(self.fs, downpath, downfn, callback=self.callback)
+        self._mkcache()
 
-            # update metadata - only happens when downloads are successful
-            newdetail = [
-                {
-                    "original": path,
-                    "fn": self._mapper(path),
-                    "blocks": True,
-                    "time": time.time(),
-                    "uid": self.fs.ukey(path),
-                }
-                for path in downpath
+        from fsspec.implementations.cache_lock import cache_locks
+
+        locks = cache_locks(self.storage[-1])
+
+        # Unique sources preserve first-seen order: aliases to one source are
+        # downloaded once, but every OpenFile still gets its own read handle.
+        unique_paths = list(dict.fromkeys(source_paths))
+        cache_names = self._assign_cache_names(unique_paths, locks)
+
+        missing = [p for p in unique_paths if not self._is_complete_cache(p)]
+        if missing:
+            # one bulk get for the whole group of missing files. Locks are not
+            # held during the transfer, so a stalled download cannot block
+            # another process fetching different files.
+            downfn = [
+                os.path.join(self.storage[-1], cache_names[p]) for p in missing
             ]
-            for path, detail in zip(downpath, newdetail):
-                self._metadata.update_file(path, detail)
-            self.save_cache()
+            _atomic_get(self.fs, missing, downfn, callback=self.callback)
+            with locks("metadata"):
+                # merge metadata published by concurrent processes instead of
+                # overwriting it with this instance's stale in-memory copy
+                self.load_cache()
+                for path in missing:
+                    self._metadata.update_file(
+                        path,
+                        {
+                            "original": path,
+                            "fn": cache_names[path],
+                            "blocks": True,
+                            "time": time.time(),
+                            "uid": self.fs.ukey(path),
+                        },
+                    )
+                self.save_cache()
 
-        def firstpart(fn):
-            # helper to adapt both whole-file and simple-cache
-            return fn[1] if isinstance(fn, tuple) else fn
-
-        return [
-            open(firstpart(fn0) if fn0 else fn1, mode=open_files.mode)
-            for fn0, fn1 in zip(details, downfn0)
-        ]
+        streams = []
+        for of, path in zip(open_files, source_paths):
+            # always a fresh binary descriptor: independent read position, and
+            # text/compression wrappers are applied by the OpenFile itself
+            streams.append(
+                open(os.path.join(self.storage[-1], cache_names[path]), "rb")
+            )
+        return streams
 
     def commit_many(self, open_files):
         self.fs.put([f.fn for f in open_files], [f.path for f in open_files])
@@ -718,7 +815,10 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         self._cache_size = None
 
     def _make_local_details(self, path, uid=None):
-        hash = self._mapper(path)
+        # Honor a cache filename already assigned (and persisted) by open_many
+        # while resolving a same_names basename collision.
+        existing = self._metadata.cached_files[-1].get(path)
+        hash = existing["fn"] if existing and existing.get("fn") else self._mapper(path)
         fn = os.path.join(self.storage[-1], hash)
         detail = {
             "original": path,
@@ -998,6 +1098,49 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
             fn = os.path.join(storage, sha)
             if os.path.exists(fn):
                 return fn
+
+    def open_many(self, open_files, **kwargs):
+        source_paths = [self._strip_protocol(of._cache_path()) for of in open_files]
+
+        if "r" not in open_files[0].mode:
+            return [
+                LocalTempFile(
+                    self.fs,
+                    path,
+                    mode=of.mode,
+                    autocommit=not self._intrans,
+                    fn=os.path.join(self.storage[-1], self._mapper(path)),
+                    **kwargs,
+                )
+                for of, path in zip(open_files, source_paths)
+            ]
+
+        self._mkcache()
+        unique_paths = list(dict.fromkeys(source_paths))
+        missing = [p for p in unique_paths if not self._check_file(p)]
+
+        if missing:
+            from fsspec.implementations.cache_lock import cache_locks
+
+            locks = cache_locks(self.storage[-1])
+            cache_names = {p: self._mapper(p) for p in missing}
+            with ExitStack() as stack:
+                for name in sorted(cache_names.values()):
+                    stack.enter_context(locks(name))
+                still_missing = [p for p in missing if not self._check_file(p)]
+                if still_missing:
+                    downfn = [
+                        os.path.join(self.storage[-1], cache_names[p])
+                        for p in still_missing
+                    ]
+                    _atomic_get(
+                        self.fs, still_missing, downfn, callback=self.callback
+                    )
+
+        # a fresh descriptor per OpenFile, each with its own read position
+        return [
+            open(self._check_file(path), "rb") for path in source_paths
+        ]
 
     def save_cache(self):
         pass

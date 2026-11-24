@@ -95,11 +95,39 @@ class OpenFile:
     def __repr__(self):
         return f"<OpenFile '{self.path}'>"
 
-    def __enter__(self):
+    def _cache_fs(self):
+        # The outermost filesystem that can fetch a whole batch at once. For a
+        # DirFileSystem this is the wrapped filesystem, but the descriptor is
+        # always requested through this OpenFile's own chain, never another
+        # station's.
+        return self._cache_fs_from(self.fs)
+
+    @classmethod
+    def _cache_fs_from(cls, fs):
+        while not hasattr(fs, "open_many"):
+            inner = getattr(fs, "fs", None)
+            if inner is None:
+                return None
+            fs = inner
+        return fs
+
+    def _cache_path(self):
+        # The path the caching filesystem sees: DirFileSystem joins its root
+        # onto the (possibly relative) path of this OpenFile.
+        if hasattr(self.fs, "open_many"):
+            return self.fs._strip_protocol(self.path)
+        if hasattr(self.fs, "_join"):
+            return self.fs._join(self.path)
+        return self.path
+
+    def __enter__(self, descriptor=None):
         mode = self.mode.replace("t", "").replace("b", "") + "b"
 
         try:
-            f = self.fs.open(self.path, mode=mode)
+            if descriptor is None:
+                f = self.fs.open(self.path, mode=mode)
+            else:
+                f = descriptor
         except FileNotFoundError as e:
             if has_magic(self.path):
                 raise FileNotFoundError(
@@ -138,14 +166,14 @@ class OpenFile:
     def full_name(self):
         return _unstrip_protocol(self.path, self.fs)
 
-    def open(self):
+    def open(self, descriptor=None):
         """Materialise this as a real open file without context
 
         The OpenFile object should be explicitly closed to avoid enclosed file
         instances persisting. You must, therefore, keep a reference to the OpenFile
         during the life of the file-like it generates.
         """
-        return self.__enter__()
+        return self.__enter__(descriptor)
 
     def close(self):
         """Close all encapsulated file objects"""
@@ -180,48 +208,73 @@ class OpenFiles(list):
         self.mode = mode
         self.fs = fs
         self.files = []
+        self._write_groups = []
         super().__init__(*args)
 
     def __enter__(self):
         if self.fs is None:
             raise ValueError("Context has already been used")
 
-        fs = self.fs
-        while True:
-            if hasattr(fs, "open_many"):
-                # check for concurrent cache download; or set up for upload
-                self.files = fs.open_many(self)
-                return self.files
-            if hasattr(fs, "fs") and fs.fs is not None:
-                fs = fs.fs
-            else:
-                break
-        with ExitStack() as stack:
-            files = [stack.enter_context(s) for s in self]
-            # All files opened: transfer cleanup to OpenFiles.__exit__ so they
-            # stay open after this temporary entry-failure guard exits.
-            stack.pop_all()
-            return files
+        # Group OpenFiles by the caching filesystem that can fetch their raw
+        # descriptors in one bulk operation. Each OpenFile keeps its own
+        # fs/path pair, so a relative path under one DirFileSystem can never
+        # be resolved against another station's filesystem.
+        groups = {}
+        for open_file in self:
+            cache_fs = open_file._cache_fs()
+            if cache_fs is None:
+                continue
+            is_read = "r" in open_file.mode
+            groups.setdefault((id(cache_fs), is_read), [cache_fs, is_read, []])[
+                2
+            ].append(open_file)
+
+        descriptor_of = {}
+        fetched = []  # (OpenFile, raw descriptor) pairs
+        handed_off = set()  # descriptors now owned by an OpenFile wrapper
+        self._write_groups = []
+        try:
+            for cache_fs, is_read, members in groups.values():
+                streams = cache_fs.open_many(members)
+                if not is_read:
+                    self._write_groups.append((cache_fs, streams))
+                for open_file, stream in zip(members, streams):
+                    descriptor_of[id(open_file)] = stream
+                    fetched.append((open_file, stream))
+
+            files = []
+            for open_file in self:
+                descriptor = descriptor_of.get(id(open_file))
+                if descriptor is not None and "r" not in open_file.mode:
+                    # write descriptors are returned unwrapped, as before
+                    files.append(descriptor)
+                    handed_off.add(id(open_file))
+                else:
+                    files.append(open_file.open(descriptor))
+                    handed_off.add(id(open_file))
+        except BaseException:
+            # Close fetched descriptors that were never handed to an OpenFile,
+            # including handles opened later in the batch than the failing
+            # OpenFile. Wrapped chains are torn down via their OpenFile.
+            for open_file, stream in fetched:
+                if id(open_file) not in handed_off:
+                    stream.close()
+            for open_file in self:
+                open_file.close()
+            raise
+
+        self.files = files
+        return files
 
     def __exit__(self, *args):
-        fs = self.fs
         with ExitStack() as stack:
-            if "r" in self.mode:
-                # open_many() returns files without populating the OpenFile objects.
-                for f in reversed(self.files):
-                    stack.callback(f.close)
-            for s in reversed(self):
-                stack.callback(s.close)
+            for open_file in reversed(self):
+                stack.callback(open_file.close)
         if "r" not in self.mode:
-            while True:
-                if hasattr(fs, "open_many"):
-                    # check for concurrent cache upload
-                    fs.commit_many(self.files)
-                    return
-                if hasattr(fs, "fs") and fs.fs is not None:
-                    fs = fs.fs
-                else:
-                    break
+            for cache_fs, streams in self._write_groups:
+                # grouped concurrent cache upload
+                cache_fs.commit_many(streams)
+        self._write_groups = []
 
     def __getitem__(self, item):
         out = super().__getitem__(item)
