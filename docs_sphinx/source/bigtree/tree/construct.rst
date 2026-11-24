@@ -67,6 +67,23 @@ Under the hood, they have the following dependency,
    :target: https://github.com/kayjan/bigtree/raw/master/assets/docs/tree_construct.png
    :alt: Tree Constructor Dependency Diagram
 
+Newick Cleaning
+---------------
+
+Use `clean_newick` as the single entry point for Newick inputs from different producers. It accepts a filename, raw
+Newick text, or a list mixing both, and returns one root per tree in input order.
+
+.. code-block:: python
+
+    from bigtree import clean_newick
+
+    roots = clean_newick(["lab_a.nwk", "lab_b.nwk"])
+
+Quoted labels containing ``(``, ``)``, ``;``, ``,``, or ``:`` are preserved. Multiple trees per file, trailing
+``;``, internal-node annotations, and branch lengths are supported. Duplicate sibling labels are kept when their
+sample codes differ; duplicate leaf values of `code_attr` (default ``"code"``) raise `NewickError` unless
+`allow_duplicate_codes=True`. The error exposes `source`, `tree_index`, `line`, `column`, `label`, and `code`.
+
 .. automodule:: bigtree.tree.construct
    :members:
    :show-inheritance:

@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added:
 - Dos: Default doctest in github workflows and `pytest` commands.
+- Tree Construct: `clean_newick`, `clean_newick_file`, `clean_newick_files`, `newick_to_trees`, and `read_newick`
+  to load one or more Newick files through a single interface, including quoted labels, duplicate leaf labels with
+  distinct sample codes, multiple trees per file, and trailing tree terminators.
+- Tree Construct: `NewickError` exposing `source`, `tree_index`, `line`, `column`, `label`, and `code` for
+  source-located Newick handoff failures.
 ### Fixed:
 - Stubs: Signature for tree.query.
+- Tree Construct: `newick_to_tree` to parse quoted labels with parentheses/semicolons, duplicate sibling leaf labels,
+  and trailing semicolons.
+- Tree Export: `tree_to_newick` to preserve an explicit length of `0` and omit nodes without a length instead of
+  raising an error, so round-trips keep zero and absent branch lengths distinct.
 
 ## [1.5.3] - 2026-07-17
 ### Added:

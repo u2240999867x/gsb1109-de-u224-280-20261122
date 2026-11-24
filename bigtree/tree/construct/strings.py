@@ -188,7 +188,18 @@ def str_to_tree(
     return root_node
 
 
-def newick_to_tree(
+def _needs_source_aware_parser(tree_string: str) -> bool:
+    """Check for a Newick tree terminator outside quoted labels."""
+    quote = False
+    for character in tree_string:
+        if character == constants.NewickCharacter.ATTR_QUOTE:
+            quote = not quote
+        elif character == ";" and not quote:
+            return True
+    return False
+
+
+def _newick_to_tree_legacy(
     tree_string: str,
     length_attr: str = "length",
     attr_prefix: str = "&&NHX:",
@@ -325,9 +336,9 @@ def newick_to_tree(
                 _raise_value_error(tree_string_idx)
             if cumulative_string:
                 _raise_value_error(tree_string_idx)
-            assert (
-                not cumulative_string_value
-            ), f"{state_title}, should not have cumulative_string_value"
+            assert not cumulative_string_value, (
+                f"{state_title}, should not have cumulative_string_value"
+            )
             tree_string_idx += 1
             continue
 
@@ -363,9 +374,9 @@ def newick_to_tree(
             if character == constants.NewickCharacter.NODE_SEP:
                 current_node = None
             cumulative_string = ""
-            assert (
-                not cumulative_string_value
-            ), f"{state_title}, should not have cumulative_string_value"
+            assert not cumulative_string_value, (
+                f"{state_title}, should not have cumulative_string_value"
+            )
             tree_string_idx += 1
             continue
 
@@ -393,9 +404,9 @@ def newick_to_tree(
             assert current_node, f"{state_title}, should have current_node"
             if not cumulative_string:
                 _raise_value_error(tree_string_idx)
-            assert (
-                not cumulative_string_value
-            ), f"{state_title}, should not have cumulative_string_value"
+            assert not cumulative_string_value, (
+                f"{state_title}, should not have cumulative_string_value"
+            )
             tree_string_idx += 1
             continue
 
@@ -413,13 +424,15 @@ def newick_to_tree(
                 if cumulative_string:
                     _raise_value_error(tree_string_idx)
                 cumulative_string = tree_string[
-                    tree_string_idx + 1 : quote_end_idx  # noqa: E203
+                    tree_string_idx
+                    + 1 : quote_end_idx  # noqa: E203
                 ]
             else:
                 if cumulative_string_value:
                     _raise_value_error(tree_string_idx)
                 cumulative_string_value = tree_string[
-                    tree_string_idx + 1 : quote_end_idx  # noqa: E203
+                    tree_string_idx
+                    + 1 : quote_end_idx  # noqa: E203
                 ]
             tree_string_idx = quote_end_idx + 1
             continue
@@ -444,9 +457,9 @@ def newick_to_tree(
                     current_depth,
                 )
                 cumulative_string = ""
-                assert (
-                    not cumulative_string_value
-                ), f"{state_title}, should not have cumulative_string_value"
+                assert not cumulative_string_value, (
+                    f"{state_title}, should not have cumulative_string_value"
+                )
                 tree_string_idx += 1
                 continue
             else:
@@ -478,6 +491,110 @@ def newick_to_tree(
         current_depth,
     )
     return current_node
+
+
+def newick_to_tree(
+    tree_string: str,
+    length_attr: str = "length",
+    attr_prefix: str = "&&NHX:",
+    node_type: type[T] = node.Node,  # type: ignore[assignment]
+    *,
+    code_attr: str | None = None,
+    allow_duplicate_codes: bool = False,
+    attr_sep: str = ":",
+) -> T:
+    """Construct tree from Newick notation, return root of tree.
+
+    This is the single-tree compatibility wrapper around the source-aware
+    Newick parser. It first uses the original parser so existing error
+    messages and indices stay stable, then falls back to the source-aware
+    parser for Newick files with tree terminators, duplicate sibling labels,
+    quoted labels, or annotations in a different order.
+
+    Args:
+        tree_string: Newick notation, or path to an existing Newick file
+        length_attr: attribute name to store node length, optional
+        attr_prefix: prefix before all attributes, within square bracket, used to detect attributes
+        node_type: node type of tree to be created
+        code_attr: leaf attribute identifying a sample; when given, duplicate
+            leaf values raise a source-aware `NewickError`
+        allow_duplicate_codes: allow duplicate ``code_attr`` values
+        attr_sep: separator between attributes inside square brackets
+
+    Returns:
+        Node
+    """
+    import os
+
+    from bigtree.tree.construct.newick import newick_to_trees
+
+    source = None
+    if isinstance(tree_string, str) and os.path.isfile(tree_string):
+        source = tree_string
+        with open(tree_string, "r", encoding="utf-8") as file_handle:
+            tree_string = file_handle.read()
+
+    def _from_cleaner() -> T:
+        trees = newick_to_trees(
+            tree_string,
+            length_attr=length_attr,
+            attr_prefix=attr_prefix,
+            node_type=node_type,
+            code_attr=code_attr,
+            allow_duplicate_codes=allow_duplicate_codes,
+            attr_sep=attr_sep,
+            source=source,
+        )
+        if len(trees) != 1:
+            raise ValueError(
+                f"Expected a single Newick tree, received {len(trees)} trees; "
+                f"use `newick_to_trees` or `clean_newick` for multiple trees"
+            )
+        return trees[0]
+
+    if _needs_source_aware_parser(tree_string):
+        try:
+            return _from_cleaner()
+        except exceptions.NewickError:
+            raise
+        except Exception:
+            pass
+
+    try:
+        newick_tree = _newick_to_tree_legacy(
+            tree_string,
+            length_attr=length_attr,
+            attr_prefix=attr_prefix,
+            node_type=node_type,
+        )
+    except exceptions.TreeError as legacy_error:
+        if "Duplicate node with same path" not in str(legacy_error):
+            raise
+        try:
+            return _from_cleaner()
+        except Exception:
+            raise legacy_error from None
+    except ValueError as legacy_error:
+        if not _needs_source_aware_parser(tree_string):
+            raise
+        try:
+            return _from_cleaner()
+        except exceptions.NewickError:
+            raise
+        except Exception:
+            raise legacy_error from None
+
+    if code_attr and not allow_duplicate_codes:
+        from bigtree.tree.construct.newick import validate_newick_codes
+
+        validate_newick_codes(
+            tree_string,
+            code_attr=code_attr,
+            allow_duplicate_codes=allow_duplicate_codes,
+            attr_prefix=attr_prefix,
+            attr_sep=attr_sep,
+        )
+    return newick_tree
 
 
 @exceptions.optional_dependencies_rich

@@ -189,6 +189,10 @@ class Tree:
         length_attr: str = "length",
         attr_prefix: str = "&&NHX:",
         node_type: type[NodeT] = _node.Node,  # type: ignore[assignment]
+        *,
+        code_attr: str | None = None,
+        allow_duplicate_codes: bool = False,
+        attr_sep: str = ":",
     ) -> Tree: ...
     @classmethod
     def from_rich(

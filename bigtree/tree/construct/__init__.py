@@ -16,6 +16,17 @@ from .dictionaries import (
     nested_dict_to_tree,
 )
 from .lists import list_to_tree, list_to_tree_by_relation
+from .newick import (
+    clean_newick,
+    clean_newick_file,
+    clean_newick_files,
+    newick_file_to_trees,
+    newick_files_to_trees,
+    newick_to_trees,
+    read_newick,
+    read_newick_file,
+    read_newick_files,
+)
 from .render import render_tree
 from .strings import add_path_to_tree, newick_to_tree, rich_to_tree, str_to_tree
 
@@ -38,6 +49,15 @@ __all__ = [
     "render_tree",
     "add_path_to_tree",
     "newick_to_tree",
+    "newick_to_trees",
+    "newick_file_to_trees",
+    "newick_files_to_trees",
+    "read_newick",
+    "read_newick_file",
+    "read_newick_files",
+    "clean_newick",
+    "clean_newick_file",
+    "clean_newick_files",
     "rich_to_tree",
     "str_to_tree",
 ]

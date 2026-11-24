@@ -41,6 +41,80 @@ class SearchError(TreeError):
     pass
 
 
+class NewickError(ValueError):
+    """Error during Newick construction, with optional source location.
+
+    The class inherits from :class:`ValueError` for backwards compatibility with
+    the existing Newick parser. ``message`` keeps the plain message, while
+    ``str(error)`` appends the source, tree number, line, column, and label when
+    ``context=True``. ``source``, ``tree_index``, ``line``, ``column``, and
+    ``label`` expose the original file position so callers can report which
+    tree/label failed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        index: int | None = None,
+        line: int | None = None,
+        column: int | None = None,
+        tree_index: int | None = None,
+        tree_label: str | None = None,
+        label: str | None = None,
+        code: object | None = None,
+        source: str | None = None,
+        context: bool = False,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.index = index
+        self.line = line
+        self.column = column
+        self.tree_index = tree_index
+        self.tree_label = tree_label
+        self.label = label
+        self.code = code
+        self.source = source
+        self.context = context
+
+    @property
+    def tree(self) -> int | None:
+        """Alias for ``tree_index``."""
+        return self.tree_index
+
+    @property
+    def filename(self) -> str | None:
+        """Alias for ``source``."""
+        return self.source
+
+    @property
+    def position(self) -> tuple[int | None, int | None]:
+        """Line and column of the error in the original source."""
+        return self.line, self.column
+
+    def __str__(self) -> str:
+        if not self.context:
+            return self.message
+        location = []
+        if self.source:
+            location.append(f"source {self.source}")
+        if self.tree_index is not None:
+            tree = f"tree {self.tree_index}"
+            if self.tree_label:
+                tree += f" {self.tree_label!r}"
+            location.append(tree)
+        if self.line is not None:
+            location.append(f"line {self.line}")
+        if self.column is not None:
+            location.append(f"column {self.column}")
+        if self.label is not None:
+            location.append(f"label {self.label!r}")
+        if not location:
+            return self.message
+        return f"{self.message} ({', '.join(location)})"
+
+
 def safe_action(func: Callable[..., None]) -> Callable[..., None]:  # pragma: no cover
     """
     This is a decorator for studio which performs safe actions and raises error in notify pop-up.

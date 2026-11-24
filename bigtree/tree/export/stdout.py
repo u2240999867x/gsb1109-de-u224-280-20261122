@@ -1280,6 +1280,9 @@ def tree_to_newick(
         >>> tree_to_newick(root, length_attr="age", attr_list=["species"])
         '((d:40[&&NHX:species=human],e:35[&&NHX:species=human])b:65[&&NHX:species=human],c:60[&&NHX:species=human])a[&&NHX:species=human]'
 
+    A length of `0` is exported as `0`; nodes with no length are omitted so a
+    later round-trip keeps zero and absent lengths distinct.
+
     Args:
         tree: tree to be exported
         intermediate_node_name: indicator if intermediate nodes have node names
@@ -1299,6 +1302,15 @@ def tree_to_newick(
     if isinstance(attr_sep, constants.NewickCharacter):
         attr_sep = attr_sep.value
 
+    if length_attr:
+        non_root_nodes = [
+            _node for _node in [tree, *tree.descendants] if not _node.is_root
+        ]
+        if non_root_nodes and all(
+            _node.get_attr(length_attr) is None for _node in non_root_nodes
+        ):
+            raise ValueError(f"Length attribute does not exist for node {tree}")
+
     def _serialize(item: Any) -> Any:
         """Serialise item if it contains special Newick characters.
 
@@ -1308,45 +1320,40 @@ def tree_to_newick(
         Returns:
             Serialised item
         """
-        if isinstance(item, str) and set(item).intersection(
-            constants.NewickCharacter.values()
+        if isinstance(item, str) and (
+            set(item).intersection(constants.NewickCharacter.values()) or ";" in item
         ):
             item = f"""'{item.replace(constants.NewickCharacter.ATTR_QUOTE, '"')}'"""
         return item
 
-    node_name_str = ""
-    if intermediate_node_name or (not intermediate_node_name and tree.is_leaf):
-        node_name_str = _serialize(tree.node_name)
-    if length_attr and not tree.is_root:
-        if not tree.get_attr(length_attr):
-            raise ValueError(f"Length attribute does not exist for node {tree}")
-        node_name_str += f"{length_sep}{tree.get_attr(length_attr)}"
+    def _tree_to_newick(_tree: T) -> str:
+        """Recursively serialise a subtree, omitting absent lengths."""
+        if not _tree:
+            return ""
+        node_name_str = ""
+        if intermediate_node_name or (not intermediate_node_name and _tree.is_leaf):
+            node_name_str = _serialize(_tree.node_name)
+        if length_attr and not _tree.is_root:
+            length = _tree.get_attr(length_attr)
+            if length is not None:
+                node_name_str += f"{length_sep}{length}"
 
-    attr_str = ""
-    if attr_list:
-        attr_str = attr_sep.join(
-            [
-                f"{_serialize(k)}={_serialize(tree.get_attr(k))}"
-                for k in attr_list
-                if tree.get_attr(k)
-            ]
-        )
-        if attr_str:
-            attr_str = f"[{attr_prefix}{attr_str}]"
+        attr_str = ""
+        if attr_list:
+            attr_str = attr_sep.join(
+                [
+                    f"{_serialize(k)}={_serialize(_tree.get_attr(k))}"
+                    for k in attr_list
+                    if _tree.get_attr(k) is not None
+                ]
+            )
+            if attr_str:
+                attr_str = f"[{attr_prefix}{attr_str}]"
 
-    if tree.is_leaf:
-        return f"{node_name_str}{attr_str}"
+        if _tree.is_leaf:
+            return f"{node_name_str}{attr_str}"
 
-    children_newick = ",".join(
-        tree_to_newick(
-            child,
-            intermediate_node_name=intermediate_node_name,
-            length_attr=length_attr,
-            length_sep=length_sep,
-            attr_list=attr_list,
-            attr_prefix=attr_prefix,
-            attr_sep=attr_sep,
-        )
-        for child in tree.children
-    )
-    return f"({children_newick}){node_name_str}{attr_str}"
+        children_newick = ",".join(_tree_to_newick(child) for child in _tree.children)
+        return f"({children_newick}){node_name_str}{attr_str}"
+
+    return _tree_to_newick(tree)
