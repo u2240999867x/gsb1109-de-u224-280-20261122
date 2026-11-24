@@ -254,3 +254,61 @@ Once you have a PeriodicDataFrame defined using such callbacks, you
 can then use all the rest of the functionality supported by streamz,
 including aggregations, rolling windows, etc., and streaming
 `visualization. <plotting>`_
+
+Aligning branches by original-item provenance
+---------------------------------------------
+
+When a pipeline splits each original record into nested items (for example
+waybills into shipping boxes, and boxes into fees) and processes those
+items on independent branches, joining the branches back together by
+display values (Pandas index, business keys) is ambiguous: those values
+may repeat across batches.  The ``streamz.dataframe.provenance`` module
+offers an opt-in alternative that aligns the branches by the original
+items their rows came from.
+
+``ProvenanceDataFrame`` behaves like a regular streaming dataframe, but
+every emitted partition carries its rows' provenance in the stream
+metadata rather than in table columns.  Row-preserving operations
+(projection, ``reset_index``, ``assign``, ...) keep the provenance
+automatically, ``query`` and ``explode`` transform it accordingly, and
+custom partition functions that change row correspondence can declare it
+explicitly:
+
+.. code-block:: python
+
+   from streamz.dataframe.provenance import (ProvenanceDataFrame, Attach,
+                                             align)
+
+   boxes = ProvenanceDataFrame(example=example)
+   fees = ProvenanceDataFrame(example=example)
+   insurance = ProvenanceDataFrame(example=example)
+
+   shipped = (boxes.query("status == 'active'")
+                   .explode('boxes')
+                   .query("shipped")
+                   .map_partitions(lambda df: df.iloc[::-1],
+                                   provenance=lambda rec, x, res: rec.take(
+                                       range(len(x) - 1, -1, -1)))
+                   .reset_index())
+
+   combined = align(shipped, attach=[
+       Attach(fees.explode('boxes').explode('fee'),
+              column='fee', into='fees', kind='collect'),
+       Attach(insurance, column='insurance', into='insurance',
+              kind='broadcast'),
+   ])
+
+``align`` buffers each branch per batch and emits one combined partition
+per batch, exactly once, after every branch confirmed the batch complete
+(``emit(..., final=True)``).  Each base row receives the values collected
+from its own descendant rows (ordered by their original positions) and the
+scalar values of its ancestor rows.  Rows that reference original items
+which do not exist are reported on ``combined.errors`` together with the
+offending batch and original position; their batch is dropped without
+partial results while later batches proceed normally.
+
+Because provenance lives in the metadata channel, downstream ``query``,
+column projection and ``reset_index`` work as usual, and inspectors can
+still trace every emitted row back to its original batch, original item
+and original position with ``provenance_of(combined)``.  Table operations
+that do not opt into this usage are unaffected.
