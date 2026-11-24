@@ -29,6 +29,12 @@ def getitem(x, key):
     if isinstance(mask, SparseArray) and mask.dtype == np.bool_:
         return GCXS.from_coo(x.tocoo()[mask])
 
+    # Tuple indices combining sparse masks or sparse integer arrays with
+    # basic indices are evaluated on the COO form without densifying them.
+    if isinstance(key, tuple) and any(isinstance(k, SparseArray) for k in key):
+        result = x.tocoo()[key]
+        return GCXS.from_coo(result) if isinstance(result, SparseArray) else result
+
     if x.ndim == 1:
         result = x.tocoo()[key]
         if np.isscalar(result):

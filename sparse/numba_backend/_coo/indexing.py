@@ -5,7 +5,7 @@ import numba
 
 import numpy as np
 
-from .._slicing import advanced_index_axis, normalize_index
+from .._slicing import advanced_index_axis, check_index, clip_slice, normalize_index, posify_index, replace_none
 from .._utils import _zero_of_dtype, equivalent
 
 
@@ -35,6 +35,11 @@ def getitem(x, index):
         mask = COO.from_numpy(np.asarray(mask))
     if isinstance(mask, SparseArray) and mask.dtype == np.bool_:
         return _boolean_index(x, mask.asformat("coo"))
+
+    # Tuple indices may combine a sparse boolean mask and sparse integer
+    # arrays with basic indices, e.g. x[mask, ::-1, category].
+    if isinstance(index, tuple) and any(isinstance(ind, SparseArray) for ind in index):
+        return _mixed_sparse_index(x, index)
 
     # If string, this is an index into an np.void
 
@@ -197,6 +202,314 @@ def _boolean_index(x, mask):
         sorted=True,
         fill_value=x.fill_value,
     )
+
+
+def _mixed_sparse_index(x, index):
+    """
+    Index with a tuple that contains sparse index arrays.
+
+    A sparse boolean array masks the axes it covers, keeping the positions
+    where its (possibly implicit) value is True. Sparse integer arrays pair
+    with the mask's selection position-by-position, like dense integer arrays
+    in NumPy's advanced indexing, but evaluate to their fill value everywhere
+    except at their stored coordinates. Neither kind of index is densified and
+    no Cartesian product is formed, so selections over huge axes stay compact.
+    """
+    from .common import linear_loc
+    from .core import COO
+
+    index = _normalize_mixed_index(index, x.shape)
+
+    # Locate the advanced components: one sparse boolean mask plus any number
+    # of integer arrays (sparse or dense).
+    mask = None
+    mask_pos = mask_axis = None
+    int_indices = []
+    adv_positions = []
+    axis = 0
+    for pos, ind in enumerate(index):
+        if ind is None:
+            continue
+        if isinstance(ind, COO):
+            if mask is not None:
+                raise NotImplementedError("Only one sparse boolean mask is supported per index.")
+            mask, mask_pos, mask_axis = ind, pos, axis
+            adv_positions.append(pos)
+            axis += ind.ndim
+        elif isinstance(ind, _SparseIntIndex | np.ndarray):
+            int_indices.append((axis, ind))
+            adv_positions.append(pos)
+            axis += 1
+        else:
+            axis += 1
+
+    if mask is None:
+        raise NotImplementedError("Sparse integer index arrays are only supported together with a sparse boolean mask.")
+
+    # Stored mask entries that differ from the fill value select (fill False)
+    # or exclude (fill True) their positions; implicit entries are never listed.
+    mask_loc = np.asarray(mask.linear_loc()[mask.data != mask.fill_value], dtype=np.intp)
+    count = mask.size - mask_loc.size if mask.fill_value else mask_loc.size
+
+    # Pair every integer index with the selection, without expanding it.
+    specs = [(ax, _broadcast_int_index(ind, count)) for ax, ind in int_indices]
+
+    coords = x.coords
+    nnz = coords.shape[1]
+    locs = np.asarray(linear_loc(coords[mask_axis : mask_axis + mask.ndim], mask.shape), dtype=np.intp)
+    ranks = np.searchsorted(mask_loc, locs)
+    in_bounds = ranks < mask_loc.size
+    matches = np.zeros(nnz, dtype=bool)
+    matches[in_bounds] = mask_loc[ranks[in_bounds]] == locs[in_bounds]
+    if mask.fill_value:
+        keep = ~matches
+        adv_pos = locs - ranks
+    else:
+        keep = matches
+        adv_pos = ranks
+
+    # Excluded entries may rank past the end of the selection; their lookups
+    # are clipped away and discarded by ``keep`` anyway.
+    if count:
+        safe_pos = np.minimum(adv_pos, count - 1)
+        for ax, (kind, payload) in specs:
+            c = coords[ax]
+            if kind == "scalar":
+                keep &= c == payload
+            elif kind == "dense":
+                keep &= c == payload[safe_pos]
+            else:
+                keep &= c == _sparse_index_values(payload, adv_pos)
+
+    axis = 0
+    for ind in index:
+        if ind is None:
+            continue
+        if isinstance(ind, Integral):
+            keep &= coords[axis] == ind
+            axis += 1
+        elif isinstance(ind, slice):
+            if ind != slice(0, x.shape[axis], 1):
+                c = coords[axis].astype(np.intp)
+                if ind.step > 0:
+                    keep &= (c >= ind.start) & (c < ind.stop) & ((c - ind.start) % ind.step == 0)
+                else:
+                    keep &= (c <= ind.start) & (c > ind.stop) & ((c - ind.start) % ind.step == 0)
+            axis += 1
+        elif isinstance(ind, COO):
+            axis += ind.ndim
+        else:
+            axis += 1
+
+    n = int(np.count_nonzero(keep))
+
+    # NumPy keeps the advanced dimensions where the first advanced index is
+    # when they are adjacent, and moves them to the front otherwise.
+    first_adv = min(adv_positions)
+    contiguous = all(pos in adv_positions for pos in range(first_adv, max(adv_positions) + 1))
+
+    rows = []
+    shape = []
+    adv_row = None
+    axis = 0
+    for ind in index:
+        if ind is None:
+            rows.append(np.zeros(n, dtype=np.intp))
+            shape.append(1)
+        elif isinstance(ind, Integral):
+            axis += 1
+        elif isinstance(ind, slice):
+            rows.append((coords[axis][keep].astype(np.intp) - ind.start) // ind.step)
+            shape.append(len(range(ind.start, ind.stop, ind.step)))
+            axis += 1
+        else:
+            if adv_row is None:
+                adv_row = len(rows)
+                rows.append(adv_pos[keep])
+                shape.append(count)
+            axis += ind.ndim if isinstance(ind, COO) else 1
+
+    if not contiguous:
+        rows.insert(0, rows.pop(adv_row))
+        shape.insert(0, shape.pop(adv_row))
+
+    out_coords = np.empty((len(rows), n), dtype=np.intp)
+    for i, row in enumerate(rows):
+        out_coords[i] = row
+
+    # The selection position is monotonic in the (sorted) coordinates as long
+    # as no advanced index comes before the mask and no varying axis resets
+    # the mask's linearized locations before they are emitted.
+    before_mask = index[:mask_pos]
+    if any(isinstance(ind, COO | _SparseIntIndex | np.ndarray) for ind in before_mask):
+        adv_monotonic = False
+    elif contiguous:
+        adv_monotonic = True
+    else:
+        adv_monotonic = not any(isinstance(ind, slice) for ind in before_mask)
+    is_sorted = adv_monotonic and not any(isinstance(ind, slice) and ind.step < 0 for ind in index)
+
+    return COO(
+        out_coords,
+        x.data[keep],
+        shape=tuple(shape),
+        has_duplicates=False,
+        sorted=is_sorted,
+        fill_value=x.fill_value,
+    )
+
+
+def _normalize_mixed_index(index, shape):
+    """Normalize a tuple index to canonical form, keeping sparse index arrays unevaluated."""
+    from .._sparse_array import SparseArray
+    from .core import COO
+
+    prepared = []
+    for ind in index:
+        if isinstance(ind, SparseArray | slice | Integral) or ind is None or ind is Ellipsis:
+            prepared.append(ind)
+            continue
+        if not hasattr(ind, "dtype") and len(ind) == 0:
+            prepared.append(np.array([], dtype=np.intp))
+            continue
+        arr = np.asarray(ind)
+        if arr.dtype == np.bool_:
+            if arr.ndim == 0:
+                prepared.append(int(arr))
+            elif arr.ndim == 1:
+                # A dense boolean mask selects the same positions as a sparse one.
+                prepared.append(COO.from_numpy(arr))
+            else:
+                raise IndexError("Only one-dimensional boolean arrays can be combined with sparse index arrays.")
+        elif np.issubdtype(arr.dtype, np.integer):
+            prepared.append(arr)
+        else:
+            raise IndexError(
+                "only integers, slices (`:`), ellipsis (`...`), numpy.newaxis (`None`) and "
+                "integer or boolean arrays are valid indices"
+            )
+
+    n_axes = 0
+    for ind in prepared:
+        if ind is None or ind is Ellipsis:
+            continue
+        n_axes += ind.ndim if isinstance(ind, SparseArray) and ind.dtype == np.bool_ else 1
+    if sum(ind is Ellipsis for ind in prepared) > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    if n_axes > len(shape):
+        raise IndexError("Too many indices for array")
+    ellipsis_loc = next((i for i, ind in enumerate(prepared) if ind is Ellipsis), None)
+    if ellipsis_loc is not None:
+        prepared = prepared[:ellipsis_loc] + [slice(None)] * (len(shape) - n_axes) + prepared[ellipsis_loc + 1 :]
+    else:
+        prepared += [slice(None)] * (len(shape) - n_axes)
+
+    result = []
+    axis = 0
+    for ind in prepared:
+        if ind is None:
+            result.append(None)
+            continue
+        if isinstance(ind, SparseArray):
+            if ind.dtype == np.bool_:
+                if tuple(ind.shape) != tuple(shape[axis : axis + ind.ndim]):
+                    raise IndexError("boolean index did not match indexed array")
+                result.append(ind.asformat("coo"))
+                axis += ind.ndim
+            elif np.issubdtype(ind.dtype, np.integer):
+                result.append(_SparseIntIndex(ind.asformat("coo"), shape[axis]))
+                axis += 1
+            else:
+                raise IndexError(
+                    "only integers, slices (`:`), ellipsis (`...`), numpy.newaxis (`None`) and "
+                    "integer or boolean arrays are valid indices"
+                )
+            continue
+        dim = shape[axis]
+        check_index(ind, dim)
+        if isinstance(ind, slice):
+            ind = clip_slice(posify_index(dim, replace_none(ind, dim)), dim)
+        elif isinstance(ind, Integral):
+            ind = posify_index(dim, ind)
+        else:
+            ind = posify_index(dim, np.asarray(ind))
+        result.append(ind)
+        axis += 1
+    return result
+
+
+def _broadcast_int_index(ind, count):
+    """
+    Pair an integer index with a boolean selection of length ``count``.
+
+    The index is returned in a form that never expands to the selection
+    length: a scalar, a dense array that already has that length, or a sparse
+    array looked up by position.
+    """
+    if isinstance(ind, _SparseIntIndex):
+        if ind.shape == (count,):
+            return "sparse", ind
+        if ind.size == 1:
+            return "scalar", ind.scalar_value()
+    else:
+        if ind.shape == (count,):
+            return "dense", ind
+        if ind.size == 1:
+            return "scalar", ind.flat[0]
+    raise IndexError(
+        "shape mismatch: indexing arrays could not be broadcast together "
+        f"with shapes ({count},) {getattr(ind, 'shape', ())}"
+    )
+
+
+def _sparse_index_values(spec, positions):
+    """Look up ``positions`` in a sparse integer index without expanding it."""
+    if spec.coords.size == 0:
+        return np.full(positions.shape, spec.fill, dtype=np.intp)
+    idx = np.searchsorted(spec.coords, positions)
+    clipped = np.minimum(idx, spec.coords.size - 1)
+    found = spec.coords[clipped] == positions
+    return np.where(found, spec.data[clipped], spec.fill)
+
+
+class _SparseIntIndex:
+    """
+    A one-dimensional sparse integer index array.
+
+    Stored coordinates hold the exceptions; every other position selects
+    ``fill``. Values are validated and made positive at construction.
+    """
+
+    def __init__(self, arr, dim):
+        if arr.ndim != 1:
+            raise IndexError("Only one-dimensional sparse integer arrays are supported as indices.")
+        fill = arr.fill_value
+        if not isinstance(fill, Integral | np.integer):
+            if isinstance(fill, float | np.floating) and float(fill).is_integer():
+                fill = int(fill)
+            else:
+                raise IndexError("Sparse integer index arrays must have an integer fill value.")
+        self.coords = np.asarray(arr.coords[0], dtype=np.intp)
+        self.data = np.asarray(arr.data, dtype=np.intp)
+        self.shape = tuple(arr.shape)
+        self.size = arr.size
+        if dim == 0:
+            # An empty axis stores no entries, so the fill value is never used.
+            self.fill = 0
+            return
+        fill = int(fill)
+        if not -dim <= fill < dim:
+            raise IndexError(f"Index {fill:d} is out of bounds for dimension {dim:d}")
+        if ((self.data >= dim) | (self.data < -dim)).any():
+            raise IndexError(f"Index out of bounds for dimension {dim:d}")
+        self.fill = fill % dim
+        self.data = np.where(self.data < 0, self.data + dim, self.data)
+
+    def scalar_value(self):
+        """The single value of a size-one sparse index."""
+        if self.coords.size != 0 and self.coords[0] == 0:
+            return self.data[0]
+        return self.fill
 
 
 def _mask(coords, indices, shape):

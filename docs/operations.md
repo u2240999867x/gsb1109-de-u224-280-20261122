@@ -258,9 +258,33 @@ array([0, 0])
 
 Masks with either `False` or `True` fill values are supported without densifying
 either operand or listing the mask's implicit entries. GCXS uses a COO
-conversion for this operation. Combining sparse masks with other indices in
-one indexing operation, sparse integer indices, and assignment through a
-sparse mask are not supported.
+conversion for this operation. Assignment through a sparse mask is not supported.
+
+**Combining sparse masks with sparse integer indices**
+
+A sparse boolean mask can be combined with slices, integers, `None`, ellipses
+and index arrays in a single indexing operation. In particular, a sparse
+integer array can pair with the mask's selection position-by-position,
+following NumPy's advanced indexing rules: the *i*-th selected position of the
+mask is combined with the *i*-th entry of the integer array, and the broadcast
+dimensions move to the front when the advanced indices are separated by a
+slice, `None` or an ellipsis. A sparse integer index evaluates to its fill
+value everywhere except at its stored coordinates, so with a `True` mask fill
+and a zero integer fill only the exceptions are ever stored — neither index is
+densified and no Cartesian product is formed, even for axes with billions of
+entries. For example, `x[mask, ::-1, category]` pairs each kept leading
+position with its category and keeps the full reversed middle axis. Sparse
+integer indices require exactly one sparse boolean mask in the same index and
+must match the selection's length (or be broadcastable scalars); dense integer
+arrays may join the same pairing following the usual broadcasting rules.
+
+```python
+>>> x = sparse.COO.from_numpy(np.arange(5 * 3 * 2).reshape(5, 3, 2))
+>>> mask = sparse.COO([np.array([1])], [False], shape=(5,), fill_value=True)
+>>> category = sparse.COO([np.array([1, 3])], [1, 1], shape=(4,), fill_value=0)
+>>> x[mask, ::-1, category].shape  # rows (0, 0), (2, 1), (3, 0), (4, 1)
+(4, 3)
+```
 
 **Dense array indices**
 
@@ -283,7 +307,8 @@ z[np.array([[0], [2]]), np.array([1, 3, 1])]  # shape (2, 3, 7)
 z[np.array([[0], [2]]), :, np.array([1, 5])]  # shape (2, 2, 6)
 ```
 
-Sparse integer index arrays and assignment to COO arrays are not supported.
+Sparse integer index arrays are supported only together with a sparse boolean
+mask, as described above. Assignment to COO arrays is not supported.
 Multidimensional dense boolean masks are not covered by this integer indexing support.
 
 

@@ -336,6 +336,11 @@ class DOK(SparseArray, NDArrayOperatorsMixin):
         if not isinstance(key, tuple):
             key = (key,)
 
+        # Sparse index arrays are evaluated on the COO form without densifying them.
+        if any(isinstance(k, SparseArray) for k in key):
+            ret = self.asformat("coo")[key]
+            return ret.asformat("dok") if isinstance(ret, SparseArray) else ret
+
         if all(isinstance(k, Iterable) for k in key):
             if len(key) != self.ndim:
                 raise NotImplementedError(f"Index sequences for all {self.ndim} array dimensions needed!")
