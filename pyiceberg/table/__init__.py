@@ -58,6 +58,15 @@ from pyiceberg.manifest import (
 )
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table.changelog import (
+    ChangelogOperation as ChangelogOperation,
+)
+from pyiceberg.table.changelog import (
+    ChangelogScanTask as ChangelogScanTask,
+)
+from pyiceberg.table.changelog import (
+    IncrementalChangelogScan as IncrementalChangelogScan,
+)
 from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.labels import Labels
@@ -1594,6 +1603,61 @@ class Table:
             encryption_manager=self.encryption_manager,
         )
 
+    def incremental_changelog_scan(
+        self,
+        *,
+        from_snapshot_id_exclusive: int | None = None,
+        to_snapshot_id_inclusive: int | None = None,
+        row_filter: str | BooleanExpression = ALWAYS_TRUE,
+        selected_fields: tuple[str, ...] = ("*",),
+        case_sensitive: bool = True,
+        options: Properties = EMPTY_DICT,
+        limit: int | None = None,
+    ) -> IncrementalChangelogScan:
+        """Fetch an IncrementalChangelogScan based on the table's current metadata.
+
+        The changelog scan reports the row-level inserts and deletes that take effect between two
+        snapshots of the same branch. Identical rows are matched without a business key, so duplicate
+        rows with the same values are counted individually by multiplicity. Rewrites that only reorganize
+        files without changing the logical data produce no events.
+
+        Args:
+            from_snapshot_id_exclusive:
+                Optional ID of the snapshot establishing the starting row multiset, exclusively. If not set,
+                the scan starts from an empty table and includes every snapshot up to the end snapshot.
+            to_snapshot_id_inclusive:
+                Optional ID of the snapshot to end the scan at, inclusively. If not set, it defaults to the
+                table's current snapshot.
+            row_filter:
+                A string or BooleanExpression that describes the rows whose changes are reported. Columns used
+                only for filtering need not be included in ``selected_fields``.
+            selected_fields:
+                The column names to return. The result always includes an additional ``change_type`` column.
+            case_sensitive:
+                If True column matching is case sensitive.
+            options:
+                Additional Table properties as a dictionary of string key value pairs to use for this scan.
+            limit:
+                An integer representing the number of rows to return in the scan result. If None, fetches all
+                matching rows.
+
+        Returns:
+            An IncrementalChangelogScan based on the table's current metadata and provided parameters.
+        """
+        return IncrementalChangelogScan(
+            table_metadata=self.metadata,
+            io=self.io,
+            row_filter=row_filter,
+            selected_fields=selected_fields,
+            case_sensitive=case_sensitive,
+            from_snapshot_id=from_snapshot_id_exclusive,
+            from_snapshot_inclusive=False,
+            to_snapshot_id=to_snapshot_id_inclusive,
+            options=options,
+            limit=limit,
+            encryption_manager=self.encryption_manager,
+        )
+
     @property
     def format_version(self) -> TableVersion:
         return self.metadata.format_version
@@ -2142,6 +2206,19 @@ class StagedTable(Table):
         options: Properties = EMPTY_DICT,
         limit: int | None = None,
     ) -> IncrementalAppendScan:
+        raise ValueError("Cannot scan a staged table")
+
+    def incremental_changelog_scan(
+        self,
+        *,
+        from_snapshot_id_exclusive: int | None = None,
+        to_snapshot_id_inclusive: int | None = None,
+        row_filter: str | BooleanExpression = ALWAYS_TRUE,
+        selected_fields: tuple[str, ...] = ("*",),
+        case_sensitive: bool = True,
+        options: Properties = EMPTY_DICT,
+        limit: int | None = None,
+    ) -> IncrementalChangelogScan:
         raise ValueError("Cannot scan a staged table")
 
     def to_daft(self) -> daft.DataFrame:

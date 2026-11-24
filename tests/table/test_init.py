@@ -42,6 +42,7 @@ from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.serializers import ToOutputFile
 from pyiceberg.table import (
+    ChangelogOperation,
     CommitTableRequest,
     StagedTable,
     StaticTable,
@@ -709,6 +710,355 @@ def test_incremental_append_scan_staged_table_raises(table_v2: Table) -> None:
     )
     with pytest.raises(ValueError, match="Cannot scan a staged table"):
         staged_table.incremental_append_scan()
+
+
+def _build_changelog_bill_table(catalog: Catalog) -> tuple[Table, dict[str, int]]:
+    """Build a v2 table whose lineage exercises a rewrite, a position delete and an add-back.
+
+    Snapshots:
+        s0: two identical (amount=10, active) bills and one (amount=20, active) bill.
+        s1: a same-data rewrite that only reorganizes files; logical rows are unchanged.
+        s2: a position delete removing exactly one of the two identical amount=10 bills.
+        s3: an append adding one (amount=10, active) bill back.
+        s4: an overwrite that flips the amount=20 bill from active to archived.
+    """
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    schema = Schema(
+        NestedField(field_id=1, name="amount", field_type=IntegerType(), required=False),
+        NestedField(field_id=2, name="status", field_type=StringType(), required=False),
+    )
+    table = catalog.create_table("default.changelog_bills", schema=schema, properties={"format-version": "2"})
+
+    table.append(pa.table({"amount": pa.array([10, 10, 20], pa.int32()), "status": ["active", "active", "active"]}))
+    s0 = table.current_snapshot().snapshot_id
+
+    # A same-data rewrite: drop every live file and re-append identical rows in new files.
+    from pyiceberg.io.pyarrow import _dataframe_to_data_files
+
+    all_rows = table.scan().to_arrow()
+    with table.transaction() as transaction, transaction.update_snapshot().overwrite() as rewrite:
+        for task in table.scan().plan_files():
+            rewrite.delete_data_file(task.file)
+        for data_file in _dataframe_to_data_files(
+            table_metadata=table.metadata, df=all_rows, io=table.io, write_uuid=rewrite.commit_uuid
+        ):
+            rewrite.append_data_file(data_file)
+    table.refresh()
+    s1 = table.current_snapshot().snapshot_id
+
+    rewritten_file = next(iter(table.scan().plan_files())).file
+    commit_partition_position_delete(table, Record(), rewritten_file.file_path, pos=0, row={"amount": 10, "status": "active"})
+    table.refresh()
+    s2 = table.current_snapshot().snapshot_id
+
+    table.append(pa.table({"amount": pa.array([10], pa.int32()), "status": ["active"]}))
+    table.refresh()
+    s3 = table.current_snapshot().snapshot_id
+
+    table.overwrite(pa.table({"amount": pa.array([20], pa.int32()), "status": ["archived"]}), overwrite_filter="amount == 20")
+    table.refresh()
+    s4 = table.current_snapshot().snapshot_id
+
+    return table, {"s0": s0, "s1": s1, "s2": s2, "s3": s3, "s4": s4}
+
+
+def _changelog_events(scan: Any) -> list[tuple[Any, ...]]:
+    table = scan.to_arrow()
+    return sorted(tuple(row[column] for column in table.column_names) for row in table.to_pylist())
+
+
+def test_incremental_changelog_scan_full_range_filtered_and_projected(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    # Project only `amount`; filter on `status`, which is not part of the output.
+    scan = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s0"],
+        to_snapshot_id_inclusive=ids["s4"],
+        selected_fields=("amount",),
+        row_filter="status = 'active'",
+    )
+    result = scan.to_arrow()
+    assert result.schema.names == ["amount", "change_type"]
+    # One position delete of a matching duplicate, one add-back, and the amount=20 bill leaving the
+    # active set when it is archived. The same-data rewrite produces no event, so there is no double count.
+    assert _changelog_events(scan) == [(10, "delete"), (10, "insert"), (20, "delete")]
+
+
+def test_incremental_changelog_scan_rewrite_only_range_has_no_events(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    scan = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s0"],
+        to_snapshot_id_inclusive=ids["s1"],
+        selected_fields=("amount",),
+        row_filter="status = 'active'",
+    )
+    # The file-level plan still sees the rewritten file as one added and one deleted data file, but the
+    # row multiset reconciliation in to_arrow cancels them: a same-data rewrite emits no bill event.
+    assert {task.change_type for task in scan.plan_files()} == {
+        ChangelogOperation.INSERT,
+        ChangelogOperation.DELETE,
+    }
+    assert scan.to_arrow().num_rows == 0
+
+
+def test_incremental_changelog_scan_position_delete_range_emits_single_delete(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    scan = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s1"],
+        to_snapshot_id_inclusive=ids["s2"],
+        selected_fields=("amount",),
+        row_filter="status = 'active'",
+    )
+    # Two identical amount=10 rows exist; only the one targeted by the position delete leaves the set.
+    assert _changelog_events(scan) == [(10, "delete")]
+
+
+def test_incremental_changelog_scan_tracks_duplicates_by_multiplicity(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    add_back = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s2"],
+        to_snapshot_id_inclusive=ids["s3"],
+        selected_fields=("amount", "status"),
+        row_filter="status = 'active'",
+    )
+    assert _changelog_events(add_back) == [(10, "active", "insert")]
+
+
+def test_incremental_changelog_scan_filter_change_emits_on_both_sides_without_filter_column(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    # Without a filter, the active->archived flip is a delete plus an insert over the full row values.
+    unfiltered = table.incremental_changelog_scan(from_snapshot_id_exclusive=ids["s0"], to_snapshot_id_inclusive=ids["s4"])
+    assert _changelog_events(unfiltered) == [
+        (10, "active", "delete"),
+        (10, "active", "insert"),
+        (20, "active", "delete"),
+        (20, "archived", "insert"),
+    ]
+
+    # Filtering to archived rows only surfaces the entry into the archived set.
+    archived = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s0"],
+        to_snapshot_id_inclusive=ids["s4"],
+        selected_fields=("amount",),
+        row_filter="status = 'archived'",
+    )
+    assert _changelog_events(archived) == [(20, "insert")]
+
+
+def test_incremental_changelog_scan_empty_interval_reads_no_files(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    scan = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s2"], to_snapshot_id_inclusive=ids["s2"], selected_fields=("amount",)
+    )
+    opened: list[str] = []
+    real_new_input = table.io.new_input
+
+    def _spy(path: str, *args: Any, **kwargs: Any) -> Any:
+        opened.append(path)
+        return real_new_input(path, *args, **kwargs)
+
+    table.io.new_input = _spy
+    try:
+        assert scan.to_arrow().num_rows == 0
+    finally:
+        table.io.new_input = real_new_input
+
+    assert opened == []
+    assert list(scan.plan_files()) == []
+
+
+def test_incremental_changelog_scan_reads_each_data_file_at_most_once(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    scan = table.incremental_changelog_scan(
+        from_snapshot_id_exclusive=ids["s1"], to_snapshot_id_inclusive=ids["s3"], selected_fields=("amount",)
+    )
+    opens: dict[str, int] = {}
+    real_new_input = table.io.new_input
+
+    def _spy(path: str, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(path, str) and path.endswith(".parquet"):
+            opens[path] = opens.get(path, 0) + 1
+        return real_new_input(path, *args, **kwargs)
+
+    table.io.new_input = _spy
+    try:
+        scan.to_arrow()
+    finally:
+        table.io.new_input = real_new_input
+
+    assert opens, "expected the range to read at least one data file"
+    assert all(count == 1 for count in opens.values())
+
+
+def test_incremental_changelog_scan_builders_and_readers(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    scan = (
+        table.incremental_changelog_scan()
+        .from_snapshot_id_exclusive(ids["s0"])
+        .to_snapshot_id_inclusive(ids["s4"])
+        .select("amount")
+        .filter("status = 'active'")
+        .with_case_sensitive(False)
+    )
+    assert scan.from_snapshot_id == ids["s0"]
+    assert scan.from_snapshot_inclusive is False
+    assert scan.to_snapshot_id == ids["s4"]
+    assert scan.case_sensitive is False
+    assert scan.selected_fields == ("amount",)
+
+    from_arrow = _changelog_events(scan)
+    reader = scan.to_arrow_batch_reader().read_all()
+    from_reader = sorted((row["amount"], row["change_type"]) for row in reader.to_pylist())
+    assert from_reader == from_arrow
+
+    assert {field.name for field in scan.projection().fields} == {"amount"}
+    assert scan.update(limit=1).to_arrow().num_rows == 1
+
+
+def test_incremental_changelog_scan_inclusive_from(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    # Inclusive-from s3 uses s2 as its boundary, exactly like exclusive-from s2, so the ranges coincide.
+    inclusive = table.incremental_changelog_scan().from_snapshot_id_inclusive(ids["s3"]).to_snapshot_id_inclusive(ids["s4"])
+    exclusive = table.incremental_changelog_scan(from_snapshot_id_exclusive=ids["s2"], to_snapshot_id_inclusive=ids["s4"])
+    assert _changelog_events(inclusive) == _changelog_events(exclusive)
+
+    # Inclusive-from s2 additionally reports the position delete that s2 itself introduced.
+    inclusive_from_s2 = (
+        table.incremental_changelog_scan().from_snapshot_id_inclusive(ids["s2"]).to_snapshot_id_inclusive(ids["s4"])
+    )
+    assert _changelog_events(inclusive_from_s2) == [
+        (10, "active", "delete"),
+        *_changelog_events(exclusive),
+    ]
+
+    # An inclusive start that is not an ancestor of the end snapshot is rejected with both ids.
+    inclusive_mismatch = rf"Start snapshot .inclusive. {ids['s4']} is not an ancestor of end snapshot {ids['s2']}"
+    with pytest.raises(ValueError, match=inclusive_mismatch):
+        (table.incremental_changelog_scan().from_snapshot_id_inclusive(ids["s4"]).to_snapshot_id_inclusive(ids["s2"]).to_arrow())
+
+
+def test_incremental_changelog_scan_rejects_diverged_and_missing_boundaries(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    diverged_match = rf"Start snapshot .exclusive. 999 is not on the ancestor chain of end snapshot {ids['s4']}"
+    with pytest.raises(ValueError, match=diverged_match):
+        table.incremental_changelog_scan(from_snapshot_id_exclusive=999, to_snapshot_id_inclusive=ids["s4"]).to_arrow()
+
+    with pytest.raises(ValueError, match="End snapshot not found in table metadata: 999"):
+        table.incremental_changelog_scan(to_snapshot_id_inclusive=999).to_arrow()
+
+
+def test_incremental_changelog_scan_rejects_expired_exclusive_boundary(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    # Simulate expiration: s1 is still referenced as s2's parent but is removed from the metadata.
+    trimmed = [snapshot for snapshot in table.metadata.snapshots if snapshot.snapshot_id != ids["s1"]]
+    table.metadata = table.metadata.model_copy(update={"snapshots": trimmed})
+    assert table.snapshot_by_id(ids["s1"]) is None
+
+    with pytest.raises(ValueError, match="not present in table metadata; the ancestor chain .* is incomplete"):
+        table.incremental_changelog_scan(from_snapshot_id_exclusive=ids["s1"], to_snapshot_id_inclusive=ids["s2"]).to_arrow()
+
+
+def test_incremental_changelog_scan_no_current_snapshot(
+    example_table_metadata_no_snapshot_v1: dict[str, Any],
+) -> None:
+    table = Table(
+        identifier=("default", "test_no_snapshot"),
+        metadata=TableMetadataV1(**example_table_metadata_no_snapshot_v1),
+        metadata_location="s3://bucket/test/metadata.json",
+        io=load_file_io(),
+        catalog=NoopCatalog("noop"),
+    )
+
+    assert list(table.incremental_changelog_scan().plan_files()) == []
+    assert table.incremental_changelog_scan().to_arrow().num_rows == 0
+
+    with pytest.raises(ValueError, match="End snapshot is not set and table has no current snapshot"):
+        table.incremental_changelog_scan(from_snapshot_id_exclusive=42).to_arrow()
+
+
+def test_incremental_changelog_scan_staged_table_raises(table_v2: Table) -> None:
+    staged_table = StagedTable(
+        identifier=table_v2._identifier,
+        metadata=table_v2.metadata,
+        metadata_location=table_v2.metadata_location,
+        io=table_v2.io,
+        catalog=table_v2.catalog,
+    )
+    with pytest.raises(ValueError, match="Cannot scan a staged table"):
+        staged_table.incremental_changelog_scan()
+
+
+def test_incremental_changelog_scan_treats_nan_duplicates_by_multiplicity(catalog: Catalog) -> None:
+    import math
+
+    import pyarrow as pa
+
+    from pyiceberg.io.pyarrow import _dataframe_to_data_files
+    from pyiceberg.types import DoubleType
+
+    catalog.create_namespace("default")
+    schema = Schema(NestedField(field_id=1, name="value", field_type=DoubleType(), required=False))
+    table = catalog.create_table("default.changelog_nan", schema=schema, properties={"format-version": "2"})
+
+    table.append(pa.table({"value": pa.array([float("nan"), float("nan"), 1.0], pa.float64())}))
+    s0 = table.current_snapshot().snapshot_id
+
+    # A same-data rewrite of rows containing NaN must cancel out rather than emit spurious events.
+    all_rows = table.scan().to_arrow()
+    with table.transaction() as transaction, transaction.update_snapshot().overwrite() as rewrite:
+        for task in table.scan().plan_files():
+            rewrite.delete_data_file(task.file)
+        for data_file in _dataframe_to_data_files(
+            table_metadata=table.metadata, df=all_rows, io=table.io, write_uuid=rewrite.commit_uuid
+        ):
+            rewrite.append_data_file(data_file)
+    table.refresh()
+    s1 = table.current_snapshot().snapshot_id
+    assert table.incremental_changelog_scan(from_snapshot_id_exclusive=s0, to_snapshot_id_inclusive=s1).to_arrow().num_rows == 0
+
+    # Adding a third identical NaN row is a single insert despite NaN not being equal to itself.
+    table.append(pa.table({"value": pa.array([float("nan")], pa.float64())}))
+    table.refresh()
+    s2 = table.current_snapshot().snapshot_id
+    rows = table.incremental_changelog_scan(from_snapshot_id_exclusive=s1, to_snapshot_id_inclusive=s2).to_arrow().to_pylist()
+    assert len(rows) == 1
+    assert rows[0]["change_type"] == "insert"
+    assert math.isnan(rows[0]["value"])
+
+
+def test_incremental_append_scan_remains_available_alongside_changelog_scan(catalog: Catalog) -> None:
+    table, ids = _build_changelog_bill_table(catalog)
+
+    # The append-only scan keeps its original semantics: it ignores rewrites/deletes and only reports appends.
+    append_rows = sorted(
+        table.incremental_append_scan(from_snapshot_id_exclusive=ids["s0"], to_snapshot_id_inclusive=ids["s4"])
+        .to_arrow()["amount"]
+        .to_pylist()
+    )
+    assert 10 in append_rows
+
+    changelog_rows = _changelog_events(
+        table.incremental_changelog_scan(
+            from_snapshot_id_exclusive=ids["s0"],
+            to_snapshot_id_inclusive=ids["s4"],
+            selected_fields=("amount",),
+            row_filter="status = 'active'",
+        )
+    )
+    # The changelog scan additionally reports the delete that an append-only scan cannot express.
+    assert any(event[1] == "delete" for event in changelog_rows)
 
 
 def test_static_table_same_as_table(table_v2: Table, metadata_location: str) -> None:
