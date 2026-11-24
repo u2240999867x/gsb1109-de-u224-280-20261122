@@ -1360,6 +1360,20 @@ class ManifestWriterV2(ManifestWriter):
         return entry
 
 
+class ManifestWriterV2Deletes(ManifestWriterV2):
+    """A v2 manifest writer that stores delete file entries in a deletes manifest."""
+
+    def content(self) -> ManifestContent:
+        return ManifestContent.DELETES
+
+    @property
+    def _meta(self) -> dict[str, str]:
+        return {
+            **super(ManifestWriterV2, self)._meta,
+            "content": "deletes",
+        }
+
+
 def write_manifest(
     format_version: TableVersion,
     spec: PartitionSpec,
@@ -1367,10 +1381,15 @@ def write_manifest(
     output_file: OutputFile,
     snapshot_id: int,
     avro_compression: AvroCompressionCodec,
+    content: ManifestContent = ManifestContent.DATA,
 ) -> ManifestWriter:
     if format_version == 1:
+        if content == ManifestContent.DELETES:
+            raise ValueError("Cannot store delete manifests in a v1 table")
         return ManifestWriterV1(spec, schema, output_file, snapshot_id, avro_compression)
     elif format_version == 2:
+        if content == ManifestContent.DELETES:
+            return ManifestWriterV2Deletes(spec, schema, output_file, snapshot_id, avro_compression)
         return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression)
     else:
         raise ValueError(f"Cannot write manifest for table version: {format_version}")

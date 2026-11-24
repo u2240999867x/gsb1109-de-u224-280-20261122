@@ -885,6 +885,228 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
             raise ValidationException(f"Missing required files to delete: {', '.join(sorted(missing))}")
 
 
+class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
+    """Rewrite the manifests handed off at a snapshot into target-sized manifests.
+
+    Only manifest entries that are live in both the handed-off snapshot and the branch HEAD at
+    commit time are rewritten. Entries introduced after the hand-off stay outside the rewrite, even
+    when another writer packed them into the same manifest as handed-off entries. The rewrite is
+    metadata-only: every rewritten entry keeps pointing at its original data or delete file and
+    retains its source snapshot id, data sequence number and file sequence number.
+    """
+
+    _from_snapshot_id: int
+    _target_size_bytes: int
+
+    def __init__(
+        self,
+        transaction: Transaction,
+        io: FileIO,
+        from_snapshot_id: int,
+        target_size_bytes: int,
+        branch: str | None = MAIN_BRANCH,
+        commit_uuid: uuid.UUID | None = None,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+    ) -> None:
+        super().__init__(
+            operation=Operation.REPLACE,
+            transaction=transaction,
+            io=io,
+            commit_uuid=commit_uuid,
+            snapshot_properties=snapshot_properties,
+            branch=branch,
+        )
+        if target_size_bytes <= 0:
+            raise ValueError(f"Target manifest size must be a positive number, got: {target_size_bytes}")
+        if transaction.table_metadata.snapshot_by_id(from_snapshot_id) is None:
+            raise ValidationException(f"Cannot find handed-off snapshot {from_snapshot_id}")
+        self._from_snapshot_id = from_snapshot_id
+        self._target_size_bytes = target_size_bytes
+
+    def _validate_concurrency(self) -> None:
+        """Skip conflict validation because the rewrite replans against the refreshed branch HEAD."""
+
+    def _deleted_entries(self) -> list[ManifestEntry]:
+        """Return no deleted entries; a manifest rewrite only repacks entries."""
+        return []
+
+    def _existing_manifests(self) -> list[ManifestFile]:
+        """Return no base manifests, since the manifest list is planned directly in _commit."""
+        return []
+
+    def new_manifest_writer(self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA) -> ManifestWriter:
+        return write_manifest(
+            format_version=self._transaction.table_metadata.format_version,
+            spec=spec,
+            schema=self.schema(),
+            output_file=self.new_manifest_output(),
+            snapshot_id=self._snapshot_id,
+            avro_compression=self._compression,
+            content=content,
+        )
+
+    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
+        # A manifest rewrite changes no data or delete files, so it carries no add/remove metrics.
+        return Summary(operation=self._operation, **snapshot_properties)
+
+    def _live_entry_index(self, snapshot: Snapshot) -> dict[str, ManifestEntry]:
+        """Index the live entries of a snapshot by their data or delete file path."""
+        entries: dict[str, ManifestEntry] = {}
+        for manifest in snapshot.manifests(io=self._io):
+            for entry in manifest.fetch_manifest_entry(io=self._io, discard_deleted=True):
+                entries[entry.data_file.file_path] = entry
+        return entries
+
+    def _write_entries(self, spec_id: int, content: ManifestContent, entries: list[ManifestEntry]) -> ManifestFile:
+        with self.new_manifest_writer(spec=self.spec(spec_id), content=content) as writer:
+            for entry in entries:
+                writer.existing(entry)
+        return writer.to_manifest_file()
+
+    def _plan_manifests(self) -> tuple[list[ManifestFile], bool]:
+        """Plan the rewritten manifest list against the current branch HEAD.
+
+        Returns the manifests for the new snapshot and whether any manifest actually changed.
+        """
+        table_metadata = self._transaction.table_metadata
+        from_snapshot = table_metadata.snapshot_by_id(self._from_snapshot_id)
+        if from_snapshot is None:
+            raise ValidationException(f"Cannot find handed-off snapshot {self._from_snapshot_id}")
+
+        head_snapshot = table_metadata.snapshot_by_name(self._target_branch)
+        if head_snapshot is None:
+            raise ValidationException(f"Branch {self._target_branch} has no snapshot to rewrite manifests for")
+
+        if not is_ancestor_of(head_snapshot.snapshot_id, from_snapshot.snapshot_id, table_metadata):
+            raise ValidationException(
+                f"Handed-off snapshot {from_snapshot.snapshot_id} is not an ancestor of branch "
+                f"{self._target_branch} HEAD {head_snapshot.snapshot_id}"
+            )
+
+        handed_off_paths = set(self._live_entry_index(from_snapshot).keys())
+        head_manifests = head_snapshot.manifests(io=self._io)
+        head_live_paths = set()
+        for manifest in head_manifests:
+            for entry in manifest.fetch_manifest_entry(io=self._io, discard_deleted=True):
+                head_live_paths.add(entry.data_file.file_path)
+        rewrite_paths = handed_off_paths & head_live_paths
+
+        # Each unit carries the entries of one source manifest that are in rewrite scope. The flag
+        # marks manifests whose live entries are all in scope, so an oversized manifest stays untouched.
+        in_scope_units: dict[tuple[int, ManifestContent], list[tuple[ManifestFile, list[ManifestEntry], bool]]] = defaultdict(
+            list
+        )
+        rewritten_manifests: list[ManifestFile] = []
+        changed = False
+
+        for manifest in head_manifests:
+            entries = manifest.fetch_manifest_entry(io=self._io, discard_deleted=True)
+            in_scope_entries = [entry for entry in entries if entry.data_file.file_path in rewrite_paths]
+            out_of_scope_entries = [entry for entry in entries if entry.data_file.file_path not in rewrite_paths]
+            fully_in_scope = len(out_of_scope_entries) == 0 and len(in_scope_entries) > 0
+
+            if in_scope_entries:
+                in_scope_units[(manifest.partition_spec_id, manifest.content)].append(
+                    (manifest, in_scope_entries, fully_in_scope)
+                )
+
+            if out_of_scope_entries:
+                if len(in_scope_entries) == 0:
+                    # The manifest is untouched by the rewrite, keep its original path.
+                    rewritten_manifests.append(manifest)
+                else:
+                    # Handed-off entries move out, so the entries introduced after the hand-off are
+                    # rewritten on their own to keep them live without leaving the rewrite scope.
+                    rewritten_manifests.append(
+                        self._write_entries(manifest.partition_spec_id, manifest.content, out_of_scope_entries)
+                    )
+                    changed = True
+
+        packer: ListPacker[tuple[ManifestFile, list[ManifestEntry], bool]] = ListPacker(
+            target_weight=self._target_size_bytes, lookback=1, largest_bin_first=False
+        )
+
+        for spec_id, content in sorted(in_scope_units, key=lambda key: (key[0], key[1])):
+            units = in_scope_units[(spec_id, content)]
+            bins = packer.pack_end(units, lambda unit: unit[0].manifest_length)
+            for bin_units in bins:
+                if len(bin_units) == 1 and bin_units[0][2]:
+                    # A single manifest that is fully in scope stays on its original path, so oversized
+                    # manifests (for example the old yearly manifest) are never rewritten.
+                    rewritten_manifests.append(bin_units[0][0])
+                else:
+                    merged_entries = list(itertools.chain.from_iterable(entries for _, entries, _ in bin_units))
+                    rewritten_manifests.append(self._write_entries(spec_id, content, merged_entries))
+                    changed = True
+
+        return rewritten_manifests, changed
+
+    def _commit(self) -> UpdatesAndRequirements:
+        new_manifests, changed = self._plan_manifests()
+        if not changed:
+            # Nothing is small enough to keep merging, so the current branch HEAD stays in place.
+            return (), ()
+
+        next_sequence_number = self._transaction.table_metadata.next_sequence_number()
+
+        summary = self._summary(self.snapshot_properties)
+        file_name = _new_manifest_list_file_name(
+            snapshot_id=self._snapshot_id,
+            attempt=0,
+            commit_uuid=self.commit_uuid,
+        )
+        location_provider = self._transaction._table.location_provider()
+        manifest_list_file_path = location_provider.new_metadata_location(file_name)
+        self._written_manifest_lists.append(manifest_list_file_path)
+
+        with write_manifest_list(
+            format_version=self._transaction.table_metadata.format_version,
+            output_file=self._io.new_output(manifest_list_file_path),
+            snapshot_id=self._snapshot_id,
+            parent_snapshot_id=self._parent_snapshot_id,
+            sequence_number=next_sequence_number,
+            avro_compression=self._compression,
+        ) as writer:
+            writer.add_manifests(new_manifests)
+
+        snapshot = Snapshot(
+            snapshot_id=self._snapshot_id,
+            parent_snapshot_id=self._parent_snapshot_id,
+            manifest_list=manifest_list_file_path,
+            sequence_number=next_sequence_number,
+            summary=summary,
+            schema_id=self._transaction.table_metadata.current_schema_id,
+        )
+
+        add_snapshot_update = AddSnapshotUpdate(snapshot=snapshot)
+
+        if self._target_branch is None:
+            return (
+                (add_snapshot_update,),
+                (),
+            )
+        else:
+            return (
+                (
+                    add_snapshot_update,
+                    SetSnapshotRefUpdate(
+                        snapshot_id=self._snapshot_id,
+                        parent_snapshot_id=self._parent_snapshot_id,
+                        ref_name=self._target_branch,
+                        type=SnapshotRefType.BRANCH,
+                    ),
+                ),
+                (
+                    AssertRefSnapshotId(
+                        snapshot_id=self._transaction.table_metadata.refs[self._target_branch].snapshot_id
+                        if self._target_branch in self._transaction.table_metadata.refs
+                        else None,
+                        ref=self._target_branch,
+                    ),
+                ),
+            )
+
+
 class UpdateSnapshot:
     _transaction: Transaction
     _io: FileIO
@@ -938,6 +1160,25 @@ class UpdateSnapshot:
             operation=Operation.DELETE,
             transaction=self._transaction,
             io=self._io,
+            branch=self._branch,
+            snapshot_properties=self._snapshot_properties,
+        )
+
+    def rewrite_manifests(self, from_snapshot_id: int, target_size_bytes: int) -> _RewriteManifests:
+        """Rewrite the manifests handed off at a snapshot into target-sized manifests.
+
+        Args:
+            from_snapshot_id: The handed-off snapshot whose live entries are in scope for the rewrite.
+            target_size_bytes: The target size in bytes of a rewritten manifest.
+
+        Returns:
+            A _RewriteManifests producer that commits the rewritten manifest list.
+        """
+        return _RewriteManifests(
+            transaction=self._transaction,
+            io=self._io,
+            from_snapshot_id=from_snapshot_id,
+            target_size_bytes=target_size_bytes,
             branch=self._branch,
             snapshot_properties=self._snapshot_properties,
         )
