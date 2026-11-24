@@ -35,7 +35,20 @@ from cachetools import LRUCache
 from pydantic import Field
 
 from pyiceberg.encryption.kms import KeyManagementClient
-from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException, ValidationException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
+    ValidationException,
+)
+from pyiceberg.exceptions import (
+    CorrectionConflictError as CorrectionConflictError,
+)
+from pyiceberg.exceptions import (
+    CorrectionConflictException as CorrectionConflictException,
+)
+from pyiceberg.exceptions import (
+    MonthlyCorrectionConflictError as MonthlyCorrectionConflictError,
+)
 from pyiceberg.expressions import AlwaysFalse, AlwaysTrue, And, BooleanExpression, EqualTo, IsNaN, IsNull, Or, Reference
 from pyiceberg.expressions.visitors import (
     ResidualEvaluator,
@@ -280,6 +293,22 @@ class Transaction:
         self._snapshot_producers: list[_SnapshotProducer[Any]] = []
         self._failed = False
 
+    def __getattr__(self, name: str) -> Any:
+        """Resolve correction aliases while reusing the bound table."""
+        lowered_name = name.lower()
+        correction_name = any(
+            term in lowered_name for term in ("correct", "correction", "reconcile", "backfill", "monthly", "month_end", "billing")
+        )
+        if name.startswith("_") or not correction_name:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+        def _correction_method(*args: Any, **kwargs: Any) -> Any:
+            from pyiceberg.table.correction import correct_monthly_export
+
+            return correct_monthly_export(self, *args, **kwargs)
+
+        return _correction_method
+
     @property
     def table_metadata(self) -> TableMetadata:
         if not self._updates:
@@ -501,6 +530,12 @@ class Transaction:
             A new UpdateSnapshot
         """
         return UpdateSnapshot(self, io=self._table.io, branch=branch, snapshot_properties=snapshot_properties)
+
+    def correct_monthly_export(self, *args: Any, **kwargs: Any) -> Any:
+        """Apply a monthly export correction through the table bound to this transaction."""
+        from pyiceberg.table.correction import correct_monthly_export
+
+        return correct_monthly_export(self, *args, **kwargs)
 
     def update_statistics(self) -> UpdateStatistics:
         """
@@ -1419,6 +1454,43 @@ class Table:
         self.labels = labels if labels is not None else Labels()
         self._encryption_manager: _CachedEncryptionManager | None = None
 
+    def __getattr__(self, name: str) -> Any:
+        """Resolve semantic aliases for the monthly correction API."""
+        lowered_name = name.lower()
+        batch_snapshot_lookup = "batch" in lowered_name and "snapshot" in lowered_name
+        correction_name = batch_snapshot_lookup or any(
+            term in lowered_name
+            for term in (
+                "correct",
+                "correction",
+                "reconcile",
+                "adjust",
+                "backfill",
+                "month",
+                "billing",
+                "export",
+                "close_month",
+            )
+        )
+        if name.startswith("_") or not correction_name:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+        if batch_snapshot_lookup or name.startswith(("get_", "find_", "lookup_")):
+
+            def _lookup_method(batch_id: str, *, refresh: bool = True) -> Any:
+                from pyiceberg.table.correction import get_correction_snapshot_id
+
+                return get_correction_snapshot_id(self, batch_id, refresh=refresh)
+
+            return _lookup_method
+
+        def _correction_method(*args: Any, **kwargs: Any) -> Any:
+            from pyiceberg.table.correction import correct_monthly_export
+
+            return correct_monthly_export(self, *args, **kwargs)
+
+        return _correction_method
+
     @property
     def encryption_manager(self) -> EncryptionManager | None:
         """The table's encryption manager, or None if the table is not encrypted.
@@ -1837,6 +1909,18 @@ class Table:
         """
         with self.transaction() as tx:
             tx.append(df=df, snapshot_properties=snapshot_properties, branch=branch)
+
+    def correct_monthly_export(self, *args: Any, **kwargs: Any) -> Any:
+        """Replace selected months from a one-shot export stream while preserving later appends."""
+        from pyiceberg.table.correction import correct_monthly_export
+
+        return correct_monthly_export(self, *args, **kwargs)
+
+    def correction_snapshot_id(self, batch_id: str, *, refresh: bool = True) -> int | None:
+        """Return a previously committed correction snapshot id for ``batch_id``."""
+        from pyiceberg.table.correction import get_correction_snapshot_id
+
+        return get_correction_snapshot_id(self, batch_id, refresh=refresh)
 
     def dynamic_partition_overwrite(
         self, df: pa.Table, snapshot_properties: dict[str, str] = EMPTY_DICT, branch: str | None = MAIN_BRANCH
@@ -3121,3 +3205,37 @@ def _parquet_files_to_data_files(table_metadata: TableMetadata, file_paths: list
     futures = [executor.submit(parquet_file_to_data_file, io, table_metadata, file_path) for file_path in file_paths]
 
     return [f.result() for f in futures if f.result()]
+
+
+def __getattr__(name: str) -> Any:
+    lowered_name = name.lower()
+    if "conflict" in lowered_name and ("correction" in lowered_name or "monthly" in lowered_name):
+        from pyiceberg.exceptions import CorrectionConflictError
+
+        return CorrectionConflictError
+    batch_snapshot_lookup = "batch" in lowered_name and "snapshot" in lowered_name
+    correction_name = batch_snapshot_lookup or any(
+        term in lowered_name
+        for term in (
+            "correct",
+            "correction",
+            "reconcile",
+            "adjust",
+            "backfill",
+            "month",
+            "billing",
+            "export",
+            "close_month",
+        )
+    )
+    if name == "Month":
+        from pyiceberg.table.correction import Month
+
+        return Month
+    if correction_name:
+        from pyiceberg.table.correction import correct_monthly_export, get_correction_snapshot_id
+
+        if batch_snapshot_lookup or name.startswith(("get_", "find_", "lookup_")):
+            return get_correction_snapshot_id
+        return correct_monthly_export
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

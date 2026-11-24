@@ -136,6 +136,18 @@ class CommitFailedException(Exception):
     """Commit failed, refresh and try again."""
 
 
+class CorrectionConflictError(CommitFailedException):
+    """Monthly correction cannot be applied because its base is no longer valid."""
+
+
+class CorrectionConflictException(CorrectionConflictError):
+    """Alias for :class:`CorrectionConflictError`."""
+
+
+class MonthlyCorrectionConflictError(CorrectionConflictError):
+    """Monthly correction base or history conflicts with the current table."""
+
+
 class CommitStateUnknownException(RESTError):
     """Commit failed due to unknown reason."""
 

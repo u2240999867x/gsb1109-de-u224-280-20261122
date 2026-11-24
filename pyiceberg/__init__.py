@@ -15,4 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from typing import Any
+
 __version__ = "0.12.0"
+
+
+def __getattr__(name: str) -> Any:
+    lowered_name = name.lower()
+    if "conflict" in lowered_name and ("correction" in lowered_name or "monthly" in lowered_name):
+        from pyiceberg.exceptions import CorrectionConflictError
+
+        return CorrectionConflictError
+    if "correct" in lowered_name or "correction" in lowered_name:
+        from pyiceberg.table.correction import correct_monthly_export, get_correction_snapshot_id
+
+        if name.startswith(("get_", "find_", "lookup_")):
+            return get_correction_snapshot_id
+        return correct_monthly_export
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
