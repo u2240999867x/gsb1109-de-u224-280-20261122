@@ -14,6 +14,8 @@ from typing import (
 
 from typing_extensions import Buffer, TypeForm
 
+from . import PrecheckResult
+
 _T = TypeVar("_T")
 
 _EncHookSig: TypeAlias = Callable[[Any], Any] | None
@@ -69,6 +71,8 @@ class Decoder(Generic[_T]):
     ) -> None: ...
     def decode(self, buf: Buffer | str, /) -> _T: ...
     def decode_lines(self, buf: Buffer | str, /) -> list[_T]: ...
+    def precheck(self, buf: Buffer | str, /) -> PrecheckResult[_T]: ...
+    def precheck_lines(self, buf: Buffer | str, /) -> list[PrecheckResult[_T]]: ...
     def __class_getitem__(cls, item: Any, /) -> GenericAlias: ...
     # This is `READONLY` in C, but we can't use `Final` here:
     @property
@@ -92,6 +96,42 @@ def decode(
     strict: bool = True,
     dec_hook: _DecHookSig = None,
 ) -> Any: ...
+@overload
+def precheck_lines(
+    buf: Buffer | str,
+    /,
+    *,
+    type: TypeForm[_T],
+    strict: bool = True,
+    dec_hook: _DecHookSig = None,
+) -> list[PrecheckResult[_T]]: ...
+@overload
+def precheck_lines(
+    buf: Buffer | str,
+    /,
+    *,
+    type: Any = Any,
+    strict: bool = True,
+    dec_hook: _DecHookSig = None,
+) -> list[PrecheckResult[Any]]: ...
+@overload
+def precheck(
+    buf: Buffer | str,
+    /,
+    *,
+    type: TypeForm[_T],
+    strict: bool = True,
+    dec_hook: _DecHookSig = None,
+) -> PrecheckResult[_T]: ...
+@overload
+def precheck(
+    buf: Buffer | str,
+    /,
+    *,
+    type: Any = Any,
+    strict: bool = True,
+    dec_hook: _DecHookSig = None,
+) -> PrecheckResult[Any]: ...
 def encode(
     obj: Any,
     /,

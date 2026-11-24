@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `msgspec.json.precheck`, `msgspec.msgpack.precheck`, and
+  `Decoder.precheck` for validating a message without evaluating any
+  `default_factory`. Fields that would receive a default are returned as
+  `DEFERRED`, with their paths listed on the returned `PrecheckResult`.
+  `PrecheckResult.apply_defaults` then re-decodes the original submitted
+  message and fills in the defaults, so changes to a prechecked value can't
+  alter which defaults are applied.
 - Fix `Encoder.encode_into` shrinking the buffer's capacity when passed an
   `offset` inside the buffer. An `offset` past the end of the buffer now fills
   the gap with zeros instead of leaving it uninitialized, and a failed encode no

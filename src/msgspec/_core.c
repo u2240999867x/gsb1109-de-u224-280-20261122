@@ -834,6 +834,21 @@ cleanup:
     return out;
 }
 
+/* Return just the path portion (e.g. ``$.foo[0]``), without the leading
+ * " - at " and surrounding backticks used by `PathNode_ErrSuffix`. */
+static PyObject *
+PathNode_Plain(PathNode *path) {
+    PyObject *suffix = PathNode_ErrSuffix(path);
+    if (suffix == NULL) return NULL;
+    Py_ssize_t size = PyUnicode_GET_LENGTH(suffix);
+    if (size >= 8) {
+        PyObject *out = PyUnicode_Substring(suffix, 7, size - 1);
+        Py_DECREF(suffix);
+        return out;
+    }
+    return suffix;
+}
+
 /*************************************************************************
  * Lookup Tables for ints & strings                                      *
  *************************************************************************/
@@ -2297,6 +2312,69 @@ PyTypeObject NoDefault_Type = {
 };
 
 PyObject _NoDefault_Object = _PyObject_HEAD_INIT(&NoDefault_Type);
+
+/*************************************************************************
+ * DEFERRED singleton                                                    *
+ *************************************************************************/
+
+PyObject _Deferred_Object;
+#define DEFERRED &_Deferred_Object
+
+PyDoc_STRVAR(deferred__doc__,
+"DeferredType()\n"
+"--\n"
+"\n"
+"A singleton indicating that a field value has not been evaluated yet.\n"
+"\n"
+"Prechecking a message with `msgspec.json.precheck` or\n"
+"`msgspec.msgpack.precheck` validates the supplied fields without calling\n"
+"any ``default_factory``. Fields that would normally receive a default are\n"
+"left as ``DEFERRED`` instead, and are reported in the precheck receipt.\n"
+"Calling ``apply_defaults`` on the receipt evaluates them (and any factories)\n"
+"from the original submitted message."
+);
+static PyObject *
+deferred_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
+{
+    if (PyTuple_GET_SIZE(args) || (kwargs && PyDict_GET_SIZE(kwargs))) {
+        PyErr_SetString(PyExc_TypeError, "DeferredType takes no arguments");
+        return NULL;
+    }
+    Py_INCREF(DEFERRED);
+    return DEFERRED;
+}
+
+static PyObject *
+deferred_repr(PyObject *op)
+{
+    return PyUnicode_FromString("DEFERRED");
+}
+
+static PyObject *
+deferred_reduce(PyObject *op, PyObject *args)
+{
+    return PyUnicode_FromString("DEFERRED");
+}
+
+static PyMethodDef deferred_methods[] = {
+    {"__reduce__", deferred_reduce, METH_NOARGS, NULL},
+    {NULL, NULL}
+};
+
+PyTypeObject Deferred_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "msgspec._core.DeferredType",
+    .tp_doc = deferred__doc__,
+    .tp_repr = deferred_repr,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = deferred_methods,
+    .tp_new = deferred_new,
+    .tp_dealloc = 0,
+    .tp_itemsize = 0,
+    .tp_basicsize = 0
+};
+
+PyObject _Deferred_Object = _PyObject_HEAD_INIT(&Deferred_Type);
 
 /*************************************************************************
  * UNSET singleton                                                       *
@@ -7751,6 +7829,60 @@ Struct_decode_post_init(StructMetaObject *st_type, PyObject *obj, PathNode *path
     return 0;
 }
 
+/* Store the `DEFERRED` marker in every field slot that wasn't supplied by the
+ * message. `precheck` uses this instead of `Struct_fill_in_defaults` so that
+ * no default (and in particular no `default_factory`) is evaluated. Missing
+ * required fields are still reported as errors. If `deferred` is non-NULL,
+ * the path of every field left unevaluated is appended to it. */
+static int
+Struct_store_deferred_defaults(
+    StructMetaObject *st_type, PyObject *obj, PathNode *path, PyObject *deferred
+) {
+    Py_ssize_t nfields, ndefaults, i;
+    bool is_gc, should_untrack;
+
+    nfields = PyTuple_GET_SIZE(st_type->struct_encode_fields);
+    ndefaults = PyTuple_GET_SIZE(st_type->struct_defaults);
+    is_gc = MS_TYPE_IS_GC(st_type);
+    should_untrack = is_gc;
+
+    for (i = 0; i < nfields; i++) {
+        PyObject *val = Struct_get_index_noerror(obj, i);
+        if (val == NULL) {
+            if (i < (nfields - ndefaults)) goto missing_required;
+            val = PyTuple_GET_ITEM(
+                st_type->struct_defaults, i - (nfields - ndefaults)
+            );
+            if (MS_UNLIKELY(val == NODEFAULT)) goto missing_required;
+            Py_INCREF(DEFERRED);
+            Struct_set_index(obj, i, DEFERRED);
+            if (deferred != NULL) {
+                PathNode field_path = {path, i, (PyObject *)st_type};
+                PyObject *field_name = PathNode_Plain(&field_path);
+                if (field_name == NULL) return -1;
+                int status = PyList_Append(deferred, field_name);
+                Py_DECREF(field_name);
+                if (status < 0) return -1;
+            }
+            val = DEFERRED;
+        }
+        if (should_untrack) {
+            should_untrack = !MS_MAYBE_TRACKED(val);
+        }
+    }
+
+    if (is_gc && should_untrack && MS_IS_TRACKED(obj))
+        PyObject_GC_UnTrack(obj);
+
+    return 0;
+
+missing_required:
+    ms_missing_required_field(
+        PyTuple_GET_ITEM(st_type->struct_encode_fields, i), path
+    );
+    return -1;
+}
+
 static int
 Struct_fill_in_defaults(StructMetaObject *st_type, PyObject *obj, PathNode *path) {
     Py_ssize_t nfields, ndefaults, i;
@@ -9123,7 +9255,10 @@ DataclassInfo_lookup_key(
 
 
 static int
-DataclassInfo_post_decode(DataclassInfo *self, PyObject *obj, PathNode *path) {
+DataclassInfo_post_decode(
+    DataclassInfo *self, PyObject *obj, PathNode *path,
+    bool defer_defaults, PyObject *deferred
+) {
     Py_ssize_t nfields = Py_SIZE(self);
     Py_ssize_t ndefaults = PyTuple_GET_SIZE(self->defaults);
 
@@ -9133,6 +9268,22 @@ DataclassInfo_post_decode(DataclassInfo *self, PyObject *obj, PathNode *path) {
             if (i < (nfields - ndefaults)) {
                 ms_missing_required_field(name, path);
                 return -1;
+            }
+            else if (defer_defaults) {
+                Py_INCREF(DEFERRED);
+                int status = PyObject_GenericSetAttr(obj, name, DEFERRED);
+                if (status < 0) {
+                    Py_DECREF(DEFERRED);
+                    return -1;
+                }
+                if (deferred != NULL) {
+                    PathNode field_path = {path, PATH_STR, name};
+                    PyObject *field_name = PathNode_Plain(&field_path);
+                    if (field_name == NULL) return -1;
+                    status = PyList_Append(deferred, field_name);
+                    Py_DECREF(field_name);
+                    if (status < 0) return -1;
+                }
             }
             else {
                 PyObject *default_value = PyTuple_GET_ITEM(
@@ -9150,6 +9301,11 @@ DataclassInfo_post_decode(DataclassInfo *self, PyObject *obj, PathNode *path) {
                 if (status < 0) return -1;
             }
         }
+    }
+    if (defer_defaults) {
+        /* `__post_init__` may rely on the defaults, so it isn't run until the
+         * defaults are applied. */
+        return 0;
     }
     if (self->post_init != NULL) {
         PyObject *res = PyObject_CallOneArg(self->post_init, obj);
@@ -15309,6 +15465,258 @@ msgspec_json_encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
 }
 
 /*************************************************************************
+ * PrecheckResult                                                        *
+ *************************************************************************/
+
+/* A validated-but-not-finalized message.
+ *
+ * `precheck` decodes a message exactly like `decode`, except struct fields
+ * that would receive a default are instead filled with `DEFERRED`. This
+ * validates the supplied fields without ever evaluating a `default_factory`,
+ * which may have side effects (e.g. consuming a sequence).
+ *
+ * The result keeps a reference to the original message together with the
+ * decoder configuration, so that `apply_defaults` can re-decode the submitted
+ * message from scratch. Applying defaults never consults fields of a
+ * `PrecheckResult` value, only the original message. Changes made to an
+ * accepted value after prechecking therefore don't affect which defaults get
+ * filled in.
+ *
+ * `deferred` lists the paths of all fields that weren't evaluated; `message`
+ * is the original submitted message. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *message;      /* the submitted message, as received */
+    PyObject *value;        /* the decoded value with `DEFERRED` fields */
+    PyObject *deferred;     /* list of paths of unevaluated fields */
+    PyObject *error;        /* exception instance for a failed line, or NULL */
+    PyObject *orig_type;    /* the decoder's `orig_type` */
+    PyObject *dec_hook;
+    PyObject *ext_hook;
+    PyObject *float_hook;
+    Py_ssize_t start;       /* start offset into `message` (for line prechecks) */
+    Py_ssize_t end;         /* end offset into `message` */
+    int strict;
+    int json;               /* whether this came from the JSON decoder */
+} PrecheckResult;
+
+/* defined after both decoder implementations */
+static PyObject *precheck_apply_defaults(PrecheckResult *self);
+
+static void
+PrecheckResult_dealloc(PrecheckResult *self)
+{
+    PyObject_GC_UnTrack(self);
+    Py_XDECREF(self->message);
+    Py_XDECREF(self->value);
+    Py_XDECREF(self->deferred);
+    Py_XDECREF(self->error);
+    Py_XDECREF(self->orig_type);
+    Py_XDECREF(self->dec_hook);
+    Py_XDECREF(self->ext_hook);
+    Py_XDECREF(self->float_hook);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static int
+PrecheckResult_traverse(PrecheckResult *self, visitproc visit, void *arg)
+{
+    Py_VISIT(self->message);
+    Py_VISIT(self->value);
+    Py_VISIT(self->deferred);
+    Py_VISIT(self->error);
+    Py_VISIT(self->orig_type);
+    Py_VISIT(self->dec_hook);
+    Py_VISIT(self->ext_hook);
+    Py_VISIT(self->float_hook);
+    return 0;
+}
+
+static int
+PrecheckResult_clear(PrecheckResult *self)
+{
+    Py_CLEAR(self->message);
+    Py_CLEAR(self->value);
+    Py_CLEAR(self->deferred);
+    Py_CLEAR(self->error);
+    Py_CLEAR(self->orig_type);
+    Py_CLEAR(self->dec_hook);
+    Py_CLEAR(self->ext_hook);
+    Py_CLEAR(self->float_hook);
+    return 0;
+}
+
+static PyObject *
+PrecheckResult_repr(PrecheckResult *self)
+{
+    PyObject *type_repr = PyObject_Repr(self->orig_type);
+    if (type_repr == NULL) return NULL;
+    PyObject *out = PyUnicode_FromFormat(
+        "PrecheckResult(type=%U, deferred=%R)", type_repr, self->deferred
+    );
+    Py_DECREF(type_repr);
+    return out;
+}
+
+PyDoc_STRVAR(PrecheckResult__doc__,
+"PrecheckResult(type, message, /)\n"
+"--\n"
+"\n"
+"A validated message returned by ``precheck``, with defaults deferred.\n"
+"\n"
+"Attributes\n"
+"----------\n"
+"type : type\n"
+"    The type this message was checked against.\n"
+"message : Any\n"
+"    The originally submitted message.\n"
+"value : Any\n"
+"    The decoded value, with unevaluated fields set to ``DEFERRED``.\n"
+"deferred : list[str]\n"
+"    Paths of all fields that were left unevaluated.\n"
+"\n"
+"Methods\n"
+"-------\n"
+"apply_defaults()\n"
+"    Re-decode the original message and fill in defaults, evaluating any\n"
+"    ``default_factory`` for the missing fields.\n"
+);
+
+static PyObject *
+PrecheckResult_get_type(PrecheckResult *self, void *closure)
+{
+    Py_INCREF(self->orig_type);
+    return self->orig_type;
+}
+
+static PyObject *
+PrecheckResult_get_message(PrecheckResult *self, void *closure)
+{
+    Py_INCREF(self->message);
+    return self->message;
+}
+
+static PyObject *
+PrecheckResult_get_value(PrecheckResult *self, void *closure)
+{
+    if (self->value == NULL) Py_RETURN_NONE;
+    Py_INCREF(self->value);
+    return self->value;
+}
+
+static PyObject *
+PrecheckResult_get_deferred(PrecheckResult *self, void *closure)
+{
+    return PySequence_List(self->deferred);
+}
+
+static PyObject *
+PrecheckResult_get_ok(PrecheckResult *self, void *closure)
+{
+    return PyBool_FromLong(self->error == NULL);
+}
+
+static PyObject *
+PrecheckResult_get_error(PrecheckResult *self, void *closure)
+{
+    if (self->error == NULL) Py_RETURN_NONE;
+    Py_INCREF(self->error);
+    return self->error;
+}
+
+static PyGetSetDef PrecheckResult_getset[] = {
+    {"type", (getter) PrecheckResult_get_type, NULL, "The type of the prechecked message", NULL},
+    {"message", (getter) PrecheckResult_get_message, NULL, "The submitted message", NULL},
+    {"value", (getter) PrecheckResult_get_value, NULL, "The decoded value with DEFERRED placeholders, or None for a failed line", NULL},
+    {"deferred", (getter) PrecheckResult_get_deferred, NULL, "Paths of fields left unevaluated", NULL},
+    {"ok", (getter) PrecheckResult_get_ok, NULL, "Whether the line was accepted", NULL},
+    {"error", (getter) PrecheckResult_get_error, NULL, "The validation error for a rejected line, or None", NULL},
+    {NULL},
+};
+
+static PyObject *
+PrecheckResult_apply_defaults(PrecheckResult *self, PyObject *noargs)
+{
+    return precheck_apply_defaults(self);
+}
+
+static PyMethodDef PrecheckResult_methods[] = {
+    {
+        "apply_defaults", (PyCFunction) PrecheckResult_apply_defaults, METH_NOARGS,
+        "apply_defaults($self, /)\n"
+        "--\n"
+        "\n"
+        "Re-decode the original message and apply any deferred defaults.\n"
+        "\n"
+        "Any ``default_factory`` is evaluated for the omitted fields. The\n"
+        "submitted message is used, not the prechecked value, so later edits\n"
+        "to ``value`` don't change which defaults are applied.\n"
+        "\n"
+        "Returns\n"
+        "-------\n"
+        "obj : Any\n"
+        "    The fully decoded object.\n"
+    },
+    {NULL, NULL}
+};
+
+static PyTypeObject PrecheckResult_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "msgspec._core.PrecheckResult",
+    .tp_doc = PrecheckResult__doc__,
+    .tp_basicsize = sizeof(PrecheckResult),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_new = NULL,
+    .tp_dealloc = (destructor) PrecheckResult_dealloc,
+    .tp_traverse = (traverseproc) PrecheckResult_traverse,
+    .tp_clear = (inquiry) PrecheckResult_clear,
+    .tp_repr = (reprfunc) PrecheckResult_repr,
+    .tp_getset = PrecheckResult_getset,
+    .tp_methods = PrecheckResult_methods,
+};
+
+static void
+PrecheckResult_init_type(
+    PrecheckResult *out, PyObject *orig_type, PyObject *dec_hook,
+    PyObject *ext_hook, PyObject *float_hook, int strict, int json
+) {
+    Py_INCREF(orig_type);
+    out->orig_type = orig_type;
+    Py_XINCREF(dec_hook);
+    out->dec_hook = dec_hook;
+    Py_XINCREF(ext_hook);
+    out->ext_hook = ext_hook;
+    Py_XINCREF(float_hook);
+    out->float_hook = float_hook;
+    out->strict = strict;
+    out->json = json;
+}
+
+static PyObject *
+PrecheckResult_New(void)
+{
+    PrecheckResult *out = (PrecheckResult *)PrecheckResult_Type.tp_alloc(
+        &PrecheckResult_Type, 0
+    );
+    if (out == NULL) return NULL;
+    out->message = NULL;
+    out->value = NULL;
+    out->deferred = NULL;
+    out->error = NULL;
+    out->orig_type = NULL;
+    out->dec_hook = NULL;
+    out->ext_hook = NULL;
+    out->float_hook = NULL;
+    out->start = 0;
+    out->end = 0;
+    out->strict = 1;
+    out->json = 1;
+    return (PyObject *)out;
+}
+
+
+/*************************************************************************
  * MessagePack Decoder                                                   *
  *************************************************************************/
 
@@ -15318,6 +15726,12 @@ typedef struct DecoderState {
     PyObject *dec_hook;
     PyObject *ext_hook;
     bool strict;
+    /* When set, struct defaults are stored as `DEFERRED` rather than evaluated.
+     * Used by `precheck` to validate without calling `default_factory`. */
+    bool defer_defaults;
+    /* When non-NULL, paths of fields left unevaluated are appended here
+     * (borrowed reference). */
+    PyObject *deferred_paths;
 
     /* Per-message attributes */
     PyObject *buffer_obj;
@@ -16342,6 +16756,11 @@ mpack_decode_struct_array_inner(
             size--;
             item_path.index++;
         }
+        else if (MS_UNLIKELY(self->defer_defaults)) {
+            /* Leave the slot unset; `Struct_store_deferred_defaults` marks it
+             * as deferred and records its path. */
+            continue;
+        }
         else {
             val = get_default(
                 PyTuple_GET_ITEM(st_type->struct_defaults, i - npos)
@@ -16373,7 +16792,13 @@ mpack_decode_struct_array_inner(
             }
         }
     }
-    if (Struct_decode_post_init(st_type, res, path) < 0) goto error;
+    if (MS_UNLIKELY(self->defer_defaults)) {
+        if (Struct_store_deferred_defaults(
+                st_type, res, path, self->deferred_paths) < 0) goto error;
+    }
+    else {
+        if (Struct_decode_post_init(st_type, res, path) < 0) goto error;
+    }
     Py_LeaveRecursiveCall();
     if (is_gc && should_untrack && MS_IS_TRACKED(res))
         PyObject_GC_UnTrack(res);
@@ -16669,7 +17094,9 @@ mpack_decode_dataclass(
             if (mpack_skip(self) < 0) goto error;
         }
     }
-    if (DataclassInfo_post_decode(info, out, path) < 0) goto error;
+    if (DataclassInfo_post_decode(
+            info, out, path, self->defer_defaults, self->deferred_paths
+        ) < 0) goto error;
 
     Py_LeaveRecursiveCall();
     return out;
@@ -16727,7 +17154,13 @@ mpack_decode_struct_map(
         }
     }
 
-    if (Struct_fill_in_defaults(st_type, res, path) < 0) goto error;
+    if (MS_UNLIKELY(self->defer_defaults)) {
+        if (Struct_store_deferred_defaults(
+                st_type, res, path, self->deferred_paths) < 0) goto error;
+    }
+    else {
+        if (Struct_fill_in_defaults(st_type, res, path) < 0) goto error;
+    }
     Py_LeaveRecursiveCall();
     return res;
 error:
@@ -17075,7 +17508,9 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
         .type = self->type,
         .strict = self->strict,
         .dec_hook = self->dec_hook,
-        .ext_hook = self->ext_hook
+        .ext_hook = self->ext_hook,
+        .defer_defaults = false,
+        .deferred_paths = NULL
     };
 
     Py_buffer buffer;
@@ -17098,10 +17533,97 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
     return NULL;
 }
 
+PyDoc_STRVAR(Decoder_precheck__doc__,
+"precheck($self, buf, /)\n"
+"--\n"
+"\n"
+"Validate a MessagePack message without evaluating any ``default_factory``.\n"
+"\n"
+"Fields that would receive a default are left as ``DEFERRED``, and their\n"
+"paths are listed in the returned result's ``deferred`` attribute. The\n"
+"original message is retained so that ``apply_defaults`` can re-decode it\n"
+"later.\n"
+"\n"
+"Parameters\n"
+"----------\n"
+"buf : bytes-like\n"
+"    The message to precheck.\n"
+"\n"
+"Returns\n"
+"-------\n"
+"result : PrecheckResult\n"
+"    The validated message and the paths of unevaluated fields.\n"
+);
+static PyObject*
+Decoder_precheck(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (!check_positional_nargs(nargs, 1, 1)) {
+        return NULL;
+    }
+
+    DecoderState state = {
+        .type = self->type,
+        .strict = self->strict,
+        .dec_hook = self->dec_hook,
+        .ext_hook = self->ext_hook,
+        .defer_defaults = true,
+        .deferred_paths = NULL
+    };
+
+    PyObject *res = NULL;
+    PyObject *deferred = PyList_New(0);
+    if (deferred == NULL) return NULL;
+    state.deferred_paths = deferred;
+
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    if (PyObject_GetBuffer(args[0], &buffer, PyBUF_CONTIG_RO) >= 0) {
+        state.buffer_obj = args[0];
+        state.input_start = buffer.buf;
+        state.input_pos = buffer.buf;
+        state.input_end = state.input_pos + buffer.len;
+
+        PyObject *value = mpack_decode(&state, state.type, NULL, false);
+
+        if (value != NULL && mpack_has_trailing_characters(&state)) {
+            Py_CLEAR(value);
+        }
+
+        PyBuffer_Release(&buffer);
+
+        if (value != NULL) {
+            PrecheckResult *out = (PrecheckResult *)PrecheckResult_New();
+            if (out == NULL) {
+                Py_DECREF(value);
+            }
+            else {
+                Py_INCREF(args[0]);
+                out->message = args[0];
+                out->value = value;
+                out->deferred = deferred;
+                out->start = 0;
+                out->end = buffer.len;
+                deferred = NULL;
+                PrecheckResult_init_type(
+                    out, self->orig_type, self->dec_hook, self->ext_hook,
+                    NULL, self->strict, 0
+                );
+                res = (PyObject *)out;
+            }
+        }
+    }
+    Py_XDECREF(deferred);
+    return res;
+}
+
 static struct PyMethodDef Decoder_methods[] = {
     {
         "decode", (PyCFunction) Decoder_decode, METH_FASTCALL,
         Decoder_decode__doc__,
+    },
+    {
+        "precheck", (PyCFunction) Decoder_precheck, METH_FASTCALL,
+        Decoder_precheck__doc__,
     },
     {"__class_getitem__", Py_GenericAlias, METH_O|METH_CLASS},
     {NULL, NULL}                /* sentinel */
@@ -17277,6 +17799,137 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     return res;
 }
 
+PyDoc_STRVAR(msgspec_msgpack_precheck__doc__,
+"msgpack_precheck(buf, /, *, type='Any', strict=True, dec_hook=None, ext_hook=None)\n"
+"--\n"
+"\n"
+"Validate a MessagePack message without evaluating any ``default_factory``.\n"
+"\n"
+"See `msgspec.msgpack.Decoder.precheck` for details.\n"
+);
+static PyObject*
+msgspec_msgpack_precheck(
+    PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames
+)
+{
+    PyObject *res = NULL, *buf = NULL, *type = NULL, *dec_hook = NULL,
+             *ext_hook = NULL, *strict_obj = NULL;
+    int strict = 1;
+    MsgspecState *mod = msgspec_get_state(self);
+
+    if (!check_positional_nargs(nargs, 1, 1)) return NULL;
+    buf = args[0];
+    if (kwnames != NULL) {
+        Py_ssize_t nkwargs = PyTuple_GET_SIZE(kwnames);
+        if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
+        if ((strict_obj = find_keyword(kwnames, args + nargs, mod->str_strict)) != NULL) nkwargs--;
+        if ((dec_hook = find_keyword(kwnames, args + nargs, mod->str_dec_hook)) != NULL) nkwargs--;
+        if ((ext_hook = find_keyword(kwnames, args + nargs, mod->str_ext_hook)) != NULL) nkwargs--;
+        if (nkwargs > 0) {
+            PyErr_SetString(PyExc_TypeError, "Extra keyword arguments provided");
+            return NULL;
+        }
+    }
+
+    if (dec_hook == Py_None) dec_hook = NULL;
+    if (dec_hook != NULL && !PyCallable_Check(dec_hook)) {
+        PyErr_SetString(PyExc_TypeError, "dec_hook must be callable");
+        return NULL;
+    }
+    if (ext_hook == Py_None) ext_hook = NULL;
+    if (ext_hook != NULL && !PyCallable_Check(ext_hook)) {
+        PyErr_SetString(PyExc_TypeError, "ext_hook must be callable");
+        return NULL;
+    }
+    if (strict_obj != NULL) {
+        strict = PyObject_IsTrue(strict_obj);
+        if (strict < 0) return NULL;
+    }
+
+    TypeNode *type_node;
+    TypeNode typenode_any = {MS_TYPE_ANY};
+    TypeNodeSimple typenode_struct;
+    bool own_type = false;
+
+    if (type == NULL || type == mod->typing_any) {
+        type_node = &typenode_any;
+    }
+    else if (ms_is_struct_cls(type)) {
+        PyObject *info = StructInfo_Convert(type);
+        if (info == NULL) return NULL;
+        bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
+        typenode_struct.types = array_like ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
+        typenode_struct.details[0].pointer = info;
+        type_node = (TypeNode *)(&typenode_struct);
+    }
+    else {
+        type_node = TypeNode_Convert(type);
+        if (type_node == NULL) return NULL;
+        own_type = true;
+    }
+
+    DecoderState state = {
+        .type = type_node,
+        .strict = strict,
+        .dec_hook = dec_hook,
+        .ext_hook = ext_hook,
+        .defer_defaults = true,
+        .deferred_paths = NULL
+    };
+
+    PyObject *deferred = PyList_New(0);
+    if (deferred == NULL) goto cleanup;
+    state.deferred_paths = deferred;
+
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    if (PyObject_GetBuffer(buf, &buffer, PyBUF_CONTIG_RO) >= 0) {
+        state.buffer_obj = buf;
+        state.input_start = buffer.buf;
+        state.input_pos = buffer.buf;
+        state.input_end = state.input_pos + buffer.len;
+
+        PyObject *value = mpack_decode(&state, state.type, NULL, false);
+
+        if (value != NULL && mpack_has_trailing_characters(&state)) {
+            Py_CLEAR(value);
+        }
+
+        PyBuffer_Release(&buffer);
+
+        if (value != NULL) {
+            PrecheckResult *out = (PrecheckResult *)PrecheckResult_New();
+            if (out == NULL) {
+                Py_DECREF(value);
+            }
+            else {
+                Py_INCREF(buf);
+                out->message = buf;
+                out->value = value;
+                out->deferred = deferred;
+                out->start = 0;
+                out->end = buffer.len;
+                deferred = NULL;
+                PrecheckResult_init_type(
+                    out, type != NULL ? type : mod->typing_any,
+                    dec_hook, ext_hook, NULL, strict, 0
+                );
+                res = (PyObject *)out;
+            }
+        }
+    }
+
+cleanup:
+    Py_XDECREF(deferred);
+    if (type_node == (TypeNode *)&typenode_struct) {
+        Py_DECREF(typenode_struct.details[0].pointer);
+    }
+    else if (own_type) {
+        TypeNode_Free(type_node);
+    }
+    return res;
+}
+
 /*************************************************************************
  * JSON Decoder                                                          *
  *************************************************************************/
@@ -17287,6 +17940,12 @@ typedef struct JSONDecoderState {
     PyObject *dec_hook;
     PyObject *float_hook;
     bool strict;
+    /* When set, struct defaults are stored as `DEFERRED` rather than evaluated.
+     * Used by `precheck` to validate without calling `default_factory`. */
+    bool defer_defaults;
+    /* When non-NULL, paths of fields left unevaluated are appended here
+     * (borrowed reference). */
+    PyObject *deferred_paths;
 
     /* Temporary scratch space */
     unsigned char *scratch;
@@ -18683,17 +19342,28 @@ json_decode_struct_array_inner(
         goto error;
     }
     /* Fill in missing fields with defaults */
-    for (; i < nfields; i++) {
-        item = get_default(
-            PyTuple_GET_ITEM(st_type->struct_defaults, i - npos)
-        );
-        if (item == NULL) goto error;
-        Struct_set_index(out, i, item);
-        if (should_untrack) {
-            should_untrack = !MS_MAYBE_TRACKED(item);
+    if (MS_UNLIKELY(self->defer_defaults)) {
+        /* Leave missing slots unset; the helper below marks them deferred. */
+    }
+    else {
+        for (; i < nfields; i++) {
+            item = get_default(
+                PyTuple_GET_ITEM(st_type->struct_defaults, i - npos)
+            );
+            if (item == NULL) goto error;
+            Struct_set_index(out, i, item);
+            if (should_untrack) {
+                should_untrack = !MS_MAYBE_TRACKED(item);
+            }
         }
     }
-    if (Struct_decode_post_init(st_type, out, path) < 0) goto error;
+    if (MS_UNLIKELY(self->defer_defaults)) {
+        if (Struct_store_deferred_defaults(
+                st_type, out, path, self->deferred_paths) < 0) goto error;
+    }
+    else {
+        if (Struct_decode_post_init(st_type, out, path) < 0) goto error;
+    }
     Py_LeaveRecursiveCall();
     if (is_gc && should_untrack && MS_IS_TRACKED(out))
         PyObject_GC_UnTrack(out);
@@ -19265,7 +19935,9 @@ json_decode_dataclass(
             if (json_skip(self) < 0) goto error;
         }
     }
-    if (DataclassInfo_post_decode(info, out, path) < 0) goto error;
+    if (DataclassInfo_post_decode(
+            info, out, path, self->defer_defaults, self->deferred_paths
+        ) < 0) goto error;
 
     Py_LeaveRecursiveCall();
     return out;
@@ -19366,7 +20038,13 @@ json_decode_struct_map_inner(
             }
         }
     }
-    if (Struct_fill_in_defaults(st_type, out, path) < 0) goto error;
+    if (MS_UNLIKELY(self->defer_defaults)) {
+        if (Struct_store_deferred_defaults(
+                st_type, out, path, self->deferred_paths) < 0) goto error;
+    }
+    else {
+        if (Struct_fill_in_defaults(st_type, out, path) < 0) goto error;
+    }
     Py_LeaveRecursiveCall();
     return out;
 
@@ -20179,19 +20857,6 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
     return NULL;
 }
 
-static struct PyMethodDef JSONDecoder_methods[] = {
-    {
-        "decode", (PyCFunction) JSONDecoder_decode, METH_FASTCALL,
-        JSONDecoder_decode__doc__,
-    },
-    {
-        "decode_lines", (PyCFunction) JSONDecoder_decode_lines, METH_FASTCALL,
-        JSONDecoder_decode_lines__doc__,
-    },
-    {"__class_getitem__", Py_GenericAlias, METH_O|METH_CLASS},
-    {NULL, NULL}                /* sentinel */
-};
-
 static PyMemberDef JSONDecoder_members[] = {
     {"type", T_OBJECT_EX, offsetof(JSONDecoder, orig_type), READONLY, "The Decoder type"},
     {"strict", T_BOOL, offsetof(JSONDecoder, strict), READONLY, "The Decoder strict setting"},
@@ -20199,6 +20864,8 @@ static PyMemberDef JSONDecoder_members[] = {
     {"float_hook", T_OBJECT, offsetof(JSONDecoder, float_hook), READONLY, "The Decoder float_hook"},
     {NULL},
 };
+
+static struct PyMethodDef JSONDecoder_methods[];
 
 static PyTypeObject JSONDecoder_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
@@ -20214,6 +20881,637 @@ static PyTypeObject JSONDecoder_Type = {
     .tp_methods = JSONDecoder_methods,
     .tp_members = JSONDecoder_members,
 };
+
+/*************************************************************************
+ * Precheck                                                              *
+ *************************************************************************/
+
+PyDoc_STRVAR(JSONDecoder_precheck__doc__,
+"precheck($self, buf, /)\n"
+"--\n"
+"\n"
+"Validate a JSON message without evaluating any ``default_factory``.\n"
+"\n"
+"Fields that would receive a default are left as ``DEFERRED``, and their\n"
+"paths are listed in the returned result's ``deferred`` attribute. The\n"
+"original message is retained so that ``apply_defaults`` can re-decode it\n"
+"later.\n"
+"\n"
+"Parameters\n"
+"----------\n"
+"buf : bytes-like or str\n"
+"    The message to precheck.\n"
+"\n"
+"Returns\n"
+"-------\n"
+"result : PrecheckResult\n"
+"    The validated message and the paths of unevaluated fields.\n"
+);
+static PyObject*
+JSONDecoder_precheck(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (!check_positional_nargs(nargs, 1, 1)) {
+        return NULL;
+    }
+
+    JSONDecoderState state = {
+        .type = self->type,
+        .strict = self->strict,
+        .dec_hook = self->dec_hook,
+        .float_hook = self->float_hook,
+        .defer_defaults = true,
+        .deferred_paths = NULL,
+        .scratch = NULL,
+        .scratch_capacity = 0,
+        .scratch_len = 0
+    };
+
+    PyObject *res = NULL;
+    PyObject *deferred = PyList_New(0);
+    if (deferred == NULL) return NULL;
+    state.deferred_paths = deferred;
+
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    if (ms_get_buffer(args[0], &buffer) >= 0) {
+        state.buffer_obj = args[0];
+        state.input_start = buffer.buf;
+        state.input_pos = buffer.buf;
+        state.input_end = state.input_pos + buffer.len;
+
+        PyObject *value = json_decode(&state, state.type, NULL);
+
+        if (value != NULL && json_has_trailing_characters(&state)) {
+            Py_CLEAR(value);
+        }
+
+        ms_release_buffer(&buffer);
+        PyMem_Free(state.scratch);
+
+        if (value != NULL) {
+            PrecheckResult *out = (PrecheckResult *)PrecheckResult_New();
+            if (out == NULL) {
+                Py_DECREF(value);
+                goto done;
+            }
+            Py_INCREF(args[0]);
+            out->message = args[0];
+            out->value = value;
+            out->deferred = deferred;
+            out->start = 0;
+            out->end = buffer.len;
+            deferred = NULL;
+            PrecheckResult_init_type(
+                out, self->orig_type, self->dec_hook, NULL,
+                self->float_hook, self->strict, 1
+            );
+            res = (PyObject *)out;
+        }
+    }
+done:
+    Py_XDECREF(deferred);
+    return res;
+}
+
+PyDoc_STRVAR(JSONDecoder_precheck_lines__doc__,
+"precheck_lines($self, buf, /)\n"
+"--\n"
+"\n"
+"Precheck newline-delimited JSON, returning one result per item.\n"
+"\n"
+"Unlike ``decode_lines``, a rejected line doesn't abort the batch. Every\n"
+"line is reported, with ``ok`` set to False and ``error`` describing why.\n"
+"No ``default_factory`` is evaluated for any line.\n"
+"\n"
+"Parameters\n"
+"----------\n"
+"buf : bytes-like or str\n"
+"    The newline-delimited message to precheck.\n"
+"\n"
+"Returns\n"
+"-------\n"
+"items : list[PrecheckResult]\n"
+"    One result per non-empty line.\n"
+);
+static PyObject*
+JSONDecoder_precheck_lines(
+    JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs
+)
+{
+    if (!check_positional_nargs(nargs, 1, 1)) {
+        return NULL;
+    }
+
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    if (ms_get_buffer(args[0], &buffer) < 0) {
+        return NULL;
+    }
+
+    PyObject *out = PyList_New(0);
+    if (out == NULL) {
+        ms_release_buffer(&buffer);
+        return NULL;
+    }
+
+    unsigned char *start = (unsigned char *)buffer.buf;
+    unsigned char *end = start + buffer.len;
+
+    while (start < end) {
+        /* Skip whitespace between items */
+        while (start < end) {
+            unsigned char c = *start;
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+            start++;
+        }
+        if (start == end) break;
+
+        JSONDecoderState state = {
+            .type = self->type,
+            .strict = self->strict,
+            .dec_hook = self->dec_hook,
+            .float_hook = self->float_hook,
+            .defer_defaults = true,
+            .deferred_paths = NULL,
+            .scratch = NULL,
+            .scratch_capacity = 0,
+            .scratch_len = 0
+        };
+
+        PyObject *deferred = PyList_New(0);
+        if (deferred == NULL) goto error;
+        state.deferred_paths = deferred;
+
+        state.buffer_obj = args[0];
+        state.input_start = (unsigned char *)buffer.buf;
+        state.input_pos = start;
+        state.input_end = end;
+
+        PyObject *value = json_decode(&state, state.type, NULL);
+        unsigned char *item_start = start;
+
+        if (value != NULL) {
+            start = state.input_pos;
+        }
+        else {
+            /* Rejected line: capture the exception in the receipt, then skip
+             * to the end of this line so later lines are still checked. */
+            PyObject *exc_type = NULL, *exc = NULL, *tb = NULL;
+            PyErr_Fetch(&exc_type, &exc, &tb);
+            PyErr_NormalizeException(&exc_type, &exc, &tb);
+            if (exc == NULL) {
+                /* Normalization failed (or no exception was set); surface a
+                 * concrete error instead of masking it. */
+                Py_XDECREF(exc_type);
+                Py_XDECREF(tb);
+                Py_DECREF(deferred);
+                PyMem_Free(state.scratch);
+                Py_DECREF(out);
+                if (!PyErr_Occurred()) PyErr_NoMemory();
+                goto error_cleanup;
+            }
+            Py_XDECREF(exc_type);
+            Py_XDECREF(tb);
+            start = item_start;
+            while (start < end && *start != '\n') start++;
+            if (start < end) start++;
+
+            Py_DECREF(deferred);
+            deferred = NULL;
+            PyMem_Free(state.scratch);
+
+            PrecheckResult *line = (PrecheckResult *)PrecheckResult_New();
+            if (line == NULL) {
+                Py_XDECREF(exc);
+                Py_DECREF(out);
+                goto error_cleanup;
+            }
+            Py_INCREF(args[0]);
+            line->message = args[0];
+            line->start = item_start - (unsigned char *)buffer.buf;
+            line->end = start - (unsigned char *)buffer.buf;
+            line->error = exc;
+            line->deferred = PyList_New(0);
+            if (line->deferred == NULL) {
+                Py_DECREF(line);
+                Py_DECREF(out);
+                goto error_cleanup;
+            }
+            PrecheckResult_init_type(
+                line, self->orig_type, self->dec_hook, NULL,
+                self->float_hook, self->strict, 1
+            );
+            if (PyList_Append(out, (PyObject *)line) < 0) {
+                Py_DECREF(line);
+                goto error_cleanup;
+            }
+            Py_DECREF(line);
+            continue;
+        }
+
+        PyMem_Free(state.scratch);
+
+        PrecheckResult *line = (PrecheckResult *)PrecheckResult_New();
+        if (line == NULL) {
+            Py_XDECREF(value);
+            Py_XDECREF(deferred);
+            goto error_cleanup;
+        }
+        Py_INCREF(args[0]);
+        line->message = args[0];
+        line->start = item_start - (unsigned char *)buffer.buf;
+        line->end = start - (unsigned char *)buffer.buf;
+        line->value = value;
+        line->deferred = deferred;
+
+        PrecheckResult_init_type(
+            line, self->orig_type, self->dec_hook, NULL,
+            self->float_hook, self->strict, 1
+        );
+
+        if (PyList_Append(out, (PyObject *)line) < 0) {
+            Py_DECREF(line);
+            Py_DECREF(out);
+            goto error_cleanup;
+        }
+        Py_DECREF(line);
+    }
+
+    ms_release_buffer(&buffer);
+    return out;
+
+error:
+    ms_release_buffer(&buffer);
+    Py_DECREF(out);
+    return NULL;
+
+error_cleanup:
+    ms_release_buffer(&buffer);
+    return NULL;
+}
+
+PyDoc_STRVAR(msgspec_json_precheck__doc__,
+"json_precheck(buf, /, *, type='Any', strict=True, dec_hook=None)\n"
+"--\n"
+"\n"
+"Validate a JSON message without evaluating any ``default_factory``.\n"
+"\n"
+"See `msgspec.json.Decoder.precheck` for details.\n"
+);
+static PyObject*
+msgspec_json_precheck(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+{
+    PyObject *res = NULL, *buf = NULL, *type = NULL, *dec_hook = NULL, *strict_obj = NULL;
+    int strict = 1;
+    MsgspecState *mod = msgspec_get_state(self);
+
+    if (!check_positional_nargs(nargs, 1, 1)) return NULL;
+    buf = args[0];
+    if (kwnames != NULL) {
+        Py_ssize_t nkwargs = PyTuple_GET_SIZE(kwnames);
+        if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
+        if ((strict_obj = find_keyword(kwnames, args + nargs, mod->str_strict)) != NULL) nkwargs--;
+        if ((dec_hook = find_keyword(kwnames, args + nargs, mod->str_dec_hook)) != NULL) nkwargs--;
+        if (nkwargs > 0) {
+            PyErr_SetString(PyExc_TypeError, "Extra keyword arguments provided");
+            return NULL;
+        }
+    }
+
+    if (dec_hook == Py_None) dec_hook = NULL;
+    if (dec_hook != NULL && !PyCallable_Check(dec_hook)) {
+        PyErr_SetString(PyExc_TypeError, "dec_hook must be callable");
+        return NULL;
+    }
+    if (strict_obj != NULL) {
+        strict = PyObject_IsTrue(strict_obj);
+        if (strict < 0) return NULL;
+    }
+
+    TypeNode *type_node;
+    TypeNode typenode_any = {MS_TYPE_ANY};
+    TypeNodeSimple typenode_struct;
+    bool own_type = false;
+
+    if (type == NULL || type == mod->typing_any) {
+        type_node = &typenode_any;
+    }
+    else if (ms_is_struct_cls(type)) {
+        PyObject *info = StructInfo_Convert(type);
+        if (info == NULL) return NULL;
+        bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
+        typenode_struct.types = array_like ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
+        typenode_struct.details[0].pointer = info;
+        type_node = (TypeNode *)(&typenode_struct);
+    }
+    else {
+        type_node = TypeNode_Convert(type);
+        if (type_node == NULL) return NULL;
+        own_type = true;
+    }
+
+    JSONDecoderState state = {
+        .type = type_node,
+        .strict = strict,
+        .dec_hook = dec_hook,
+        .float_hook = NULL,
+        .defer_defaults = true,
+        .deferred_paths = NULL,
+        .scratch = NULL,
+        .scratch_capacity = 0,
+        .scratch_len = 0
+    };
+
+    PyObject *deferred = PyList_New(0);
+    if (deferred == NULL) goto cleanup;
+    state.deferred_paths = deferred;
+
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    if (ms_get_buffer(buf, &buffer) >= 0) {
+        state.buffer_obj = buf;
+        state.input_start = buffer.buf;
+        state.input_pos = buffer.buf;
+        state.input_end = state.input_pos + buffer.len;
+
+        PyObject *value = json_decode(&state, state.type, NULL);
+
+        if (value != NULL && json_has_trailing_characters(&state)) {
+            Py_CLEAR(value);
+        }
+
+        ms_release_buffer(&buffer);
+        PyMem_Free(state.scratch);
+
+        if (value != NULL) {
+            PrecheckResult *out = (PrecheckResult *)PrecheckResult_New();
+            if (out == NULL) {
+                Py_DECREF(value);
+            }
+            else {
+                Py_INCREF(buf);
+                out->message = buf;
+                out->value = value;
+                out->deferred = deferred;
+                out->start = 0;
+                out->end = buffer.len;
+                deferred = NULL;
+                PrecheckResult_init_type(
+                    out, type != NULL ? type : mod->typing_any,
+                    dec_hook, NULL, NULL, strict, 1
+                );
+                res = (PyObject *)out;
+            }
+        }
+    }
+
+cleanup:
+    Py_XDECREF(deferred);
+    if (type_node == (TypeNode *)&typenode_struct) {
+        Py_DECREF(typenode_struct.details[0].pointer);
+    }
+    else if (own_type) {
+        TypeNode_Free(type_node);
+    }
+    return res;
+}
+
+PyDoc_STRVAR(msgspec_json_precheck_lines__doc__,
+"json_precheck_lines(buf, /, *, type='Any', strict=True, dec_hook=None)\n"
+"--\n"
+"\n"
+"Precheck newline-delimited JSON, returning one result per line.\n"
+"\n"
+"See `msgspec.json.Decoder.precheck_lines` for details.\n"
+);
+static PyObject*
+msgspec_json_precheck_lines(
+    PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames
+)
+{
+    PyObject *type = NULL, *dec_hook = NULL, *strict_obj = NULL;
+    int strict = 1;
+    MsgspecState *mod = msgspec_get_state(self);
+
+    if (!check_positional_nargs(nargs, 1, 1)) return NULL;
+    if (kwnames != NULL) {
+        Py_ssize_t nkwargs = PyTuple_GET_SIZE(kwnames);
+        if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
+        if ((strict_obj = find_keyword(kwnames, args + nargs, mod->str_strict)) != NULL) nkwargs--;
+        if ((dec_hook = find_keyword(kwnames, args + nargs, mod->str_dec_hook)) != NULL) nkwargs--;
+        if (nkwargs > 0) {
+            PyErr_SetString(PyExc_TypeError, "Extra keyword arguments provided");
+            return NULL;
+        }
+    }
+
+    if (dec_hook == Py_None) dec_hook = NULL;
+    if (dec_hook != NULL && !PyCallable_Check(dec_hook)) {
+        PyErr_SetString(PyExc_TypeError, "dec_hook must be callable");
+        return NULL;
+    }
+    if (strict_obj != NULL) {
+        strict = PyObject_IsTrue(strict_obj);
+        if (strict < 0) return NULL;
+    }
+
+    TypeNode *type_node;
+    TypeNode typenode_any = {MS_TYPE_ANY};
+    TypeNodeSimple typenode_struct;
+    bool own_type = false;
+
+    if (type == NULL || type == mod->typing_any) {
+        type_node = &typenode_any;
+    }
+    else if (ms_is_struct_cls(type)) {
+        PyObject *info = StructInfo_Convert(type);
+        if (info == NULL) return NULL;
+        bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
+        typenode_struct.types = array_like ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
+        typenode_struct.details[0].pointer = info;
+        type_node = (TypeNode *)(&typenode_struct);
+    }
+    else {
+        type_node = TypeNode_Convert(type);
+        if (type_node == NULL) return NULL;
+        own_type = true;
+    }
+
+    JSONDecoder decoder = {
+        .orig_type = type != NULL ? type : mod->typing_any,
+        .type = type_node,
+        .strict = (char)strict,
+        .dec_hook = dec_hook,
+        .float_hook = NULL
+    };
+
+    PyObject *res = JSONDecoder_precheck_lines(&decoder, args, nargs);
+
+    if (type_node == (TypeNode *)&typenode_struct) {
+        Py_DECREF(typenode_struct.details[0].pointer);
+    }
+    else if (own_type) {
+        TypeNode_Free(type_node);
+    }
+    return res;
+}
+
+/* Re-decode the *original* message, now evaluating defaults. This is
+ * intentionally kept separate from the prechecked value: reviewers may change
+ * the prechecked value after the fact, but the submitted message is what
+ * determines which defaults get applied. */
+static PyObject *
+precheck_apply_defaults(PrecheckResult *self)
+{
+    MsgspecState *mod = msgspec_get_global_state();
+    PyObject *type = self->orig_type;
+
+    if (self->message == NULL) {
+        PyErr_SetString(PyExc_ValueError, "PrecheckResult has no message");
+        return NULL;
+    }
+
+    if (self->json) {
+        TypeNode *type_node;
+        TypeNode typenode_any = {MS_TYPE_ANY};
+        TypeNodeSimple typenode_struct;
+        bool own_type = false;
+
+        if (type == NULL || type == mod->typing_any) {
+            type_node = &typenode_any;
+        }
+        else if (ms_is_struct_cls(type)) {
+            PyObject *info = StructInfo_Convert(type);
+            if (info == NULL) return NULL;
+            bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
+            typenode_struct.types = array_like
+                ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
+            typenode_struct.details[0].pointer = info;
+            type_node = (TypeNode *)(&typenode_struct);
+        }
+        else {
+            type_node = TypeNode_Convert(type);
+            if (type_node == NULL) return NULL;
+            own_type = true;
+        }
+
+        JSONDecoderState state = {
+            .type = type_node,
+            .strict = self->strict,
+            .dec_hook = self->dec_hook,
+            .float_hook = self->float_hook,
+            .defer_defaults = false,
+            .deferred_paths = NULL,
+            .scratch = NULL,
+            .scratch_capacity = 0,
+            .scratch_len = 0
+        };
+
+        PyObject *res = NULL;
+        Py_buffer buffer;
+        buffer.buf = NULL;
+        if (ms_get_buffer(self->message, &buffer) >= 0) {
+            state.buffer_obj = self->message;
+            state.input_start = buffer.buf;
+            state.input_pos = buffer.buf + self->start;
+            state.input_end = buffer.buf + self->end;
+
+            res = json_decode(&state, state.type, NULL);
+            if (res != NULL && json_has_trailing_characters(&state)) {
+                Py_CLEAR(res);
+            }
+            ms_release_buffer(&buffer);
+        }
+        PyMem_Free(state.scratch);
+
+        if (type_node == (TypeNode *)&typenode_struct) {
+            Py_DECREF(typenode_struct.details[0].pointer);
+        }
+        else if (own_type) {
+            TypeNode_Free(type_node);
+        }
+        return res;
+    }
+    else {
+        TypeNode *type_node;
+        TypeNode typenode_any = {MS_TYPE_ANY};
+        TypeNodeSimple typenode_struct;
+        bool own_type = false;
+
+        if (type == NULL || type == mod->typing_any) {
+            type_node = &typenode_any;
+        }
+        else if (ms_is_struct_cls(type)) {
+            PyObject *info = StructInfo_Convert(type);
+            if (info == NULL) return NULL;
+            bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
+            typenode_struct.types = array_like
+                ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
+            typenode_struct.details[0].pointer = info;
+            type_node = (TypeNode *)(&typenode_struct);
+        }
+        else {
+            type_node = TypeNode_Convert(type);
+            if (type_node == NULL) return NULL;
+            own_type = true;
+        }
+
+        DecoderState state = {
+            .type = type_node,
+            .strict = self->strict,
+            .dec_hook = self->dec_hook,
+            .ext_hook = self->ext_hook,
+            .defer_defaults = false,
+            .deferred_paths = NULL
+        };
+
+        PyObject *res = NULL;
+        Py_buffer buffer;
+        buffer.buf = NULL;
+        if (PyObject_GetBuffer(self->message, &buffer, PyBUF_CONTIG_RO) >= 0) {
+            state.buffer_obj = self->message;
+            state.input_start = buffer.buf;
+            state.input_pos = buffer.buf + self->start;
+            state.input_end = buffer.buf + self->end;
+
+            res = mpack_decode(&state, state.type, NULL, false);
+            if (res != NULL && mpack_has_trailing_characters(&state)) {
+                Py_CLEAR(res);
+            }
+            PyBuffer_Release(&buffer);
+        }
+
+        if (type_node == (TypeNode *)&typenode_struct) {
+            Py_DECREF(typenode_struct.details[0].pointer);
+        }
+        else if (own_type) {
+            TypeNode_Free(type_node);
+        }
+        return res;
+    }
+}
+
+static struct PyMethodDef JSONDecoder_methods[] = {
+    {
+        "decode", (PyCFunction) JSONDecoder_decode, METH_FASTCALL,
+        JSONDecoder_decode__doc__,
+    },
+    {
+        "decode_lines", (PyCFunction) JSONDecoder_decode_lines, METH_FASTCALL,
+        JSONDecoder_decode_lines__doc__,
+    },
+    {
+        "precheck", (PyCFunction) JSONDecoder_precheck, METH_FASTCALL,
+        JSONDecoder_precheck__doc__,
+    },
+    {
+        "precheck_lines", (PyCFunction) JSONDecoder_precheck_lines, METH_FASTCALL,
+        JSONDecoder_precheck_lines__doc__,
+    },
+    {"__class_getitem__", Py_GenericAlias, METH_O|METH_CLASS},
+    {NULL, NULL}                /* sentinel */
+};
+
 
 PyDoc_STRVAR(msgspec_json_decode__doc__,
 "json_decode(buf, /, *, type='Any', strict=True, dec_hook=None)\n"
@@ -22312,7 +23610,7 @@ convert_dict_to_dataclass(
             if (status < 0) goto error;
         }
     }
-    if (DataclassInfo_post_decode(info, out, path) < 0) goto error;
+    if (DataclassInfo_post_decode(info, out, path, false, NULL) < 0) goto error;
     Py_LeaveRecursiveCall();
     return out;
 error:
@@ -23022,12 +24320,24 @@ static struct PyMethodDef msgspec_methods[] = {
         msgspec_msgpack_decode__doc__,
     },
     {
+        "msgpack_precheck", (PyCFunction) msgspec_msgpack_precheck, METH_FASTCALL | METH_KEYWORDS,
+        msgspec_msgpack_precheck__doc__,
+    },
+    {
         "json_encode", (PyCFunction) msgspec_json_encode, METH_FASTCALL | METH_KEYWORDS,
         msgspec_json_encode__doc__,
     },
     {
         "json_decode", (PyCFunction) msgspec_json_decode, METH_FASTCALL | METH_KEYWORDS,
         msgspec_json_decode__doc__,
+    },
+    {
+        "json_precheck", (PyCFunction) msgspec_json_precheck, METH_FASTCALL | METH_KEYWORDS,
+        msgspec_json_precheck__doc__,
+    },
+    {
+        "json_precheck_lines", (PyCFunction) msgspec_json_precheck_lines, METH_FASTCALL | METH_KEYWORDS,
+        msgspec_json_precheck_lines__doc__,
     },
     {
         "json_format", (PyCFunction) msgspec_json_format, METH_VARARGS | METH_KEYWORDS,
@@ -23264,6 +24574,10 @@ PyInit__core(void)
         goto error;
     if (PyType_Ready(&JSONDecoder_Type) < 0)
         goto error;
+    if (PyType_Ready(&PrecheckResult_Type) < 0)
+        goto error;
+    if (PyType_Ready(&Deferred_Type) < 0)
+        goto error;
 
 #define SET_TEMP_OBJ(TEMP) \
     do { \
@@ -23295,7 +24609,9 @@ PyInit__core(void)
     SET_MODULE_REF("MsgpackDecoder", (PyObject *)&Decoder_Type);
     SET_MODULE_REF("JSONEncoder", (PyObject *)&JSONEncoder_Type);
     SET_MODULE_REF("JSONDecoder", (PyObject *)&JSONDecoder_Type);
+    SET_MODULE_REF("PrecheckResult", (PyObject *)&PrecheckResult_Type);
     SET_MODULE_REF("UnsetType", (PyObject *)&Unset_Type);
+    SET_MODULE_REF("DeferredType", (PyObject *)&Deferred_Type);
     SET_MODULE_REF("StructMeta", (PyObject *)&StructMetaType);
 
     st = msgspec_get_state(m);
@@ -23308,6 +24624,9 @@ PyInit__core(void)
 
     /* Add UNSET singleton */
     SET_MODULE_REF("UNSET", UNSET);
+
+    /* Add DEFERRED singleton */
+    SET_MODULE_REF("DEFERRED", DEFERRED);
 
     /* Initialize the exceptions. */
     st->MsgspecError = PyErr_NewExceptionWithDoc(

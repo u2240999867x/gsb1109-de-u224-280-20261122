@@ -54,6 +54,14 @@ Unset
 
 .. autoclass:: UnsetType
 
+.. autodata:: DEFERRED
+   :no-value:
+
+.. autoclass:: DeferredType
+
+.. autoclass:: PrecheckResult
+    :members: apply_defaults
+
 
 JSON
 ----
@@ -64,11 +72,15 @@ JSON
     :members: encode, encode_lines, encode_into
 
 .. autoclass:: Decoder
-    :members: decode, decode_lines
+    :members: decode, decode_lines, precheck, precheck_lines
 
 .. autofunction:: encode
 
 .. autofunction:: decode
+
+.. autofunction:: precheck
+
+.. autofunction:: precheck_lines
 
 .. autofunction:: format
 
@@ -90,6 +102,8 @@ MessagePack
 .. autofunction:: encode
 
 .. autofunction:: decode
+
+.. autofunction:: precheck
 
 
 YAML

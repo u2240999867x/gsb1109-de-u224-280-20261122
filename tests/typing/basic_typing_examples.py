@@ -932,6 +932,61 @@ def check_json_Decoder_decode_lines_typed() -> None:
     assert_type(o, list[int])
 
 
+def check_deferred() -> None:
+    assert_type(msgspec.DEFERRED, Literal[msgspec.DeferredType.DEFERRED])
+    assert_type(type(msgspec.DEFERRED), type[msgspec.DeferredType])
+    str(msgspec.DEFERRED)
+    pickle.dumps(msgspec.DEFERRED)
+
+
+def check_json_precheck_typed() -> None:
+    b = msgspec.json.encode([1, 2, 3])
+    res = msgspec.json.precheck(b, type=list[int])
+    assert_type(res, msgspec.PrecheckResult[list[int]])
+    assert_type(res.value, list[int])
+    assert_type(res.message, Any)
+    assert_type(res.deferred, list[str])
+    assert_type(res.apply_defaults(), list[int])
+
+
+def check_json_precheck_any() -> None:
+    b = msgspec.json.encode([1, 2, 3])
+    res = msgspec.json.precheck(b)
+    assert_type(res, msgspec.PrecheckResult[Any])
+
+
+def check_json_Decoder_precheck() -> None:
+    dec = msgspec.json.Decoder(int)
+    res = dec.precheck(b'1')
+    assert_type(res, msgspec.PrecheckResult[int])
+
+
+def check_json_precheck_lines() -> None:
+    res = msgspec.json.precheck_lines(b'1\n2', type=int)
+    assert_type(res, list[msgspec.PrecheckResult[int]])
+
+
+def check_json_Decoder_precheck_lines() -> None:
+    dec = msgspec.json.Decoder(int)
+    res = dec.precheck_lines(b'1\n2')
+    assert_type(res, list[msgspec.PrecheckResult[int]])
+
+
+def check_msgpack_precheck_typed() -> None:
+    b = msgspec.msgpack.encode([1, 2, 3])
+    res = msgspec.msgpack.precheck(b, type=list[int])
+    assert_type(res, msgspec.PrecheckResult[list[int]])
+    assert_type(res.value, list[int])
+    assert_type(res.apply_defaults(), list[int])
+
+
+def check_msgpack_Decoder_precheck() -> None:
+    dec = msgspec.msgpack.Decoder(int)
+    res = dec.precheck(b'\x01')
+    assert_type(res, msgspec.PrecheckResult[int])
+
+
+
 def check_json_decode_any() -> None:
     b = msgspec.json.encode([1, 2, 3])
     o = msgspec.json.decode(b)

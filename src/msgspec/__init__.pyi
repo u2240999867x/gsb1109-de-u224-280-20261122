@@ -5,6 +5,7 @@ from typing import (
     Any,
     ClassVar,
     Final,
+    Generic,
     Literal,
     TypeVar,
     final,
@@ -81,6 +82,28 @@ class _NoDefault(enum.Enum):
     NODEFAULT = "NODEFAULT"
 
 NODEFAULT: Final = _NoDefault.NODEFAULT
+
+@final
+class DeferredType(enum.Enum):
+    DEFERRED = "DEFERRED"
+
+DEFERRED: Final = DeferredType.DEFERRED
+
+@final
+class PrecheckResult(Generic[_T]):
+    @property
+    def type(self) -> type[_T]: ...
+    @property
+    def message(self) -> Any: ...
+    @property
+    def value(self) -> _T: ...
+    @property
+    def deferred(self) -> list[str]: ...
+    @property
+    def ok(self) -> bool: ...
+    @property
+    def error(self) -> BaseException | None: ...
+    def apply_defaults(self, /) -> _T: ...
 
 @overload
 def field(*, default: _T, name: str | None = None) -> _T: ...

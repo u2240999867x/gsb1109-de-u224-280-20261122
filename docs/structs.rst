@@ -695,6 +695,78 @@ still type checks. Specifying ``default=[]`` works too: ``msgspec`` doesn't
 share mutable default values between instances.
 
 
+.. _precheck:
+
+Prechecking Without Evaluating Defaults
+---------------------------------------
+
+The normal `decode <msgspec.json.decode>` functions apply all missing defaults
+immediately, which means any ``default_factory`` is called during decoding. If
+a factory has external side effects - for example, pulling the next number from
+a sequence - you may want to validate the fields supplied in a message *before*
+consuming any defaults, and only apply them for the messages you accept.
+
+`msgspec.json.precheck` and `msgspec.msgpack.precheck` (also available as
+``Decoder.precheck``) validate a message exactly like ``decode``, except that
+fields which would receive a default are left as `msgspec.DEFERRED` instead.
+The returned `msgspec.PrecheckResult` lists those fields in ``deferred`` and
+keeps the original message around:
+
+.. code-block:: python
+
+    >>> import itertools
+    >>> import msgspec
+
+    >>> numbers = itertools.count(1)
+
+    >>> class Ticket(msgspec.Struct):
+    ...     sku: str
+    ...     qty: int
+    ...     note: str | None = None
+    ...     number: int = msgspec.field(default_factory=lambda: next(numbers))
+
+    >>> line = msgspec.json.encode({"sku": "A-001", "qty": 1, "note": None})
+
+    >>> result = msgspec.json.precheck(line, type=Ticket)
+
+    >>> result.value
+    Ticket(sku='A-001', qty=1, note=None, number=DEFERRED)
+
+    >>> result.deferred
+    ['$.number']
+
+    >>> # No number has been consumed by the precheck itself
+    >>> result.apply_defaults()
+    Ticket(sku='A-001', qty=1, note=None, number=1)
+
+    >>> next(numbers)  # the next available number is still 2
+    2
+
+``apply_defaults`` re-decodes the **original submitted message**, not the value
+returned by ``precheck``. This means later edits to the prechecked value (for
+example, adjusting an accepted row in a review step) can't change which
+defaults are applied, or the order in which factories run. Calling
+``apply_defaults`` again evaluates the factories again from the same message.
+
+If validation fails, ``precheck`` raises a `msgspec.ValidationError` just like
+``decode``; no default or factory is evaluated for a rejected message. The
+regular ``decode`` functions are unchanged, and still evaluate defaults
+immediately.
+
+For newline-delimited JSON, ``precheck_lines`` checks each item independently
+and returns one `msgspec.PrecheckResult` per line. A rejected line doesn't
+abort the batch; its result has ``ok=False``, ``value=None``, and the
+`msgspec.ValidationError` in ``error``. This makes it simple to precheck a
+batch, select the accepted rows, and apply defaults only for those:
+
+.. code-block:: python
+
+    >>> msgspec.json.precheck_lines(line + b"\n" + bad_line, type=Ticket)
+    [PrecheckResult(...), PrecheckResult(...)]
+
+    >>> [r.apply_defaults() for r in results if r.ok]
+
+
 .. _forbid-unknown-fields:
 
 Forbidding Unknown Fields
