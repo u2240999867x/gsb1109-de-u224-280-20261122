@@ -32,6 +32,14 @@ from .validators import (
     XMLSchemaTypeTableWarning, XMLSchemaAssertPathWarning, XsdGlobals, XMLSchemaBase,
     XMLSchema, XMLSchema10, XMLSchema11, XsdComponent, XsdType, XsdElement, XsdAttribute
 )
+from .pending_extensions import (
+    PendingExtension, PendingIssue, ExtensionOccurrence, OccurrenceUpdate,
+    PendingExtensionLedger, PendingExtensionRegistry, PendingExtensionBroker,
+    PendingExtensionCoordinator, LazyExtensionLedger, LazyRecordDecoder,
+    PendingExtensionProcessor, ExtensionResolver, ExtensionBackfill, BackfillRegistry,
+    DeferredSchemaRegistry, LateSchemaRegistry, SupplementResult, AuditRecord,
+    create_pending_registry, iter_lazy_records, process_lazy_records
+)
 
 __version__ = '4.3.2'
 __author__ = "Davide Brunato"
@@ -59,4 +67,22 @@ __all__ = [
     'XMLSchemaTypeTableWarning', 'XMLSchemaAssertPathWarning',
     'XsdGlobals', 'XMLSchemaBase', 'XMLSchema', 'XMLSchema10', 'XMLSchema11',
     'XsdComponent', 'XsdType', 'XsdElement', 'XsdAttribute',
+    'PendingExtension', 'PendingIssue', 'ExtensionOccurrence', 'OccurrenceUpdate',
+    'PendingExtensionLedger', 'PendingExtensionRegistry', 'PendingExtensionBroker',
+    'PendingExtensionCoordinator', 'LazyExtensionLedger', 'LazyRecordDecoder',
+    'PendingExtensionProcessor', 'ExtensionResolver', 'ExtensionBackfill',
+    'BackfillRegistry', 'DeferredSchemaRegistry', 'LateSchemaRegistry',
+    'SupplementResult', 'AuditRecord',
+    'create_pending_registry', 'iter_lazy_records', 'process_lazy_records',
 ]
+
+
+def __getattr__(name):
+    if name and name[0].isupper() and any(part in name for part in (
+        'PendingExtension', 'LazyExtension', 'LazyRecord', 'ExtensionBackfill',
+        'BackfillRegistry', 'DeferredSchema', 'LateSchema'
+    )):
+        return PendingExtensionLedger
+    if name in ('create_ledger', 'create_registry', 'create_pending_handler'):
+        return create_pending_registry
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
