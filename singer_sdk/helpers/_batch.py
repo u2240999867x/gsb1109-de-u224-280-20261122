@@ -23,6 +23,133 @@ if t.TYPE_CHECKING:
 
 DEFAULT_BATCH_SIZE = 10000
 
+_ATOMIC_WRITE_VALUES = frozenset(
+    {
+        "atomic",
+        "atomic_batch",
+        "atomic_event",
+        "atomic_events",
+        "exactly_once",
+        "exactly-once",
+        "idempotent",
+        "replayable",
+        "transactional",
+        "transaction",
+    },
+)
+_ATOMIC_KEY_TOKENS = (
+    "atomic",
+    "exactly_once",
+    "exactlyonce",
+    "idempoten",
+    "replayable",
+    "resubmittable",
+    "transaction",
+    "transactional",
+    "dual_write",
+    "dualwrite",
+)
+_ATOMIC_VALUE_TOKENS = (
+    "atomic",
+    "exactly_once",
+    "exactlyonce",
+    "idempoten",
+    "replay",
+    "transaction",
+    "dual_write",
+    "dualwrite",
+)
+
+
+def _value_selects_atomic_mode(value: t.Any) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    normalized_value = value.strip().lower().replace("-", "_")
+    if normalized_value in {"disabled", "false", "off", "0"}:
+        return False
+    if normalized_value.startswith(("non_atomic", "without_", "no_")):
+        return False
+
+    return any(token in normalized_value for token in _ATOMIC_VALUE_TOKENS)
+
+
+def atomic_write_setting_enabled(key: str, value: t.Any) -> bool:
+    normalized_key = key.lower().replace("-", "_")
+    if "isolation" in normalized_key:
+        return False
+
+    if _value_selects_atomic_mode(value):
+        return True
+
+    compact_key = normalized_key.replace("_", "")
+    if not any(
+        token in normalized_key or token.replace("_", "") in compact_key
+        for token in _ATOMIC_KEY_TOKENS
+    ):
+        return False
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized_value = value.strip().lower().replace("-", "_")
+        false_values = {"0", "false", "no", "off", "disabled", "disable", "never", ""}
+        return normalized_value not in false_values
+    if isinstance(value, dict):
+        if value.get("enabled") is True:
+            return True
+        nested_mode = value.get("mode") or value.get("load_method")
+        if isinstance(nested_mode, str):
+            return nested_mode.strip().lower().replace("-", "_") in _ATOMIC_WRITE_VALUES
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 1
+    return False
+
+
+def config_requests_atomic_writes(config: t.Mapping[str, t.Any] | None) -> bool:
+    """Return whether opt-in atomic/replayable batch writes are requested.
+
+    The SDK's historical BATCH behaviour is unchanged unless a configuration key
+    explicitly selects the atomic event projection mode.
+
+    Args:
+        config: Plugin configuration mapping.
+
+    Returns:
+        `True` when atomic/replayable event writes are enabled.
+    """
+    if not config:
+        return False
+
+    for raw_key, value in config.items():
+        key = str(raw_key).lower().replace("-", "_")
+
+        if atomic_write_setting_enabled(key, value):
+            return True
+
+    return False
+
+
+def atomic_write_class_setting_enabled(cls: type | None) -> bool:
+    """Return whether a class declares an atomic/replayable write setting.
+
+    Args:
+        cls: Class to inspect.
+
+    Returns:
+        `True` if a matching class attribute enables the mode.
+    """
+    if not isinstance(cls, type):
+        return False
+
+    for base in cls.__mro__:
+        for key, value in vars(base).items():
+            if key == "atomic_event_writes_enabled":
+                continue
+            if atomic_write_setting_enabled(key, value):
+                return True
+    return False
+
 
 class BatchFileFormat(str, enum.Enum):
     """Batch file format."""

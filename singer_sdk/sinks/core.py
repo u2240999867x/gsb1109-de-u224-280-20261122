@@ -40,7 +40,12 @@ from singer_sdk.exceptions import (
     InvalidRecord,
     MissingKeyPropertiesError,
 )
-from singer_sdk.helpers._batch import BatchConfig, StorageTarget
+from singer_sdk.helpers._batch import (
+    BatchConfig,
+    StorageTarget,
+    atomic_write_class_setting_enabled,
+    config_requests_atomic_writes,
+)
 from singer_sdk.helpers._compat import (
     date_fromisoformat,
     datetime_fromisoformat,
@@ -194,6 +199,9 @@ class Sink(abc.ABC):  # noqa: PLR0904
         self.logger = target.logger.getChild(stream_name)
         self.sync_started_at = target.initialized_at
         self._config = dict(target.config)
+        self._target_requests_atomic_writes = bool(
+            getattr(target, "atomic_event_writes_enabled", False),
+        )
         self._pending_batch: dict | None = None
         self.stream_name = stream_name
         self.logger.debug(
@@ -438,6 +446,15 @@ class Sink(abc.ABC):  # noqa: PLR0904
         return self.config.get("add_record_metadata", False)  # type: ignore[no-any-return]
 
     @property
+    def atomic_event_writes_enabled(self) -> bool:
+        """True if atomic, replayable event projection writes are enabled."""
+        return (
+            self._target_requests_atomic_writes
+            or config_requests_atomic_writes(self.config)
+            or atomic_write_class_setting_enabled(type(self))
+        )
+
+    @property
     def process_activate_version_messages(self) -> bool:
         """True if activate version messages should be processed."""
         return self.config.get("process_activate_version_messages", True)  # type: ignore[no-any-return]
@@ -500,6 +517,12 @@ class Sink(abc.ABC):  # noqa: PLR0904
             "_sdc_batched_at",
             "_sdc_deleted_at",
         ):
+            if (
+                col == "_sdc_deleted_at"
+                and self.atomic_event_writes_enabled
+                and col in properties_dict
+            ):
+                continue
             properties_dict[col] = {
                 "type": ["null", "string"],
                 "format": "date-time",
@@ -781,6 +804,30 @@ class Sink(abc.ABC):  # noqa: PLR0904
             encoding: The batch file encoding.
             files: The batch files to process.
         """
+        records = self.iter_batch_file_records(encoding, files)
+        while chunk := list(itertools.islice(records, self.max_size)):
+            context = {"records": chunk}
+            count = self.process_batch(context)
+            self.tally_record_written(
+                count  # Only when count is not None
+                if count is not None
+                else len(chunk)
+            )
+
+    def iter_batch_file_records(
+        self,
+        encoding: BaseBatchFileEncoding,
+        files: t.Sequence[str],
+    ) -> t.Iterator[dict]:
+        """Yield decoded records from batch files in their input order.
+
+        Args:
+            encoding: The batch file encoding.
+            files: The batch files to read.
+
+        Yields:
+            Individual decoded records.
+        """
         storage = self.batch_config.storage if self.batch_config else None
         reader = BaseBatchReader.from_encoding(encoding)
 
@@ -789,12 +836,4 @@ class Sink(abc.ABC):  # noqa: PLR0904
             file_storage = storage or StorageTarget.from_url(head)
 
             with file_storage.open(tail, mode="rb") as file:
-                records = iter(reader.read(file))
-                while chunk := list(itertools.islice(records, self.max_size)):
-                    context = {"records": chunk}
-                    count = self.process_batch(context)
-                    self.tally_record_written(
-                        count  # Only when count is not None
-                        if count is not None
-                        else len(chunk)
-                    )
+                yield from reader.read(file)

@@ -635,6 +635,7 @@ class SQLConnector:  # noqa: PLR0904
         self._config = config or {}
         self._sqlalchemy_url: str | None = sqlalchemy_url or None
         self._tables_prepared: dict[str, bool] = {}
+        self._sdk_atomic_connection: sa.Connection | None = None
 
     @property
     def config(self) -> Mapping[str, t.Any]:

@@ -33,7 +33,11 @@
         "enum": [
           "append-only",
           "upsert",
-          "overwrite"
+          "overwrite",
+          "atomic",
+          "transactional",
+          "idempotent",
+          "exactly-once"
         ]
       },
       "batch_size_rows": {

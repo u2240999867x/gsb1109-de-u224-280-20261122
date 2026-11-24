@@ -34,7 +34,11 @@ from joblib import Parallel, delayed, parallel_config
 
 from singer_sdk.configuration._dict_config import merge_missing_config_jsonschema
 from singer_sdk.exceptions import RecordsWithoutSchemaException
-from singer_sdk.helpers._batch import BaseBatchFileEncoding
+from singer_sdk.helpers._batch import (
+    BaseBatchFileEncoding,
+    atomic_write_class_setting_enabled,
+    config_requests_atomic_writes,
+)
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning
 from singer_sdk.helpers.capabilities import (
     PluginCapabilities,
@@ -55,11 +59,14 @@ if t.TYPE_CHECKING:
     from pathlib import PurePath
     from types import FrameType
 
+    import sqlalchemy as sa
+
     from singer_sdk.helpers.capabilities import CapabilitiesEnum
     from singer_sdk.mapper import PluginMapper
     from singer_sdk.singerlib.encoding.base import GenericSingerReader
     from singer_sdk.singerlib.types import KeyProperties
     from singer_sdk.sinks import Sink
+    from singer_sdk.sql import SQLConnector
     from singer_sdk.sql import SQLTarget  # noqa: F401
 
 _MAX_PARALLELISM = 8
@@ -156,6 +163,21 @@ class Target(BaseSingerReader, abc.ABC):
             new_value: The new max degree of parallelism for this target.
         """
         self._max_parallelism = new_value
+
+    @property
+    def atomic_event_writes_enabled(self) -> bool:
+        """True if BATCH files contain source events and require atomic projection."""
+        if config_requests_atomic_writes(self.config):
+            return True
+        if atomic_write_class_setting_enabled(type(self)):
+            return True
+
+        sink_class = getattr(self, "default_sink_class", None)
+        if atomic_write_class_setting_enabled(sink_class):
+            return True
+
+        active_sinks = [*self._sinks_active.values(), *self._sinks_to_clear]
+        return any(sink.atomic_event_writes_enabled for sink in active_sinks)
 
     def get_sink(
         self,
@@ -370,6 +392,13 @@ class Target(BaseSingerReader, abc.ABC):
             self._assert_sink_exists(stream_map.stream_alias)
             sink = self.get_sink(stream_map.stream_alias, record=transformed_record)
             context = sink._get_context(transformed_record)  # noqa: SLF001
+            if (
+                self.atomic_event_writes_enabled
+                and sink.include_sdc_metadata_properties
+                and "_sdc_deleted_at" not in transformed_record
+                and "_sdc_deleted_at" in raw_record
+            ):
+                transformed_record["_sdc_deleted_at"] = raw_record["_sdc_deleted_at"]
             if sink.include_sdc_metadata_properties:
                 sink._add_sdc_metadata_to_record(  # noqa: SLF001
                     transformed_record,
@@ -505,6 +534,10 @@ class Target(BaseSingerReader, abc.ABC):
         Args:
             message_dict: TODO
         """
+        if self.atomic_event_writes_enabled:
+            self._process_atomic_batch_message(message_dict)
+            return
+
         stream_name = message_dict["stream"]
         encoding = BaseBatchFileEncoding.from_dict(message_dict["encoding"])
 
@@ -515,6 +548,108 @@ class Target(BaseSingerReader, abc.ABC):
                 message_dict["manifest"],
             )
             self._handle_max_record_age()
+
+    def _process_atomic_batch_message(self, message_dict: dict) -> None:
+        """Process source-event JSONL batches with atomic multi-table writes.
+
+        Pending RECORD messages are drained first to preserve Singer input order.
+        Each decoded source event is mapped into every projected sink and all
+        resulting rows are committed in one transaction. A failed event rolls
+        back only that event, while earlier events remain visible and replay is
+        safe because inserts are de-duplicated by sink key properties.
+
+        Args:
+            message_dict: The BATCH message dictionary.
+        """
+        self.drain_all()
+
+        stream_name = message_dict["stream"]
+        encoding = BaseBatchFileEncoding.from_dict(message_dict["encoding"])
+        stream_maps = self.mapper.stream_maps[stream_name]
+        sinks = [self.get_sink(stream_map.stream_alias) for stream_map in stream_maps]
+        if not sinks:  # pragma: no cover
+            return
+
+        records = sinks[0].iter_batch_file_records(
+            encoding,
+            message_dict["manifest"],
+        )
+        for raw_record in records:
+            event_sinks: list[Sink] = []
+
+            for stream_map, sink in zip(stream_maps, sinks, strict=True):
+                raw_copy = copy.copy(raw_record)
+                transformed_record = stream_map.transform(raw_copy)
+                if transformed_record is None:
+                    continue
+
+                context = sink._get_context(transformed_record)  # noqa: SLF001
+                if (
+                    sink.include_sdc_metadata_properties
+                    and "_sdc_deleted_at" not in transformed_record
+                    and "_sdc_deleted_at" in raw_record
+                ):
+                    transformed_record["_sdc_deleted_at"] = raw_record[
+                        "_sdc_deleted_at"
+                    ]
+
+                if sink.include_sdc_metadata_properties:
+                    sink._add_sdc_metadata_to_record(  # noqa: SLF001
+                        transformed_record,
+                        {"record": raw_record},
+                        context,
+                    )
+                else:
+                    sink._remove_sdc_metadata_from_record(transformed_record)  # noqa: SLF001
+
+                sink._validate_and_parse(transformed_record)  # noqa: SLF001
+                transformed_record = sink.preprocess_record(transformed_record, context)
+                sink._singer_validate_message(transformed_record)  # noqa: SLF001
+                sink.tally_record_read()
+                sink.process_record(transformed_record, context)
+                sink._after_process_record(context)  # noqa: SLF001
+                event_sinks.append(sink)
+
+            try:
+                self._drain_all(event_sinks, 1)
+            except Exception as exc:
+                self._annotate_event_write_error(exc, raw_record)
+                raise
+
+            self._handle_max_record_age()
+
+    @staticmethod
+    def _annotate_event_write_error(exc: Exception, raw_record: dict) -> None:
+        """Add source event identity to a write failure.
+
+        Args:
+            exc: The exception raised while writing the mapped event rows.
+            raw_record: The source event that was being written.
+        """
+        event_id = raw_record.get("event_id")
+        if event_id is None:
+            return
+
+        annotation = f"source event_id={event_id!s}"
+        exc.event_id = event_id  # type: ignore[attr-defined]
+        exc.source_event_id = event_id  # type: ignore[attr-defined]
+        if hasattr(exc, "add_note"):
+            exc.add_note(annotation)
+
+        if exc.args and isinstance(exc.args[0], str) and event_id not in exc.args[0]:
+            exc.args = (f"{exc.args[0]} ({annotation})", *exc.args[1:])
+
+        original = getattr(exc, "orig", None)
+        if (
+            original is not None
+            and original.args
+            and isinstance(original.args[0], str)
+            and event_id not in original.args[0]
+        ):
+            original.args = (
+                f"{original.args[0]} ({annotation})",
+                *original.args[1:],
+            )
 
     # Sink drain methods
 
@@ -561,8 +696,13 @@ class Target(BaseSingerReader, abc.ABC):
         sink.mark_drained()
 
     def _drain_all(self, sink_list: Iterable[Sink], parallelism: int) -> None:
+        sinks = list(sink_list)
+        if self.atomic_event_writes_enabled:
+            self._drain_sinks_atomically(sinks)
+            return
+
         if parallelism == 1:
-            for sink in sink_list:
+            for sink in sinks:
                 self.drain_one(sink)
             return
 
@@ -570,7 +710,58 @@ class Target(BaseSingerReader, abc.ABC):
             self.drain_one(sink)
 
         with parallel_config(backend="threading", n_jobs=parallelism):
-            Parallel()(delayed(_drain_sink)(sink=sink) for sink in sink_list)
+            Parallel()(delayed(_drain_sink)(sink=sink) for sink in sinks)
+
+    def _drain_sinks_atomically(self, sinks: list[Sink]) -> None:
+        """Drain pending records in one shared SQL transaction when possible.
+
+        Non-SQL sinks, or sink sets that do not expose an SDK connector, fall
+        back to normal serial draining.
+
+        Args:
+            sinks: Sinks whose pending batches should be drained.
+        """
+        pending_sinks = [sink for sink in sinks if sink.current_size > 0]
+        if not pending_sinks:
+            return
+
+        connectors: list[SQLConnector] = []
+        for sink in pending_sinks:
+            connector = getattr(sink, "connector", None)
+            connect = getattr(connector, "_connect", None)
+            if connector is None or not callable(connect):
+                for pending_sink in pending_sinks:
+                    self.drain_one(pending_sink)
+                return
+            connectors.append(connector)
+
+        connector = connectors[0]
+        if any(sink_connector is not connector for sink_connector in connectors):
+            # Cross-connector atomic commits require backend-specific XA support.
+            for sink in pending_sinks:
+                self.drain_one(sink)
+            return
+
+        with connector._connect() as conn, conn.begin():  # noqa: SLF001
+            previous_connections: list[
+                tuple[SQLConnector, sa.Connection | None]
+            ] = []
+            try:
+                for sink in pending_sinks:
+                    sink_connector = getattr(sink, "connector", None)
+                    if sink_connector is None:
+                        continue
+                    previous_connections.append(
+                        (
+                            sink_connector,
+                            getattr(sink_connector, "_sdk_atomic_connection", None),
+                        ),
+                    )
+                    sink_connector._sdk_atomic_connection = conn
+                    self.drain_one(sink)
+            finally:
+                for sink_connector, previous_connection in previous_connections:
+                    sink_connector._sdk_atomic_connection = previous_connection
 
     def _write_state_message(self, state: dict) -> None:
         """Emit the stream's latest state.

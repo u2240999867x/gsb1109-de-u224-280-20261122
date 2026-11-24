@@ -354,10 +354,86 @@ class SQLSink(BatchSink, t.Generic[_C]):
 
         self.logger.info("Inserting with SQL: %s", insert_sql)
 
-        with self.connector._connect() as conn, conn.begin():  # noqa: SLF001
-            result = conn.execute(insert_sql, new_records)
+        ambient_connection = getattr(self.connector, "_sdk_atomic_connection", None)
+        idempotent = self.atomic_event_writes_enabled
+
+        if ambient_connection is not None:
+            if idempotent:
+                new_records = self._filter_existing_key_records(
+                    ambient_connection,
+                    insert_sql,
+                    new_records,
+                )
+            if not new_records:
+                return 0
+            result = ambient_connection.execute(insert_sql, new_records)
+        else:
+            with self.connector._connect() as conn, conn.begin():  # noqa: SLF001
+                if idempotent:
+                    new_records = self._filter_existing_key_records(
+                        conn,
+                        insert_sql,
+                        new_records,
+                    )
+                if not new_records:
+                    return 0
+                result = conn.execute(insert_sql, new_records)
 
         return result.rowcount if result.rowcount >= 0 else None
+
+    def _filter_existing_key_records(
+        self,
+        connection: sa.Connection,
+        insert_sql: str | Executable,
+        records: list[dict[str, t.Any]],
+    ) -> list[dict[str, t.Any]]:
+        """Skip records whose primary key already exists.
+
+        This preserves the first stored version, including Target metadata such
+        as ``_sdc_received_at``, when a failed input is redelivered.
+
+        Args:
+            connection: Connection participating in the current write transaction.
+            insert_sql: The generated INSERT statement.
+            records: Records prepared for insertion.
+
+        Returns:
+            Records that do not already exist by primary key.
+        """
+        key_properties = list(self.key_properties)
+        table = getattr(insert_sql, "table", None)
+        if (
+            not key_properties
+            and table is not None
+            and table.c.get("event_id") is not None
+        ):
+            key_properties = ["event_id"]
+        if not key_properties or table is None:
+            return records
+
+        missing = []
+        for record in records:
+            predicates: list[t.Any] = []
+            for key_property in key_properties:
+                column = table.c.get(key_property)
+                if column is None or key_property not in record:
+                    predicates = []
+                    break
+                predicates.append(column == record[key_property])
+
+            if not predicates:
+                missing.append(record)
+                continue
+
+            statement = (
+                sa.select(sa.literal(1))
+                .select_from(table)
+                .where(sa.and_(*predicates))
+            )
+            if connection.execute(statement).first() is None:
+                missing.append(record)
+
+        return missing
 
     def merge_upsert_from_table(
         self,

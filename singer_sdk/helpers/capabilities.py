@@ -454,6 +454,18 @@ class TargetLoadMethods(str, Enum):
     # delete all existing records and insert all input records
     OVERWRITE = "overwrite"
 
+    # Commit all projections of one event together and skip redelivered events.
+    ATOMIC = "atomic"
+
+    # Alias for ATOMIC.
+    TRANSACTIONAL = "transactional"
+
+    # Alias for ATOMIC.
+    IDEMPOTENT = "idempotent"
+
+    # Alias for ATOMIC.
+    EXACTLY_ONCE = "exactly-once"
+
 
 def _load_method_config() -> dict[str, t.Any]:
     """Build the JSON schema for `TARGET_LOAD_METHOD_CONFIG`.
@@ -476,6 +488,10 @@ def _load_method_config() -> dict[str, t.Any]:
                 TargetLoadMethods.APPEND_ONLY,
                 TargetLoadMethods.UPSERT,
                 TargetLoadMethods.OVERWRITE,
+                TargetLoadMethods.ATOMIC,
+                TargetLoadMethods.TRANSACTIONAL,
+                TargetLoadMethods.IDEMPOTENT,
+                TargetLoadMethods.EXACTLY_ONCE,
             ],
             default=TargetLoadMethods.APPEND_ONLY,
         ),
