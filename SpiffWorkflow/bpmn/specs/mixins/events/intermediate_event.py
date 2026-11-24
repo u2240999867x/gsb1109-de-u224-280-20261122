@@ -51,6 +51,21 @@ class BoundaryEvent(CatchingEvent):
         # Boundary events should only be caught while waiting
         return my_task.state == TaskState.WAITING and super().catches(my_task, event)
 
+    def catch(self, my_task, event):
+        super().catch(my_task, event)
+        from SpiffWorkflow.bpmn.specs.event_definitions import EscalationEventDefinition
+        if not self.cancel_activity and isinstance(event.event_definition, EscalationEventDefinition):
+            self._create_replacement(my_task)
+
+    def _create_replacement(self, my_task):
+        parent = my_task.parent
+        if parent is None:
+            return
+        replacement = parent._add_child(self, TaskState.MAYBE)
+        self._predict(replacement)
+        replacement._set_state(TaskState.WAITING)
+        self._update(replacement)
+
 
 class EventBasedGateway(CatchingEvent):
 

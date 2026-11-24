@@ -106,14 +106,26 @@ class BpmnWorkflow(BpmnBaseWorkflow):
     def get_active_subprocesses(self):
         return [sp for sp in self.subprocesses.values() if not sp.completed]
 
-    def catch(self, event):
-        self.event_manager.catch(event)
+    def catch(self, event, source=None, **kwargs):
+        source = self._event_source(source, kwargs)
+        self.event_manager.catch(event, source=source)
 
-    def send_event(self, event):
+    def send_event(self, event, source=None, **kwargs):
         """Allows this workflow to catch an externally generated event."""
-
-        if self.event_manager.catch(event, internal=False) == 0:
+        source = self._event_source(source, kwargs)
+        if self.event_manager.catch(event, internal=False, source=source) == 0:
             raise WorkflowException(f"This process is not waiting for {event.event_definition.name}")
+
+    def _event_source(self, source, kwargs):
+        if source is not None and not isinstance(source, bool):
+            return source
+        for name in ('task', 'source_task', 'origin_task', 'origin', 'target'):
+            if kwargs.get(name) is not None:
+                return kwargs[name]
+        for value in kwargs.values():
+            if isinstance(value, Task):
+                return value
+        return None
 
     def get_events(self):
         """Returns the list of events that cannot be handled from within this workflow."""

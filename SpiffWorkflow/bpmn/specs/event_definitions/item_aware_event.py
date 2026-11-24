@@ -35,14 +35,15 @@ class CodeEventDefinition(ItemAwareEventDefinition):
 
     def throw(self, my_task):
         payload = deepcopy(my_task.data)
-        event = BpmnEvent(self, payload=payload, target=my_task.workflow)
+        event = BpmnEvent(self, payload=payload, target=my_task.workflow, source=my_task)
         my_task.workflow.top_workflow.catch(event)
 
     def details(self, my_task):
         return PendingBpmnEvent(self.name, self.__class__.__name__, self.code)
 
     def __eq__(self, other):
-        return super().__eq__(other) and self.code in [None, other.code]
+        is_wildcard = self.code is None or self.code == ''
+        return super().__eq__(other) and (is_wildcard or self.code == other.code)
 
 
 class ErrorEventDefinition(CodeEventDefinition):

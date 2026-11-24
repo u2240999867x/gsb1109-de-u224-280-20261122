@@ -73,7 +73,7 @@ class SpiffItemAwareEventDefinition(ItemAwareEventDefinition):
             payload = my_task.workflow.script_engine.evaluate(my_task, self.expression)
         else:
             payload = None
-        event = BpmnEvent(self, payload=payload)
+        event = BpmnEvent(self, payload=payload, source=my_task)
         my_task.workflow.top_workflow.catch(event)
 
     def update_task_data(self, my_task):
