@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import date, datetime
@@ -5,6 +7,7 @@ from decimal import Decimal
 from hashlib import sha1
 from typing import Any
 from urllib.parse import urlencode, urlparse
+from weakref import WeakSet
 
 from sqlalchemy import Connection, ResultProxy
 from sqlalchemy.engine import Row
@@ -50,6 +53,39 @@ class DatasetError(Exception):
 
 class QueryError(DatasetError):
     pass
+
+
+class TransactionClosedError(DatasetError, ResourceClosedError, RuntimeError):
+    """A result was consumed after its owning transaction ended."""
+
+
+TRANSACTION_ENDED_MESSAGE = (
+    "The original transaction has ended; the transaction has been closed, "
+    "so this result object is closed and its iterator can no longer be fetched."
+)
+
+
+class ResultLease:
+    """Track result iterators created by one transaction generation."""
+
+    __slots__ = ("ended", "results")
+
+    def __init__(self) -> None:
+        self.ended = False
+        self.results: WeakSet[ResultIter] = WeakSet()
+
+    def register(self, result: ResultIter) -> None:
+        self.results.add(result)
+
+    def has_active_results(self) -> bool:
+        return any(not result.closed for result in self.results)
+
+    def end(self) -> None:
+        if self.ended:
+            return
+        self.ended = True
+        for result in list(self.results):
+            result._end_transaction()
 
 
 def iter_result_proxy(
@@ -111,10 +147,16 @@ class ResultIter(Iterator[OutRow]):
         row_type: RowFactory = row_factory,
         step: int | None = None,
         connection: Connection | None = None,
+        lease: ResultLease | None = None,
     ):
         self.row_type = row_type
         self.result_proxy = result_proxy
         self._conn = connection
+        self._lease = lease
+        self._closed = False
+        self._transaction_ended = False
+        if lease is not None:
+            lease.register(self)
         if result_proxy is None:
             self.keys: list[str] = []
             self._iter: Iterator[Row[Any]] = iter([])
@@ -127,10 +169,20 @@ class ResultIter(Iterator[OutRow]):
                 self._iter = iter([])
 
     def __next__(self) -> OutRow:
+        if self._transaction_ended:
+            raise TransactionClosedError(TRANSACTION_ENDED_MESSAGE)
+        if self._closed:
+            raise StopIteration
         try:
             return convert_row(self.row_type, next(self._iter))
         except StopIteration:
             self.close()
+            raise
+        except ResourceClosedError as exc:
+            if self._transaction_ended or (
+                self._lease is not None and self._lease.ended
+            ):
+                raise TransactionClosedError(TRANSACTION_ENDED_MESSAGE) from exc
             raise
 
     next = __next__
@@ -138,12 +190,34 @@ class ResultIter(Iterator[OutRow]):
     def __iter__(self) -> Iterator[OutRow]:
         return self
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _end_transaction(self) -> None:
+        if self._transaction_ended:
+            return
+        self._transaction_ended = True
+        self.close()
+
     def close(self) -> None:
-        if self.result_proxy is not None:
-            self.result_proxy.close()
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        if self._closed:
+            return
+        self._closed = True
+
+        close_iterator = getattr(self._iter, "close", None)
+        try:
+            if callable(close_iterator):
+                close_iterator()
+        finally:
+            try:
+                if self.result_proxy is not None:
+                    self.result_proxy.close()
+            finally:
+                if self._conn is not None:
+                    conn = self._conn
+                    self._conn = None
+                    conn.close()
 
 
 def ensure_strings(value: str | Iterable[str] | None) -> list[str]:

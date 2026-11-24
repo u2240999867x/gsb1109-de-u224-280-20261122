@@ -58,18 +58,20 @@ dataset/
 ## Important Implementation Details
 
 ### Threading & Concurrency
-- Each thread gets its own database connection (thread-local storage)
+- Each thread and each `asyncio.Task` gets its own database scope/connection; direct coroutine calls in the same task share it
+- New tasks do not inherit an active transaction, even though `asyncio` copies `contextvars`; idle inherited connections are released before the new scope checks one out
 - Schema changes in transactions with multiple threads trigger warnings
 - Locking strategy:
-  - `self.lock` (RLock) protects metadata operations
-  - Keep lock scope small for performance
+  - `self.lock` (RLock) protects metadata operations and connection bookkeeping
+  - Keep lock scope small for performance; pool checkouts happen outside the lock
   - Schema operations are fully synchronized
 
 ### Transaction Handling (SQLAlchemy 2.x Migration)
 - The library supports both SQLAlchemy 1.4+ and 2.x
 - Key change: SQLAlchemy 2.x uses "autobegin" (transactions start on first use)
 - `db._auto_commit()` commits after writes when not in explicit transaction
-- Transaction nesting tracked via `self.local.tx` stack
+- Transaction nesting is tracked in a context/task-aware scope stack; inner contexts use savepoints so inner rollbacks preserve outer work
+- Root commit/rollback releases the scope connection and invalidates result iterators created by that transaction
 
 ### Column & Table Name Normalization
 - Case-insensitive column matching via `normalize_column_key()`
@@ -163,7 +165,7 @@ The codebase passes both ruff and `mypy --strict` with zero errors.
 ### Modifying Transaction Behavior
 - Be careful: both nested and non-nested transactions must work
 - Test with multiple threads
-- Transaction state tracked in `self.local.tx` (thread-local)
+- Transaction state tracked in the context/task-aware `_TransactionScope` stack (`Database._scope()`)
 - See `begin()`, `commit()`, `rollback()` in [database.py](dataset/database.py:134-175)
 
 ## Known Limitations
@@ -252,7 +254,7 @@ The codebase passes both ruff and `mypy --strict` with zero errors.
 
 ### When Debugging
 - Check which database backend is being used (`db.is_sqlite`, `db.is_postgres`, `db.is_mysql`)
-- Look at thread-local state (`self.local.tx`) for transaction issues
+- Look at the current `_TransactionScope` (`Database._scope()`) for transaction issues
 - Column name mismatches often due to case sensitivity - check `_column_keys`
 - SQLAlchemy version differences may affect behavior
 

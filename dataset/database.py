@@ -1,7 +1,10 @@
+import asyncio
+import contextvars
 import logging
 import threading
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
+from weakref import WeakSet
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -16,6 +19,7 @@ from dataset.types import ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
     ResultIter,
+    ResultLease,
     RowFactory,
     normalize_table_name,
     row_factory,
@@ -23,6 +27,30 @@ from dataset.util import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class _TransactionScope:
+    """Transaction and connection state owned by one task or thread."""
+
+    __slots__ = (
+        "owner_task",
+        "thread_id",
+        "connection",
+        "transactions",
+        "lease",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        thread_id: int,
+        owner_task: asyncio.Task[Any] | None,
+    ) -> None:
+        self.thread_id = thread_id
+        self.owner_task = owner_task
+        self.connection: Connection | None = None
+        self.transactions: list[Any] = []
+        self.lease = ResultLease()
 
 
 class Database:
@@ -51,6 +79,10 @@ class Database:
         self.lock = threading.RLock()
         self.local = threading.local()
         self.connections: dict[int, Connection] = {}
+        self._scope_var: contextvars.ContextVar[_TransactionScope | None] = (
+            contextvars.ContextVar(f"dataset_database_{id(self)}_scope", default=None)
+        )
+        self._scopes: WeakSet[_TransactionScope] = WeakSet()
 
         if len(parsed_url.query):
             query = parse_qs(parsed_url.query)
@@ -88,16 +120,58 @@ class Database:
         self.ensure_schema = ensure_schema
         self._tables: dict[str, Table] = {}
 
+    def _current_task(self) -> asyncio.Task[Any] | None:
+        try:
+            return asyncio.current_task()
+        except RuntimeError:
+            return None
+
+    def _scope(self) -> _TransactionScope:
+        """Return the scope shared by callers in the same task or thread."""
+        thread_id = threading.get_ident()
+        owner_task = self._current_task()
+        scope = self._scope_var.get()
+
+        if scope is not None and scope.thread_id == thread_id:
+            if scope.owner_task is owner_task:
+                pass
+            elif scope.owner_task is None:
+                # A synchronous setup scope can be adopted by the event-loop
+                # task that starts running in this same call context.
+                scope.owner_task = owner_task
+            elif scope.owner_task.done() and not scope.transactions:
+                self._release_connection(scope)
+                scope.owner_task = owner_task
+            else:
+                if not scope.transactions:
+                    # The parent context may still own an idle autocommit
+                    # connection. Return it before this new task checks one out;
+                    # an active transaction must remain open and isolated.
+                    self._release_connection(scope)
+                scope = None
+
+        if scope is None or scope.thread_id != thread_id:
+            scope = _TransactionScope(thread_id, owner_task)
+            self._scope_var.set(scope)
+
+        self._scopes.add(scope)
+        return scope
+
     @property
     def executable(self) -> Connection:
         """Connection against which statements will be executed."""
-        with self.lock:
-            tid = threading.get_ident()
-            if tid not in self.connections:
-                if self.engine is None:
-                    raise RuntimeError("Database is closed")
-                self.connections[tid] = self.engine.connect()
-            return self.connections[tid]
+        scope = self._scope()
+        connection = scope.connection
+        if connection is None:
+            if self.engine is None:
+                raise RuntimeError("Database is closed")
+            # Check out outside the database lock: with a tiny pool, another
+            # thread may need that lock to release its connection first.
+            connection = self.engine.connect()
+            with self.lock:
+                scope.connection = connection
+                self.connections[id(scope)] = connection
+        return connection
 
     @property
     def op(self) -> Operations:
@@ -121,17 +195,31 @@ class Database:
     @property
     def in_transaction(self) -> bool:
         """Check if this database is in a transactional context."""
-        if not hasattr(self.local, "tx"):
-            return False
-        return len(self.local.tx) > 0
+        return bool(self._scope().transactions)
 
-    def _release_connection(self) -> None:
-        """Close and release the current thread's connection back to the pool."""
-        with self.lock:
-            tid = threading.get_ident()
-            conn = self.connections.pop(tid, None)
-            if conn is not None:
-                conn.close()
+    def _detach_result_lease(self, scope: _TransactionScope) -> ResultLease:
+        lease = scope.lease
+        scope.lease = ResultLease()
+        lease.end()
+        return lease
+
+    def _release_connection(self, scope: _TransactionScope | None = None) -> None:
+        """Close and release a scope's connection back to the pool."""
+        if scope is None:
+            scope = self._scope()
+
+        lease = scope.lease
+        scope.lease = ResultLease()
+        try:
+            lease.end()
+        finally:
+            with self.lock:
+                connection = scope.connection
+                scope.connection = None
+                self.connections.pop(id(scope), None)
+
+            if connection is not None:
+                connection.close()
 
     def _flush_tables(self) -> None:
         """Clear the table metadata after transaction rollbacks."""
@@ -146,51 +234,71 @@ class Database:
         after each write operation when the user has not started an
         explicit transaction via ``begin()``/``with db:``.
         """
-        if not self.in_transaction:
+        scope = self._scope()
+        if not scope.transactions:
             self.executable.commit()
+            if not scope.lease.has_active_results():
+                self._release_connection(scope)
 
     def begin(self) -> None:
         """Enter a transaction explicitly.
 
         No data will be written until the transaction has been committed.
+        Nested calls use SQL savepoints so an inner failure can be rolled
+        back without discarding the caller's transaction.
         """
-        if not hasattr(self.local, "tx"):
-            self.local.tx = []
-        if not self.executable.in_transaction():
-            # No active transaction; start an explicit one (master semantics).
-            self.local.tx.append(self.executable.begin())
-        else:
-            # An autobegin transaction is already active (e.g., from a read);
-            # track the nesting depth without starting a second transaction.
-            self.local.tx.append(True)
+        scope = self._scope()
+        connection = self.executable
+        if scope.transactions:
+            scope.transactions.append(connection.begin_nested())
+            return
+
+        if not connection.in_transaction():
+            connection.begin()
+        scope.transactions.append(True)
 
     def commit(self) -> None:
         """Commit the current transaction.
 
         Make all statements executed since the transaction was begun permanent.
         """
-        if hasattr(self.local, "tx") and self.local.tx:
-            tx = self.local.tx.pop()
-            if not self.local.tx:
-                if tx is not True:
-                    tx.commit()
-                else:
-                    self.executable.commit()
-                self._release_connection()
+        scope = self._scope()
+        if not scope.transactions:
+            return
+
+        transaction = scope.transactions.pop()
+        if scope.transactions:
+            transaction.commit()
+            return
+
+        try:
+            if scope.connection is not None:
+                self._detach_result_lease(scope)
+                scope.connection.commit()
+        finally:
+            self._release_connection(scope)
 
     def rollback(self) -> None:
         """Roll back the current transaction.
 
         Discard all statements executed since the transaction was begun.
         """
-        if hasattr(self.local, "tx") and self.local.tx:
-            tx = self.local.tx.pop()
-            if not self.local.tx:
-                if tx is not True:
-                    tx.rollback()
-                else:
-                    self.executable.rollback()
-                self._release_connection()
+        scope = self._scope()
+        if not scope.transactions:
+            return
+
+        transaction = scope.transactions.pop()
+        is_outermost = not scope.transactions
+        try:
+            if is_outermost:
+                if scope.connection is not None:
+                    self._detach_result_lease(scope)
+                    scope.connection.rollback()
+            else:
+                transaction.rollback()
+        finally:
+            if is_outermost:
+                self._release_connection(scope)
             self._flush_tables()
 
     def __enter__(self) -> "Database":
@@ -218,10 +326,17 @@ class Database:
         This should be called when the database is no longer needed,
         especially in multi-threaded or connection-pooled setups.
         """
+        scopes = list(self._scopes)
+        for scope in scopes:
+            scope.lease.end()
+
         with self.lock:
             for conn in self.connections.values():
                 conn.close()
             self.connections.clear()
+            for scope in scopes:
+                scope.connection = None
+
         if self.engine is not None:
             self.engine.dispose()
         self._tables = {}
@@ -371,11 +486,17 @@ class Database:
         _step = kwargs.pop("_step", QUERY_STEP)
         if _step is False or _step == 0:
             _step = None
+        scope = self._scope()
         if kwargs:
             rp = self.executable.execute(query, kwargs)
         else:
             rp = self.executable.execute(query)
-        return ResultIter(rp, row_type=self.row_type, step=_step)
+        return ResultIter(
+            rp,
+            row_type=self.row_type,
+            step=_step,
+            lease=scope.lease,
+        )
 
     def __repr__(self) -> str:
         """Text representation contains the URL."""

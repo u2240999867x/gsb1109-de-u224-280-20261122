@@ -24,6 +24,7 @@ from dataset.util import (
     OutRow,
     QueryError,
     ResultIter,
+    ResultLease,
     SQLWriteValue,
     WriteRow,
     ensure_strings,
@@ -768,16 +769,28 @@ class Table:
             query = query.order_by(*orderings)
 
         stream_conn = None
+        scope = self.db._scope()
+        lease: ResultLease | None = scope.lease
         conn = self.db.executable
         if _streamed:
-            stream_conn = self.db.engine.connect()
-            conn = stream_conn.execution_options(stream_results=True)
+            if self.db.in_transaction:
+                # Reuse the transaction's connection so uncommitted writes are
+                # visible and streaming does not check out a third pool link.
+                conn = conn.execution_options(stream_results=True)
+            else:
+                # Outside an explicit transaction, keep the historical
+                # dedicated streaming connection so callers can write through
+                # the main connection while consuming a large result.
+                stream_conn = self.db.engine.connect()
+                conn = stream_conn.execution_options(stream_results=True)
+                lease = None
 
         return ResultIter(
             conn.execute(query),
             row_type=self.db.row_type,
             step=_step,
             connection=stream_conn,
+            lease=lease,
         )
 
     def find_one(
