@@ -520,6 +520,7 @@ def map_overlap(
     trim=True,
     align_arrays=True,
     allow_rechunk=True,
+    mask=None,
     **kwargs,
 ):
     """Map a function over blocks of arrays with some overlap
@@ -571,6 +572,12 @@ def map_overlap(
     allow_rechunk: bool, keyword only
         Allows rechunking, otherwise chunk sizes need to match and core
         dimensions are to consist only of one chunk.
+    mask: dask array, keyword only
+        Optional boolean array marking the valid interior (the water surface)
+        of each row.  The overlap neighbourhood is taken periodically inside
+        each row's true run, so the banks need not be known before the graph
+        is built.  The mask may use a different chunking from the measurement
+        array.
     **kwargs:
         Other keyword arguments valid in ``map_blocks``
 
@@ -702,6 +709,15 @@ def map_overlap(
             "Usage:   da.map_overlap(function, x)\n"
             "   or:   da.map_overlap(function, x, y, z)"
         )
+
+    if mask is not None:
+        if len(args) != 1:
+            raise ValueError("mask= is only supported for a single measurement array")
+        if not trim:
+            raise ValueError("mask= requires trim=True")
+        from dask.array._masked_overlap import masked_map_overlap
+
+        return masked_map_overlap(func, args[0], mask, depth, **kwargs)
 
     # Coerce depth and boundary arguments to lists of individual
     # specifications for each array argument

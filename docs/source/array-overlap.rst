@@ -179,5 +179,32 @@ and ``trim_internal``:
    >>> g2 = g.map_blocks(myfunc)
    >>> result = da.overlap.trim_internal(g2, {0: 2, 1: 2})
 
+
+Per-row surfaces
+----------------
+
+Some measurements have a shoreline per row: each row contains one contiguous
+run of valid cells (and possibly no valid cells at all), and the neighbourhood
+of a cell should wrap around inside that row's run rather than read cells on
+the other side of the bank.  Pass a lazy boolean array as ``mask=``; its
+chunks may differ from the measurement array, and the extents of the run need
+not be known until compute time:
+
+.. code-block:: python
+
+   >>> x = da.from_array(measurements, chunks=(1, 1))
+   >>> wet = da.from_array(surface, chunks=(1, 3))
+   >>> result = da.map_overlap(
+   ...     func, x, depth=(4, 2), mask=wet, dtype=float
+   ... )
+
+For every row with a valid centre in the block, the whole extended block is
+filled periodically from that row's valid run (NaN outside it).  The callable
+receives the extended block plus, when it asks for one, ``valid_center`` (a
+boolean block marking the centres inside the run), ``block_info`` and
+``block_id``.  After trimming, centres outside the run are NaN.  The returned
+array keeps the measurement shape and chunks, and the graph contains only
+small bank summaries plus the measurement fragments each target block needs.
+
 .. _Life: https://en.wikipedia.org/wiki/Conway%27s_Game_of_Life
 .. _Numba: https://numba.pydata.org/

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import dask
 from dask.array import from_array
 from dask.base import collections_to_expr
 
@@ -985,3 +986,192 @@ def test_overlap_not_blowing_up_graph():
     result = arr.rolling(dim={"year": 11}, center=True).construct("window_dim")
     dc = collections_to_expr([result.data]).__dask_graph__()
     assert len(dc) <= 1651  # previously 3000
+
+
+def _banked_measurement(width=1024, rows=3):
+    ys, xs = np.mgrid[0:rows, 0:width]
+    values = np.where(
+        ys == 0, xs, np.where(ys == 1, xs + 10000, 0.0)
+    ).astype(float)
+    return values
+
+
+def _neighbourhood_func(block, valid_center=None, block_info=None):
+    # two times the left-most neighbour plus the right-most neighbour, for
+    # every centre in the extended block
+    rows, cols = block.shape
+    ncols = cols - 6
+    return 2 * block[:, :ncols] + block[:, 6 : 6 + ncols]
+
+
+def test_map_overlap_with_mask_example():
+    width = 1024
+    values = _banked_measurement(width)
+    x = da.from_array(values, chunks=(1, 1))
+
+    automatic = np.zeros((3, width), dtype=bool)
+    automatic[0, 1:1023] = True
+    automatic[1, 510:512] = True
+
+    reviewed = np.zeros((3, width), dtype=bool)
+    reviewed[0, 6:1021] = True
+    reviewed[1, 510:512] = True
+
+    auto = da.map_overlap(
+        _neighbourhood_func,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(automatic, chunks=(1, 3)),
+        dtype=float,
+    )
+    manual = da.map_overlap(
+        _neighbourhood_func,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(reviewed, chunks=(1, 3)),
+        dtype=float,
+    )
+
+    assert auto.shape == x.shape
+    assert auto.chunks == x.chunks
+    assert manual.chunks == x.chunks
+
+    a, m = dask.compute(auto, manual)
+
+    assert a[0, 1] == 2041
+    assert np.isnan(m[0, 1])
+    assert a[0, 6] == 12
+    assert m[0, 6] == 2042
+    assert a[1, 510] == 31530
+    assert m[1, 510] == 31530
+    assert np.isnan(a[2]).all()
+    assert np.isnan(m[2]).all()
+
+
+def test_map_overlap_with_mask_sees_full_window():
+    width = 1024
+    values = _banked_measurement(width)
+    x = da.from_array(values, chunks=(1, 1))
+    mask = np.zeros((3, width), dtype=bool)
+    mask[0, 1:1023] = True
+    mask[1, 510:512] = True
+    seen = {}
+
+    def record(block, valid_center=None, block_info=None):
+        seen[block_info[0]["chunk-location"]] = block.copy()
+        return block
+
+    result = da.map_overlap(
+        record,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(mask, chunks=(1, 3)),
+        dtype=float,
+    )
+    result.compute()
+
+    block = seen[(1, 510)]
+    assert block.shape == (1, 7)
+    np.testing.assert_array_equal(
+        block[0], np.array([10510, 10511, 10510, 10511, 10510, 10511, 10510])
+    )
+
+
+@pytest.mark.parametrize("chunks", [(1, 1), (2, 1), (1, 7), (3, 5), (2, 64)])
+@pytest.mark.parametrize("mask_chunks", [(1, 3), (2, 5), (3, 7)])
+def test_map_overlap_with_mask_chunking_invariant(chunks, mask_chunks):
+    width = 128
+    values = _banked_measurement(width)
+    x = da.from_array(values, chunks=chunks)
+
+    mask = np.zeros((3, width), dtype=bool)
+    mask[0, 1:127] = True
+    mask[1, 62:64] = True
+    mask[2, 40:42] = True
+
+    def func(block, valid_center=None):
+        return block * valid_center
+
+    mask_spec = da.core.normalize_chunks(mask_chunks, shape=(3, width))
+
+    expected = da.map_overlap(
+        func,
+        da.from_array(values, chunks=(1, 1)),
+        depth=(4, 2),
+        mask=da.from_array(mask, chunks=mask_spec),
+        dtype=float,
+    ).compute()
+
+    result = da.map_overlap(
+        func,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(mask, chunks=mask_spec),
+        dtype=float,
+    ).compute()
+
+    np.testing.assert_allclose(result, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("width", [256, 512, 1024])
+def test_map_overlap_with_mask_graph_growth(width):
+    values = _banked_measurement(width)
+    x = da.from_array(values, chunks=(1, 1))
+
+    auto = np.zeros((3, width), dtype=bool)
+    auto[0, 1 : width - 1] = True
+    auto[1, width // 2 : width // 2 + 2] = True
+
+    reviewed = np.zeros((3, width), dtype=bool)
+    reviewed[0, 6 : width - 3] = True
+    reviewed[1, width // 2 : width // 2 + 2] = True
+
+    auto_result = da.map_overlap(
+        _neighbourhood_func,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(auto, chunks=(1, 3)),
+        dtype=float,
+    )
+    manual_result = da.map_overlap(
+        _neighbourhood_func,
+        x,
+        depth=(4, 2),
+        mask=da.from_array(reviewed, chunks=(1, 3)),
+        dtype=float,
+    )
+
+    # The two results share the measurement reads and each mask block is read
+    # once, so the combined graph grows linearly with the width.
+    shared = set(dict(auto_result.dask)) & set(dict(manual_result.dask))
+    assert len(shared) >= width
+
+    auto_result.compute()
+    manual_result.compute()
+
+
+def test_map_overlap_mask_extras():
+    width = 16
+    values = np.arange(width, dtype=float)[None, :]
+    x = da.from_array(values, chunks=(1, 4))
+    mask = np.zeros((1, width), dtype=bool)
+    mask[0, 2:14] = True
+    M = da.from_array(mask, chunks=(1, 3))
+
+    seen = {}
+
+    def func(block, valid_center=None, block_info=None, coords=None):
+        seen["valid_center"] = valid_center.shape
+        seen["coords"] = coords
+        return block
+
+    result = da.map_overlap(func, x, left=2, right=2, mask=M, dtype=float)
+    result.compute()
+    assert seen["valid_center"] == (1, 8)
+    assert seen["coords"] == [(0, 1), (0, 4)]
+
+    # Ordinary map_overlap calls keep their previous behaviour.
+    plain = x.map_overlap(
+        lambda block: block + 1, depth=1, boundary="reflect"
+    ).compute()
+    np.testing.assert_array_equal(plain, values + 1)
