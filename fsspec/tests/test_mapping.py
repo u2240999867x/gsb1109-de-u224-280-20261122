@@ -522,3 +522,222 @@ def test_delete_directory_key_raises_key_error(tmp_path, protocol):
         del mapper["dir"]
 
     assert mapper["dir/key"] == b"value"
+
+
+def _encoded_fs_and_root(protocol, tmp_path, name="mapping"):
+    if protocol == "file":
+        fs = LocalFileSystem(skip_instance_cache=True)
+        root = tmp_path.joinpath(name).as_posix()
+    else:
+        fs = MemoryFileSystem(skip_instance_cache=True)
+        root = f"/{name}-{uuid.uuid4().hex}"
+    return fs, root
+
+
+def _write_legacy_store(fs, root, values):
+    """Populate a root with the plain files a legacy FSMap would write"""
+    legacy = fs.get_mapper(root)
+    for key, value in values.items():
+        legacy[key] = value
+    return legacy
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+def test_encoded_mode_reads_legacy_store_without_migration(tmp_path, protocol):
+    fs, root = _encoded_fs_and_root(protocol, tmp_path)
+    _write_legacy_store(
+        fs, root, {"site/a": b"summary", "__fsmap_keys__": b"reserved-legacy"}
+    )
+
+    m = fs.get_mapper(root, mode="encoded")
+
+    assert m.mode == "encoded"
+    assert m["site/a"] == b"summary"
+    assert m["__fsmap_keys__"] == b"reserved-legacy"
+    assert "site/a" in m
+    assert "__fsmap_keys__" in m
+    assert "site/a/" not in m
+    assert "missing" not in m
+    with pytest.raises(KeyError):
+        _ = m["missing"]
+    assert set(m) == {"site/a", "__fsmap_keys__"}
+    assert len(m) == 2
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+def test_encoded_mode_submetrics_reserved_and_trailing_slash(tmp_path, protocol):
+    fs, root = _encoded_fs_and_root(protocol, tmp_path)
+    _write_legacy_store(
+        fs, root, {"site/a": b"summary", "__fsmap_keys__": b"reserved-legacy"}
+    )
+    m = fs.get_mapper(root, mode="encoded")
+
+    m.setitems(
+        {
+            "site/a/minute/00": b"m00",
+            "site/a/minute/01": b"m01",
+            "__fsmap_keys__": b"reserved-new",
+            "site/a/": b"trailing",
+        }
+    )
+
+    # the summary key keeps its old value and is independent from "site/a/"
+    assert m["site/a"] == b"summary"
+    assert m["site/a/"] == b"trailing"
+    assert m["site/a/minute/00"] == b"m00"
+    assert m["site/a/minute/01"] == b"m01"
+    assert m["__fsmap_keys__"] == b"reserved-new"
+    assert "site/a/" in m
+
+    # delete the key ending in a literal slash and reopen the store
+    del m["site/a/"]
+    fs2, _ = _encoded_fs_and_root(protocol, tmp_path)
+    m2 = fs2.get_mapper(root, mode="encoded")
+
+    keys = set(m2)
+    assert {"site/a", "site/a/minute/00", "site/a/minute/01", "__fsmap_keys__"} <= keys
+    assert "site/a/" not in keys
+    assert "site/a/" not in m2
+    with pytest.raises(KeyError):
+        _ = m2["site/a/"]
+    assert m2["site/a"] == b"summary"
+    assert m2["site/a/minute/00"] == b"m00"
+    assert m2["site/a/minute/01"] == b"m01"
+    assert m2["__fsmap_keys__"] == b"reserved-new"
+    # internal objects never surface as keys of the mapping
+    assert not any("fsmap_meta" in key or "index" in key or "%" in key for key in keys)
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+def test_encoded_mode_failed_batch_keeps_previous_value(
+    tmp_path, protocol, monkeypatch
+):
+    from fsspec.mapping import encode_key
+
+    fs, root = _encoded_fs_and_root(protocol, tmp_path)
+    _write_legacy_store(fs, root, {"site/a": b"summary-old"})
+    m = fs.get_mapper(root, mode="encoded")
+    m.setitems({"site/a/minute/00": b"m00"})
+
+    # make the physical write of the summary key fail
+    bad_name = encode_key("site/a")
+    real_pipe_file = fs.pipe_file
+
+    def flaky_pipe_file(path, value, *args, **kwargs):
+        if path.rsplit("/", 1)[-1] == bad_name:
+            raise OSError("injected write failure")
+        return real_pipe_file(path, value, *args, **kwargs)
+
+    monkeypatch.setattr(fs, "pipe_file", flaky_pipe_file)
+    with pytest.raises(OSError, match="injected write failure"):
+        m.setitems({"site/a": b"summary-new", "site/b": b"new-key"})
+    monkeypatch.undo()
+
+    # the failed item still reads its previous value, the item that did
+    # reach the disk is accurately readable, also after reopening
+    assert m["site/a"] == b"summary-old"
+    assert m["site/b"] == b"new-key"
+    fs2, _ = _encoded_fs_and_root(protocol, tmp_path)
+    m2 = fs2.get_mapper(root, mode="encoded")
+    assert m2["site/a"] == b"summary-old"
+    assert m2["site/b"] == b"new-key"
+
+    # now the summary update succeeds; deleting it must also remove the old
+    # plain file, so the legacy value cannot reappear after reopening
+    m2["site/a"] = b"summary-new"
+    assert m2["site/a"] == b"summary-new"
+    del m2["site/a"]
+
+    fs3, _ = _encoded_fs_and_root(protocol, tmp_path)
+    m3 = fs3.get_mapper(root, mode="encoded")
+    assert "site/a" not in m3
+    with pytest.raises(KeyError):
+        _ = m3["site/a"]
+    assert m3["site/a/minute/00"] == b"m00"
+    assert m3["site/b"] == b"new-key"
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+def test_encoded_mode_single_and_bulk_roundtrip(tmp_path, protocol):
+    fs, root = _encoded_fs_and_root(protocol, tmp_path)
+    m = fs.get_mapper(root, mode="encoded", create=True)
+
+    m["site/a"] = b"one"
+    m["site/a/minute/00"] = b"two"
+    assert m["site/a"] == b"one"
+    assert m["site/a/minute/00"] == b"two"
+    assert len(m) == 2
+
+    m.setitems({"k1": b"v1", "k2": b"v2"})
+    assert m.getitems(["k1", "k2", "site/a"]) == {
+        "k1": b"v1",
+        "k2": b"v2",
+        "site/a": b"one",
+    }
+    out = m.getitems(["k1", "missing"], on_error="return")
+    assert out["k1"] == b"v1"
+    assert isinstance(out["missing"], KeyError)
+    assert m.getitems(["k1", "missing"], on_error="omit") == {"k1": b"v1"}
+    with pytest.raises(KeyError):
+        m.getitems(["k1", "missing"])
+
+    m.delitems(["k1", "k2"])
+    assert "k1" not in m
+    assert set(m) == {"site/a", "site/a/minute/00"}
+
+    # reopening the same directory gives the same view
+    fs2, _ = _encoded_fs_and_root(protocol, tmp_path)
+    m2 = fs2.get_mapper(root, mode="encoded")
+    assert dict(m2) == {"site/a": b"one", "site/a/minute/00": b"two"}
+
+    m2.clear()
+    assert list(m2) == []
+    fs3, _ = _encoded_fs_and_root(protocol, tmp_path)
+    assert list(fs3.get_mapper(root, mode="encoded")) == []
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+def test_encoded_mode_metadata_never_a_business_key(tmp_path, protocol):
+    fs, root = _encoded_fs_and_root(protocol, tmp_path)
+    m = fs.get_mapper(root, mode="encoded", create=True)
+    m["__fsmap_keys__"] = b"business"
+    m["__fsmap_meta__"] = b"looks-internal"
+    m["a/b/c"] = b"deep"
+
+    fs2, _ = _encoded_fs_and_root(protocol, tmp_path)
+    m2 = fs2.get_mapper(root, mode="encoded")
+    keys = set(m2)
+    assert keys == {"__fsmap_keys__", "__fsmap_meta__", "a/b/c"}
+    assert m2["__fsmap_keys__"] == b"business"
+    assert m2["__fsmap_meta__"] == b"looks-internal"
+    # the physical metadata directory does not leak into the mapping
+    assert not any(key.startswith("__fsmap_meta__/") for key in keys)
+    assert "index.json" not in keys
+
+
+def test_encoded_mode_pickle_roundtrip():
+    fs = MemoryFileSystem(skip_instance_cache=True)
+    root = f"/pickle-{uuid.uuid4().hex}"
+    m = fs.get_mapper(root, mode="encoded", create=True)
+    m["a/b"] = b"data"
+
+    m2 = pickle.loads(pickle.dumps(m))
+    assert m2.mode == "encoded"
+    assert m2["a/b"] == b"data"
+    assert list(m2) == ["a/b"]
+
+
+def test_fsmap_invalid_mode():
+    fs = MemoryFileSystem(skip_instance_cache=True)
+    with pytest.raises(ValueError, match="mode"):
+        fs.get_mapper("/mapping", mode="bogus")
+    with pytest.raises(ValueError, match="mode"):
+        fsspec.get_mapper("memory://mapping", mode="bogus")
+
+
+def test_legacy_mode_is_the_default(tmp_path):
+    fs = LocalFileSystem(skip_instance_cache=True)
+    m = fs.get_mapper(tmp_path.as_posix())
+    assert m.mode == "legacy"
+    m["a"] = b"data"
+    assert (tmp_path / "a").read_bytes() == b"data"

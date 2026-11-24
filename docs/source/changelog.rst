@@ -6,6 +6,11 @@ Dev
 
 Enhancements
 
+- Add an opt-in ``mode="encoded"`` to ``FSMap``/``get_mapper``: keys may
+  contain "/" (so "site/a" and "site/a/minute/00" can coexist), may end in
+  "/", and may be named like internal metadata, while plain files written
+  by previous versions stay readable without migration.
+
 - Strip the protocol from ``LocalFileSystem`` paths without building every
   prefix on each call, so ``ls`` and other local path operations are faster.
 
