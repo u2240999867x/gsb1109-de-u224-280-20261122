@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### 🐛 Fixes
+
+- Keep flattened stream-map column names stable and unique across deployments: explicit top-level property names are reserved first and colliding generated (abbreviated) nested names receive a deterministic numeric suffix instead of raising a `Duplicate column name` error. Schema and record flattening now share a name registry so values land in the declared columns.
+- Pure field-reference stream maps (e.g. `"won": "warehouse_order_number"`) now inherit the source property's nullability and `required` declaration, distinguish an explicit `null` from an omitted source path, and expand an explicitly-null object into `null` values for its flattened leaf columns.
+
 ## v0.54.9 (2026-10-19)
 
 ### 🐛 Fixes

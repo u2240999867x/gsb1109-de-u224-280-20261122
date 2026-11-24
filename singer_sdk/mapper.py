@@ -42,6 +42,7 @@ import singer_sdk.typing as th
 from singer_sdk.exceptions import MapExpressionError, StreamMapConfigError
 from singer_sdk.helpers._catalog import get_selected_schema
 from singer_sdk.helpers._flattening import (
+    FlattenedNameRegistry,
     flatten_record,
     flatten_schema,
     get_flattening_options,
@@ -127,6 +128,96 @@ def check_uuid(value: object, version: int | None = None) -> bool:
 StreamMapsDict: t.TypeAlias = dict[str, str | dict | None]
 
 
+_RECORD_ALIASES = frozenset({"_", "record"})
+
+
+def _reference_path(node: ast.AST) -> tuple[str, ...] | None:
+    """Return the property path of a pure field-reference expression.
+
+    A pure reference is an expression made only of record field accesses, such
+    as ``warehouse_order_number``, ``wholesale_hub.zip`` or
+    ``warehouse_history['zip']``. The record aliases ``_`` and ``record`` are
+    accepted as the root (e.g. ``_['name']``). Transformations (calls,
+    built-in variables, etc.) are not references and return None.
+
+    Args:
+        node: The parsed expression AST node.
+
+    Returns:
+        The referenced property path, or None if the expression is not a pure
+        field reference (or references the whole record).
+    """
+    path = _reference_path_parts(node)
+    return path or None
+
+
+def _reference_path_parts(node: ast.AST) -> tuple[str, ...] | None:
+    if isinstance(node, ast.Name):
+        if node.id in _RECORD_ALIASES:
+            return ()
+        return (node.id,)
+    if isinstance(node, ast.Attribute):
+        parent = _reference_path_parts(node.value)
+        return (*parent, node.attr) if parent is not None else None
+    if isinstance(node, ast.Subscript):
+        parent = _reference_path_parts(node.value)
+        slice_node = node.slice
+        if (
+            parent is not None
+            and isinstance(slice_node, ast.Constant)
+            and isinstance(slice_node.value, str)
+        ):
+            return (*parent, slice_node.value)
+    return None
+
+
+def _read_reference(
+    record: dict,
+    path: tuple[str, ...],
+) -> tuple[bool, t.Any]:
+    """Read a field-reference path from a record.
+
+    Args:
+        record: The source record.
+        path: The property path to read.
+
+    Returns:
+        A ``(found, value)`` tuple. ``found`` is False only when an object on
+        the path is omitted entirely; an explicit null propagates as
+        ``(True, None)`` so callers can distinguish null from omission.
+    """
+    current: t.Any = record
+    for key in path:
+        if current is None:
+            return True, None
+        if not isinstance(current, t.MutableMapping) or key not in current:
+            return False, None
+        current = current[key]
+    return True, current
+
+
+def _resolve_source_schema(
+    raw_schema: dict,
+    path: tuple[str, ...],
+) -> dict | None:
+    """Resolve the JSON schema of a nested source property path.
+
+    Args:
+        raw_schema: The raw stream schema.
+        path: The property path to resolve.
+
+    Returns:
+        The property schema, or None if the path is not declared.
+    """
+    node = raw_schema
+    for key in path:
+        properties = node.get("properties")
+        if not isinstance(properties, dict) or key not in properties:
+            return None
+        node = properties[key]
+    return copy.deepcopy(node)
+
+
 class StreamMap(abc.ABC):
     """Abstract base class for all map classes."""
 
@@ -151,6 +242,14 @@ class StreamMap(abc.ABC):
         self.transformed_schema = raw_schema
         self.transformed_key_properties = key_properties
         self.flattening_options = flattening_options
+        self.flattening_registry: FlattenedNameRegistry | None = (
+            FlattenedNameRegistry(
+                separator=flattening_options.separator,
+                max_key_length=flattening_options.max_key_length,
+            )
+            if flattening_options is not None and self.flattening_enabled
+            else None
+        )
         if self.flattening_enabled:
             self.transformed_schema = self.flatten_schema(self.transformed_schema)
 
@@ -187,6 +286,7 @@ class StreamMap(abc.ABC):
             max_level=self.flattening_options.max_level,
             separator=self.flattening_options.separator,
             max_key_length=self.flattening_options.max_key_length,
+            registry=self.flattening_registry,
         )
 
     def flatten_schema(self, raw_schema: dict) -> dict:
@@ -206,6 +306,7 @@ class StreamMap(abc.ABC):
             separator=self.flattening_options.separator,
             max_level=self.flattening_options.max_level,
             max_key_length=self.flattening_options.max_key_length,
+            registry=self.flattening_registry,
         )
 
     @abc.abstractmethod
@@ -623,6 +724,7 @@ class CustomStreamMap(StreamMap):
             transformed_schema["properties"] = {}
 
         stream_map_parsed: list[tuple[str, str | None, ast.Expr | None]] = []
+        reference_paths: dict[str, tuple[str, ...] | None] = {}
         for prop_key, prop_def in list(stream_map.items()):
             if prop_def in {None, NULL_STRING}:
                 if prop_key in (self.transformed_key_properties or []):
@@ -643,29 +745,57 @@ class CustomStreamMap(StreamMap):
                     ]
                 stream_map_parsed.append((prop_key, prop_def, None))
             elif isinstance(prop_def, str):
-                default_type: th.JSONTypeHelper = th.StringType()  # Fallback to string
-                existing_schema: dict = (
-                    # Use transformed schema if available
-                    transformed_schema["properties"].get(prop_key, {})
-                    # ...or original schema for passthrough
-                    or self.raw_schema["properties"].get(prop_def, {})
-                )
-                if existing_schema:
-                    # Set default type if property exists already in JSON Schema
-                    default_type = th.CustomType(existing_schema)
-
-                transformed_schema["properties"].update(
-                    th.Property(
-                        prop_key,
-                        self._eval_type(prop_def, default=default_type),
-                    ).to_dict(),
-                )
                 try:
                     parsed_def: ast.Expr = ast.parse(prop_def).body[0]  # type: ignore[assignment]
-                    stream_map_parsed.append((prop_key, prop_def, parsed_def))
                 except (SyntaxError, IndexError) as ex:
                     msg = f"Failed to parse expression {prop_def}."
                     raise MapExpressionError(msg) from ex
+
+                reference_path = _reference_path(parsed_def.value)
+                source_schema = (
+                    _resolve_source_schema(self.raw_schema, reference_path)
+                    if reference_path
+                    else None
+                )
+                # Only paths that resolve to a declared source property are
+                # treated as field references; other names (e.g. __stream_name__,
+                # config) go through normal expression evaluation.
+                reference_paths[prop_key] = (
+                    reference_path if source_schema is not None else None
+                )
+                if source_schema is not None and reference_path is not None:
+                    # A pure field reference carries over the source property's
+                    # own schema (including nullability) instead of defaulting to
+                    # an optional, nullable string.
+                    property_schema = source_schema
+                    source_required = (
+                        len(reference_path) == 1
+                        and reference_path[0]
+                        in self.raw_schema.get("required", [])
+                    )
+                else:
+                    default_type: th.JSONTypeHelper = th.StringType()  # Fallback
+                    existing_schema: dict = (
+                        # Use transformed schema if available
+                        transformed_schema["properties"].get(prop_key, {})
+                        # ...or original schema for passthrough
+                        or self.raw_schema["properties"].get(prop_def, {})
+                    )
+                    if existing_schema:
+                        # Set default type if property exists already in JSON Schema
+                        default_type = th.CustomType(existing_schema)
+                    property_schema = th.Property(
+                        prop_key,
+                        self._eval_type(prop_def, default=default_type),
+                    ).to_dict()[prop_key]
+                    source_required = False
+
+                transformed_schema["properties"][prop_key] = property_schema
+                if source_required:
+                    transformed_schema.setdefault("required", [])
+                    if prop_key not in transformed_schema["required"]:
+                        transformed_schema["required"].append(prop_key)
+                stream_map_parsed.append((prop_key, prop_def, parsed_def))
 
             else:
                 msg = (
@@ -683,7 +813,14 @@ class CustomStreamMap(StreamMap):
                 )
                 raise StreamMapConfigError(msg)
 
-        if self.flattening_enabled:
+        if self.flattening_enabled and self.flattening_options is not None:
+            # The mapped schema may drop, add, or rename properties, so its
+            # flattened column names are resolved with a fresh registry. The
+            # record transform then shares this same registry.
+            self.flattening_registry = FlattenedNameRegistry(
+                separator=self.flattening_options.separator,
+                max_key_length=self.flattening_options.max_key_length,
+            )
             transformed_schema = self.flatten_schema(transformed_schema)
 
         # Declare function variables
@@ -749,6 +886,17 @@ class CustomStreamMap(StreamMap):
                     continue
 
                 if isinstance(prop_def_parsed, ast.Expr):
+                    reference_path = reference_paths.get(prop_key)
+                    if reference_path is not None:
+                        # Pure field reference: distinguish an explicit null
+                        # (keep the key with a null value) from an omitted path
+                        # (omit the key entirely).
+                        found, value = _read_reference(record, reference_path)
+                        if found:
+                            result[prop_key] = value
+                        else:
+                            result.pop(prop_key, None)
+                        continue
                     # Apply property transform
                     result[prop_key] = self._eval(
                         expr=prop_def,

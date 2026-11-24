@@ -57,6 +57,22 @@ When flattening is enabled, the following configuration options are available:
 
 When a flattened key would exceed the `flattening_max_key_length`, the SDK automatically abbreviates parent key names to keep the total length under the limit while preserving all the key components.
 
+##### Column name collisions
+
+A generated (abbreviated) nested column name can match an existing top-level property name, for example when both `warehouse_history.zip` and a literal `wh__zip` property flatten to `wh__zip`. To keep published column names stable across deployments, the SDK resolves such collisions deterministically instead of failing:
+
+- Explicit top-level property names are reserved first and always keep their published name.
+- The colliding nested property gets a stable numeric suffix (e.g. `wh__zip_1`).
+- Schema flattening and record flattening share the same name resolution, so each value is written to the exact column declared by the flattened `SCHEMA` message.
+
+Because the resolution is stable for a given input schema, a stream map that needs a specific published name (such as reserving `wh__zip` for a future field) can map the colliding nested value to an explicitly named column instead, e.g. `"hist_zip": "warehouse_history['zip']"`.
+
+##### Null and omitted properties
+
+When flattening, an explicit `null` object is expanded into `null` values for every flattened leaf column it would have produced, while an object that is omitted from the record produces no keys at all. The same distinction applies to pure field-reference stream maps (e.g. `"won": "warehouse_order_number"`): an explicit `null` keeps the output key with a `null` value, and a missing source path omits the output key.
+
+A pure field reference also inherits the source property's own schema, including its nullability and `required` declaration, rather than defaulting to an optional nullable string.
+
 #### Flattening Example
 
 ````{tab} meltano.yml

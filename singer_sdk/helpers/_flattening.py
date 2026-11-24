@@ -88,6 +88,21 @@ def get_flattening_options(plugin_config: PluginFlatteningConfig) -> FlatteningO
     return FlatteningOptions.from_dict(plugin_config)
 
 
+def _abbreviate_key(key_name: str) -> str:
+    """Reduce a single key component to keep flattened names short.
+
+    Args:
+        key_name: The key component to abbreviate.
+
+    Returns:
+        The abbreviated, lower-cased component.
+    """
+    reduced_key = _LOWERCASE_RE.sub("", inflection.camelize(key_name))
+    return (
+        reduced_key if len(reduced_key) > 1 else key_name[:3]
+    ).lower()
+
+
 def flatten_key(
     key_name: str,
     parent_keys: list[str],
@@ -119,16 +134,138 @@ def flatten_key(
         len(separator.join(inflected_key)) >= max_key_length  # Keep the key short
         and reducer_index < len(inflected_key)
     ):
-        reduced_key = _LOWERCASE_RE.sub(
-            "",
-            inflection.camelize(inflected_key[reducer_index]),
+        inflected_key[reducer_index] = _abbreviate_key(
+            inflected_key[reducer_index],
         )
-        inflected_key[reducer_index] = (
-            reduced_key if len(reduced_key) > 1 else inflected_key[reducer_index][:3]
-        ).lower()
         reducer_index += 1
 
     return separator.join(inflected_key)
+
+
+class FlattenedNameRegistry:
+    """Resolve and remember flattened column names for a stream.
+
+    The registry guarantees that each source property path maps to a stable,
+    unique output column name for the lifetime of the stream map:
+
+    - Explicit property names (top-level properties) are reserved first, so a
+      generated (abbreviated) nested name never steals a published column name.
+    - Generated names that collide with a reserved or earlier name get a
+      deterministic numeric suffix instead of raising an error.
+    - Schema flattening and record flattening share the same registry, so the
+      values land in exactly the columns declared by the flattened schema.
+    """
+
+    def __init__(
+        self,
+        separator: str = DEFAULT_FLATTENING_SEPARATOR,
+        max_key_length: int = DEFAULT_MAX_KEY_LENGTH,
+    ) -> None:
+        """Initialize the registry.
+
+        Args:
+            separator: The separator used when concatenating key names.
+            max_key_length: The maximum length of generated key names.
+        """
+        self.separator = separator
+        self.max_key_length = max_key_length
+        self._path_to_name: dict[tuple[str, ...], str] = {}
+        self._names: set[str] = set()
+
+    def reserve_field(self, field_name: str) -> str:
+        """Reserve the flattened name of an explicit top-level property.
+
+        Explicit properties are reserved before nested properties are
+        flattened, so a generated (abbreviated) nested name never steals a
+        published top-level column name; the nested name gets a suffix instead.
+
+        Args:
+            field_name: The top-level property name to reserve.
+
+        Returns:
+            The reserved flattened column name.
+        """
+        path = (field_name,)
+        if existing := self._path_to_name.get(path):
+            return existing
+
+        candidate = flatten_key(
+            field_name,
+            [],
+            self.separator,
+            max_key_length=self.max_key_length,
+        )
+        if candidate in self._names:
+            candidate = self._unique_name(candidate)
+        self._path_to_name[path] = candidate
+        self._names.add(candidate)
+        return candidate
+
+    def register(self, field_name: str, parent_keys: list[str]) -> str:
+        """Resolve (once) the output name for a nested property path.
+
+        Args:
+            field_name: The leaf property name.
+            parent_keys: The ancestor path of the property.
+
+        Returns:
+            The stable, unique flattened column name for this path.
+        """
+        path = (*parent_keys, field_name)
+        if existing := self._path_to_name.get(path):
+            return existing
+
+        candidate = flatten_key(
+            field_name,
+            parent_keys,
+            self.separator,
+            max_key_length=self.max_key_length,
+        )
+        if candidate in self._names:
+            candidate = self._unique_name(candidate)
+        self._path_to_name[path] = candidate
+        self._names.add(candidate)
+        return candidate
+
+    def lookup(self, field_name: str, parent_keys: list[str]) -> str | None:
+        """Return the registered output name for a path, if known.
+
+        Args:
+            field_name: The leaf property name.
+            parent_keys: The ancestor path of the property.
+
+        Returns:
+            The registered output name, or None if the path was not registered.
+        """
+        return self._path_to_name.get((*parent_keys, field_name))
+
+    def leaf_names_under(self, prefix: tuple[str, ...]) -> list[str]:
+        """Return the flattened column names registered below a property path.
+
+        Used to expand an explicitly-null object into null values for every
+        flattened leaf column it would have produced.
+
+        Args:
+            prefix: The object property path to look beneath.
+
+        Returns:
+            The flattened column names of descendant property paths, in
+            registration order.
+        """
+        return [
+            name
+            for path, name in self._path_to_name.items()
+            if len(path) > len(prefix) and path[: len(prefix)] == prefix
+        ]
+
+    def _unique_name(self, candidate: str) -> str:
+        suffix_index = 1
+        unique = candidate
+        while unique in self._names:
+            suffix = f"_{suffix_index}"
+            unique = f"{candidate[: self.max_key_length - len(suffix)]}{suffix}"
+            suffix_index += 1
+        return unique
 
 
 def flatten_schema(
@@ -137,6 +274,7 @@ def flatten_schema(
     separator: str = "__",
     *,
     max_key_length: int = DEFAULT_MAX_KEY_LENGTH,
+    registry: FlattenedNameRegistry | None = None,
 ) -> dict:
     """Flatten the provided schema up to a depth of max_level.
 
@@ -145,6 +283,8 @@ def flatten_schema(
         separator: The string to use when concatenating key names.
         max_level: The max recursion level (zero-based, exclusive).
         max_key_length: The maximum length of the key. Defaults to 255.
+        registry: A name registry shared with record flattening. A new one is
+            created and attached to the returned schema when not provided.
 
     Returns:
         A flattened version of the provided schema definition.
@@ -327,12 +467,22 @@ def flatten_schema(
     }
     """
     new_schema = {k: v for k, v in schema.items() if k != "properties"}
+    if registry is None:
+        registry = FlattenedNameRegistry(
+            separator=separator,
+            max_key_length=max_key_length,
+        )
+    # Reserve explicit top-level property names first so that generated
+    # (abbreviated) nested names cannot steal a published column name.
+    for field_name in schema.get("properties", {}):
+        registry.reserve_field(field_name)
     new_schema["properties"] = _flatten_schema(
         schema_node=schema,
         parent_keys=[],
         max_level=max_level,
         separator=separator,
         max_key_length=max_key_length,
+        registry=registry,
     )
     return new_schema
 
@@ -345,6 +495,7 @@ def _flatten_schema(  # noqa: C901, PLR0912
     max_level: int = 0,
     *,
     max_key_length: int = DEFAULT_MAX_KEY_LENGTH,
+    registry: FlattenedNameRegistry | None = None,
 ) -> dict:
     """Flatten the provided schema node, recursively up to depth of `max_level`.
 
@@ -356,21 +507,23 @@ def _flatten_schema(  # noqa: C901, PLR0912
         level: The current recursion level (zero-based).
         max_level: The max recursion level (zero-based, exclusive).
         max_key_length: The maximum length of the key. Defaults to 255.
+        registry: Registry assigning stable, unique flattened column names.
+            A new registry is created when not provided.
 
     Returns:
         A flattened version of the provided node.
     """
+    if registry is None:
+        registry = FlattenedNameRegistry(
+            separator=separator,
+            max_key_length=max_key_length,
+        )
     items: list[tuple[str, dict]] = []
     if "properties" not in schema_node:
         return {}
 
     for field_name, field_schema in schema_node["properties"].items():
-        new_key = flatten_key(
-            field_name,
-            parent_keys,
-            separator,
-            max_key_length=max_key_length,
-        )
+        new_key = registry.register(field_name, parent_keys)
         if "type" in field_schema:
             if (
                 "object" in field_schema["type"]
@@ -386,6 +539,7 @@ def _flatten_schema(  # noqa: C901, PLR0912
                         level=level + 1,
                         max_level=max_level,
                         max_key_length=max_key_length,
+                        registry=registry,
                     ).items(),
                 )
                 parent_keys.pop()
@@ -434,6 +588,7 @@ def flatten_record(
     separator: str = "__",
     *,
     max_key_length: int = DEFAULT_MAX_KEY_LENGTH,
+    registry: FlattenedNameRegistry | None = None,
 ) -> dict:
     """Flatten a record up to max_level.
 
@@ -443,6 +598,9 @@ def flatten_record(
         separator: The string used to separate concatenated key names. Defaults to "__".
         max_level: The maximum depth of keys to flatten recursively.
         max_key_length: The maximum length of the key. Defaults to 255.
+        registry: The name registry used when flattening the schema. When
+            provided, record values are written to the exact column names
+            declared in the flattened schema, even when names were de-conflicted.
 
     Returns:
         A flattened version of the record.
@@ -455,6 +613,7 @@ def flatten_record(
         level=0,
         max_level=max_level,
         max_key_length=max_key_length,
+        registry=registry,
     )
 
 
@@ -467,6 +626,7 @@ def _flatten_record(
     level: int = 0,
     max_level: int = 0,
     max_key_length: int = DEFAULT_MAX_KEY_LENGTH,
+    registry: FlattenedNameRegistry | None = None,
 ) -> dict:
     """This recursive function flattens the record node.
 
@@ -482,13 +642,18 @@ def _flatten_record(
         level: The current recursion level (zero-based).
         max_level: The max recursion level (zero-based, exclusive).
         max_key_length: The maximum length of the key. Defaults to 255.
+        registry: The name registry used when flattening the schema.
 
     Returns:
         A flattened version of the provided node.
     """
     items: list[tuple[str, t.Any]] = []
     for k, v in record_node.items():
-        new_key = flatten_key(k, parent_key, separator, max_key_length=max_key_length)
+        new_key = (
+            registry.lookup(k, parent_key)
+            if registry is not None
+            else None
+        ) or flatten_key(k, parent_key, separator, max_key_length=max_key_length)
         # If the value is a dictionary, and the key is not in the schema, and the
         # level is less than the max level, then we should continue to flatten.
         if (
@@ -507,9 +672,28 @@ def _flatten_record(
                     level=level + 1,
                     max_level=max_level,
                     max_key_length=max_key_length,
+                    registry=registry,
                 ).items(),
             )
             parent_key.pop()
+        elif v is None and registry is not None and level < max_level:
+            # An explicitly-null object expands into null values for every
+            # flattened leaf column it would have produced. An omitted object
+            # produces no keys at all (handled simply by not being present in
+            # the record). Only columns actually declared in the flattened
+            # schema are emitted (intermediate object paths are not columns).
+            declared_columns = (
+                flattened_schema.get("properties", {}) if flattened_schema else {}
+            )
+            leaf_names = [
+                leaf_name
+                for leaf_name in registry.leaf_names_under((*parent_key, k))
+                if leaf_name in declared_columns
+            ]
+            if leaf_names:
+                items.extend((leaf_name, None) for leaf_name in leaf_names)
+            else:
+                items.append((new_key, v))
         else:
             items.append(
                 (

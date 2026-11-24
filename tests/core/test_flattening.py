@@ -4,6 +4,7 @@ import pytest
 
 from singer_sdk.exceptions import ConfigValidationError
 from singer_sdk.helpers._flattening import (
+    FlattenedNameRegistry,
     flatten_key,
     flatten_record,
     flatten_schema,
@@ -349,10 +350,70 @@ def test_flatten_schema_no_properties():
     assert result == {"type": "object", "properties": {}}
 
 
-def test_flatten_schema_duplicate_key():
-    """Test that flatten_schema raises ValueError on a duplicate flattened key.
+def test_flatten_record_null_object_vs_omitted_object():
+    """An explicit null object yields null leaf columns; an omitted one yields none."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "hub": {
+                "type": ["object", "null"],
+                "properties": {"zip": {"type": ["string", "null"]}},
+            },
+        },
+    }
+    registry = FlattenedNameRegistry()
+    flattened = flatten_schema(schema, max_level=1, registry=registry)
 
-    Two fields that flatten to the same key name should raise a ValueError.
+    assert flatten_record(
+        {"id": "1", "hub": None},
+        flattened_schema=flattened,
+        max_level=1,
+        registry=registry,
+    ) == {"id": "1", "hub__zip": None}
+
+    assert flatten_record(
+        {"id": "1"},
+        flattened_schema=flattened,
+        max_level=1,
+        registry=registry,
+    ) == {"id": "1"}
+
+
+def test_flatten_record_null_object_only_emits_declared_leaf_columns():
+    """Intermediate object paths must not appear as extra columns for null values."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {
+                "type": ["object", "null"],
+                "properties": {
+                    "b": {
+                        "type": ["object", "null"],
+                        "properties": {"c": {"type": "string"}},
+                    },
+                },
+            },
+        },
+    }
+    registry = FlattenedNameRegistry()
+    flattened = flatten_schema(schema, max_level=2, registry=registry)
+    assert set(flattened["properties"]) == {"a__b__c"}
+
+    assert flatten_record(
+        {"a": None},
+        flattened_schema=flattened,
+        max_level=2,
+        registry=registry,
+    ) == {"a__b__c": None}
+
+
+def test_flatten_schema_duplicate_key():
+    """Test flatten_schema resolves a flattened name collision deterministically.
+
+    An explicit top-level property keeps its published name, while the nested
+    property that would flatten to the same name gets a stable numeric suffix.
+    Record values are routed to the matching columns.
     """
     schema = {
         "type": "object",
@@ -364,11 +425,17 @@ def test_flatten_schema_duplicate_key():
             },
         },
     }
-    with pytest.raises(
-        ValueError,
-        match="Duplicate column name produced in schema: a__b",
-    ):
-        flatten_schema(schema, max_level=1)
+    registry = FlattenedNameRegistry()
+    flattened = flatten_schema(schema, max_level=1, registry=registry)
+    assert set(flattened["properties"]) == {"a__b", "a__b_1"}
+
+    record = flatten_record(
+        {"a__b": "top-level", "a": {"b": "nested"}},
+        flattened_schema=flattened,
+        max_level=1,
+        registry=registry,
+    )
+    assert record == {"a__b": "top-level", "a__b_1": "nested"}
 
 
 def test_flatten_schema_long_key_abbreviation():
