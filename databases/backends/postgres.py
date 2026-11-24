@@ -105,7 +105,11 @@ class PostgresConnection(ConnectionBackend):
         rows = await self._connection.fetch(query_str, *args)
         dialect = self._dialect
         column_maps = create_column_maps(result_columns)
-        return [Record(row, result_columns, dialect, column_maps) for row in rows]
+        projection = getattr(query, "inner_columns", None)
+        return [
+            Record(row, result_columns, dialect, column_maps, projection)
+            for row in rows
+        ]
 
     async def fetch_one(self, query: ClauseElement) -> typing.Optional[RecordInterface]:
         assert self._connection is not None, "Connection is not acquired"
@@ -118,6 +122,7 @@ class PostgresConnection(ConnectionBackend):
             result_columns,
             self._dialect,
             create_column_maps(result_columns),
+            getattr(query, "inner_columns", None),
         )
 
     async def fetch_val(
@@ -155,8 +160,11 @@ class PostgresConnection(ConnectionBackend):
         assert self._connection is not None, "Connection is not acquired"
         query_str, args, result_columns = self._compile(query)
         column_maps = create_column_maps(result_columns)
+        projection = getattr(query, "inner_columns", None)
         async for row in self._connection.cursor(query_str, *args):
-            yield Record(row, result_columns, self._dialect, column_maps)
+            yield Record(
+                row, result_columns, self._dialect, column_maps, projection
+            )
 
     def transaction(self) -> TransactionBackend:
         return PostgresTransaction(connection=self)

@@ -92,16 +92,23 @@ class SQLiteConnection(ConnectionBackend):
     async def fetch_all(self, query: ClauseElement) -> typing.List[Record]:
         assert self._connection is not None, "Connection is not acquired"
         query_str, args, result_columns, context = self._compile(query)
-        column_maps = create_column_maps(result_columns)
         dialect = self._dialect
 
         async with self._connection.execute(query_str, args) as cursor:
             rows = await cursor.fetchall()
             metadata = CursorResultMetaData(context, cursor.description)
+            actual_names = [column[0] for column in cursor.description]
+            column_maps = create_column_maps(
+                result_columns, actual_names, getattr(query, "inner_columns", None)
+            )
+            if len(result_columns) == len(actual_names):
+                processors = metadata._processors
+            else:
+                processors = column_maps.resolver.processors(dialect)
             rows = [
                 Row(
                     metadata,
-                    metadata._processors,
+                    processors,
                     metadata._keymap,
                     row,
                 )
@@ -112,7 +119,6 @@ class SQLiteConnection(ConnectionBackend):
     async def fetch_one(self, query: ClauseElement) -> typing.Optional[Record]:
         assert self._connection is not None, "Connection is not acquired"
         query_str, args, result_columns, context = self._compile(query)
-        column_maps = create_column_maps(result_columns)
         dialect = self._dialect
 
         async with self._connection.execute(query_str, args) as cursor:
@@ -120,9 +126,17 @@ class SQLiteConnection(ConnectionBackend):
             if row is None:
                 return None
             metadata = CursorResultMetaData(context, cursor.description)
+            actual_names = [column[0] for column in cursor.description]
+            column_maps = create_column_maps(
+                result_columns, actual_names, getattr(query, "inner_columns", None)
+            )
+            if len(result_columns) == len(actual_names):
+                processors = metadata._processors
+            else:
+                processors = column_maps.resolver.processors(dialect)
             row = Row(
                 metadata,
-                metadata._processors,
+                processors,
                 metadata._keymap,
                 row,
             )
@@ -147,15 +161,22 @@ class SQLiteConnection(ConnectionBackend):
     ) -> typing.AsyncGenerator[typing.Any, None]:
         assert self._connection is not None, "Connection is not acquired"
         query_str, args, result_columns, context = self._compile(query)
-        column_maps = create_column_maps(result_columns)
         dialect = self._dialect
 
         async with self._connection.execute(query_str, args) as cursor:
             metadata = CursorResultMetaData(context, cursor.description)
+            actual_names = [column[0] for column in cursor.description]
+            column_maps = create_column_maps(
+                result_columns, actual_names, getattr(query, "inner_columns", None)
+            )
+            if len(result_columns) == len(actual_names):
+                processors = metadata._processors
+            else:
+                processors = column_maps.resolver.processors(dialect)
             async for row in cursor:
                 record = Row(
                     metadata,
-                    metadata._processors,
+                    processors,
                     metadata._keymap,
                     row,
                 )
