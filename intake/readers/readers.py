@@ -1834,8 +1834,18 @@ class PolarsFeather(Polars):
 class PyArrowIPCReader(FileReader):
     """Read an Arrow IPC file or stream into a PyArrow Table.
 
-    Supports both the "file" (random-access) and "stream" formats via
-    ``pyarrow.ipc.open_file`` / ``open_stream`` heuristic.
+    Supports both the "file" (random-access, ``ARROW1``) and "stream" formats.
+    A payload that begins with the ``ARROW1`` magic is treated as an archive
+    *file*: if its footer or framing is damaged, the failure is reported as
+    :class:`~intake.readers.ipc_stream.CorruptArrowIPCFile` rather than silently
+    retried as a stream, because a corrupt archive offers no resumable stream
+    position.
+
+    For device uploads over a non-seekable connection, :meth:`read_stream`
+    returns a :class:`~intake.readers.ipc_stream.ResumableIPCReader` that hands
+    over each complete record batch as it arrives and can be resumed from a
+    saved :class:`~intake.readers.ipc_stream.StreamResumeInfo` after a
+    disconnect.
     """
 
     implements = {datatypes.ArrowIPC}
@@ -1844,25 +1854,87 @@ class PyArrowIPCReader(FileReader):
     output_instance = "pyarrow.lib:Table"
     url_arg = "source"
 
-    def _read(self, data, **kwargs):
+    def _open_table_reader(self, data, kwargs):
         import pyarrow.ipc as ipc
 
+        from intake.readers.ipc_stream import (
+            CorruptArrowIPCFile,
+            check_ipc_file_magic,
+            open_ipc_file,
+        )
+
         try:
-            reader = ipc.open_file(data.url, **kwargs)
-        except Exception:
-            reader = ipc.open_stream(data.url, **kwargs)
+            check_ipc_file_magic(data.url, data.storage_options)
+        except CorruptArrowIPCFile:
+            # No ARROW1 magic: this is the non-seekable stream format.
+            return ipc.open_stream(data.url, **kwargs), False
+        # A damaged ARROW1 archive raises CorruptArrowIPCFile (no stream resume
+        # position) instead of silently being retried as a stream.
+        return open_ipc_file(data.url, data.storage_options, **kwargs), True
+
+    def _read(self, data, **kwargs):
+        reader, _is_file = self._open_table_reader(data, kwargs)
         return reader.read_all()
 
     def discover(self, **kwargs):
         import pyarrow.ipc as ipc
 
+        from intake.readers.ipc_stream import CorruptArrowIPCFile, check_ipc_file_magic
+
         data = self.kwargs.get("data") or (self.kwargs.get("args") or [None])[0]
         try:
-            reader = ipc.open_file(data.url)
-            return reader.read_all().slice(0, 10)
-        except Exception:
+            check_ipc_file_magic(data.url, data.storage_options)
+        except CorruptArrowIPCFile:
             reader = ipc.open_stream(data.url)
             return reader.read_next_batch()
+        reader, _ = self._open_table_reader(data, kwargs)
+        return reader.read_all().slice(0, 10)
+
+    def read_stream(
+        self,
+        stream_id,
+        stream_version,
+        feed=None,
+        resume_info=None,
+        confirmed_batch=None,
+    ):
+        """Open a non-seekable Arrow IPC stream for batch-by-batch delivery.
+
+        Parameters
+        ----------
+        stream_id, stream_version:
+            Identity of the device stream, checked against any *resume_info*.
+        feed:
+            Zero-argument callable yielding the next stream bytes (socket-style
+            ``read`` contract) or a file-like object.  When omitted, the data
+            URL is opened through fsspec.
+        resume_info:
+            :class:`~intake.readers.ipc_stream.StreamResumeInfo` saved by a
+            previous reader instance for the same stream.
+        confirmed_batch:
+            Highest batch number confirmed by the warehouse; batches up to this
+            prefix are replayed internally but not delivered again.
+
+        Returns
+        -------
+        ResumableIPCReader
+            Iterate it as ``(batch_number, record_batch)`` pairs.  On a broken
+            connection it raises :class:`ArrowIPCInterrupted` carrying the first
+            unfinished message position, the last delivered batch and the
+            replay start implied by *confirmed_batch*.
+        """
+        from intake.readers.ipc_stream import ResumableIPCReader
+
+        data = self.kwargs.get("data") or (self.kwargs.get("args") or [None])[0]
+        if feed is None:
+            feed = fsspec.open(data.url, "rb", **(data.storage_options or {})).open()
+        return ResumableIPCReader(
+            feed,
+            stream_id=stream_id,
+            stream_version=stream_version,
+            resume_info=resume_info,
+            confirmed_batch=confirmed_batch,
+        )
 
 
 class PandasArrowIPC(Pandas):
