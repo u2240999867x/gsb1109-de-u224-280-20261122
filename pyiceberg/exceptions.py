@@ -158,3 +158,58 @@ class SnapshotRefTypeError(ValueError):
 
 class NotAncestorError(ValueError):
     """Raised when an operation requires ancestry between two snapshots and it does not hold."""
+
+
+class ReplayError(ValueError):
+    """Base class for replay guarantee failures."""
+
+
+class ReplayNotEnabledError(ReplayError):
+    """Raised when replay guarantee state is requested from an unprotected table."""
+
+
+class ReplayCoverageError(ReplayError):
+    """Raised when a requested time or interval precedes replay coverage."""
+
+
+class SnapshotCleanedError(ReplayError):
+    """Raised when a replay target snapshot has already been cleaned."""
+
+    def __init__(self, message: str, snapshot_id: int | None = None, timestamp_ms: int | None = None) -> None:
+        super().__init__(message)
+        self.snapshot_id = snapshot_id
+        self.timestamp_ms = timestamp_ms
+
+
+class UnreplayableWindowError(ReplayError):
+    """Raised when a registration interval cannot be replayed as it was observed."""
+
+
+class ReplayRegistrationNotFoundError(ReplayError):
+    """Raised when revoking a replay registration that does not exist."""
+
+
+ReplayGuaranteeError = ReplayError
+ReplayProtectionError = ReplayError
+ReplayAssuranceError = ReplayError
+ReplayWindowError = UnreplayableWindowError
+ReplayWindowRejectedError = UnreplayableWindowError
+ReplayWindowUnavailableError = UnreplayableWindowError
+WindowNotReplayableError = UnreplayableWindowError
+SnapshotCleanedUpError = SnapshotCleanedError
+SnapshotExpiredForReplayError = SnapshotCleanedError
+SnapshotExpiredError = SnapshotCleanedError
+CleanedSnapshotError = SnapshotCleanedError
+ReplayCoverageNotEnabledError = ReplayCoverageError
+ReplayNotCoveredError = ReplayCoverageError
+NotCoveredByReplayError = ReplayCoverageError
+CoverageBeforeEnablementError = ReplayCoverageError
+
+SnapshotCleaned = SnapshotCleanedError
+SnapshotExpired = SnapshotExpiredError
+CleanedSnapshot = CleanedSnapshotError
+NotCovered = ReplayNotCoveredError
+CoverageNotEnabled = ReplayCoverageNotEnabledError
+ReplayUnavailable = UnreplayableWindowError
+WindowNotReplayable = WindowNotReplayableError
+ReplayRegistrationNotFound = ReplayRegistrationNotFoundError

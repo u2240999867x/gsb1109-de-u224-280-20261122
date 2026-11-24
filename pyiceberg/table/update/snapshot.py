@@ -23,9 +23,9 @@ from abc import abstractmethod
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import cached_property
-from typing import TYPE_CHECKING, Generic
+from typing import TYPE_CHECKING, Any, Generic
 
 from pyiceberg.avro.codecs import AvroCompressionCodec
 from pyiceberg.exceptions import (
@@ -58,6 +58,24 @@ from pyiceberg.manifest import (
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
+from pyiceberg.table.replay import (
+    age_ms as _replay_age_ms,
+)
+from pyiceberg.table.replay import (
+    commit_with_refresh_retry as _commit_replay_with_retry,
+)
+from pyiceberg.table.replay import (
+    load_replay_state as _load_replay_state,
+)
+from pyiceberg.table.replay import (
+    plan_cleanup as _plan_replay_cleanup,
+)
+from pyiceberg.table.replay import (
+    replay_protected_snapshot_ids as _replay_protected_ids,
+)
+from pyiceberg.table.replay import (
+    timestamp_ms as _replay_timestamp_ms,
+)
 from pyiceberg.table.snapshots import (
     Operation,
     Snapshot,
@@ -83,7 +101,6 @@ from pyiceberg.table.update import (
 from pyiceberg.typedef import EMPTY_DICT, KeyDefaultDict, Record
 from pyiceberg.utils.bin_packing import ListPacker
 from pyiceberg.utils.concurrent import ExecutorFactory
-from pyiceberg.utils.datetime import datetime_to_millis
 from pyiceberg.utils.properties import property_as_bool, property_as_int
 
 if TYPE_CHECKING:
@@ -1104,14 +1121,20 @@ class ManageSnapshots(UpdateTableMetadata["ManageSnapshots"]):
         self._requirements += requirements
         return self
 
-    def create_tag(self, snapshot_id: int, tag_name: str, max_ref_age_ms: int | None = None) -> ManageSnapshots:
+    def create_tag(
+        self,
+        snapshot_id: int,
+        tag_name: str,
+        max_ref_age_ms: int | timedelta | None = None,
+        **retention_options: Any,
+    ) -> ManageSnapshots:
         """
         Create a new tag pointing to the given snapshot id.
 
         Args:
             snapshot_id (int): snapshot id of the existing snapshot to tag
             tag_name (str): name of the tag
-            max_ref_age_ms (Optional[int]): max ref age in milliseconds
+            max_ref_age_ms (Optional[int | timedelta]): max ref age in milliseconds
 
         Returns:
             This for method chaining
@@ -1119,13 +1142,18 @@ class ManageSnapshots(UpdateTableMetadata["ManageSnapshots"]):
         Raises:
             ValueError: If a branch or tag with this name already exists.
         """
+        max_ref_age_value = (
+            max_ref_age_ms
+            if max_ref_age_ms is not None
+            else retention_options.get("max_ref_age") or retention_options.get("ttl") or retention_options.get("expires_in")
+        )
         if tag_name in self._effective_refs():
             raise ValueError(f"Ref {tag_name} already exists")
         update, requirement = self._transaction._set_ref_snapshot(
             snapshot_id=snapshot_id,
             ref_name=tag_name,
             type=SnapshotRefType.TAG,
-            max_ref_age_ms=max_ref_age_ms,
+            max_ref_age_ms=_replay_age_ms(max_ref_age_value),
         )
         self._updates += update
         self._requirements += requirement
@@ -1155,9 +1183,10 @@ class ManageSnapshots(UpdateTableMetadata["ManageSnapshots"]):
         self,
         snapshot_id: int,
         branch_name: str,
-        max_ref_age_ms: int | None = None,
-        max_snapshot_age_ms: int | None = None,
+        max_ref_age_ms: int | timedelta | None = None,
+        max_snapshot_age_ms: int | timedelta | None = None,
         min_snapshots_to_keep: int | None = None,
+        **retention_options: Any,
     ) -> ManageSnapshots:
         """
         Create a new branch pointing to the given snapshot id.
@@ -1174,14 +1203,22 @@ class ManageSnapshots(UpdateTableMetadata["ManageSnapshots"]):
         Raises:
             ValueError: If a branch or tag with this name already exists.
         """
+        if max_ref_age_ms is None:
+            max_ref_age_ms = retention_options.get("max_ref_age") or retention_options.get("ref_ttl")
+        if max_snapshot_age_ms is None:
+            max_snapshot_age_ms = (
+                retention_options.get("max_snapshot_age") or retention_options.get("max_age") or retention_options.get("lookback")
+            )
+        if min_snapshots_to_keep is None:
+            min_snapshots_to_keep = retention_options.get("retain_last") or retention_options.get("min_keep")
         if branch_name in self._effective_refs():
             raise ValueError(f"Ref {branch_name} already exists")
         update, requirement = self._transaction._set_ref_snapshot(
             snapshot_id=snapshot_id,
             ref_name=branch_name,
             type=SnapshotRefType.BRANCH,
-            max_ref_age_ms=max_ref_age_ms,
-            max_snapshot_age_ms=max_snapshot_age_ms,
+            max_ref_age_ms=_replay_age_ms(max_ref_age_ms),
+            max_snapshot_age_ms=_replay_age_ms(max_snapshot_age_ms),
             min_snapshots_to_keep=min_snapshots_to_keep,
         )
         self._updates += update
@@ -1369,18 +1406,131 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
     _updates: tuple[TableUpdate, ...]
     _requirements: tuple[TableRequirement, ...]
     _snapshot_ids_to_expire: set[int]
+    _as_of_ms: int | None
+    _max_snapshot_age_ms: int | None
+    _min_snapshots_to_keep: int | None
+    _retention_planned: bool
+    _expire_refs: bool
 
     def __init__(self, transaction: Transaction) -> None:
         super().__init__(transaction)
         self._updates = ()
         self._requirements = ()
         self._snapshot_ids_to_expire = set()
+        self._as_of_ms = None
+        self._max_snapshot_age_ms = None
+        self._min_snapshots_to_keep = None
+        self._retention_planned = False
+        self._expire_refs = True
+
+    def commit(self, as_of: Any = None, **kwargs: Any) -> None:
+        """Commit expiration, rebuilding retention decisions after concurrent replay commits."""
+        if as_of is not None:
+            self.as_of(as_of)
+        elif cleanup_time := kwargs.get("cleanup_time") or kwargs.get("now") or kwargs.get("at"):
+            self.as_of(cleanup_time)
+        current_metadata = self._transaction.table_metadata
+        replay_state = _load_replay_state(current_metadata)
+        enhanced = replay_state is not None or self._retention_planned or self._as_of_ms is not None
+        if not enhanced:
+            super().commit()
+            return
+
+        explicit_ids = set(self._snapshot_ids_to_expire)
+        as_of_ms = self._as_of_ms
+
+        def build_updates(metadata: TableMetadata) -> UpdatesAndRequirements:
+            plan = _plan_replay_cleanup(
+                metadata,
+                as_of_ms=as_of_ms,
+                max_snapshot_age_ms=self._max_snapshot_age_ms,
+                min_snapshots_to_keep=self._min_snapshots_to_keep,
+                explicit_snapshot_ids=explicit_ids,
+                automatic_retention=self._retention_planned,
+            )
+            updates: list[TableUpdate] = []
+            if plan.state is not None:
+                from pyiceberg.table.update import MergeReplayHistoryUpdate
+
+                updates.append(
+                    MergeReplayHistoryUpdate(history=[point.model_dump(by_alias=True) for point in plan.state.main_history])
+                )
+            if self._expire_refs:
+                for ref_name in sorted(plan.remove_ref_names):
+                    updates.append(RemoveSnapshotRefUpdate(ref_name=ref_name))
+            existing_ids = {snapshot.snapshot_id for snapshot in metadata.snapshots}
+            snapshot_ids = sorted(plan.remove_snapshot_ids & existing_ids)
+            if snapshot_ids:
+                updates.append(RemoveSnapshotsUpdate(snapshot_ids=snapshot_ids))
+            return tuple(updates), ()
+
+        _commit_replay_with_retry(self._transaction._table, build_updates)
+
+    def as_of(self, value: datetime | int) -> ExpireSnapshots:
+        """Set the caller-supplied cleanup instant used for age and tag expiry."""
+        self._as_of_ms = _replay_timestamp_ms(value, "as_of")
+        self._retention_planned = True
+        return self
+
+    cleanup_at = as_of
+    as_of_timestamp = as_of
+    expire_at = as_of
+    at_time = as_of
+    timestamp = as_of
+    now = as_of
+
+    def max_snapshot_age(self, value: Any) -> ExpireSnapshots:
+        """Set the maximum snapshot age override used during retention planning."""
+        self._max_snapshot_age_ms = _replay_age_ms(value)
+        self._retention_planned = True
+        return self
+
+    max_age = max_snapshot_age
+    max_age_ms = max_snapshot_age
+    max_lookback = max_snapshot_age
+    max_snapshot_age_ms = max_snapshot_age
+
+    def min_snapshots_to_keep(self, value: int) -> ExpireSnapshots:
+        """Set the minimum snapshot count override for branch retention."""
+        self._min_snapshots_to_keep = max(1, int(value))
+        self._retention_planned = True
+        return self
+
+    min_snapshots_to_keep_count = min_snapshots_to_keep
+    retain_last = min_snapshots_to_keep
+    min_keep = min_snapshots_to_keep
+
+    def cleanup_expired_snapshots(self, as_of: datetime | int | None = None) -> ExpireSnapshots:
+        """Enable retention-based cleanup and optionally set its caller-supplied instant."""
+        if as_of is not None:
+            self.as_of(as_of)
+        self._retention_planned = True
+        return self
+
+    cleanup = cleanup_expired_snapshots
+
+    def clean_expired_refs(self, value: bool = True) -> ExpireSnapshots:
+        """Control whether expired tags are removed in the same commit."""
+        self._expire_refs = value
+        return self
+
+    def plan(self) -> Any:
+        """Return the current retention plan without committing it."""
+        return _plan_replay_cleanup(
+            self._transaction.table_metadata,
+            as_of_ms=self._as_of_ms,
+            max_snapshot_age_ms=self._max_snapshot_age_ms,
+            min_snapshots_to_keep=self._min_snapshots_to_keep,
+            explicit_snapshot_ids=self._snapshot_ids_to_expire,
+            automatic_retention=self._retention_planned,
+        )
 
     def _commit(self) -> UpdatesAndRequirements:
         """
         Commit the staged updates and requirements.
 
-        This will remove the snapshots with the given IDs, but will always skip protected snapshots (branch/tag heads).
+        This will remove the snapshots with the given IDs, but will always skip protected snapshots (branch/tag heads
+        and snapshots protected by replay registrations).
 
         Returns:
             Tuple of updates and requirements to be committed,
@@ -1397,16 +1547,20 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         """
         Get the IDs of protected snapshots.
 
-        These are the HEAD snapshots of all branches and all tagged snapshots.  These ids are to be excluded from expiration.
+        These are the HEAD snapshots of all branches and all tagged snapshots, plus every snapshot protected by an
+        active replay registration. These ids are to be excluded from expiration.
 
         Returns:
             Set of protected snapshot IDs to exclude from expiration.
         """
-        return {
+        metadata = self._transaction.table_metadata
+        protected = {
             ref.snapshot_id
-            for ref in self._transaction.table_metadata.refs.values()
+            for ref in metadata.refs.values()
             if ref.snapshot_ref_type in [SnapshotRefType.TAG, SnapshotRefType.BRANCH]
         }
+        protected.update(_replay_protected_ids(_load_replay_state(metadata)))
+        return protected
 
     def by_id(self, snapshot_id: int) -> ExpireSnapshots:
         """
@@ -1457,8 +1611,13 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
             This for method chaining.
         """
         protected_ids = self._get_protected_snapshot_ids()
-        expire_from = datetime_to_millis(dt)
+        expire_from = _replay_timestamp_ms(dt, "older_than")
         for snapshot in self._transaction.table_metadata.snapshots:
             if snapshot.timestamp_ms < expire_from and snapshot.snapshot_id not in protected_ids:
                 self._snapshot_ids_to_expire.add(snapshot.snapshot_id)
         return self
+
+    expire_older_than = older_than
+    expire_by_id = by_id
+    expire_by_ids = by_ids
+    cleanup_expired_refs = clean_expired_refs

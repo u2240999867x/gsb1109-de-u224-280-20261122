@@ -26,6 +26,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from functools import cached_property
 from itertools import chain
 from types import TracebackType
@@ -67,6 +68,21 @@ from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
 from pyiceberg.table.metadata_columns import project_schema, split_selected_fields
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
+from pyiceberg.table.replay import (
+    ReplayGuard as ReplayGuard,
+)
+from pyiceberg.table.replay import (
+    ReplayRegistration as ReplayRegistration,
+)
+from pyiceberg.table.replay import (
+    ReplayState as ReplayState,
+)
+from pyiceberg.table.replay import (
+    ReplayStatus as ReplayStatus,
+)
+from pyiceberg.table.replay import (
+    ReplayWindow as ReplayWindow,
+)
 from pyiceberg.table.snapshots import (
     Operation,
     Snapshot,
@@ -1477,6 +1493,17 @@ class Table:
         self.config = fresh.config
         return self
 
+    def __getattr__(self, name: str) -> Any:
+        """Delegate descriptive replay maintenance aliases to the maintenance entry."""
+        lower = name.lower()
+        is_replay_alias = "replay" in lower or (
+            any(word in lower for word in ("fetch_time", "extraction_window", "read_window", "query_window"))
+        )
+        is_cleanup_alias = any(word in lower for word in ("cleanup_snapshot", "expire_snapshot_retention"))
+        if is_replay_alias or is_cleanup_alias:
+            return getattr(self.maintenance, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
     def name(self) -> Identifier:
         """Return the identifier of this table.
 
@@ -1666,17 +1693,69 @@ class Table:
             return self.snapshot_by_id(ref.snapshot_id)
         return None
 
-    def snapshot_as_of_timestamp(self, timestamp_ms: int, inclusive: bool = True) -> Snapshot | None:
-        """Get the snapshot that was current as of or right before the given timestamp, or None if there is no matching snapshot.
+    def snapshot_as_of_timestamp(
+        self,
+        timestamp_ms: int | datetime,
+        inclusive: bool = True,
+        *,
+        replay_strict: bool = True,
+    ) -> Snapshot | None:
+        """Get the snapshot that was current as of or right before the given timestamp, or None if no matching snapshot.
+
+        When optional replay protection is enabled, fetch-time resolution raises explicit coverage and cleanup errors.
+        Tables without replay protection keep the historical return-``None`` behavior.
 
         Args:
             timestamp_ms: Find snapshot that was current at/before this timestamp
             inclusive: Includes timestamp_ms in search when True. Excludes timestamp_ms when False
         """
+        from pyiceberg.table.replay import load_replay_state, replay_snapshot_at
+        from pyiceberg.table.replay import timestamp_ms as _replay_timestamp_ms
+
+        timestamp_value = _replay_timestamp_ms(timestamp_ms, "timestamp")
+        replay_state = load_replay_state(self.metadata) if replay_strict else None
+        if replay_state is not None:
+            return replay_snapshot_at(
+                self.metadata,
+                replay_state,
+                timestamp_value,
+                refresh_history=True,
+                inclusive=inclusive,
+            )
+
         for log_entry in reversed(self.history()):
-            if (inclusive and log_entry.timestamp_ms <= timestamp_ms) or log_entry.timestamp_ms < timestamp_ms:
+            log_timestamp = log_entry.timestamp_ms
+            if (inclusive and log_timestamp <= timestamp_value) or log_timestamp < timestamp_value:
                 return self.snapshot_by_id(log_entry.snapshot_id)
         return None
+
+    @property
+    def replay_guard(self) -> Any:
+        """Return the optional replay guarantee registry and resolver."""
+        from pyiceberg.table.replay import ReplayGuard
+
+        return ReplayGuard(self)
+
+    def enable_replay_protection(self, *args: Any, **kwargs: Any) -> ReplayGuard:
+        """Enable optional replay guarantee through the table maintenance entry."""
+        return self.maintenance.enable_replay_protection(*args, **kwargs)
+
+    enable_replay_guarantee = enable_replay_protection
+
+    def register_replay_window(self, *args: Any, **kwargs: Any) -> Any:
+        """Register a downstream half-open fetch interval."""
+        return self.maintenance.register_replay_window(*args, **kwargs)
+
+    def unregister_replay_window(self, *args: Any, **kwargs: Any) -> Any:
+        """Revoke a downstream replay interval registration."""
+        return self.maintenance.unregister_replay_window(*args, **kwargs)
+
+    def replay_snapshot_at(self, timestamp: int | datetime | None = None, **kwargs: Any) -> Snapshot | None:
+        """Resolve a downstream fetch time through the replay guarantee when enabled."""
+        return self.replay_guard.snapshot_at(timestamp, **kwargs)
+
+    snapshot_for_replay = replay_snapshot_at
+    snapshot_at_fetch_time = replay_snapshot_at
 
     def history(self) -> list[SnapshotLogEntry]:
         """Get the snapshot history of this table."""

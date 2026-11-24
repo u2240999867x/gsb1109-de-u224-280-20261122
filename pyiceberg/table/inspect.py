@@ -657,7 +657,9 @@ class InspectTable:
         )
 
         def metadata_log_entry_to_row(metadata_entry: MetadataLogEntry) -> dict[str, Any]:
-            latest_snapshot = self.tbl.snapshot_as_of_timestamp(metadata_entry.timestamp_ms)
+            latest_snapshot = self.tbl.snapshot_as_of_timestamp(
+                metadata_entry.timestamp_ms, replay_strict=False
+            )
             return {
                 "timestamp": metadata_entry.timestamp_ms,
                 "file": metadata_entry.metadata_file,

@@ -1634,6 +1634,37 @@ def cleanup_old_snapshots(table_name: str, snapshot_ids: list[int]):
 cleanup_old_snapshots("analytics.user_events", [12345, 67890, 11111])
 ```
 
+### Replay Guarantee
+
+Enable the optional replay guarantee when downstream jobs need to register historical main-branch fetch windows before snapshot cleanup:
+
+```python
+from datetime import datetime, timedelta, UTC
+
+guard = table.maintenance.replay_guard
+guard.enable(at=datetime(2026, 1, 15, 9, tzinfo=UTC))
+
+table.maintenance.register_replay_window(
+    "finance",
+    datetime(2026, 1, 15, 10, 15, tzinfo=UTC),
+    datetime(2026, 1, 15, 10, 45, tzinfo=UTC),
+).commit()
+
+snapshot = table.snapshot_as_of_timestamp(
+    datetime(2026, 1, 15, 10, 30, tzinfo=UTC)
+)
+
+table.maintenance.cleanup_snapshots(
+    as_of=datetime(2026, 1, 15, 13, 10, tzinfo=UTC),
+    max_snapshot_age=timedelta(hours=1),
+    min_snapshots_to_keep=1,
+).commit()
+
+table.maintenance.unregister_replay_window("finance").commit()
+```
+
+Intervals are UTC half-open ranges: the start is inclusive and the end is exclusive. A registration commits only when every main-branch snapshot effective during the interval is still present. After cleanup, replay queries return the effective snapshot, raise `SnapshotCleanedError` for a cleaned instant, or raise `ReplayCoverageError` for an instant before protection was enabled. Tables that never enable the guarantee keep the original timestamp lookup behavior.
+
 ## Views
 
 If PyIceberg is unable to automatically determine view support on your REST Catalog, you can manually specify, `"view-endpoints-supported": "true"`:

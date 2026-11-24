@@ -179,6 +179,12 @@ class RemovePropertiesUpdate(IcebergBaseModel):
     removals: list[str]
 
 
+class MergeReplayHistoryUpdate(IcebergBaseModel):
+    action: Literal["merge-replay-history"] = Field(default="merge-replay-history")
+    property_name: str = Field(alias="property-name", default="pyiceberg.maintenance.replay-state")
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SetStatisticsUpdate(IcebergBaseModel):
     action: Literal["set-statistics"] = Field(default="set-statistics")
     statistics: StatisticsFile
@@ -255,6 +261,7 @@ TableUpdate = Annotated[
     | SetLocationUpdate
     | SetPropertiesUpdate
     | RemovePropertiesUpdate
+    | MergeReplayHistoryUpdate
     | SetStatisticsUpdate
     | RemoveStatisticsUpdate
     | RemovePartitionSpecsUpdate
@@ -368,6 +375,30 @@ def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _Ta
     properties = dict(base_metadata.properties)
     for key in update.removals:
         properties.pop(key)
+
+    context.add_update(update)
+    return base_metadata.model_copy(update={"properties": properties})
+
+
+@_apply_table_update.register(MergeReplayHistoryUpdate)
+def _(update: MergeReplayHistoryUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    raw_state = base_metadata.properties.get(update.property_name)
+    if not raw_state:
+        return base_metadata
+
+    from pyiceberg.table.replay import REPLAY_ENABLED_PROPERTY, ReplayPoint, ReplayState
+
+    state = ReplayState.model_validate_json(raw_state)
+    points = {(point.timestamp_ms, point.snapshot_id): point for point in state.main_history}
+    for item in update.history:
+        point = item if isinstance(item, ReplayPoint) else ReplayPoint.model_validate(item)
+        points[(point.timestamp_ms, point.snapshot_id)] = point
+    history = sorted(points.values(), key=lambda point: (point.timestamp_ms, point.snapshot_id))
+    state = state.model_copy(update={"main_history": history})
+
+    properties = dict(base_metadata.properties)
+    properties[update.property_name] = state.model_dump_json(by_alias=True, exclude_none=True)
+    properties[REPLAY_ENABLED_PROPERTY] = "true"
 
     context.add_update(update)
     return base_metadata.model_copy(update={"properties": properties})
