@@ -11,6 +11,15 @@ class DatabaseBackend:
     async def disconnect(self) -> None:
         raise NotImplementedError()  # pragma: no cover
 
+    def prepare_disconnect(self) -> None:
+        """
+        Synchronously mark the session as shutting down.
+
+        Called by ``Database.disconnect()`` before the shared shutdown task
+        starts, so that new borrows are rejected from the moment shutdown is
+        requested rather than only once that task gets scheduled.
+        """
+
     def connection(self) -> "ConnectionBackend":
         raise NotImplementedError()  # pragma: no cover
 

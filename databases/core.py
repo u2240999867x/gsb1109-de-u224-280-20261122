@@ -36,6 +36,16 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("databases")
 
 
+def _consume_task_exception(task: "asyncio.Future") -> None:
+    # Start and shutdown failures are reported to the coroutines awaiting the
+    # shared task.  If every waiter was cancelled there may be nobody left to
+    # retrieve the exception, so consume it here to avoid a spurious warning.
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
 _ACTIVE_TRANSACTIONS: ContextVar[
     typing.Optional["weakref.WeakKeyDictionary['Transaction', 'TransactionBackend']"]
 ] = ContextVar("databases:active_transactions", default=None)
@@ -64,6 +74,12 @@ class Database:
         self.options = options
         self.is_connected = False
         self._connection_map = weakref.WeakKeyDictionary()
+
+        # Connection startup and shutdown are shared by all callers.  Keeping
+        # the operations in tasks means that cancelling any one caller does
+        # not abort the work that other callers are waiting for.
+        self._connect_task: typing.Optional[asyncio.Task] = None
+        self._disconnect_task: typing.Optional[asyncio.Task] = None
 
         self._force_rollback = force_rollback
 
@@ -105,53 +121,227 @@ class Database:
         """
         Establish the connection pool.
         """
-        if self.is_connected:
-            logger.debug("Already connected, skipping connection")
-            return None
+        while True:
+            # A shutdown always has to fully complete before a new session
+            # may be started.  Wait for the shared shutdown operation so
+            # that a failed shutdown is reported to every waiter.  This is
+            # checked before `is_connected`, because that flag stays true
+            # until the shutdown has actually finished.
+            disconnect_task = self._disconnect_task
+            if disconnect_task is not None:
+                if disconnect_task.done():
+                    # A previous shutdown has already settled.  Its failure
+                    # was reported to the callers that were waiting on it;
+                    # this call is free to start a fresh session.
+                    if self._disconnect_task is disconnect_task:
+                        self._disconnect_task = None
+                    continue
 
-        await self._backend.connect()
-        logger.info(
-            "Connected to database %s", self.url.obscure_password, extra=CONNECT_EXTRA
-        )
-        self.is_connected = True
+                try:
+                    await asyncio.shield(disconnect_task)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    if self._disconnect_task is disconnect_task:
+                        self._disconnect_task = None
+                    raise
+                if self._disconnect_task is disconnect_task:
+                    self._disconnect_task = None
+                continue
 
-        if self._force_rollback:
-            assert self._global_connection is None
-            assert self._global_transaction is None
+            if self.is_connected:
+                logger.debug("Already connected, skipping connection")
+                return None
 
-            self._global_connection = Connection(self, self._backend)
-            self._global_transaction = self._global_connection.transaction(
-                force_rollback=True
+            connect_task = self._connect_task
+            if connect_task is not None and connect_task.done():
+                # A previous startup attempt either failed or was cancelled.
+                # Do not reuse it; a fresh call is allowed to retry.
+                connect_task = None
+                self._connect_task = None
+
+            if connect_task is None:
+                connect_task = asyncio.ensure_future(self._connect())
+                self._connect_task = connect_task
+
+            try:
+                # Shield the shared startup task: cancelling one caller must
+                # not abort the startup that other callers are waiting for.
+                await asyncio.shield(connect_task)
+            except asyncio.CancelledError:
+                if connect_task.done() and self._connect_task is connect_task:
+                    self._connect_task = None
+                elif self._connect_task is connect_task:
+                    connect_task.add_done_callback(_consume_task_exception)
+                raise
+            except BaseException:
+                if self._connect_task is connect_task:
+                    self._connect_task = None
+                raise
+            return
+
+    async def _connect(self) -> None:
+        global_connection: typing.Optional[Connection] = None
+        global_transaction: typing.Optional[Transaction] = None
+        try:
+            await self._backend.connect()
+            logger.info(
+                "Connected to database %s",
+                self.url.obscure_password,
+                extra=CONNECT_EXTRA,
             )
 
-            await self._global_transaction.__aenter__()
+            if self._force_rollback:
+                assert self._global_connection is None
+                assert self._global_transaction is None
+
+                global_connection = Connection(self, self._backend)
+                global_transaction = global_connection.transaction(
+                    force_rollback=True
+                )
+                await global_transaction.__aenter__()
+
+                self._global_connection = global_connection
+                self._global_transaction = global_transaction
+
+            self.is_connected = True
+        except BaseException:
+            # Do not leave a half-started session behind (notably the
+            # SQLite shared-memory keeper connection).
+            self._global_connection = None
+            self._global_transaction = None
+            if global_connection is not None and global_transaction is not None:
+                with contextlib.suppress(Exception):
+                    if global_connection._transaction_stack:
+                        await global_transaction.__aexit__(None, None, None)
+                    elif global_connection._connection_counter:
+                        await global_connection.__aexit__(None, None, None)
+            with contextlib.suppress(Exception):
+                await self._backend.disconnect()
+            raise
 
     async def disconnect(self) -> None:
         """
         Close all connections in the connection pool.
         """
-        if not self.is_connected:
-            logger.debug("Already disconnected, skipping disconnection")
-            return None
-
-        if self._force_rollback:
-            assert self._global_connection is not None
-            assert self._global_transaction is not None
-
-            await self._global_transaction.__aexit__()
-
-            self._global_transaction = None
-            self._global_connection = None
-        else:
+        # Drop this task's task-local connection reference in the caller's
+        # context (the shared shutdown runs in its own task).
+        if self._global_connection is None and self._connection is not None:
             self._connection = None
 
-        await self._backend.disconnect()
-        logger.info(
-            "Disconnected from database %s",
-            self.url.obscure_password,
-            extra=DISCONNECT_EXTRA,
-        )
-        self.is_connected = False
+        if self._disconnect_task is None and (
+            self.is_connected
+            or (self._connect_task is not None and not self._connect_task.done())
+        ):
+            # Reject new borrows from the moment shutdown is requested, even
+            # before the shared shutdown task gets scheduled.
+            self._backend.prepare_disconnect()
+
+        while True:
+            disconnect_task = self._disconnect_task
+            if disconnect_task is not None:
+                try:
+                    await asyncio.shield(disconnect_task)
+                except asyncio.CancelledError:
+                    if disconnect_task.done() and (
+                        self._disconnect_task is disconnect_task
+                    ):
+                        self._disconnect_task = None
+                    raise
+                except BaseException:
+                    if self._disconnect_task is disconnect_task:
+                        self._disconnect_task = None
+                    raise
+                if self._disconnect_task is disconnect_task:
+                    self._disconnect_task = None
+                return
+
+            if not self.is_connected:
+                # If startup is still in flight, let it settle (or fail)
+                # before deciding that there is nothing to shut down.
+                connect_task = self._connect_task
+                if connect_task is not None and not connect_task.done():
+                    try:
+                        await asyncio.shield(connect_task)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException:
+                        if self._connect_task is connect_task:
+                            self._connect_task = None
+                        return
+                if not self.is_connected:
+                    if self._connect_task is connect_task:
+                        self._connect_task = None
+                    logger.debug("Already disconnected, skipping disconnection")
+                    return None
+
+            disconnect_task = asyncio.ensure_future(self._disconnect())
+            self._disconnect_task = disconnect_task
+            try:
+                await asyncio.shield(disconnect_task)
+            except asyncio.CancelledError:
+                if disconnect_task.done() and (
+                    self._disconnect_task is disconnect_task
+                ):
+                    self._disconnect_task = None
+                elif self._disconnect_task is disconnect_task:
+                    disconnect_task.add_done_callback(_consume_task_exception)
+                raise
+            except BaseException:
+                if self._disconnect_task is disconnect_task:
+                    self._disconnect_task = None
+                raise
+            if self._disconnect_task is disconnect_task:
+                self._disconnect_task = None
+            return
+
+    async def _disconnect(self) -> None:
+        error: typing.Optional[BaseException] = None
+        try:
+            if self._force_rollback:
+                global_connection = self._global_connection
+                global_transaction = self._global_transaction
+                # Clear these even if the rollback fails: the session is no
+                # longer usable and a later connect() must start clean.
+                self._global_transaction = None
+                self._global_connection = None
+
+                if global_transaction is not None:
+                    try:
+                        await global_transaction.__aexit__()
+                    except BaseException as exc:
+                        error = exc
+                        # Make sure the underlying connection is returned so
+                        # that shutdown can still drain the session.
+                        if global_connection is not None and (
+                            global_connection._connection_counter
+                        ):
+                            with contextlib.suppress(Exception):
+                                await global_connection.__aexit__(None, None, None)
+
+            try:
+                await self._backend.disconnect()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+
+            if error is None:
+                logger.info(
+                    "Disconnected from database %s",
+                    self.url.obscure_password,
+                    extra=DISCONNECT_EXTRA,
+                )
+        finally:
+            # Even a failed shutdown must leave the Database object in a
+            # state where a later connect() can retry the whole session.
+            self.is_connected = False
+            self._connect_task = None
+            if self._disconnect_task is asyncio.current_task():
+                # The failure is reported by the waiter below.
+                self._disconnect_task = None
+
+        if error is not None:
+            raise error
 
     async def __aenter__(self) -> "Database":
         await self.connect()
@@ -277,8 +467,14 @@ class Connection:
             assert self._connection is not None
             self._connection_counter -= 1
             if self._connection_counter == 0:
-                await self._connection.release()
-                self._database._connection = None
+                try:
+                    await self._connection.release()
+                finally:
+                    # A release may finish after a later session has already
+                    # installed a new connection for this task.  Never clear
+                    # that newer connection as a side effect of the old one.
+                    if self._database._connection is self:
+                        self._database._connection = None
 
     async def fetch_all(
         self,
@@ -374,6 +570,11 @@ class Transaction:
         self._connection_callable = connection_callable
         self._force_rollback = force_rollback
         self._extra_options = kwargs
+        # Backend created by the most recent start().  Normally commit() and
+        # rollback() find it in the task-local ContextVar; this reference
+        # additionally covers shutdown, which runs in a shared task where the
+        # initiating task's context is not available.
+        self._started_transaction: typing.Optional["TransactionBackend"] = None
 
     @property
     def _connection(self) -> "Connection":
@@ -405,6 +606,12 @@ class Transaction:
 
         _ACTIVE_TRANSACTIONS.set(transactions)
         return transactions.get(self, None)
+
+    def _active_transaction(self) -> typing.Optional["TransactionBackend"]:
+        transaction = self._transaction
+        if transaction is not None:
+            return transaction
+        return self._started_transaction
 
     async def __aenter__(self) -> "Transaction":
         """
@@ -446,34 +653,42 @@ class Transaction:
         return wrapper  # type: ignore
 
     async def start(self) -> "Transaction":
-        self._transaction = self._connection._connection.transaction()
+        # The same Transaction instance may be used concurrently (for example
+        # by a decorator).  Keep the backend local until it is fully started.
+        started_transaction = self._connection._connection.transaction()
 
         async with self._connection._transaction_lock:
             is_root = not self._connection._transaction_stack
             await self._connection.__aenter__()
-            await self._transaction.start(
+            await started_transaction.start(
                 is_root=is_root, extra_options=self._extra_options
             )
             self._connection._transaction_stack.append(self)
+            self._started_transaction = started_transaction
+            self._transaction = started_transaction
         return self
 
     async def commit(self) -> None:
         async with self._connection._transaction_lock:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
-            assert self._transaction is not None
-            await self._transaction.commit()
+            transaction = self._active_transaction()
+            assert transaction is not None
+            await transaction.commit()
             await self._connection.__aexit__()
             self._transaction = None
+            self._started_transaction = None
 
     async def rollback(self) -> None:
         async with self._connection._transaction_lock:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
-            assert self._transaction is not None
-            await self._transaction.rollback()
+            transaction = self._active_transaction()
+            assert transaction is not None
+            await transaction.rollback()
             await self._connection.__aexit__()
             self._transaction = None
+            self._started_transaction = None
 
 
 class _EmptyNetloc(str):

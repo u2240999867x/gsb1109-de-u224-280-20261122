@@ -1721,3 +1721,234 @@ async def test_mapping_property_interface(database_url):
         list_result = await database.fetch_all(query=query)
         assert list_result[0]._mapping["text"] == "example1"
         assert list_result[0]._mapping["completed"] is True
+
+
+SHARED_MEMORY_URL = "sqlite:///file:reconcile?mode=memory&cache=shared"
+OTHER_SHARED_MEMORY_URL = "sqlite:///file:other?mode=memory&cache=shared"
+
+
+@async_adapter
+async def test_shared_memory_survives_without_borrowed_connection():
+    """
+    The shared in-memory database must survive a round that has no borrowed
+    connection at all, so the next round sees the previous data.
+    """
+    async with Database(SHARED_MEMORY_URL, uri=True) as database:
+        await database.execute(sqlalchemy.schema.CreateTable(notes))
+        await database.execute(notes.insert().values(text="round-1", completed=True))
+
+        gc.collect()
+
+        result = await database.fetch_one(notes.select())
+        assert result.text == "round-1"
+
+
+@async_adapter
+async def test_shared_memory_reconnect_starts_empty():
+    async with Database(SHARED_MEMORY_URL, uri=True) as database:
+        await database.execute(sqlalchemy.schema.CreateTable(notes))
+        await database.execute(notes.insert().values(text="round-1", completed=True))
+
+    async with Database(SHARED_MEMORY_URL, uri=True) as database:
+        with pytest.raises(sqlite3.OperationalError):
+            await database.fetch_all(notes.select())
+
+
+@async_adapter
+async def test_shared_memory_databases_are_isolated():
+    async with Database(SHARED_MEMORY_URL, uri=True) as database:
+        async with Database(OTHER_SHARED_MEMORY_URL, uri=True) as other:
+            await database.execute(sqlalchemy.schema.CreateTable(notes))
+            await database.execute(
+                notes.insert().values(text="reconcile-only", completed=True)
+            )
+
+            with pytest.raises(sqlite3.OperationalError):
+                await other.fetch_all(notes.select())
+
+
+@async_adapter
+async def test_connect_waiter_survives_cancelled_first_caller():
+    """
+    The first connect() opens the keeper while a second caller joins.  If the
+    first caller is cancelled, the second caller's startup must still finish.
+    """
+    database = Database(SHARED_MEMORY_URL, uri=True)
+    opening = asyncio.Event()
+    may_open = asyncio.Event()
+
+    original_connect = database._backend.connect
+
+    async def gated_connect():
+        opening.set()
+        await may_open.wait()
+        await original_connect()
+
+    database._backend.connect = gated_connect
+
+    first = asyncio.create_task(database.connect())
+    await opening.wait()
+    second = asyncio.create_task(database.connect())
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert not second.done(), "the waiting caller must not be cancelled"
+
+    may_open.set()
+    await second
+    assert database.is_connected
+    assert database._backend._pool._memref is not None
+
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+    await database.disconnect()
+
+
+@async_adapter
+async def test_disconnect_waits_for_borrowers_and_rejects_new_ones():
+    database = Database(SHARED_MEMORY_URL, uri=True)
+    await database.connect()
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+    await database.execute(notes.insert().values(text="held", completed=True))
+
+    borrowed = asyncio.Event()
+    may_finish = asyncio.Event()
+    finished = {}
+
+    async def borrowed_operation():
+        async with database.connection() as connection:
+            borrowed.set()
+            await may_finish.wait()
+            finished["result"] = await connection.fetch_one(notes.select())
+
+    operation = asyncio.create_task(borrowed_operation())
+    await borrowed.wait()
+
+    shutdown = asyncio.create_task(database.disconnect())
+    await asyncio.sleep(0)
+    assert not shutdown.done(), "shutdown must wait for borrowed operations"
+
+    with pytest.raises(RuntimeError):
+        await database.fetch_one(notes.select())
+
+    may_finish.set()
+    await operation
+    await shutdown
+
+    assert finished["result"].text == "held"
+    assert not database.is_connected
+
+
+@async_adapter
+async def test_reconnect_after_failed_shutdown():
+    database = Database(SHARED_MEMORY_URL, uri=True)
+    await database.connect()
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+
+    original_disconnect = database._backend.disconnect
+
+    async def failing_disconnect():
+        raise RuntimeError("shutdown failed")
+
+    database._backend.disconnect = failing_disconnect
+
+    errors = []
+
+    async def waiter():
+        try:
+            await database.disconnect()
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    await asyncio.gather(waiter(), waiter())
+    assert [str(exc) for exc in errors] == ["shutdown failed", "shutdown failed"]
+    assert not database.is_connected
+
+    database._backend.disconnect = original_disconnect
+
+    await database.connect()
+    assert database.is_connected
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+    await database.execute(notes.insert().values(text="recovered", completed=True))
+    result = await database.fetch_one(notes.select())
+    assert result.text == "recovered"
+    await database.disconnect()
+
+
+@async_adapter
+async def test_file_database_has_no_keeper_connection(tmp_path):
+    database = Database("sqlite:///" + str(tmp_path / "test.db"))
+    await database.connect()
+
+    assert database._backend._pool._memref is None
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+    await database.execute(notes.insert().values(text="file", completed=True))
+
+    result = await database.fetch_one(notes.select())
+    assert result.text == "file"
+
+    await database.disconnect()
+    assert database._backend._pool._memref is None
+
+
+@async_adapter
+async def test_paused_borrower_then_reconnect_rounds():
+    """
+    A query that is paused in the old session keeps reading that round's data
+    while shutdown and the next connect are already requested.  The new round
+    must be empty and must not be wiped out when the old borrower releases
+    late.  Repeating the cycle must stay consistent.
+    """
+    database = Database(SHARED_MEMORY_URL, uri=True)
+
+    await database.connect()
+    await database.execute(sqlalchemy.schema.CreateTable(notes))
+    await database.execute(notes.insert().values(text="round-0", completed=True))
+
+    paused = asyncio.Event()
+    may_finish = asyncio.Event()
+    old_rows = {}
+
+    async def paused_query():
+        async with database.connection() as connection:
+            paused.set()
+            await may_finish.wait()
+            old_rows["rows"] = await connection.fetch_all(notes.select())
+
+    old_operation = asyncio.create_task(paused_query())
+    await paused.wait()
+
+    shutdown = asyncio.create_task(database.disconnect())
+    await asyncio.sleep(0)
+    next_connect = asyncio.create_task(database.connect())
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    assert not next_connect.done(), "connect must wait for the old session"
+
+    may_finish.set()
+    await old_operation
+    assert [row.text for row in old_rows["rows"]] == ["round-0"]
+
+    await shutdown
+    await next_connect
+    assert database.is_connected
+
+    with pytest.raises(sqlite3.OperationalError):
+        await database.fetch_all(notes.select())
+
+    for round_no in range(1, 3):
+        await database.disconnect()
+        await database.connect()
+        with pytest.raises(sqlite3.OperationalError):
+            await database.fetch_all(notes.select())
+
+        await database.execute(sqlalchemy.schema.CreateTable(notes))
+        await database.execute(
+            notes.insert().values(text=f"round-{round_no}", completed=True)
+        )
+        result = await database.fetch_all(notes.select())
+        assert [row.text for row in result] == [f"round-{round_no}"]
+
+    await database.disconnect()
