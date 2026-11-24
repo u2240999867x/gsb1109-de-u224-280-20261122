@@ -19,6 +19,7 @@ from .._utils import (
     can_store,
     check_fill_value,
     check_zero_fill_value,
+    data_matches_fill,
     equivalent,
     normalize_axis,
 )
@@ -451,7 +452,13 @@ class COO(SparseArray, NDArrayOperatorsMixin):  # lgtm [py/missing-equals]
         >>> np.array_equal(x, x2)
         True
         """
-        x = np.full(self.shape, self.fill_value, self.dtype)
+        fill_value = self.fill_value
+        if np.ndim(fill_value):
+            # Structured field views store an array fill aligned with their
+            # trailing field axes; broadcast it across the leading grid axes.
+            field_ndim = np.ndim(fill_value)
+            fill_value = np.asarray(fill_value).reshape((1,) * (self.ndim - field_ndim) + np.asarray(fill_value).shape)
+        x = np.full(self.shape, fill_value, self.dtype)
 
         coords = tuple([self.coords[i, :] for i in range(self.ndim)])
         data = self.data
@@ -1449,9 +1456,161 @@ class COO(SparseArray, NDArrayOperatorsMixin):  # lgtm [py/missing-equals]
         >>> s.nnz
         3
         """
-        mask = ~equivalent(self.data, self.fill_value)
+        mask = ~data_matches_fill(self.data, self.fill_value)
         self.coords = self.coords[:, mask]
         self.data = self.data[mask]
+
+    def merge_field(self, name, values, /, component=None):
+        """Merge an externally updated structured field back into this array.
+
+        Only the named field is replaced; every other field keeps its value at
+        each cell, including the explicitly stored cells. Implicit cells never
+        need to be enumerated: the value fill supplies the new background, and
+        cells that become equivalent to the resulting fill are pruned.
+
+        Parameters
+        ----------
+        name : str
+            Name of the structured field to replace.
+        values : SparseArray or numpy.ndarray
+            The updated values. For a whole-field merge their shape is
+            ``self.shape`` followed by the field shape. To replace a single
+            component of a sub-array field, pass ``component`` and values whose
+            shape covers the remaining component axes, e.g. shape
+            ``self.shape`` for one scalar component. Dense values must cover
+            every cell; a [`sparse.COO`][] value only stores the cells that
+            differ from its fill value.
+        component : int or tuple[int], optional
+            Index of the field component to replace. ``None`` (the default)
+            replaces the whole field.
+
+        Returns
+        -------
+        COO
+            A new structured [`sparse.COO`][] array with the field merged in.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> dt = np.dtype([("flag", np.int64), ("pressure", np.int64, (2,))])
+        >>> background = np.array((1, [9, 2]), dtype=dt)
+        >>> dense = np.full((3, 3), background, dtype=dt)
+        >>> dense[0, 0] = (1, [0, 2])
+        >>> dense[1, 1] = (1, [9, 5])
+        >>> s = COO.from_numpy(dense, fill_value=background)
+        >>> first_component = s["pressure"][..., 0]
+        >>> calibrated = COO.from_numpy(
+        ...     np.where(first_component.todense() == 9, 1, first_component.todense()),
+        ...     fill_value=1,
+        ... )
+        >>> merged = s.merge_field("pressure", calibrated, component=0)
+        >>> merged[2, 2]
+        np.void((1, [1, 2]), dtype=[('flag', '<i8'), ('pressure', '<i8', (2,))])
+        >>> merged[0, 0]
+        np.void((1, [0, 2]), dtype=[('flag', '<i8'), ('pressure', '<i8', (2,))])
+        >>> merged[1, 1]
+        np.void((1, [1, 5]), dtype=[('flag', '<i8'), ('pressure', '<i8', (2,))])
+        """
+        if not self.dtype.names:
+            raise ValueError("`merge_field` requires a structured dtype.")
+        if name not in self.dtype.names:
+            raise ValueError(f"{name!r} is not a field of dtype {self.dtype!s}.")
+
+        field_subshape = self.dtype[name].shape
+        if component is None:
+            component_tuple = ()
+        else:
+            component_tuple = component if isinstance(component, tuple) else (component,)
+        if len(component_tuple) > len(field_subshape):
+            raise ValueError(f"Field {name!r} has shape {field_subshape}, cannot index with {component!r}.")
+
+        value_subshape = field_subshape[len(component_tuple) :]
+        expected_shape = self.shape + value_subshape
+
+        if isinstance(values, SparseArray):
+            values = values.asformat("coo")
+        else:
+            values = np.asarray(values)
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"Field {name!r} expects shape {expected_shape}, but got shape {values.shape}."
+                )
+            values = COO.from_numpy(values, fill_value=np.asarray(self.fill_value[name])[component_tuple or ...])
+
+        if values.shape != expected_shape:
+            raise ValueError(f"Field {name!r} expects shape {expected_shape}, but got shape {values.shape}.")
+
+        value_fill = np.asarray(values.fill_value)
+        if value_fill.ndim == 0:
+            value_fill = np.broadcast_to(value_fill, value_subshape).copy()
+        else:
+            value_fill = value_fill.reshape(value_subshape).copy()
+
+        value_lookup = self._field_value_lookup(values, len(value_subshape), value_subshape, value_fill)
+
+        self_loc = self.linear_loc()
+        value_locs = np.asarray(tuple(value_lookup), dtype=np.intp)
+        union_loc = np.unique(np.concatenate([self_loc, value_locs])) if value_locs.size else self_loc
+        union_coords = np.asarray(np.unravel_index(union_loc, self.shape))
+
+        if self_loc.size:
+            self_pos = np.searchsorted(self_loc, union_loc)
+            in_self = np.zeros(union_loc.shape, dtype=bool)
+            valid = self_pos < self_loc.size
+            in_self[valid] = self_loc[self_pos[valid]] == union_loc[valid]
+        else:
+            self_pos = np.zeros(union_loc.shape, dtype=np.intp)
+            in_self = np.zeros(union_loc.shape, dtype=bool)
+
+        new_fill = np.array(self.fill_value, dtype=self.dtype)
+        merged_fill_value = value_fill if not component_tuple else np.asarray(new_fill[name]).copy()
+        if component_tuple:
+            merged_fill_value[component_tuple] = value_fill
+        new_fill[name] = merged_fill_value
+
+        new_data = np.empty(union_loc.size, dtype=self.dtype)
+        for k, loc in enumerate(union_loc):
+            record = np.array(self.data[self_pos[k]] if in_self[k] else self.fill_value, dtype=self.dtype)
+            field = np.asarray(record[name]).copy()
+            field[component_tuple] = value_lookup.get(int(loc), value_fill)
+            record[name] = field
+            new_data[k] = record
+
+        return COO(
+            union_coords,
+            new_data,
+            shape=self.shape,
+            has_duplicates=False,
+            sorted=True,
+            fill_value=new_fill[()],
+            prune=True,
+        )
+
+    @staticmethod
+    def _field_value_lookup(values, value_ndim, value_subshape, value_fill):
+        """Map each explicit base cell of a field array to its full value."""
+        lookup = {}
+        if values.nnz == 0:
+            return lookup
+
+        base_ndim = values.ndim - value_ndim
+        base_shape = values.shape[:base_ndim]
+        base_loc = np.ravel_multi_index(values.coords[:base_ndim], base_shape)
+        unique_loc, first = np.unique(base_loc, return_index=True)
+
+        for loc, start in zip(unique_loc, first, strict=True):
+            value = value_fill.copy()
+            end = start + 1
+            while end < base_loc.size and base_loc[end] == loc:
+                end += 1
+            if value_subshape:
+                sub_coords = tuple(values.coords[base_ndim:, start:end])
+                value[sub_coords] = values.data[start:end]
+            else:
+                value[()] = values.data[start]
+            lookup[int(loc)] = value
+
+        return lookup
 
     def broadcast_to(self, shape):
         """

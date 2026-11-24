@@ -702,6 +702,134 @@ def test_custom_dtype_slicing():
     assert_eq(x["part3"], s["part3"])
 
 
+def _station_dense():
+    dt = np.dtype([("flag", np.int64), ("pressure", np.int64, (2,))])
+    background = np.array((1, [9, 2]), dtype=dt)
+    dense = np.full((3, 3), background, dtype=dt)
+    dense[0, 0] = (1, [0, 2])
+    dense[1, 1] = (1, [9, 5])
+    return dt, background, dense
+
+
+def _cell_pressure(cell):
+    return cell["flag"], cell["pressure"].tolist()
+
+
+def _void_tuple(value):
+    value = np.asarray(value)[()]
+    return value["flag"], value["pressure"].tolist()
+
+
+def test_structured_field_read_with_nonuniform_fill():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    assert s.nnz == 2
+    assert tuple(s.coords[:, 0]) == (0, 0)
+    assert tuple(s.coords[:, 1]) == (1, 1)
+
+    pressure = s["pressure"]
+    assert pressure.shape == (3, 3, 2)
+    assert pressure.fill_value.tolist() == [9, 2]
+    assert_eq(pressure, dense["pressure"])
+
+    first = pressure[..., 0]
+    second = pressure[..., 1]
+    assert first.fill_value == 9
+    assert second.fill_value == 2
+    assert_eq(first, dense["pressure"][..., 0])
+    assert_eq(second, dense["pressure"][..., 1])
+
+    # The untouched scalar field and the whole-cell reads are unchanged.
+    assert s["flag"].fill_value == 1
+    assert s[0, 0]["pressure"].tolist() == [0, 2]
+    assert s[1, 1]["pressure"].tolist() == [9, 5]
+    assert s[2, 2]["pressure"].tolist() == [9, 2]
+
+
+def test_structured_field_merge_calibration_roundtrip():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    # Only the first pressure component is handed out for calibration.
+    first = s["pressure"][..., 0]
+    calibrated_dense = np.where(first.todense() == 9, 1, first.todense())
+    calibrated = COO.from_numpy(calibrated_dense, fill_value=1)
+
+    merged = s.merge_field("pressure", calibrated, component=0)
+
+    assert _void_tuple(merged.fill_value) == (1, [1, 2])
+    assert merged.nnz == 2
+    assert _cell_pressure(merged[2, 2]) == (1, [1, 2])
+    assert _cell_pressure(merged[0, 0]) == (1, [0, 2])
+    assert _cell_pressure(merged[1, 1]) == (1, [1, 5])
+    # The station flag and the second pressure component are preserved.
+    assert merged[0, 0]["flag"] == 1
+    assert merged[1, 1]["pressure"][1] == 5
+
+    expected = dense.copy()
+    expected["pressure"][..., 0] = calibrated_dense
+    assert np.array_equal(merged.todense(), expected)
+
+
+def test_structured_field_merge_keeps_implicit_cells_unlisted():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    # A uniform calibration of the first component changes only the background,
+    # so no previously implicit cell has to be enumerated.
+    values = COO.from_numpy(np.ones((3, 3), dtype=np.int64), fill_value=1)
+    merged = s.merge_field("pressure", values, component=0)
+
+    assert merged.nnz == 1
+    assert tuple(merged.coords[:, 0]) == (1, 1)
+    assert merged[0, 0]["pressure"].tolist() == [1, 2]
+    assert merged[2, 2]["pressure"].tolist() == [1, 2]
+
+
+def test_structured_field_merge_whole_field_and_sparse_values():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    whole = np.broadcast_to(np.array([1, 2]), (3, 3, 2)).copy()
+    whole[1, 1] = [7, 8]
+    whole_sparse = COO.from_numpy(whole, fill_value=np.array([1, 2]))
+    merged = s.merge_field("pressure", whole_sparse)
+    assert _void_tuple(merged.fill_value) == (1, [1, 2])
+    assert merged[1, 1]["pressure"].tolist() == [7, 8]
+
+    # Merging the field view back must leave every value unchanged.
+    identity = s.merge_field("pressure", s["pressure"])
+    assert np.array_equal(identity.todense(), dense)
+
+
+def test_structured_field_merge_dense_values():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    whole = np.broadcast_to(np.array([1, 2]), (3, 3, 2)).copy()
+    whole[1, 1] = [7, 8]
+    merged = s.merge_field("pressure", whole)
+
+    expected = dense.copy()
+    expected["pressure"] = whole
+    assert np.array_equal(merged.todense(), expected)
+
+
+def test_structured_field_merge_errors():
+    _, background, dense = _station_dense()
+    s = COO.from_numpy(dense, fill_value=background)
+
+    with pytest.raises(ValueError, match="not a field"):
+        s.merge_field("missing", dense["pressure"])
+    with pytest.raises(ValueError, match="structured dtype"):
+        COO.from_numpy(np.zeros((3, 3))).merge_field("pressure", np.zeros((3, 3)))
+    with pytest.raises(ValueError, match="expects shape"):
+        s.merge_field("pressure", np.zeros((4, 4)), component=0)
+    with pytest.raises(ValueError, match="cannot index"):
+        s.merge_field("pressure", np.zeros((3, 3)), component=(0, 0))
+
+
 @pytest.mark.parametrize(
     "index",
     [

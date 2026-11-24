@@ -9,6 +9,32 @@ from .._slicing import advanced_index_axis, normalize_index
 from .._utils import _zero_of_dtype, equivalent
 
 
+def _field_fill_is_uniform(field_fill):
+    """Whether every component of a structured field fill shares one value."""
+    flat = np.asarray(field_fill).ravel()
+    return not flat.size or bool(equivalent(flat, flat[0]).all())
+
+
+def _index_fill_value(fill_value, index):
+    """Narrow an array fill to the axes selected by a normalized index.
+
+    Structured field views may carry an array fill aligned with their trailing
+    field axes. Indexing those axes must narrow the fill the same way NumPy
+    would. Scalar fills and selections that do not touch the field axes are
+    returned unchanged.
+    """
+    fill_ndim = np.ndim(fill_value)
+    if fill_ndim == 0:
+        return fill_value
+
+    consuming = [ind for ind in index if ind is not None]
+    if len(consuming) < fill_ndim:
+        return fill_value
+
+    new_fill = np.asarray(fill_value)[tuple(consuming[-fill_ndim:])]
+    return new_fill[()] if new_fill.ndim == 0 else new_fill
+
+
 def getitem(x, index):
     """
     This function implements the indexing functionality for COO.
@@ -40,22 +66,55 @@ def getitem(x, index):
 
     # Custom dtype.
     if isinstance(index, str):
-        data = x.data[index]
-        idx = np.where(data)
+        field = x.data[index]
+        field_fill = np.asarray(x.fill_value[index])
+        field_shape = x.data.dtype[index].shape
+
+        if field_shape and not _field_fill_is_uniform(field_fill):
+            # The field background is not a scalar (e.g. fill [9, 2]), so the
+            # field fill is stored as an array aligned with the trailing field
+            # axes. Every explicitly stored cell is kept as a complete group:
+            # a cell participates whenever at least one of its field components
+            # differs from the field fill.
+            n_components = int(np.prod(field_shape))
+            keep = ~equivalent(field, field_fill)
+            keep = keep.reshape(field.shape[0], n_components).any(axis=1)
+            field = field[keep]
+            n_cells = field.shape[0]
+
+            if n_cells:
+                coords = np.repeat(x.coords[:, keep], n_components, axis=1)
+                tail = np.tile(np.arange(n_components, dtype=np.intp), n_cells)
+                coords = np.vstack([coords, np.stack(np.unravel_index(tail, field_shape))])
+                data = field.reshape(-1)
+            else:
+                coords = np.empty((x.coords.shape[0] + len(field_shape), 0), dtype=np.intp)
+                data = field.reshape(-1)
+
+            return COO(
+                coords,
+                data,
+                shape=x.shape + field_shape,
+                has_duplicates=False,
+                sorted=True,
+                fill_value=field_fill.copy(),
+            )
+
+        data = field
+        idx = np.where(~equivalent(data, field_fill))
         data = data[idx].flatten()
         coords = list(x.coords[:, idx[0]])
         coords.extend(idx[1:])
 
-        fill_value_idx = np.asarray(x.fill_value[index]).flatten()
-        fill_value = fill_value_idx[0] if fill_value_idx.size else _zero_of_dtype(data.dtype)[()]
-
-        if not equivalent(fill_value, fill_value_idx).all():
-            raise ValueError("Fill-values in the array are inconsistent.")
+        if field_fill.ndim:
+            fill_value = field_fill.ravel()[0]
+        else:
+            fill_value = field_fill[()] if field_fill.size else _zero_of_dtype(data.dtype)[()]
 
         return COO(
             coords,
             data,
-            shape=x.shape + x.data.dtype[index].shape,
+            shape=x.shape + field_shape,
             has_duplicates=False,
             sorted=True,
             fill_value=fill_value,
@@ -83,6 +142,8 @@ def getitem(x, index):
 
     # Get the length of the mask
     n = len(range(mask.start, mask.stop, mask.step)) if isinstance(mask, slice) else len(mask)
+
+    fill_value = _index_fill_value(x.fill_value, index)
 
     coords = []
     shape = []
@@ -127,10 +188,14 @@ def getitem(x, index):
             if n != 0:
                 return x.data[mask][0]
 
-            return x.fill_value
+            return fill_value
 
     shape = tuple(shape)
     data = x.data[mask]
+
+    # Narrowing a structured field's array fill down to a scalar produces a
+    # plain component view; drop components that only matched the background.
+    prune = np.ndim(x.fill_value) > 0 and np.ndim(fill_value) == 0
 
     result = COO(
         coords,
@@ -138,7 +203,8 @@ def getitem(x, index):
         shape=shape,
         has_duplicates=False,
         sorted=sorted,
-        fill_value=x.fill_value,
+        fill_value=fill_value,
+        prune=prune,
     )
 
     # Like NumPy, move the advanced-index dimensions to the front when the advanced

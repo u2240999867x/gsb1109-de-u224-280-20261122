@@ -75,11 +75,41 @@ def assert_gcxs_slicing(s, x):
 def assert_nnz(s, x):
     fill_value = s.fill_value if hasattr(s, "fill_value") else _zero_of_dtype(s.dtype)
 
+    if np.ndim(fill_value):
+        # Structured field views store a whole cell at a time with an array
+        # fill on the trailing field axes, so count non-background cells and
+        # multiply by the number of components.
+        fill = np.asarray(fill_value)
+        n_components = fill.size
+        cells = np.asarray(x).reshape(-1, n_components)
+        n_nonfill = int((~equivalent(cells, fill.ravel())).any(axis=1).sum())
+        assert n_nonfill * n_components == s.nnz
+        return
+
     assert np.sum(~equivalent(x, fill_value)) == s.nnz
 
 
 def is_canonical(x):
-    return not x.shape or ((np.diff(x.linear_loc()) > 0).all() and not equivalent(x.data, x.fill_value).any())
+    return not x.shape or ((np.diff(x.linear_loc()) > 0).all() and not data_matches_fill(x.data, x.fill_value).any())
+
+
+def data_matches_fill(data, fill_value):
+    """Compare flat stored data against a possibly non-scalar fill value.
+
+    Structured field views keep every component of an explicit cell together
+    and may store an array fill aligned with the trailing field axes. Such a
+    cell matches the fill only when *all* of its components match, and the
+    returned mask repeats that verdict for every component of the cell so it
+    stays aligned with the flattened data.
+    """
+    data = np.asarray(data)
+    if np.ndim(fill_value) == 0:
+        return equivalent(data, fill_value)
+
+    fill = np.asarray(fill_value).ravel()
+    n_cells = data.size // fill.size
+    cell_match = equivalent(data.reshape(n_cells, fill.size), fill).all(axis=1)
+    return np.repeat(cell_match, fill.size)
 
 
 def _zero_of_dtype(dtype):
