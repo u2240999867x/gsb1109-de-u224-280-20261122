@@ -4,14 +4,15 @@ Tests for the dual-store cache implementation.
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
-from zarr.abc.store import RangeByteRequest, Store, SuffixByteRequest
-from zarr.core.buffer.core import default_buffer_prototype
+from zarr.abc.store import ByteRequest, RangeByteRequest, Store, SuffixByteRequest
+from zarr.core.buffer.core import Buffer, BufferPrototype, default_buffer_prototype
 from zarr.core.buffer.cpu import Buffer as CPUBuffer
 from zarr.experimental.cache_store import CacheStore
-from zarr.storage import MemoryStore
+from zarr.storage import MemoryStore, StorePath
 
 
 class TestCacheStore:
@@ -1073,3 +1074,185 @@ async def test_cache_coherent_after_fused_pipeline_write() -> None:
         # must observe the overwrite, not a cached copy of the first write.
         arr[:] = np.arange(100, 108, dtype="int32")
         np.testing.assert_array_equal(arr[:], np.arange(100, 108))
+
+
+class _ShardReadPause:
+    """Shared pause state for `_PausingMemoryStore` and its read-only views."""
+
+    def __init__(self, *, prefetch: bool) -> None:
+        self.prefetch = prefetch
+        self.armed = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+
+class _PausingMemoryStore(MemoryStore):
+    """MemoryStore that pauses the first byte-range (chunk-data) GET until released.
+
+    Forces a shard replacement to land between a partial shard read's index
+    fetch and its first chunk-data fetch. With `prefetch=True` the paused GET
+    reads the (old) bytes from the backend before pausing, modelling a backend
+    that already fetched the old data range but returns it only after the
+    replacement completed. Read-only views share the pause state so the
+    interleaving also works through `CacheStore.with_read_only`.
+    """
+
+    def __init__(self, *args: Any, pause: _ShardReadPause, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pause = pause
+
+    def with_read_only(self, read_only: bool = False) -> "_PausingMemoryStore":
+        return type(self)(store_dict=self._store_dict, read_only=read_only, pause=self._pause)
+
+    async def get(
+        self,
+        key: str,
+        prototype: BufferPrototype,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        pause = self._pause
+        if pause.armed and isinstance(byte_range, RangeByteRequest):
+            pause.armed = False
+            if pause.prefetch:
+                result = await super().get(key, prototype, byte_range)
+                pause.entered.set()
+                await pause.release.wait()
+                return result
+            pause.entered.set()
+            await pause.release.wait()
+        return await super().get(key, prototype, byte_range)
+
+
+def _sharded_1d_array(store: Any, values: list[int]) -> Any:
+    """Create the scenario array: one shard of four uncompressed int32 chunks."""
+    import numpy as np
+
+    import zarr
+
+    arr = zarr.create_array(
+        store, shape=(4,), chunks=(1,), shards=(4,), dtype="int32", fill_value=0, compressors=None
+    )
+    arr[:] = np.array(values, dtype="int32")
+    return arr
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+async def test_shard_replaced_between_index_and_data_read(prefetch: bool) -> None:
+    """A partial shard read must never mix the old shard index with new shard data.
+
+    Reproduces an archival interleaving: a QC reader slices ``a[1:3]`` through a
+    read-only view of the CacheStore. It reads the OLD shard index, then its
+    first chunk-data fetch is paused while an archive task replaces the whole
+    shard in place via ``CacheStore.set``. The replacement holds
+    ``[0, 222, 333, 444]`` with the first inner chunk elided as implicit fill,
+    so every later chunk sits at a lower offset than in the old shard. The
+    stalled reader must observe one consistent version of the shard — never
+    the misaligned ``[333, 444]``, mixed, or fill values that stale offsets
+    would produce.
+    """
+    import numpy as np
+
+    from zarr.api.asynchronous import open_array
+
+    pause = _ShardReadPause(prefetch=prefetch)
+    source = _PausingMemoryStore(pause=pause)
+    cached = CacheStore(source, cache_store=MemoryStore())
+
+    _sharded_1d_array(StorePath(cached) / "main", [11, 22, 33, 44])
+
+    # A second array whose already-cached reads must keep working while the
+    # first reader is stalled and the archive task replaces the other shard.
+    other = _sharded_1d_array(StorePath(cached) / "other", [5, 6, 7, 8])
+    np.testing.assert_array_equal(other[1:3], [6, 7])  # warm the cache for other/c/0
+
+    # The replacement shard, encoded exactly as the array would write it.
+    template = MemoryStore()
+    _sharded_1d_array(template, [0, 222, 333, 444])
+    new_shard = await template.get("c/0", default_buffer_prototype())
+    assert new_shard is not None
+
+    # First reader: slices a[1:3] through a read-only view. It reads the old
+    # shard index, then stalls on the first chunk-data fetch.
+    pause.armed = True
+    reader_arr = await open_array(store=cached.with_read_only(True), path="main", mode="r")
+    reader_task = asyncio.create_task(reader_arr.getitem((slice(1, 3),)))
+    await asyncio.wait_for(pause.entered.wait(), timeout=5)
+
+    # The archive task replaces the shard in place; it must not have to wait
+    # for the stalled reader to finish.
+    await cached.set("main/c/0", new_shard)
+
+    # Reads that start after the replacement observe the new shard, and cache
+    # hits on the untouched shard keep working.
+    view_arr = await open_array(store=cached.with_read_only(True), path="main", mode="r")
+    np.testing.assert_array_equal(await view_arr.getitem((slice(1, 3),)), [222, 333])
+    np.testing.assert_array_equal(await view_arr.getitem((slice(None),)), [0, 222, 333, 444])
+    other_arr = await open_array(store=cached.with_read_only(True), path="other", mode="r")
+    np.testing.assert_array_equal(await other_arr.getitem((slice(1, 3),)), [6, 7])
+
+    # The stalled reader finishes: old or new shard are both acceptable, but
+    # never misaligned, mixed, or fill values.
+    pause.release.set()
+    stalled = await asyncio.wait_for(reader_task, timeout=5)
+    np.testing.assert_array_equal(stalled, [222, 333])
+
+    # A reader reopened from the shared cache also observes the new shard.
+    reopened_arr = await open_array(store=cached.with_read_only(True), path="main", mode="r")
+    np.testing.assert_array_equal(await reopened_arr.getitem((slice(1, 3),)), [222, 333])
+    np.testing.assert_array_equal(await reopened_arr.getitem((slice(None),)), [0, 222, 333, 444])
+
+
+async def test_partial_shard_read_request_shape_without_interleaving() -> None:
+    """Without a concurrent write, small-window reads keep their lean IO shape.
+
+    A cold-cache ``a[1:3]`` read fetches only the shard index and the (coalesced)
+    data ranges from the backend — the post-data index revalidation is served
+    from the cache — and a warm-cache read reuses the cached index instead of
+    refetching it.
+    """
+    import numpy as np
+
+    from zarr.api.asynchronous import open_array
+
+    class CountingMemoryStore(MemoryStore):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.counts = {"full": 0, "range": 0, "suffix": 0}
+
+        def with_read_only(self, read_only: bool = False) -> "CountingMemoryStore":
+            new = super().with_read_only(read_only)
+            new.counts = self.counts  # share the counters across views
+            return new
+
+        async def get(
+            self,
+            key: str,
+            prototype: BufferPrototype,
+            byte_range: ByteRequest | None = None,
+        ) -> Buffer | None:
+            if byte_range is None:
+                self.counts["full"] += 1
+            elif isinstance(byte_range, RangeByteRequest):
+                self.counts["range"] += 1
+            elif isinstance(byte_range, SuffixByteRequest):
+                self.counts["suffix"] += 1
+            return await super().get(key, prototype, byte_range)
+
+    source = CountingMemoryStore()
+    cached = CacheStore(source, cache_store=MemoryStore())
+    _sharded_1d_array(cached, [11, 22, 33, 44])
+    await cached.clear_cache()
+
+    reader_arr = await open_array(store=cached.with_read_only(True), mode="r")
+
+    # Cold cache: exactly one index fetch and one coalesced data-range fetch.
+    for counter in source.counts:
+        source.counts[counter] = 0
+    np.testing.assert_array_equal(await reader_arr.getitem((slice(1, 3),)), [22, 33])
+    assert source.counts == {"full": 0, "range": 1, "suffix": 1}
+
+    # Warm cache: the index is reused; only the data ranges hit the backend.
+    for counter in source.counts:
+        source.counts[counter] = 0
+    np.testing.assert_array_equal(await reader_arr.getitem((slice(1, 3),)), [22, 33])
+    assert source.counts == {"full": 0, "range": 1, "suffix": 0}

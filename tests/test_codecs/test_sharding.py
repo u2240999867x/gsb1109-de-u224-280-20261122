@@ -306,8 +306,10 @@ def test_sharding_multiple_chunks_partial_shard_read(
     # for a total of 6 chunks accessed
     assert np.allclose(a[0, 22:42], np.arange(22, 42, dtype="float32"))
 
-    # 2 shard index reads + 2 coalesced chunk-data reads (one per shard)
-    assert _index_read_count(store_mock) == 2
+    # Per shard: 2 shard index reads (the second re-validates the first after the
+    # data fetch, guarding against a mid-read shard replacement) + 1 coalesced
+    # chunk-data read
+    assert _index_read_count(store_mock) == 4
     assert _range_read_count(store_mock) == 2
 
     store_mock.reset_mock()
@@ -315,8 +317,9 @@ def test_sharding_multiple_chunks_partial_shard_read(
     # Reads 4 chunks from both shards along dimension 0 for a total of 8 chunks accessed
     assert np.allclose(a[:, 0], np.arange(0, data.size, array_shape[1], dtype="float32"))
 
-    # 2 shard index reads + 2 coalesced chunk-data reads (one per shard)
-    assert _index_read_count(store_mock) == 2
+    # Per shard: 2 shard index reads (initial + post-data revalidation) + 1
+    # coalesced chunk-data read
+    assert _index_read_count(store_mock) == 4
     assert _range_read_count(store_mock) == 2
 
 
@@ -353,8 +356,8 @@ def test_sharding_duplicate_read_indexes(
     indexer = [8, 8, 12, 12]
     assert np.array_equal(a[indexer], data[indexer])
 
-    # 1 shard index read + 1 coalesced chunk-data read
-    assert _index_read_count(store_mock) == 1
+    # 2 shard index reads (initial + post-data revalidation) + 1 coalesced chunk-data read
+    assert _index_read_count(store_mock) == 2
     assert _range_read_count(store_mock) == 1
 
 

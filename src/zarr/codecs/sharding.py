@@ -1788,6 +1788,26 @@ class ShardingCodec(
                 if rest is not None:
                     raise rest from None
                 return None
+
+            # The shard may have been replaced under the same key between the
+            # index read and the data reads — a caching layer can keep serving
+            # the old index while the data ranges already come from the new
+            # object, so the old offsets would slice unrelated bytes out of it.
+            # Re-read the index and compare: an identical index proves the data
+            # and the index belong to the same version of the shard. Through a
+            # caching store this re-read is a cache hit, so the steady state
+            # costs no extra backend request. On any change, recover with a
+            # single whole-object read, which always yields one consistent
+            # version of the shard.
+            shard_index_after = await self._load_shard_index_maybe(byte_getter, chunks_per_shard)
+            if shard_index_after is None or not np.array_equal(
+                shard_index_after.offsets_and_lengths, shard_index.offsets_and_lengths
+            ):
+                return await self._load_full_shard_maybe(
+                    byte_getter=byte_getter,
+                    prototype=prototype,
+                    chunks_per_shard=chunks_per_shard,
+                )
         else:
             # Any other ByteGetter. In practice only `_ShardingByteGetter` for
             # nested sharding, which slices an in-memory buffer (no I/O to coalesce).
