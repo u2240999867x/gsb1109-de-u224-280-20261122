@@ -23,6 +23,10 @@ from dask.core import flatten
 from dask.dataframe._compat import PANDAS_GE_220
 from dask.dataframe.backends import pyarrow_schema_dispatch
 from dask.dataframe.io.parquet.utils import (
+    PROVENANCE_COLUMNS,
+    PROVENANCE_FILE_COLUMN,
+    PROVENANCE_ROW_GROUP_COLUMN,
+    PROVENANCE_ROW_POSITION_COLUMN,
     Engine,
     _get_aggregation_depth,
     _infer_split_row_groups,
@@ -339,6 +343,41 @@ def _need_filtering(filters, partition_keys):
     return bool(filtered_cols - partition_cols)
 
 
+def _row_wise_filters(filters, partition_keys):
+    """Return the subset of ``filters`` that must be applied row-wise.
+
+    Predicates on (hive) partition columns are already applied when the
+    collection plan is constructed, so they are dropped here. Returns
+    ``None`` if no row-wise filtering remains.
+    """
+    if not filters or isinstance(filters, pa_ds.Expression):
+        return filters
+
+    partition_cols = (
+        {v[0] for v in flatten(partition_keys, container=list) if len(v)}
+        if partition_keys
+        else set()
+    )
+    if not partition_cols:
+        return filters
+
+    if isinstance(filters[0][0], str):
+        # One nesting level too few: [(,,), ..] instead of [[(,,), ..]]
+        conjunctions = [filters]
+    else:
+        conjunctions = filters
+
+    row_filters = []
+    for conjunction in conjunctions:
+        remaining = [pred for pred in conjunction if pred[0] not in partition_cols]
+        if not remaining:
+            # Every predicate of this conjunction is satisfied by the
+            # partition keys, so the whole disjunction evaluates to True
+            return None
+        row_filters.append(remaining)
+    return row_filters
+
+
 def _hive_dirname(name, val):
     # Simple utility to produce hive directory name.
     # Note that "__HIVE_DEFAULT_PARTITION__" is the
@@ -526,6 +565,11 @@ class ArrowDatasetEngine(Engine):
     ):
         """Read in a single output partition"""
 
+        add_row_provenance = kwargs.pop("add_row_provenance", False)
+        provenance_columns = []
+        if add_row_provenance:
+            provenance_columns = [c for c in PROVENANCE_COLUMNS if c in (columns or [])]
+
         if isinstance(index, list):
             for level in index:
                 # unclear if we can use set ops here. I think the order matters.
@@ -569,17 +613,30 @@ class ArrowDatasetEngine(Engine):
                 row_group = [row_group]
 
             # Read in arrow table and convert to pandas
-            arrow_table = cls._read_table(
-                path_or_frag,
-                fs,
-                row_group,
-                columns,
-                schema,
-                filters,
-                partitions,
-                partition_keys,
-                **kwargs,
-            )
+            if provenance_columns:
+                arrow_table = cls._read_table_with_provenance(
+                    path_or_frag,
+                    fs,
+                    row_group,
+                    columns,
+                    filters,
+                    partitions,
+                    partition_keys,
+                    provenance_columns,
+                    **kwargs,
+                )
+            else:
+                arrow_table = cls._read_table(
+                    path_or_frag,
+                    fs,
+                    row_group,
+                    columns,
+                    schema,
+                    filters,
+                    partitions,
+                    partition_keys,
+                    **kwargs,
+                )
             if multi_read:
                 tables.append(arrow_table)
 
@@ -590,6 +647,15 @@ class ArrowDatasetEngine(Engine):
         df = cls._arrow_table_to_pandas(
             arrow_table, categories, dtype_backend=dtype_backend, **kwargs
         )
+
+        if provenance_columns:
+            # Give the provenance columns stable dtypes, independent of
+            # the string/dtype backends used for the data columns
+            if PROVENANCE_FILE_COLUMN in provenance_columns:
+                df[PROVENANCE_FILE_COLUMN] = df[PROVENANCE_FILE_COLUMN].astype(object)
+            for name in (PROVENANCE_ROW_GROUP_COLUMN, PROVENANCE_ROW_POSITION_COLUMN):
+                if name in provenance_columns:
+                    df[name] = df[name].astype("int64")
 
         # For pyarrow.dataset api, need to convert partition columns
         # to categorigal manually for integer types.
@@ -1711,6 +1777,188 @@ class ArrowDatasetEngine(Engine):
         # For pyarrow.dataset api, if we did not read directly from
         # fragments, we need to add the partitioned columns here.
         if partitions and isinstance(partitions, list):
+            keys_dict = {k: v for (k, v) in partition_keys}
+            for partition in partitions:
+                if partition.name not in arrow_table.schema.names:
+                    # We read from file paths, so the partition
+                    # columns may NOT be in our table yet.
+                    cat = keys_dict.get(partition.name, None)
+                    if not len(partition.keys):
+                        arr = pa.array(np.full(len(arrow_table), cat))
+                    else:
+                        cat_ind = np.full(
+                            len(arrow_table), partition.keys.get_loc(cat), dtype="i4"
+                        )
+                        arr = pa.DictionaryArray.from_arrays(
+                            cat_ind, pa.array(partition.keys)
+                        )
+                    arrow_table = arrow_table.append_column(partition.name, arr)
+
+        return arrow_table
+
+    @classmethod
+    def _read_table_with_provenance(
+        cls,
+        path_or_frag,
+        fs,
+        row_groups,
+        columns,
+        filters,
+        partitions,
+        partition_keys,
+        provenance_columns,
+        **kwargs,
+    ):
+        """Read a single piece row-group by row-group and attach provenance columns.
+
+        Row-wise filters are applied only *after* the provenance columns have
+        been attached, so that the positions always refer to the original
+        zero-based row offsets within each row group of the source file (and
+        not to the offsets within the filtered result).
+        """
+        if isinstance(path_or_frag, pa_ds.ParquetFileFragment):
+            path = path_or_frag.path
+        else:
+            path = path_or_frag
+
+        # Provenance columns are synthesized, not read from the file.
+        # Partition columns are appended below from the partition keys,
+        # so they are not read from the file either.
+        partition_cols = (
+            {v[0] for v in flatten(partition_keys, container=list) if len(v)}
+            if partition_keys
+            else set()
+        )
+        read_columns = [
+            c
+            for c in (columns or [])
+            if c not in PROVENANCE_COLUMNS and c not in partition_cols
+        ]
+
+        # Row-wise filters are applied here, after the positions have been
+        # assigned. Predicates on partition columns were already applied
+        # when the collection plan was constructed.
+        row_filters = _row_wise_filters(filters, partition_keys)
+        filter_expression = None
+        extra_columns = []
+        if row_filters is not None:
+            filter_expression = _filters_to_expression(row_filters)
+            # Make sure the columns needed to evaluate the filters are read
+            filter_cols = {f[0] for f in flatten(row_filters, container=list) if len(f)}
+            extra_columns = [
+                col
+                for col in filter_cols
+                if col not in read_columns
+                and col not in partition_cols
+                and col not in PROVENANCE_COLUMNS
+            ]
+            read_columns = read_columns + extra_columns
+
+        # Define file-opening options (mirrors `_read_table_from_path`)
+        read_kwargs = kwargs.get("read", {}).copy()
+        precache_options, open_file_options = _process_open_file_options(
+            read_kwargs.pop("open_file_options", {}),
+            **(
+                {
+                    "allow_precache": False,
+                    "default_cache": "none",
+                }
+                if _is_local_fs(fs)
+                else {
+                    "columns": read_columns or None,
+                    "row_groups": row_groups if row_groups == [None] else [row_groups],
+                    "default_engine": "pyarrow",
+                    "default_cache": "none",
+                }
+            ),
+        )
+        pre_buffer = {
+            "pre_buffer": read_kwargs.pop(
+                "pre_buffer", precache_options.get("method", None) is None
+            )
+        }
+
+        def _provenance_arrays(num_rows, row_group_id):
+            arrays = {}
+            if PROVENANCE_ROW_GROUP_COLUMN in provenance_columns:
+                arrays[PROVENANCE_ROW_GROUP_COLUMN] = pa.array(
+                    np.full(num_rows, row_group_id, dtype=np.int64)
+                )
+            if PROVENANCE_ROW_POSITION_COLUMN in provenance_columns:
+                arrays[PROVENANCE_ROW_POSITION_COLUMN] = pa.array(
+                    np.arange(num_rows, dtype=np.int64)
+                )
+            if PROVENANCE_FILE_COLUMN in provenance_columns:
+                arrays[PROVENANCE_FILE_COLUMN] = pa.repeat(pa.scalar(path), num_rows)
+            return arrays
+
+        tables = []
+        with _open_input_files(
+            [path],
+            fs=fs,
+            precache_options=precache_options,
+            **open_file_options,
+        )[0] as fil:
+            parquet_file = pq.ParquetFile(fil, **pre_buffer)
+            if row_groups == [None]:
+                row_group_ids = list(range(parquet_file.num_row_groups))
+            else:
+                row_group_ids = list(row_groups)
+            for row_group_id in row_group_ids:
+                if read_columns:
+                    table = parquet_file.read_row_group(
+                        row_group_id,
+                        columns=read_columns,
+                        use_threads=False,
+                        use_pandas_metadata=True,
+                    )
+                    num_rows = table.num_rows
+                else:
+                    # Only provenance columns were requested: the row count
+                    # is available from the footer metadata, so no data
+                    # pages need to be read at all.
+                    num_rows = parquet_file.metadata.row_group(row_group_id).num_rows
+                    table = None
+                provenance_arrays = _provenance_arrays(num_rows, row_group_id)
+                if table is None:
+                    table = pa.table(provenance_arrays)
+                else:
+                    for name, arr in provenance_arrays.items():
+                        table = table.append_column(name, arr)
+                if filter_expression is not None:
+                    table = table.filter(filter_expression)
+                tables.append(table)
+
+            if not tables:
+                # The piece contains no row groups (e.g. an empty file)
+                file_schema = parquet_file.schema_arrow
+                empty_columns = {
+                    c: pa.array([], type=file_schema.field(c).type)
+                    for c in read_columns
+                    if c in file_schema.names
+                }
+                tables.append(pa.table({**empty_columns, **_provenance_arrays(0, 0)}))
+
+        arrow_table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+        if extra_columns:
+            arrow_table = arrow_table.drop(extra_columns)
+
+        if partitions and isinstance(partitions, list):
+            if partition_keys is None:
+                # Need to discover the partition keys from the path
+                ds = pa_ds.dataset(
+                    path,
+                    filesystem=_wrapped_fs(fs),
+                    **_process_kwargs(**kwargs.get("dataset", {})),
+                )
+                frag = next(iter(ds.get_fragments()))
+                raw_keys = pa_ds._get_partition_keys(frag.partition_expression)
+                partition_keys = [
+                    (hive_part.name, raw_keys[hive_part.name])
+                    for hive_part in partitions
+                ]
+            # For pyarrow.dataset api, if we did not read directly from
+            # fragments, we need to add the partitioned columns here.
             keys_dict = {k: v for (k, v) in partition_keys}
             for partition in partitions:
                 if partition.name not in arrow_table.schema.names:

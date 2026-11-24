@@ -15,12 +15,24 @@ from dask.dataframe.dask_expr._expr import Filter, Lengths, Literal
 from dask.dataframe.dask_expr._reductions import Len
 from dask.dataframe.dask_expr.io import FusedParquetIO, ReadParquet
 from dask.dataframe.dask_expr.io.parquet import (
+    ReadParquetFSSpec,
     _aggregate_statistics_to_file,
     _combine_stats,
     _extract_stats,
 )
+from dask.dataframe.io.parquet.utils import (
+    PROVENANCE_FILE_COLUMN,
+    PROVENANCE_ROW_GROUP_COLUMN,
+    PROVENANCE_ROW_POSITION_COLUMN,
+)
 from dask.dataframe.utils import assert_eq
 from dask.utils import key_split
+
+PROVENANCE_COLS = [
+    PROVENANCE_FILE_COLUMN,
+    PROVENANCE_ROW_GROUP_COLUMN,
+    PROVENANCE_ROW_POSITION_COLUMN,
+]
 
 
 def _make_file(dir, df=None, filename="myfile.parquet", **kwargs):
@@ -649,3 +661,242 @@ def test_tune_optimization_disabled(tmpdir):
         assert len(full_lens) == n_partitions
         assert len(col_lens) == n_partitions
         assert_eq(full_lens, col_lens)
+
+
+def _make_provenance_file(dir, filename="data.parquet", biz_prefix="A"):
+    """Write a single parquet file with two row groups.
+
+    The first row group contains no matching rows at all. The second row
+    group contains a single matching row (``status == "hit"``) sandwiched
+    between two non-matching rows. Note that the ``amount`` column (and,
+    when splitting by row-group, also the pandas index) contains
+    duplicates across the row groups, so the provenance columns are the
+    only way to tell some rows apart.
+    """
+    fn = os.path.join(str(dir), filename)
+    pdf = pd.DataFrame(
+        {
+            "biz_id": [f"{biz_prefix}{i}" for i in range(6)],
+            "amount": [100.0, 200.0, 300.0, 100.0, 200.0, 300.0],
+            "status": ["miss", "miss", "miss", "miss", "hit", "miss"],
+            "flag": [0, 0, 0, 0, 1, 0],
+        }
+    )
+    pdf.to_parquet(fn, row_group_size=3, index=False)
+    return fn
+
+
+def _read_original_row(file_path, row_group, row_position):
+    """Read a single row back from the source file using provenance coordinates."""
+    import pyarrow.parquet as pq
+
+    table = pq.ParquetFile(file_path).read_row_group(row_group)
+    return table.slice(row_position, 1).to_pandas()
+
+
+def test_read_parquet_row_provenance_columns(tmpdir, filesystem):
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, filesystem=filesystem)
+    assert list(df.columns) == ["biz_id", "amount", "status", "flag"] + PROVENANCE_COLS
+
+    result = df.compute()
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [0, 0, 0, 1, 1, 1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [0, 1, 2, 0, 1, 2]
+    assert {os.path.realpath(p) for p in result[PROVENANCE_FILE_COLUMN]} == {
+        os.path.realpath(fn)
+    }
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].dtype == "int64"
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].dtype == "int64"
+
+
+def test_read_parquet_row_provenance_filter_pushdown(tmpdir, filesystem):
+    # The first row group does not match at all; the matching row sits
+    # between two non-matching rows in the second row group. After filter
+    # pushdown and column projection, the reported position must still be
+    # the original zero-based position within the second row group.
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, filesystem=filesystem)
+    result = df[df.status == "hit"][["biz_id", "amount"] + PROVENANCE_COLS].compute()
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["biz_id"] == "A4"
+    assert row["amount"] == 200.0
+    assert row[PROVENANCE_ROW_GROUP_COLUMN] == 1
+    # Zero-based position within the original row group, not within
+    # the filtered result (which would be 0)
+    assert row[PROVENANCE_ROW_POSITION_COLUMN] == 1
+
+    # The coordinates must retrieve the same row from the source file
+    original = _read_original_row(
+        row[PROVENANCE_FILE_COLUMN],
+        row[PROVENANCE_ROW_GROUP_COLUMN],
+        row[PROVENANCE_ROW_POSITION_COLUMN],
+    )
+    assert original["biz_id"].iloc[0] == row["biz_id"]
+    assert original["amount"].iloc[0] == row["amount"]
+
+
+@pytest.mark.parametrize("split_row_groups", [False, True])
+def test_read_parquet_row_provenance_split_row_groups(tmpdir, split_row_groups):
+    # Whole-file partitions and per-row-group partitions must report
+    # identical provenance for the same data
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, split_row_groups=split_row_groups)
+    result = df[df.status == "hit"].compute()
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["biz_id"] == "A4"
+    assert row[PROVENANCE_ROW_GROUP_COLUMN] == 1
+    assert row[PROVENANCE_ROW_POSITION_COLUMN] == 1
+
+
+def test_read_parquet_row_provenance_filter_projection_order(tmpdir, filesystem):
+    # Filtering first and then requesting the positions must give the same
+    # provenance as requesting the positions first and then filtering
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, filesystem=filesystem)
+    cols = ["biz_id", "amount"] + PROVENANCE_COLS
+
+    filter_first = df[df.status == "hit"][cols]
+    project_first = df[cols + ["status"]]
+    project_first = project_first[project_first.status == "hit"][cols]
+    assert_eq(filter_first, project_first)
+
+    result = filter_first.compute()
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [1]
+
+
+def test_read_parquet_row_provenance_follows_rows(tmpdir, filesystem):
+    # Re-ordering the business rows must not detach the provenance
+    # columns from their rows
+    _make_provenance_file(tmpdir, filename="part.0.parquet", biz_prefix="A")
+    _make_provenance_file(tmpdir, filename="part.1.parquet", biz_prefix="B")
+    df = read_parquet(str(tmpdir), add_row_provenance=True, filesystem=filesystem)
+
+    base = df.compute().set_index("biz_id")
+    reordered = df.shuffle("biz_id").compute().set_index("biz_id")
+    reordered = reordered.loc[base.index]
+    assert_eq(
+        base[PROVENANCE_COLS],
+        reordered[PROVENANCE_COLS],
+        check_index=False,
+    )
+
+
+def test_read_parquet_row_provenance_distinguishes_duplicate_rows(tmpdir):
+    # Two original rows can share the same pandas index and the same
+    # amount, and only differ in the column used for filtering. The
+    # provenance columns must still identify each of them uniquely.
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, split_row_groups=True)
+    result = df[df.amount == 200.0].compute()
+
+    # Both rows have amount == 200.0 and (after filtering) the same
+    # pandas index within their respective partitions
+    assert len(result) == 2
+    assert result.index.tolist() == [0, 0]
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [0, 1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [1, 1]
+    for _, row in result.iterrows():
+        original = _read_original_row(
+            row[PROVENANCE_FILE_COLUMN],
+            row[PROVENANCE_ROW_GROUP_COLUMN],
+            row[PROVENANCE_ROW_POSITION_COLUMN],
+        )
+        assert original["biz_id"].iloc[0] == row["biz_id"]
+
+
+def test_read_parquet_row_provenance_row_group_skipping(tmpdir):
+    # Row groups that cannot match the filters according to their
+    # statistics must actually be skipped, i.e. never be read
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True)
+    df = df[df.flag == 1]
+
+    (read_op,) = df.optimize().expr.find_operations(ReadParquetFSSpec)
+    row_groups = []
+    for part in read_op._plan["parts"]:
+        for piece in [part] if isinstance(part, dict) else part:
+            row_groups.extend(piece["piece"][1])
+    # The first row group only contains flag == 0 and must have been
+    # excluded based on the parquet statistics
+    assert row_groups == [1]
+
+    result = df.compute()
+    assert len(result) == 1
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [1]
+
+
+def test_read_parquet_row_provenance_column_projection(tmpdir):
+    # Only the business columns, the provenance columns, and the columns
+    # needed to evaluate the filters may be read
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True)
+    df = df[df.status == "hit"][["biz_id", "amount"] + PROVENANCE_COLS]
+
+    (read_op,) = df.optimize().expr.find_operations(ReadParquetFSSpec)
+    assert set(read_op.columns) == {"biz_id", "amount"} | set(PROVENANCE_COLS)
+    assert read_op.filters == [[("status", "==", "hit")]]
+
+    result = df.compute()
+    assert list(result.columns) == ["biz_id", "amount"] + PROVENANCE_COLS
+    assert result["biz_id"].tolist() == ["A4"]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [1]
+
+
+def test_read_parquet_row_provenance_only_provenance_columns(tmpdir, filesystem):
+    # Selecting only the provenance columns must not read any data column
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True, filesystem=filesystem)
+    result = df[PROVENANCE_COLS].compute()
+
+    assert list(result.columns) == PROVENANCE_COLS
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [0, 0, 0, 1, 1, 1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [0, 1, 2, 0, 1, 2]
+
+
+def test_read_parquet_row_provenance_explicit_columns(tmpdir):
+    # Provenance columns are appended to an explicit column projection
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, columns=["biz_id", "amount"], add_row_provenance=True)
+    assert list(df.columns) == ["biz_id", "amount"] + PROVENANCE_COLS
+
+    result = df.compute()
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [0, 0, 0, 1, 1, 1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [0, 1, 2, 0, 1, 2]
+
+
+def test_read_parquet_row_provenance_multiple_files(tmpdir, filesystem):
+    _make_provenance_file(tmpdir, filename="part.0.parquet")
+    _make_provenance_file(tmpdir, filename="part.1.parquet")
+    df = read_parquet(str(tmpdir), add_row_provenance=True, filesystem=filesystem)
+
+    result = df[df.status == "hit"].compute()
+    assert len(result) == 2
+    assert {os.path.basename(p) for p in result[PROVENANCE_FILE_COLUMN]} == {
+        "part.0.parquet",
+        "part.1.parquet",
+    }
+    for _, row in result.iterrows():
+        original = _read_original_row(
+            row[PROVENANCE_FILE_COLUMN],
+            row[PROVENANCE_ROW_GROUP_COLUMN],
+            row[PROVENANCE_ROW_POSITION_COLUMN],
+        )
+        assert original["biz_id"].iloc[0] == row["biz_id"]
+
+
+def test_read_parquet_row_provenance_filter_on_provenance_column(tmpdir):
+    # Predicates on the provenance columns cannot be pushed into the
+    # parquet scan, but they must still work as ordinary filters
+    fn = _make_provenance_file(tmpdir)
+    df = read_parquet(fn, add_row_provenance=True)
+    result = df[df[PROVENANCE_ROW_GROUP_COLUMN] == 1].compute()
+
+    assert len(result) == 3
+    assert result[PROVENANCE_ROW_GROUP_COLUMN].tolist() == [1, 1, 1]
+    assert result[PROVENANCE_ROW_POSITION_COLUMN].tolist() == [0, 1, 2]

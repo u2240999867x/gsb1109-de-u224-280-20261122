@@ -11,6 +11,20 @@ from dask import config
 from dask.dataframe.io.utils import _is_local_fs
 from dask.utils import natural_sort_key, parse_bytes
 
+# Column names used to expose per-row provenance information when
+# ``add_row_provenance=True`` is passed to ``read_parquet``. Together,
+# these columns allow every output row to be traced back to its origin:
+# the source file, the row group within that file, and the zero-based
+# position of the row within that row group.
+PROVENANCE_FILE_COLUMN = "__file_path__"
+PROVENANCE_ROW_GROUP_COLUMN = "__row_group__"
+PROVENANCE_ROW_POSITION_COLUMN = "__row_position__"
+PROVENANCE_COLUMNS = (
+    PROVENANCE_FILE_COLUMN,
+    PROVENANCE_ROW_GROUP_COLUMN,
+    PROVENANCE_ROW_POSITION_COLUMN,
+)
+
 
 class Engine:
     """The API necessary to provide a new Parquet reader/writer"""

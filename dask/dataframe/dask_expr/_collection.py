@@ -5173,6 +5173,7 @@ def read_parquet(
     filesystem="fsspec",
     engine=None,
     arrow_to_pandas=None,
+    add_row_provenance=False,
     **kwargs,
 ):
     """
@@ -5352,6 +5353,26 @@ def read_parquet(
     arrow_to_pandas: dict, default None
         Dictionary of options to use when converting from ``pyarrow.Table`` to
         a pandas ``DataFrame`` object. Only used by the "arrow" engine.
+    add_row_provenance : bool, default False
+        If True, add three columns to the output that allow every row to be
+        traced back to its origin in the source parquet files:
+
+        - ``__file_path__``: path of the parquet file containing the row.
+        - ``__row_group__``: index of the row group within that file
+          containing the row.
+        - ``__row_position__``: zero-based position of the row within that
+          row group.
+
+        The positions always refer to the original row groups of the source
+        files: they are assigned before any row-wise filtering is applied,
+        so they cannot be confused with the position of a row within the
+        filtered result. The columns are ordinary columns of the output
+        DataFrame, so they travel with each row through subsequent
+        operations (including re-ordering operations like ``shuffle`` or
+        ``sort_values``). Row-group statistics are still used to skip row
+        groups that cannot match the filters, and only the columns required
+        for the output (plus the columns needed to evaluate the filters)
+        are read from disk.
     **kwargs: dict (of dicts)
         Options to pass through to ``engine.read_partitions`` as stand-alone
         key-word arguments. Note that these options will be ignored by the
@@ -5372,9 +5393,21 @@ def read_parquet(
         ReadParquetPyarrowFS,
         _set_parquet_engine,
     )
+    from dask.dataframe.io.parquet.utils import PROVENANCE_COLUMNS
 
     if not isinstance(path, str):
         path = stringify_path(path)
+
+    if add_row_provenance:
+        # The provenance columns are appended to any explicit column
+        # projection so that they are always part of the output
+        if isinstance(columns, str):
+            columns = [columns]
+        if columns is not None:
+            columns = [
+                *columns,
+                *[c for c in PROVENANCE_COLUMNS if c not in columns],
+            ]
 
     kwargs["dtype_backend"] = dtype_backend
     if arrow_to_pandas:
@@ -5430,6 +5463,7 @@ def read_parquet(
                 arrow_to_pandas=arrow_to_pandas,
                 pyarrow_strings_enabled=pyarrow_strings_enabled(),
                 kwargs=kwargs,
+                add_row_provenance=add_row_provenance,
                 _series=isinstance(columns, str),
             )
         )
@@ -5452,6 +5486,7 @@ def read_parquet(
             filesystem=filesystem,
             engine=_set_parquet_engine(engine),
             kwargs=kwargs,
+            add_row_provenance=add_row_provenance,
             _series=isinstance(columns, str),
         )
     )

@@ -58,7 +58,13 @@ from dask.dataframe.io.parquet.core import (
     set_index_columns,
     sorted_columns,
 )
-from dask.dataframe.io.parquet.utils import _split_user_options
+from dask.dataframe.io.parquet.utils import (
+    PROVENANCE_COLUMNS,
+    PROVENANCE_FILE_COLUMN,
+    PROVENANCE_ROW_GROUP_COLUMN,
+    PROVENANCE_ROW_POSITION_COLUMN,
+    _split_user_options,
+)
 from dask.dataframe.io.utils import _is_local_fs
 from dask.delayed import delayed
 from dask.tokenize import _tokenize_deterministic, normalize_token, tokenize
@@ -110,6 +116,21 @@ NONE_LABEL = "__null_dask_index__"
 
 _CACHED_PLAN_SIZE = 10
 _cached_plan = {}  # type: ignore[var-annotated]
+
+
+def _with_provenance_columns(meta):
+    """Return ``meta`` with the (empty) row-provenance columns added.
+
+    The provenance columns always have stable dtypes, independent of the
+    string/dtype backends used for the data columns.
+    """
+    meta = meta.copy()
+    meta[PROVENANCE_FILE_COLUMN] = pd.Series([], dtype=object, index=meta.index)
+    meta[PROVENANCE_ROW_GROUP_COLUMN] = pd.Series([], dtype="int64", index=meta.index)
+    meta[PROVENANCE_ROW_POSITION_COLUMN] = pd.Series(
+        [], dtype="int64", index=meta.index
+    )
+    return meta
 
 
 class FragmentWrapper:
@@ -838,6 +859,7 @@ class ReadParquetPyarrowFS(ReadParquet):
         "arrow_to_pandas",
         "pyarrow_strings_enabled",
         "kwargs",
+        "add_row_provenance",
         "_partitions",
         "_series",
         "_dataset_info_cache",
@@ -854,6 +876,7 @@ class ReadParquetPyarrowFS(ReadParquet):
         "arrow_to_pandas": None,
         "pyarrow_strings_enabled": True,
         "kwargs": None,
+        "add_row_provenance": False,
         "_partitions": None,
         "_series": False,
         "_dataset_info_cache": None,
@@ -1071,7 +1094,10 @@ class ReadParquetPyarrowFS(ReadParquet):
             dataset_info["all_files"] = all_files
 
         dataset_info["schema"] = dataset.schema
-        dataset_info["base_meta"] = dataset.schema.empty_table().to_pandas()
+        base_meta = dataset.schema.empty_table().to_pandas()
+        if self.add_row_provenance:
+            base_meta = _with_provenance_columns(base_meta)
+        dataset_info["base_meta"] = base_meta
         self._dataset_info_cache = dataset_info
         return dataset_info
 
@@ -1172,6 +1198,10 @@ class ReadParquetPyarrowFS(ReadParquet):
             if columns is None:
                 columns = list(schema.names)
             columns.append(index_name)
+        provenance = None
+        if self.add_row_provenance:
+            provenance = [c for c in PROVENANCE_COLUMNS if c in columns]
+            columns = [c for c in columns if c not in PROVENANCE_COLUMNS]
         # Note: We use kwargs here to have an easier time to take this apart in
         # FusedParquetIO
         return Task(
@@ -1186,21 +1216,27 @@ class ReadParquetPyarrowFS(ReadParquet):
                 filters=self.filters,
                 columns=columns,
                 schema=schema,
+                provenance=provenance,
             ),
             index_name=index_name,
             arrow_to_pandas=self.arrow_to_pandas,
             dtype_backend=self.kwargs.get("dtype_backend"),
             pyarrow_strings_enabled=self.pyarrow_strings_enabled,
+            provenance=provenance,
             _data_producer=True,
         )
 
     @staticmethod
-    def _fragment_to_table(fragment_wrapper, filters, columns, schema):
+    def _fragment_to_table(fragment_wrapper, filters, columns, schema, provenance=None):
         _maybe_adjust_cpu_count()
         if isinstance(fragment_wrapper, FragmentWrapper):
             fragment = fragment_wrapper.fragment
         else:
             fragment = fragment_wrapper
+        if provenance:
+            return _read_fragment_with_provenance(
+                fragment, filters, columns, schema, provenance
+            )
         if isinstance(filters, list):
             filters = pq.filters_to_expression(filters)
         return fragment.to_table(
@@ -1228,7 +1264,12 @@ class ReadParquetPyarrowFS(ReadParquet):
 
     @staticmethod
     def _table_to_pandas(
-        table, index_name, arrow_to_pandas, dtype_backend, pyarrow_strings_enabled
+        table,
+        index_name,
+        arrow_to_pandas,
+        dtype_backend,
+        pyarrow_strings_enabled,
+        provenance=None,
     ):
         if arrow_to_pandas is None:
             arrow_to_pandas = {}
@@ -1249,7 +1290,112 @@ class ReadParquetPyarrowFS(ReadParquet):
         )
         if index_name is not None:
             df = df.set_index(index_name)
+        if provenance:
+            # Give the provenance columns stable dtypes, independent of
+            # the string/dtype backends used for the data columns
+            if PROVENANCE_FILE_COLUMN in provenance:
+                df[PROVENANCE_FILE_COLUMN] = df[PROVENANCE_FILE_COLUMN].astype(object)
+            for name in (PROVENANCE_ROW_GROUP_COLUMN, PROVENANCE_ROW_POSITION_COLUMN):
+                if name in provenance:
+                    df[name] = df[name].astype("int64")
         return df
+
+
+def _read_fragment_with_provenance(fragment, filters, columns, schema, provenance):
+    """Read a fragment row-group by row-group and attach provenance columns.
+
+    Row-wise filters are applied only *after* the provenance columns have
+    been attached, so that the positions always refer to the original
+    zero-based row offsets within each row group of the source file (and
+    not to the offsets within the filtered result).
+    """
+    # Provenance columns are synthesized, not read from the file
+    columns = [c for c in (columns or []) if c not in PROVENANCE_COLUMNS]
+
+    # Make sure the columns needed to evaluate the filters are read
+    extra_columns = []
+    if filters is not None:
+        filter_cols = {f[0] for f in flatten(filters, container=list) if len(f)}
+        extra_columns = [
+            col
+            for col in filter_cols
+            if col not in columns and col not in PROVENANCE_COLUMNS
+        ]
+    read_columns = columns + extra_columns
+    filter_expression = None
+    if filters is not None:
+        filter_expression = (
+            pq.filters_to_expression(filters)
+            if isinstance(filters, list)
+            else filters
+        )
+
+    path = fragment.path
+    need_positions = (
+        PROVENANCE_ROW_GROUP_COLUMN in provenance
+        or PROVENANCE_ROW_POSITION_COLUMN in provenance
+    )
+    fragments = list(fragment.split_by_row_group()) if need_positions else [fragment]
+    tables = []
+    for frag in fragments:
+        if read_columns:
+            table = frag.to_table(
+                schema=schema,
+                columns=read_columns,
+                # Positions must be assigned before row-wise filtering,
+                # so the filter is only applied below if positions are needed
+                filter=None if need_positions else filter_expression,
+                batch_size=10_000_000,
+                fragment_scan_options=pa.dataset.ParquetFragmentScanOptions(
+                    pre_buffer=True,
+                    cache_options=pa.CacheOptions(
+                        hole_size_limit=parse_bytes("4 MiB"),
+                        range_size_limit=parse_bytes("32.00 MiB"),
+                    ),
+                ),
+                use_threads=True,
+            )
+            num_rows = table.num_rows
+        else:
+            # Only provenance columns were requested: the row count is
+            # available from the footer metadata, so no data pages need
+            # to be read at all.
+            num_rows = frag.count_rows()
+            table = None
+        if need_positions:
+            row_group_info = frag.row_groups
+            if row_group_info is None:
+                frag.ensure_complete_metadata()
+                row_group_info = frag.row_groups
+            row_group_id = row_group_info[0].id
+        else:
+            row_group_id = 0
+        provenance_arrays = {}
+        if PROVENANCE_ROW_GROUP_COLUMN in provenance:
+            provenance_arrays[PROVENANCE_ROW_GROUP_COLUMN] = pa.array(
+                np.full(num_rows, row_group_id, dtype=np.int64)
+            )
+        if PROVENANCE_ROW_POSITION_COLUMN in provenance:
+            provenance_arrays[PROVENANCE_ROW_POSITION_COLUMN] = pa.array(
+                np.arange(num_rows, dtype=np.int64)
+            )
+        if PROVENANCE_FILE_COLUMN in provenance:
+            provenance_arrays[PROVENANCE_FILE_COLUMN] = pa.repeat(
+                pa.scalar(path), num_rows
+            )
+        if table is None:
+            table = pa.table(provenance_arrays)
+        else:
+            for name, arr in provenance_arrays.items():
+                table = table.append_column(name, arr)
+        if need_positions and filter_expression is not None:
+            table = table.filter(filter_expression)
+        tables.append(table)
+
+    table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    if extra_columns:
+        table = table.drop(extra_columns)
+    return table
 
 
 class ReadParquetFSSpec(ReadParquet):
@@ -1272,6 +1418,7 @@ class ReadParquetFSSpec(ReadParquet):
         "filesystem",
         "engine",
         "kwargs",
+        "add_row_provenance",
         "_partitions",
         "_series",
         "_dataset_info_cache",
@@ -1293,6 +1440,7 @@ class ReadParquetFSSpec(ReadParquet):
         "filesystem": "fsspec",
         "engine": "pyarrow",
         "kwargs": {"dtype_backend": None},
+        "add_row_provenance": False,
         "_partitions": None,
         "_series": False,
         "_dataset_info_cache": None,
@@ -1403,6 +1551,8 @@ class ReadParquetFSSpec(ReadParquet):
         )
         if meta.index.name == NONE_LABEL:
             meta.index.name = None
+        if self.add_row_provenance:
+            meta = _with_provenance_columns(meta)
         dataset_info["base_meta"] = meta
         dataset_info["index"] = index
         dataset_info["all_columns"] = all_columns
@@ -1457,6 +1607,9 @@ class ReadParquetFSSpec(ReadParquet):
         if self._plan["empty"]:
             return identity
         dataset_info = self._dataset_info
+        common_kwargs = self._plan["common_kwargs"]
+        if self.add_row_provenance:
+            common_kwargs = {**common_kwargs, "add_row_provenance": True}
         return ParquetFunctionWrapper(
             self.engine,
             dataset_info["fs"],
@@ -1465,7 +1618,7 @@ class ReadParquetFSSpec(ReadParquet):
             dataset_info["index"],
             dataset_info["kwargs"]["dtype_backend"],
             {},  # All kwargs should now be in `common_kwargs`
-            self._plan["common_kwargs"],
+            common_kwargs,
         )
 
     @property
@@ -1670,7 +1823,10 @@ class _DNF:
                 op = predicate_expr._operator_repr
                 column = predicate_expr.left.columns[0]
                 value = predicate_expr.right
-                _filters = (column, op, value)
+                if column not in PROVENANCE_COLUMNS:
+                    # Provenance columns are synthesized at read time, so
+                    # predicates on them cannot be pushed into the scan
+                    _filters = (column, op, value)
             elif (
                 not isinstance(predicate_expr.left, Expr)
                 and isinstance(predicate_expr.left, Projection)
@@ -1682,7 +1838,8 @@ class _DNF:
                 op = flip.get(op, op)._operator_repr  # type: ignore[call-overload]
                 column = predicate_expr.right.columns[0]
                 value = predicate_expr.left
-                _filters = (column, op, value)
+                if column not in PROVENANCE_COLUMNS:
+                    _filters = (column, op, value)
 
         elif isinstance(predicate_expr, (And, Or)):
             left = cls.extract_pq_filters(pq_expr, predicate_expr.left)._filters

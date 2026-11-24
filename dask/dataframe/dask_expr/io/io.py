@@ -188,6 +188,7 @@ class FusedParquetIO(FusedIO):
         frag_filters,
         columns,
         schema,
+        provenance=None,
         **to_pandas_kwargs,
     ):
         from dask.dataframe.dask_expr.io.parquet import ReadParquetPyarrowFS
@@ -198,11 +199,14 @@ class FusedParquetIO(FusedIO):
                 filter,
                 columns,
                 schema,
+                provenance=provenance,
             )
             for frag, filter in frag_filters
         )
         table = pa.concat_tables(tables, promote_options="permissive")
-        return ReadParquetPyarrowFS._table_to_pandas(table, **to_pandas_kwargs)
+        return ReadParquetPyarrowFS._table_to_pandas(
+            table, provenance=provenance, **to_pandas_kwargs
+        )
 
     def _task(self, name: str, index: int) -> Task:  # type: ignore[override]
         expr = self.operand("_expr")
