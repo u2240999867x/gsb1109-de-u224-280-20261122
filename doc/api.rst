@@ -215,6 +215,24 @@ Data objects API
 .. autoclass:: xmlschema.DataBindingConverter
 
 
+.. _handoff-api:
+
+Handoff editing API
+===================
+
+Optional transactional editing for :class:`xmlschema.DataElement` trees. An
+editor keeps the confirmed tree untouched while a draft is open; a draft edits
+an isolated working copy and is either committed (the final composition is
+validated and then applied in place to the same confirmed objects) or
+discarded. When the editor is not used the DataElement behavior is unchanged.
+
+.. autoclass:: xmlschema.HandoffEditor
+.. autoclass:: xmlschema.HandoffDraft
+.. autoclass:: xmlschema.HandoffError
+.. autoclass:: xmlschema.HandoffValidationError
+.. autoclass:: xmlschema.HandoffChannelConflict
+
+
 .. _url-normalization-api:
 
 URL normalization API

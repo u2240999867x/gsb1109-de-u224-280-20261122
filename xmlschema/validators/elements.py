@@ -982,7 +982,7 @@ class XsdElement(XsdComponent, ParticleMixin,
         if not self.alternatives:
             xsd_type = self.type
         else:
-            xsd_type = self.get_alternative_type(element_data)
+            xsd_type = self.get_alternative_type(element_data, context.inherited)
 
         if nm.XSI_TYPE in attributes and self.schema.meta_schema is not None:
             type_name = attributes[nm.XSI_TYPE].strip()
@@ -1018,6 +1018,19 @@ class XsdElement(XsdComponent, ParticleMixin,
             raise
 
         context.level -= 1
+
+        if self.inheritable and \
+                any(name in self.inheritable for name in attributes):
+            local_inherited = {
+                k: v for k, v in attributes.items() if k in self.inheritable
+            }
+            if context.inherited:
+                inherited = raw_encode_attributes(context.inherited)
+                inherited.update(raw_encode_attributes(local_inherited))
+            else:
+                inherited = raw_encode_attributes(local_inherited)
+        else:
+            inherited = None
 
         if nm.XSI_NIL in attributes:
             xsi_nil = attributes[nm.XSI_NIL].strip()
@@ -1071,8 +1084,17 @@ class XsdElement(XsdComponent, ParticleMixin,
 
         else:
             context.level += 1
-            xsd_type.content.raw_encode(element_data, validation, context)
-            context.level -= 1
+            if inherited is not None:
+                previous_inherited = context.inherited
+                context.inherited = inherited
+            else:
+                previous_inherited = None
+            try:
+                xsd_type.content.raw_encode(element_data, validation, context)
+            finally:
+                context.level -= 1
+                if inherited is not None:
+                    context.inherited = previous_inherited
 
         if errors:
             for e in errors:

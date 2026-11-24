@@ -32,6 +32,8 @@ from .validators import (
     XMLSchemaTypeTableWarning, XMLSchemaAssertPathWarning, XsdGlobals, XMLSchemaBase,
     XMLSchema, XMLSchema10, XMLSchema11, XsdComponent, XsdType, XsdElement, XsdAttribute
 )
+from .handoff import HandoffEditor, HandoffDraft, HandoffError, \
+    HandoffValidationError, HandoffChannelConflict
 
 __version__ = '4.3.2'
 __author__ = "Davide Brunato"
@@ -48,7 +50,9 @@ __all__ = [
     'XMLResource', 'ElementPathMixin', 'ElementData', 'XMLSchemaConverter',
     'UnorderedConverter', 'ParkerConverter', 'BadgerFishConverter', 'GDataConverter',
     'AbderaConverter', 'JsonMLConverter', 'ColumnarConverter', 'DataElement',
-    'DataElementConverter', 'DataBindingConverter', 'validate', 'is_valid',
+    'DataElementConverter', 'DataBindingConverter', 'HandoffEditor', 'HandoffDraft',
+    'HandoffError', 'HandoffValidationError', 'HandoffChannelConflict',
+    'validate', 'is_valid',
     'iter_errors', 'iter_decode', 'to_dict', 'to_json', 'to_etree', 'from_json',
     'XmlDocument', 'download_schemas', 'ElementSelector', 'ElementPathSelector',
     'SchemaLoader', 'LocationSchemaLoader', 'SafeSchemaLoader',

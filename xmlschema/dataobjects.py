@@ -53,6 +53,7 @@ class DataElement(MutableSequence['DataElement']):
     xsd_element: Optional['XsdElement'] = None
     xsd_type: Optional[BaseXsdType] = None
     _encoder: Optional['XsdElement'] = None
+    _origin: Optional['DataElement'] = None
 
     def __init__(self, tag: str,
                  value: Optional[Any] = None,
@@ -139,6 +140,38 @@ class DataElement(MutableSequence['DataElement']):
                 self._encoder = self.xsd_element
 
         super().__setattr__(key, value)
+
+    def _set_schema_binding(self, xsd_element: Optional['XsdElement'],
+                            xsd_type: Optional[BaseXsdType],
+                            encoder: Optional['XsdElement'] = None) -> None:
+        """
+        Re-bind the data element to a different schema declaration/type.
+
+        This is an internal helper for transactional editors (e.g. handoff
+        drafts) that must retarget an already decoded object after it has been
+        moved in the tree. It bypasses the immutability guards of
+        :meth:`__setattr__`, so ordinary code keeps the original "bind once"
+        :class:`DataElement` behavior.
+        """
+        if xsd_element is not None and not isinstance(xsd_element, validators.XsdElement):
+            raise XMLSchemaTypeError("invalid type for argument 'xsd_element'")
+        if xsd_type is not None and not isinstance(
+                xsd_type, (validators.XsdSimpleType, validators.XsdComplexType)):
+            raise XMLSchemaTypeError("invalid type for argument 'xsd_type'")
+
+        object.__setattr__(self, 'xsd_element', xsd_element)
+        object.__setattr__(self, 'xsd_type', xsd_type)
+        if encoder is not None:
+            object.__setattr__(self, '_encoder', encoder)
+        elif xsd_element is not None:
+            object.__setattr__(self, '_encoder', xsd_element)
+        elif xsd_type is not None:
+            synthetic = xsd_type.schema.builders.create_element(
+                self.tag, xsd_type.schema, parent=xsd_type, form='unqualified'
+            )
+            synthetic.type = xsd_type
+            object.__setattr__(self, '_encoder', synthetic)
+
 
     @property
     def text(self) -> Optional[str]:
