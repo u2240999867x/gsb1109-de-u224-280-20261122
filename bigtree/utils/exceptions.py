@@ -41,6 +41,30 @@ class SearchError(TreeError):
     pass
 
 
+class BatchError(TreeError):
+    """Error during batch modification"""
+
+    pass
+
+
+class BatchValidationError(BatchError):
+    """Batch rejected by a registered read-only validator"""
+
+    pass
+
+
+class BatchCycleError(BatchError, LoopError):
+    """Batch moves a node below one of its own descendants"""
+
+    pass
+
+
+class BatchConflictError(BatchError):
+    """Batch operations resolve to conflicting sources or destinations"""
+
+    pass
+
+
 def safe_action(func: Callable[..., None]) -> Callable[..., None]:  # pragma: no cover
     """
     This is a decorator for studio which performs safe actions and raises error in notify pop-up.

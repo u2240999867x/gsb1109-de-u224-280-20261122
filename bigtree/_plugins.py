@@ -58,7 +58,7 @@ def register_dag_plugins() -> None:
 
 def register_tree_plugins() -> None:
     """Register plugin for Tree"""
-    from bigtree.tree import construct, export, helper, modify, query, search
+    from bigtree.tree import batch, construct, export, helper, modify, query, search
     from bigtree.tree.tree import Tree
     from bigtree.utils import iterators
 
@@ -116,6 +116,14 @@ def register_tree_plugins() -> None:
         "shift_nodes": modify.shift_nodes,
         "copy_nodes": modify.copy_nodes,
         "shift_and_replace_nodes": modify.shift_and_replace_nodes,
+        "swap_subtrees": batch.swap_subtrees,
+        "move_subtree": batch.move_subtree,
+        "apply_batch": batch.apply_batch,
+        # Batch methods
+        "batch": batch.batch,
+        "open_manifest": batch.open_manifest,
+        "register_validator": batch.register_validator,
+        "unregister_validator": batch.unregister_validator,
         # Query methods
         "query": query.query_tree,
         # Search methods

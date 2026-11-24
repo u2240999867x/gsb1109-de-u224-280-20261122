@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added:
 - Dos: Default doctest in github workflows and `pytest` commands.
+- Tree Modify: `TreeBatch` to resolve subtree swaps and moves against the starting layout, validate the complete
+candidate layout with read-only callbacks, and apply the batch atomically.
+- Tree Modify: `swap_subtrees`, `move_subtree`, and `apply_batch` convenience methods.
+- Tree Helper: `open_manifest` and `TreeManifest` immutable layout snapshots that keep their original paths and sibling
+order while subsequent batches commit.
+- Error: `BatchError`, `BatchValidationError`, `BatchCycleError`, and `BatchConflictError`.
 ### Fixed:
 - Stubs: Signature for tree.query.
 

@@ -16,6 +16,7 @@ from bigtree.utils import constants
 
 if TYPE_CHECKING:
     from bigtree.node import basenode, binarynode, dagnode
+    from bigtree.tree.batch import LayoutView, TreeBatch, TreeManifest
 
     BaseNodeT = TypeVar("BaseNodeT", bound=basenode.BaseNode)
     BinaryNodeT = TypeVar("BinaryNodeT", bound=binarynode.BinaryNode)
@@ -517,6 +518,32 @@ class Tree:
         skippable: bool = False,
         delete_children: bool = False,
         with_full_path: bool = False,
+    ) -> None: ...
+    def swap_subtrees(self, first: str, second: str) -> "TreeManifest": ...
+    def move_subtree(
+        self,
+        from_path: str,
+        to_parent_path: str,
+        index: int | None = None,
+    ) -> "TreeManifest": ...
+    def apply_batch(
+        self,
+        swaps: Iterable[tuple[str, str]] = ...,
+        moves: Iterable[tuple[str, str] | tuple[str, str, int]] = ...,
+        validators: Iterable[Callable[["LayoutView"], Any]] = ...,
+        sep: str | None = None,
+    ) -> "TreeManifest": ...
+    def batch(
+        self,
+        sep: str | None = None,
+        validators: Iterable[Callable[["LayoutView"], Any]] | None = None,
+    ) -> "TreeBatch": ...
+    def open_manifest(self, sep: str | None = None) -> "TreeManifest": ...
+    def register_validator(
+        self, callback: Callable[["LayoutView"], Any]
+    ) -> Callable[["LayoutView"], Any]: ...
+    def unregister_validator(
+        self, callback: Callable[["LayoutView"], Any]
     ) -> None: ...
     def query(self, query: str, debug: bool = False) -> list[BaseNodeT]: ...
     def findall(

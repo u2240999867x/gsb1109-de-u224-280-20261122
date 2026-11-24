@@ -197,6 +197,83 @@ tree_delete_children.show(rich=True, node_format_attr="colour")
 | merge_leaves + overriding/merge_attribute   | "a/b/c"                     | "a/d/c"                   | **If path not present**: Behaves like merge_leaves<br>**If path present**: Behaves like overriding/merge_attribute, but original node `c` remains                                                          |
 | delete_children                             | "a/b"                       | "a/d/b"                   | Shift/copy node `b` only without any node `b` children                                                                                                                                                     |
 
+## Batch swaps and moves
+
+`shift_nodes` shifts each pair as it goes. That is not enough when several subtrees are exchanged in one handoff and later
+paths in the same batch refer to positions that have already changed, or when a saved `Node` reference must remain
+attached to the item it originally identified.
+
+Use `TreeBatch` for a batch that is resolved against the layout at the start of the batch, validated as a whole, and
+applied atomically:
+
+```python
+from bigtree import Tree
+
+tree = Tree.from_list(
+    [
+        "站点/旧版/归档/index",
+        "站点/新版/归档/index",
+        "站点/待采/index",
+        "站点/封存/index",
+    ]
+)
+
+batch = tree.batch()
+batch.swap("站点/旧版/归档", "站点/新版/归档")
+batch.move("站点/待采", "站点", index=2)
+manifest = batch.commit()
+```
+
+Every path is resolved against the layout captured by `tree.batch()`. Swapping `站点/旧版/归档` and `站点/新版/归档`
+therefore cannot change what `站点/旧版/归档/index` means for a later operation in the same batch. Nodes keep their
+identity: a saved reference to the old `index` now lives under its new parent instead of pointing at a different node
+that happens to have the same name.
+
+### Read-only validation
+
+Register a read-only callback with `tree.register_validator(callback)` or pass `validators=[...]` to `tree.batch()`. The
+callback receives a complete `LayoutView` candidate. It can resolve paths, enumerate the full layout, or map a saved
+`Node` reference with `view()`:
+
+```python
+def reject_pending_after_sealed(layout):
+    pending = layout.resolve("站点/待采")
+    left = layout.left_sibling_of(pending)
+    return not (left is not None and left.node_name == "封存")
+
+tree.register_validator(reject_pending_after_sealed)
+```
+
+A validator returns `False` or raises to reject the batch. When it rejects, the live parent and sibling order are
+restored before `commit()` raises `BatchValidationError`. The batch cannot then be committed, and no partial swap or
+partial manifest escapes.
+
+### Manifests
+
+`tree.open_manifest()` captures an immutable complete layout. A manifest opened before a commit keeps its original
+paths and sibling order for as long as it is held, so a reader already iterating a list finishes the version it opened.
+Opening a new manifest after a successful commit sees the complete new layout.
+
+```python
+old_index = tree.node["旧版"]["归档"]["index"]
+reader = tree.open_manifest()
+tree.swap_subtrees("站点/旧版/归档", "站点/新版/归档")
+assert reader.path_of(old_index) == "/站点/旧版/归档/index"
+assert tree.open_manifest().resolve("站点/新版/归档/index") is old_index
+```
+
+`LayoutView.full_layout()`, `paths()`, `walk()`, `children_of()`, `parent_of()`, `left_sibling_of()`, and
+`right_sibling_of()` expose the complete candidate or manifest without touching the live tree.
+
+### Cycle and conflict rejection
+
+A batch that moves a subtree below one of its own descendants raises `BatchCycleError`. A swap involving a node and one
+of its own descendants is rejected the same way. If the tree changes structurally outside the batch between creation and
+commit, the commit raises `BatchConflictError` instead of silently applying the batch to a different layout.
+
+Direct node edits such as `node.parent = other` and `node.children = [...]` continue to work as before; batches and
+manifests add an opt-in atomic path for bulk handoff.
+
 ## Guideline
 
 If you're still feeling lost over the parameters, here are some guiding questions to ask yourself.
