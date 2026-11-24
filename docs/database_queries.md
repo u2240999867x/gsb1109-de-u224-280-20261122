@@ -116,6 +116,51 @@ await database.disconnect()
 Connections are managed as a task-local state, with driver implementations
 transparently using connection pooling behind the scenes.
 
+### Streaming handoff and iteration audit
+
+`Connection.iterate()` returns an `IterationStream`. It is still an async
+iterator, so existing `async for` code keeps working. It also supports an
+idempotent `close()` and a `handoff()` helper that transfers the unread part
+of the same query result to another task without re-running the query or
+acquiring a second connection.
+
+```python
+async with database.connection() as connection:
+    stream = connection.iterate(
+        "SELECT event_id FROM events WHERE region = :region ORDER BY event_id",
+        {"region": "苏州"},
+        batch_id="SZ-42",
+        consumer="A",
+    )
+
+    first = await stream.next()
+
+    # Another task continues the same stream from the next row.
+    stream.handoff("B")
+    async for row in stream:
+        ...
+
+    # Repeated closes are no-ops and do not add terminal audit events.
+    await stream.close()
+```
+
+Each stream records one audit record under its `batch_id` in
+`databases.ITERATION_AUDIT` (also exposed as `database.audit_records` and
+`connection.audit_records`):
+
+```python
+record = database.audit_records.get("SZ-42")
+record.started_count       # Number of SELECT executions (1)
+record.delivered           # {"A": 1, "B": 1}
+record.delivered_events    # Event ids actually yielded to a consumer
+record.status              # "early_closed" or "exhausted"
+```
+
+Closing a partially consumed stream records `early_closed`; reading it to the
+end records `exhausted`. Bind values are redacted from debug logs by default
+so private filters such as a batch region do not leak. Set
+`DATABASES_LOG_QUERY_ARGUMENTS=1` to opt in to logging bind values.
+
 ## Raw queries
 
 In addition to SQLAlchemy core queries, you can also perform raw SQL queries:

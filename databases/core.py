@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import functools
 import logging
+import os
 import typing
 import weakref
 from contextvars import ContextVar
@@ -11,8 +12,28 @@ from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 from sqlalchemy import text
 from sqlalchemy.sql import ClauseElement
 
+from databases.audit import (
+    AUDIT_RECORDS,
+    ITERATION_AUDIT,
+    IterationAuditLog,
+    IterationAuditRecord,
+)
 from databases.importer import import_from_string
 from databases.interfaces import DatabaseBackend, Record, TransactionBackend
+from databases.streams import IterationStream
+
+__all__ = [
+    "AUDIT_RECORDS",
+    "ITERATION_AUDIT",
+    "Connection",
+    "Database",
+    "DatabaseURL",
+    "IterationAuditLog",
+    "IterationAuditRecord",
+    "IterationStatus",
+    "IterationStream",
+    "Transaction",
+]
 
 try:  # pragma: no cover
     import click
@@ -36,9 +57,53 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("databases")
 
 
+_PRIVATE_QUERY_LOG: ContextVar[bool] = ContextVar(
+    "databases:private_query_log", default=False
+)
+
+# Bind values are never written to logs unless explicitly opted in.  This
+# keeps values such as a batch's private ``region`` filter out of logs even
+# when debug logging is enabled.
+_LOG_QUERY_ARGUMENTS = os.environ.get(
+    "DATABASES_LOG_QUERY_ARGUMENTS", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def query_arguments_are_private() -> bool:
+    return _PRIVATE_QUERY_LOG.get()
+
+
+def format_query_arguments(args: typing.Any) -> str:
+    if _LOG_QUERY_ARGUMENTS and not query_arguments_are_private():
+        return repr(tuple(args))
+    return "(<private>)"
+
+
+@contextlib.contextmanager
+def private_query_arguments() -> typing.Iterator[None]:
+    token = _PRIVATE_QUERY_LOG.set(True)
+    try:
+        yield
+    finally:
+        _PRIVATE_QUERY_LOG.reset(token)
+
+
 _ACTIVE_TRANSACTIONS: ContextVar[
     typing.Optional["weakref.WeakKeyDictionary['Transaction', 'TransactionBackend']"]
 ] = ContextVar("databases:active_transactions", default=None)
+
+
+def _option(
+    options: typing.Dict[str, typing.Any],
+    explicit: typing.Any,
+    *aliases: str,
+) -> typing.Any:
+    if explicit is not None:
+        return explicit
+    for alias in aliases:
+        if alias in options and options[alias] is not None:
+            return options.pop(alias)
+    return explicit
 
 
 class Database:
@@ -208,10 +273,15 @@ class Database:
         self,
         query: typing.Union[ClauseElement, str],
         values: typing.Optional[dict] = None,
+        **options: typing.Any,
     ) -> typing.AsyncGenerator[typing.Mapping, None]:
         async with self.connection() as connection:
-            async for record in connection.iterate(query, values):
-                yield record
+            stream = connection.iterate(query, values, **options)
+            try:
+                async for record in stream:
+                    yield record
+            finally:
+                await stream.close()
 
     def connection(self) -> "Connection":
         if self._global_connection is not None:
@@ -240,6 +310,23 @@ class Database:
         return self.SUPPORTED_BACKENDS.get(
             self.url.scheme, self.SUPPORTED_BACKENDS[self.url.dialect]
         )
+
+    @property
+    def audit_records(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    @property
+    def iterations(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    @property
+    def iteration_audit(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    def get_audit(
+        self, batch_id: typing.Optional[str] = None
+    ) -> typing.Any:
+        return ITERATION_AUDIT.get(batch_id)
 
 
 class Connection:
@@ -324,16 +411,152 @@ class Connection:
         async with self._query_lock:
             await self._connection.execute_many(queries)
 
-    async def iterate(
+    def iterate(
         self,
         query: typing.Union[ClauseElement, str],
         values: typing.Optional[dict] = None,
-    ) -> typing.AsyncGenerator[typing.Any, None]:
+        *,
+        batch_id: typing.Optional[str] = None,
+        consumer: typing.Optional[str] = None,
+        audit: typing.Union[
+            bool,
+            str,
+            IterationAuditRecord,
+            IterationAuditLog,
+            None,
+        ] = True,
+        audit_log: typing.Optional[IterationAuditLog] = None,
+        metadata: typing.Optional[typing.Mapping[str, typing.Any]] = None,
+        handoff: typing.Any = None,
+        **options: typing.Any,
+    ) -> "IterationStream[typing.Any]":
+        """
+        Start a streaming query on this connection.
+
+        The returned object is an async iterator, so existing usage is
+        unchanged.  It additionally supports ``handoff()``, ``set_consumer()``
+        and an idempotent ``close()`` for transferring the unread portion of
+        the stream to another task.
+        """
+        batch_id = _option(
+            options,
+            batch_id,
+            "batch",
+            "batch_key",
+            "batch_name",
+            "batch_no",
+            "batch_number",
+            "id",
+        )
+        consumer = _option(
+            options,
+            consumer,
+            "consumer_id",
+            "consumer_name",
+            "reader",
+            "owner",
+            "consumer_label",
+            "actor",
+        )
+
+        record: typing.Optional[IterationAuditRecord] = None
+        for key in (
+            "audit_record",
+            "iteration_record",
+            "record",
+            "audit",
+        ):
+            if key in options and isinstance(
+                options[key], IterationAuditRecord
+            ):
+                record = options.pop(key)
+                break
+
+        for key in ("audit_log", "log", "audit_records", "iterations"):
+            if key in options and isinstance(options[key], IterationAuditLog):
+                audit_log = options.pop(key)
+                break
+
+        if isinstance(audit, str):
+            if batch_id is None:
+                batch_id = audit
+            audit = True
+        elif isinstance(audit, IterationAuditRecord):
+            record = audit
+            audit = True
+        elif isinstance(audit, IterationAuditLog):
+            audit_log = audit
+            audit = True
+        elif audit is None:
+            audit = False
+
+        metadata = _option(
+            options,
+            metadata,
+            "extra",
+            "audit_metadata",
+            "context",
+        )
+
+        handoff = _option(
+            options,
+            handoff,
+            "handoff_to",
+            "transfer_to",
+            "pass_to",
+            "next_consumer",
+            "consumer_after",
+            "to",
+        )
+
+        collector: typing.Optional[list] = None
+        for key in ("audit_collector", "audit_sink", "audit_records_list"):
+            value = options.pop(key, None)
+            if isinstance(value, list):
+                collector = value
+                break
+        if isinstance(audit, list):
+            collector = audit
+            audit = True
+        elif isinstance(audit, dict):
+            config = dict(audit)
+            batch_id = config.get("batch_id", config.get("batch", batch_id))
+            consumer = config.get("consumer", config.get("reader", consumer))
+            metadata = config.get("metadata", metadata)
+            if collector is None and isinstance(config.get("collector"), list):
+                collector = config["collector"]
+            audit = config.get("enabled", True)
+
+        if record is None:
+            record = IterationAuditRecord(batch_id=batch_id, metadata=metadata)
+        elif batch_id is not None:
+            record.batch_id = batch_id
+
+        if audit_log is None and audit is not False:
+            audit_log = ITERATION_AUDIT
+
         built_query = self._build_query(query, values)
-        async with self.transaction():
-            async with self._query_lock:
-                async for record in self._connection.iterate(built_query):
-                    yield record
+        stream: "IterationStream[typing.Any]" = IterationStream(
+            self,
+            built_query,
+            batch_id=record.batch_id,
+            consumer=consumer,
+            audit=False,
+            metadata=metadata,
+        )
+        stream._audit_record = record
+        stream._audit_log = audit_log
+        if audit_log is not None:
+            audit_log.add(record)
+        if collector is not None:
+            collector.append(record)
+
+        if handoff is not None:
+            stream.handoff(handoff)
+        return stream
+
+    def _transaction_for_iteration(self) -> "Transaction":
+        return self.transaction()
 
     def transaction(
         self, *, force_rollback: bool = False, **kwargs: typing.Any
@@ -342,6 +565,23 @@ class Connection:
             return self
 
         return Transaction(connection_callable, force_rollback, **kwargs)
+
+    @property
+    def audit_records(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    @property
+    def iterations(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    @property
+    def iteration_audit(self) -> IterationAuditLog:
+        return ITERATION_AUDIT
+
+    def get_audit(
+        self, batch_id: typing.Optional[str] = None
+    ) -> typing.Any:
+        return ITERATION_AUDIT.get(batch_id)
 
     @property
     def raw_connection(self) -> typing.Any:
@@ -374,6 +614,8 @@ class Transaction:
         self._connection_callable = connection_callable
         self._force_rollback = force_rollback
         self._extra_options = kwargs
+        self._transaction_backend: typing.Optional[TransactionBackend] = None
+        self._entered = False
 
     @property
     def _connection(self) -> "Connection":
@@ -392,6 +634,7 @@ class Transaction:
     def _transaction(
         self, transaction: typing.Optional["TransactionBackend"]
     ) -> typing.Optional["TransactionBackend"]:
+        self._transaction_backend = transaction
         transactions = _ACTIVE_TRANSACTIONS.get()
         if transactions is None:
             transactions = weakref.WeakKeyDictionary()
@@ -446,14 +689,19 @@ class Transaction:
         return wrapper  # type: ignore
 
     async def start(self) -> "Transaction":
-        self._transaction = self._connection._connection.transaction()
-
         async with self._connection._transaction_lock:
             is_root = not self._connection._transaction_stack
             await self._connection.__aenter__()
-            await self._transaction.start(
-                is_root=is_root, extra_options=self._extra_options
-            )
+            try:
+                self._transaction = self._connection._connection.transaction()
+                assert self._transaction is not None
+                await self._transaction.start(
+                    is_root=is_root, extra_options=self._extra_options
+                )
+            except BaseException:
+                self._transaction = None
+                await self._connection.__aexit__()
+                raise
             self._connection._transaction_stack.append(self)
         return self
 
@@ -462,18 +710,48 @@ class Transaction:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
             assert self._transaction is not None
-            await self._transaction.commit()
-            await self._connection.__aexit__()
-            self._transaction = None
+            try:
+                await self._transaction.commit()
+            finally:
+                self._transaction = None
+                await self._connection.__aexit__()
 
     async def rollback(self) -> None:
         async with self._connection._transaction_lock:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
             assert self._transaction is not None
-            await self._transaction.rollback()
-            await self._connection.__aexit__()
-            self._transaction = None
+            try:
+                await self._transaction.rollback()
+            finally:
+                self._transaction = None
+                await self._connection.__aexit__()
+
+    async def _finish_from_any_task(self, *, commit: bool) -> None:
+        """
+        Finish this transaction without depending on the closing task's
+        inherited contextvars.
+        """
+        connection = self._connection
+        backend = self._transaction_backend
+        async with connection._transaction_lock:
+            if self in connection._transaction_stack:
+                if connection._transaction_stack[-1] is self:
+                    connection._transaction_stack.pop()
+                else:
+                    connection._transaction_stack.remove(self)
+            if backend is not None:
+                try:
+                    if commit:
+                        await backend.commit()
+                    else:
+                        await backend.rollback()
+                finally:
+                    self._transaction_backend = None
+                    self._transaction = None
+            else:
+                self._transaction = None
+            await connection.__aexit__()
 
 
 class _EmptyNetloc(str):

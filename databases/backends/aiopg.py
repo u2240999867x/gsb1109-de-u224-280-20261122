@@ -14,7 +14,11 @@ from sqlalchemy.sql.ddl import DDLElement
 from databases.backends.common.records import Record, Row, create_column_maps
 from databases.backends.compilers.psycopg import PGCompiler_psycopg
 from databases.backends.dialects.psycopg import PGDialect_psycopg
-from databases.core import LOG_EXTRA, DatabaseURL
+from databases.core import (
+    LOG_EXTRA,
+    DatabaseURL,
+    format_query_arguments,
+)
 from databases.interfaces import (
     ConnectionBackend,
     DatabaseBackend,
@@ -245,7 +249,10 @@ class AiopgConnection(ConnectionBackend):
 
         query_message = compiled_query.replace(" \n", " ").replace("\n", " ")
         logger.debug(
-            "Query: %s Args: %s", query_message, repr(tuple(args)), extra=LOG_EXTRA
+            "Query: %s Args: %s",
+            query_message,
+            format_query_arguments(args),
+            extra=LOG_EXTRA,
         )
         return compiled.string, args, result_map, CompilationContext(execution_context)
 
