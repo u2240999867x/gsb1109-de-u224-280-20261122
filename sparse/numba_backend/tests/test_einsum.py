@@ -202,3 +202,124 @@ def test_einsum_dtype(dtype):
     result = sparse.einsum("ij,i->j", x, y, dtype=dtype)
 
     assert result.dtype == dtype
+
+
+def _index_selectors(n, entries, rng):
+    """Build distinct sparse matrices with exactly ``entries`` stored values."""
+    flat = rng.choice(n * n, size=entries, replace=False)
+    coords = np.stack(np.unravel_index(flat, (n, n)))
+    return coords, rng.random(entries)
+
+
+def _budget_case_inputs(rng, n=60, entries=2 * 60):
+    coords_a, data_a = _index_selectors(n, entries, rng)
+    coords_b, data_b = _index_selectors(n, entries, rng)
+    coords_c, data_c = _index_selectors(n, entries, rng)
+    sites = sparse.COO(coords_a, data_a, shape=(n, n))
+    rules = sparse.COO(coords_b, data_b, shape=(n, n))
+    models = sparse.COO(coords_c, data_c, shape=(n, n))
+
+    diag = np.arange(4)
+    small_block = sparse.COO(np.stack([diag, diag]), np.ones(4), shape=(n, n))
+
+    legal = np.sort(rng.choice(n, size=4, replace=False))
+    few_combos = sparse.COO(np.stack([legal, legal]), np.ones(4), shape=(n, n))
+    return sites, rules, models, small_block, few_combos
+
+
+def _reference_chain(sites, rules, models, eligibility):
+    dense = [array.todense() for array in (sites, rules, models)]
+    eligibility = np.diag(np.diag(eligibility.todense()))
+    return dense[0] @ dense[1] @ dense[2] @ eligibility @ np.ones_like(eligibility[:, 0])
+
+
+@pytest.mark.parametrize("which", ["diagonal_block", "few_legal_combinations"])
+def test_einsum_temp_budget_matches_reference(which, rng):
+    sites, rules, models, small_block, few_combos = _budget_case_inputs(rng)
+    eligibility = small_block if which == "diagonal_block" else few_combos
+    assert sites.nnz == rules.nnz == models.nnz
+    assert small_block.shape == few_combos.shape
+    assert small_block.nnz == few_combos.nnz
+
+    expected = _reference_chain(sites, rules, models, eligibility)
+    result = sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, eligibility, temp_elements=10_000)
+    assert np.allclose(result.todense(), expected)
+
+
+@pytest.mark.parametrize("which", ["diagonal_block", "few_legal_combinations"])
+def test_einsum_temp_budget_order_invariance(which, rng):
+    sites, rules, models, small_block, few_combos = _budget_case_inputs(rng)
+    eligibility = small_block if which == "diagonal_block" else few_combos
+
+    forward = sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, eligibility, temp_elements=10_000)
+    reversed_ = sparse.einsum("ll,kl,jk,ij->i", eligibility, models, rules, sites, temp_elements=10_000)
+    expected = _reference_chain(sites, rules, models, eligibility)
+    assert np.allclose(forward.todense(), expected)
+    assert np.allclose(reversed_.todense(), expected)
+
+
+def test_einsum_temp_budget_avoids_full_outer_product(rng, monkeypatch):
+    sites, rules, models, small_block, _ = _budget_case_inputs(rng, n=40, entries=80)
+
+    import sparse.numba_backend._common as common
+
+    def fail_outer(*args, **kwargs):
+        raise AssertionError("the ijkl outer product must not be materialised")
+
+    # The original path multiplies all aligned operands at once via `mul`.
+    monkeypatch.setattr(common, "mul", fail_outer)
+    result = sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, small_block, temp_elements=100)
+    assert result.shape == (40,)
+
+
+def test_einsum_temp_budget_reports_infeasible_contraction(rng):
+    sites, rules, models, small_block, _ = _budget_case_inputs(rng, n=40, entries=80)
+    with pytest.raises(sparse.EinsumBudgetError) as excinfo:
+        sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, small_block, temp_elements=1)
+
+    message = str(excinfo.value)
+    assert "ij,jk,kl,ll->i" in message
+    assert "contraction" in message
+    assert "over budget" in message
+    assert isinstance(excinfo.value, MemoryError)
+
+
+def test_einsum_temp_budget_sees_sparsity_difference(rng):
+    from sparse.numba_backend._common import _pair_candidates, _prepare_einsum_factors
+
+    sites, rules, models, small_block, few_combos = _budget_case_inputs(rng, n=30, entries=30)
+    estimates = []
+    for eligibility in (small_block, few_combos):
+        factors, sizes = _prepare_einsum_factors(["ij", "jk", "kl", "ll"], "i", [sites, rules, models, eligibility])
+        estimates.append([candidate[0] for candidate in _pair_candidates(factors, "i", sizes)])
+    assert estimates[0] != estimates[1]
+
+
+def test_einsum_temp_budget_validation():
+    x = sparse.random((2, 2), density=0.5)
+    y = sparse.random((2, 2), density=0.5)
+    with pytest.raises(TypeError):
+        sparse.einsum("ij,jk->ik", x, y, temp_elements=-1.5)
+    with pytest.raises(ValueError):
+        sparse.einsum("ij,jk->ik", x, y, temp_elements=-1)
+    with pytest.raises(TypeError):
+        sparse.einsum("ij,jk->ik", x, y, temp_elements=True)
+    with pytest.raises(ValueError):
+        sparse.einsum("ij,jk->ik", x, y, temp_elements=3, max_temp_elements=4)
+
+
+@pytest.mark.parametrize("optimize", [True, "greedy", "auto", "optimal", None])
+def test_einsum_optimize_matches_reference(optimize, rng):
+    sites, rules, models, small_block, _ = _budget_case_inputs(rng)
+    expected = _reference_chain(sites, rules, models, small_block)
+    result = sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, small_block, optimize=optimize)
+    assert np.allclose(result.todense(), expected)
+
+
+def test_einsum_optimize_validation():
+    x = sparse.random((2, 2), density=0.5)
+    y = sparse.random((2, 2), density=0.5)
+    with pytest.raises(ValueError):
+        sparse.einsum("ij,jk->ik", x, y, optimize="unknown")
+    with pytest.raises(TypeError):
+        sparse.einsum("ij,jk->ik", x, y, optimize=1.5)

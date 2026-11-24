@@ -83,6 +83,7 @@ from numpy import power as pow
 from numpy import right_shift as bitwise_right_shift
 
 from ._common import (
+    EinsumBudgetError,
     SparseArray,
     abs,
     all,
@@ -179,6 +180,7 @@ from ._utils import random
 __all__ = [
     "COO",
     "DOK",
+    "EinsumBudgetError",
     "GCXS",
     "SparseArray",
     "abs",

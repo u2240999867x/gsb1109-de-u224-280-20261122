@@ -310,3 +310,38 @@ You can view the full list on the [API reference page](../../api/).
     Some operations require zero fill-values (such as [`sparse.COO.nonzero`][])
     and others (such as [`sparse.concatenate`][]) require that all inputs have consistent fill-values.
     For details, check the API reference.
+
+### Einsum with a Temporary-Element Budget
+
+[`sparse.einsum`][] normally aligns all operands and multiplies them into a
+single outer product before reducing.  For expressions with many shared
+indices (for example `"ij,jk,kl,ll->i"` over large dimensions) that outer
+product can be several orders of magnitude larger than the inputs and result.
+
+Passing `temp_elements` selects a pairwise contraction planner instead:
+
+```python
+result = sparse.einsum("ij,jk,kl,ll->i", sites, rules, models, eligibility, temp_elements=100_000)
+```
+
+The planner inspects the actual stored entries of each candidate pair, so two
+inputs with the same shapes and the same number of stored entries but different
+sparsity patterns receive different plans.  Each pairwise contraction joins
+only matching stored entries, in chunks bounded by the budget, so the large
+`ijkl`-style intermediate is never materialised.  Contractions such as
+`"ll->l"` (a trace) and axes private to one operand are reduced on the operand
+before any product is formed.
+
+If no pairwise order keeps every intermediate within the budget,
+[`sparse.EinsumBudgetError`][] is raised before allocating anything large.  The
+error names the contraction that cannot be completed and how far it exceeds
+the budget.  It subclasses both [`ValueError`][] and [`MemoryError`][].
+
+The same budget is also accepted under the aliases `max_temp_elements`,
+`temporary_elements`, `max_intermediate_elements`, `element_budget`,
+`memory_limit` and `budget`.
+
+Without a budget, passing `optimize=True` (or `"greedy"`/`"auto"`/`"optimal"`)
+still selects the same pairwise planner, using the estimated smallest
+intermediate at each step.  The default remains the original single-product
+algorithm for backward compatibility.

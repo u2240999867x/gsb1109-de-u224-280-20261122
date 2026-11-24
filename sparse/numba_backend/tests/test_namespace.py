@@ -7,6 +7,7 @@ def test_namespace():
     all_set = {
         "COO",
         "DOK",
+        "EinsumBudgetError",
         "GCXS",
         "SparseArray",
         "abs",

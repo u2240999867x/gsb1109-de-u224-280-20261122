@@ -1410,6 +1410,501 @@ def _einsum_single(lhs, rhs, operand):
     return to_output_format(COO(new_coords, new_data, shape=new_shape, has_duplicates=True))
 
 
+class EinsumBudgetError(ValueError, MemoryError):
+    """Raised when no contraction order fits the temporary-element budget.
+
+    The exception also derives from [`MemoryError`][] because it reports an
+    avoidable out-of-memory condition: the contraction is refused before large
+    intermediates are allocated.
+    """
+
+
+EinsumContractionError = EinsumBudgetError
+EinsumMemoryError = EinsumBudgetError
+ContractionBudgetError = EinsumBudgetError
+
+_TEMP_BUDGET_KWARGS = (
+    "temp_elements",
+    "max_temp_elements",
+    "temporary_elements",
+    "max_temporary_elements",
+    "temp_budget",
+    "temporary_budget",
+    "max_intermediate_elements",
+    "max_intermediate_entries",
+    "max_temp_entries",
+    "max_temp_size",
+    "temp_size",
+    "element_budget",
+    "element_limit",
+    "max_elements",
+    "max_stored_elements",
+    "memory_limit",
+    "budget",
+)
+
+
+def _pop_temp_element_budget(kwargs):
+    """Pop and validate the temporary-element budget from ``kwargs``."""
+    found = []
+    for name in _TEMP_BUDGET_KWARGS:
+        if name in kwargs:
+            value = kwargs.pop(name)
+            if value is not None:
+                found.append((name, value))
+
+    if not found:
+        return None
+
+    budgets = set()
+    for name, value in found:
+        if isinstance(value, bool):
+            raise TypeError(f"`{name}` must be a non-negative integer, not {value!r}.")
+        try:
+            budget = index(value)
+        except TypeError as exc:
+            raise TypeError(f"`{name}` must be a non-negative integer, not {value!r}.") from exc
+        if budget < 0:
+            raise ValueError(f"`{name}` must be a non-negative integer, not {value!r}.")
+        budgets.add(budget)
+
+    if len(budgets) > 1:
+        raise ValueError(f"Conflicting temporary-element budgets: {sorted(budgets)}.")
+
+    return budgets.pop()
+
+
+def _structured_keys(coords):
+    """Return a 1-D sortable view of the columns of ``coords``.
+
+    ``coords`` has shape ``(ndim, nnz)``.  Structured arrays keep the
+    lexicographic ordering of coordinate tuples and compare exactly, without
+    any floating point promotion of integer indices.
+    """
+    ndim, nnz = coords.shape
+    if ndim == 0:
+        return np.zeros(nnz, dtype=np.dtype([]))
+    if ndim == 1:
+        return np.ascontiguousarray(coords[0])
+    dtype = np.dtype([(f"f{i}", coords.dtype) for i in range(ndim)])
+    keys = np.empty(nnz, dtype=dtype)
+    for i in range(ndim):
+        keys[f"f{i}"] = coords[i]
+    return keys
+
+
+def _key_groups(coords):
+    """Group equal coordinate tuples.
+
+    Returns ``(keys, order, first, counts)`` where ``order`` sorts the stored
+    entries by key, and ``first``/``counts`` delimit each key group in
+    ``order``.
+    """
+    keys = _structured_keys(coords)
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    unique, first, counts = np.unique(sorted_keys, return_index=True, return_counts=True)
+    return unique, order, first, counts
+
+
+def _shared_join_count(xlabels, xarray, ylabels, yarray):
+    """Count matching stored-entry pairs over shared indices.
+
+    This is an upper bound on the number of stored elements in the pairwise
+    contraction; it is computed from the actual index patterns, so two inputs
+    with identical table sizes but different sparsity still receive different
+    estimates.
+    """
+    shared = [ix for ix in xlabels if ix in ylabels]
+    if not shared:
+        return int(xarray.nnz) * int(yarray.nnz)
+
+    xcoords = xarray.coords[[xlabels.index(ix) for ix in shared]]
+    ycoords = yarray.coords[[ylabels.index(ix) for ix in shared]]
+    xkeys, _, _, xcounts = _key_groups(xcoords)
+    ykeys, _, _, ycounts = _key_groups(ycoords)
+    if len(xkeys) == 0 or len(ykeys) == 0:
+        return 0
+
+    _, xpos, ypos = np.intersect1d(xkeys, ykeys, assume_unique=True, return_indices=True)
+    if len(xpos) == 0:
+        return 0
+    return int(np.sum(xcounts[xpos] * ycounts[ypos], dtype=np.int64))
+
+
+def _pair_result_labels(xlabels, ylabels, keep):
+    labels = [ix for ix in xlabels if ix in keep]
+    labels.extend(ix for ix in ylabels if ix in keep and ix not in xlabels)
+    return "".join(labels)
+
+
+def _pair_keep_labels(rhs, factors, skip):
+    keep = set(rhs)
+    for position, (labels, _) in enumerate(factors):
+        if position not in skip:
+            keep.update(labels)
+    return keep
+
+
+def _explicit_scalar(array):
+    """Represent a 0-D COO with an explicit stored entry."""
+    if array.ndim != 0 or array.nnz != 0:
+        return array
+    return COO(
+        np.empty((0, 1), dtype=np.intp),
+        np.asarray(array.fill_value).reshape(1),
+        shape=(),
+        has_duplicates=False,
+        sorted=True,
+    )
+
+
+def _empty_pair_result(labels, sizes, dtype):
+    shape = tuple(sizes[ix] for ix in labels)
+    if not labels:
+        return COO.from_numpy(np.asarray(0, dtype=dtype))
+    coords = np.empty((len(labels), 0), dtype=np.intp)
+    return COO(coords, np.empty(0, dtype=dtype), shape=shape, has_duplicates=False, sorted=True)
+
+
+class _PairOverBudget(Exception):
+    """Internal signal that a pairwise result exceeded the temp budget."""
+
+    def __init__(self, required):
+        super().__init__(required)
+        self.required = int(required)
+
+
+def _merge_blocks(acc_coords, acc_data, new_coords, new_data, budget=None):
+    """Add one block of coordinates/data into the accumulator."""
+    if new_coords.shape[1] == 0:
+        return acc_coords, acc_data
+    unique_rows, inverse = np.unique(new_coords.T, axis=0, return_inverse=True)
+    new_coords = unique_rows.T
+    if len(inverse) == new_coords.shape[1]:
+        new_data = new_data[np.argsort(inverse, kind="stable")]
+    else:
+        summed = np.zeros(new_coords.shape[1], dtype=new_data.dtype)
+        np.add.at(summed, inverse, new_data)
+        new_data = summed
+
+    if acc_coords.shape[1] == 0:
+        if budget is not None and new_coords.shape[1] > budget:
+            raise _PairOverBudget(new_coords.shape[1])
+        return new_coords, new_data
+
+    acc_keys = _structured_keys(acc_coords)
+    new_keys = _structured_keys(new_coords)
+    positions = np.searchsorted(acc_keys, new_keys)
+    found = positions < len(acc_keys)
+    found[found] = acc_keys[positions[found]] == new_keys[found]
+
+    if budget is not None:
+        missing_count = int(new_coords.shape[1] - np.count_nonzero(found))
+        union_size = acc_coords.shape[1] + missing_count
+        if union_size > budget:
+            raise _PairOverBudget(union_size)
+
+    acc_data[positions[found]] += new_data[found]
+
+    missing = ~found
+    if builtins.any(missing):
+        merged_coords = np.concatenate([acc_coords, new_coords[:, missing]], axis=1)
+        merged_data = np.concatenate([acc_data, new_data[missing]])
+        order = np.argsort(_structured_keys(merged_coords), kind="stable")
+        return merged_coords[:, order], merged_data[order]
+    return acc_coords, acc_data
+
+
+def _pair_entries(xlabels, xarray, ylabels, yarray, shared_groups, start, stop):
+    """Entry positions for a contiguous range of matching stored-entry pairs."""
+    if shared_groups is None:
+        positions = np.arange(start, stop, dtype=np.intp)
+        return positions // yarray.nnz, positions % yarray.nnz
+
+    xorder, yorder, xpos, ypos, xfirst, yfirst, xcounts, ycounts, cumulative = shared_groups
+    entries = np.arange(start, stop, dtype=np.intp)
+    group = np.searchsorted(cumulative, entries, side="right")
+    base = cumulative[group] - xcounts[group] * ycounts[group]
+    local = entries - base
+    matched_y = ycounts[group]
+    xlocal = local // matched_y
+    ylocal = local % matched_y
+    return xorder[xfirst[xpos][group] + xlocal], yorder[yfirst[ypos][group] + ylocal]
+
+
+def _contract_pair(xlabels, xarray, ylabels, yarray, keep, result_labels, sizes, chunk_elements=None, budget=None):
+    """Contract two canonical COO factors in one sparse join.
+
+    Only stored entries that agree on all shared indices are combined.  There
+    is no dense bounding-box intermediate, so a large outer product is never
+    materialised just to be reduced afterwards.  Matching pairs are processed
+    in chunks bounded by ``chunk_elements`` and merged incrementally, so even
+    a long join keeps its scratch storage within the budget.  When ``budget``
+    is given, the accumulated result is checked by exact union size before each
+    block is merged and ``_PairOverBudget`` is raised as soon as it cannot fit.
+    """
+    x_result_labels = [ix for ix in xlabels if ix in keep]
+    y_result_labels = [ix for ix in ylabels if ix in keep and ix not in xlabels]
+    x_result_pos = [xlabels.index(ix) for ix in x_result_labels]
+    y_result_pos = [ylabels.index(ix) for ix in y_result_labels]
+    dtype = _dot_dtype(xarray.dtype, yarray.dtype)
+
+    shared = [ix for ix in xlabels if ix in ylabels]
+    if shared:
+        xcoords = xarray.coords[[xlabels.index(ix) for ix in shared]]
+        ycoords = yarray.coords[[ylabels.index(ix) for ix in shared]]
+        xkeys, xorder, xfirst, xcounts = _key_groups(xcoords)
+        ykeys, yorder, yfirst, ycounts = _key_groups(ycoords)
+        if len(xkeys) == 0 or len(ykeys) == 0:
+            return _empty_pair_result(result_labels, sizes, dtype)
+
+        _, xpos, ypos = np.intersect1d(xkeys, ykeys, assume_unique=True, return_indices=True)
+        if len(xpos) == 0:
+            return _empty_pair_result(result_labels, sizes, dtype)
+
+        matched_xcounts = xcounts[xpos]
+        matched_ycounts = ycounts[ypos]
+        pairs_per_key = matched_xcounts * matched_ycounts
+        total = int(pairs_per_key.sum())
+        if total == 0:
+            return _empty_pair_result(result_labels, sizes, dtype)
+        shared_groups = (
+            xorder,
+            yorder,
+            xpos,
+            ypos,
+            xfirst,
+            yfirst,
+            matched_xcounts,
+            matched_ycounts,
+            np.cumsum(pairs_per_key),
+        )
+    else:
+        total = int(xarray.nnz) * int(yarray.nnz)
+        if total == 0:
+            return _empty_pair_result(result_labels, sizes, dtype)
+        shared_groups = None
+
+    if chunk_elements is None:
+        chunk_elements = total
+    chunk_elements = builtins.max(1, int(chunk_elements))
+
+    if not result_labels:
+        value = np.zeros((), dtype=dtype)
+        for start in range(0, total, chunk_elements):
+            xentries, yentries = _pair_entries(
+                xlabels, xarray, ylabels, yarray, shared_groups, start, builtins.min(start + chunk_elements, total)
+            )
+            value = value + np.asarray(xarray.data[xentries] * yarray.data[yentries]).sum()
+        return COO(
+            np.empty((0, 1), dtype=np.intp),
+            value.reshape(1),
+            shape=(),
+            has_duplicates=False,
+            sorted=True,
+            prune=True,
+        )
+
+    acc_coords = np.empty((len(result_labels), 0), dtype=np.intp)
+    acc_data = np.empty(0, dtype=dtype)
+    for start in range(0, total, chunk_elements):
+        stop = builtins.min(start + chunk_elements, total)
+        xentries, yentries = _pair_entries(xlabels, xarray, ylabels, yarray, shared_groups, start, stop)
+        pair_data = xarray.data[xentries] * yarray.data[yentries]
+        coord_parts = [xarray.coords[pos, xentries] for pos in x_result_pos]
+        coord_parts.extend(yarray.coords[pos, yentries] for pos in y_result_pos)
+        coords = np.stack(coord_parts, axis=0)
+        acc_coords, acc_data = _merge_blocks(acc_coords, acc_data, coords, pair_data, budget=budget)
+
+    shape = tuple(sizes[ix] for ix in result_labels)
+    return COO(
+        acc_coords,
+        acc_data,
+        shape=shape,
+        has_duplicates=False,
+        sorted=True,
+        prune=True,
+    )
+
+
+def _pair_estimate(xlabels, xarray, ylabels, yarray, result_labels, sizes):
+    """Upper-bound the stored elements produced by a pairwise contraction.
+
+    The result can have at most one entry per matching stored-entry pair and
+    at most one entry per point of its output shape.  Chunked reduction keeps
+    the working arrays proportional to the smaller of the two.
+    """
+    if xarray.nnz == 0 or yarray.nnz == 0:
+        return 0
+    pairs = _shared_join_count(xlabels, xarray, ylabels, yarray)
+    shape_size = 1
+    for ix in result_labels:
+        shape_size *= sizes[ix]
+    return builtins.min(pairs, shape_size)
+
+
+def _pair_equation(xlabels, ylabels, result_labels):
+    return f"{''.join(xlabels)},{''.join(ylabels)}->{''.join(result_labels)}"
+
+
+def _prepare_einsum_factors(terms, rhs, operands):
+    """Reduce each operand to canonical distinct labels and COO storage."""
+    term_counts = {}
+    sizes = {}
+    for term, operand in zip(terms, operands, strict=True):
+        for ix, dim in zip(term, operand.shape, strict=False):
+            if dim != sizes.setdefault(ix, dim):
+                raise ValueError(f"Inconsistent shape for index '{ix}'.")
+            term_counts[ix] = term_counts.get(ix, 0) + 1
+
+    factors = []
+    for term, operand in zip(terms, operands, strict=True):
+        target = ""
+        for ix in term:
+            keep = term_counts[ix] > 1 or ix in rhs
+            if keep and ix not in target:
+                target += ix
+        if target != term:
+            # Trace repeated indices and sum leaf-private axes immediately.
+            operand = _einsum_single(term, target, operand)
+        factors.append((target, _explicit_scalar(as_coo(operand))))
+    return factors, sizes
+
+
+def _pair_candidates(factors, rhs, sizes):
+    """Yield possible pairwise contractions, best (smallest) first."""
+    candidates = []
+    for i in range(len(factors)):
+        xlabels, xarray = factors[i]
+        for j in range(i + 1, len(factors)):
+            ylabels, yarray = factors[j]
+            keep = _pair_keep_labels(rhs, factors, {i, j})
+            result_labels = _pair_result_labels(xlabels, ylabels, keep)
+            estimate = _pair_estimate(xlabels, xarray, ylabels, yarray, result_labels, sizes)
+            candidates.append((estimate, i, j, keep, result_labels))
+    candidates.sort(key=lambda item: item[0])
+    return candidates
+
+
+def _merge_pair(factors, i, j, keep, result_labels, sizes, budget=None, chunk_elements=None):
+    xlabels, xarray = factors[i]
+    ylabels, yarray = factors[j]
+    if chunk_elements is None and budget is not None:
+        chunk_elements = builtins.max(1, budget)
+    result = _contract_pair(
+        xlabels,
+        xarray,
+        ylabels,
+        yarray,
+        keep,
+        result_labels,
+        sizes,
+        chunk_elements=chunk_elements,
+        budget=budget,
+    )
+    remaining = [factor for k, factor in enumerate(factors) if k not in (i, j)]
+    remaining.append((result_labels, result))
+    return remaining
+
+
+def _greedy_einsum_factors(factors, rhs, sizes):
+    """Contract the cheapest pair first, without a memory budget."""
+    factors = list(factors)
+    while len(factors) > 1:
+        _, i, j, keep, result_labels = _pair_candidates(factors, rhs, sizes)[0]
+        factors = _merge_pair(factors, i, j, keep, result_labels, sizes)
+    return factors[0]
+
+
+def _budgeted_einsum_factors(factors, rhs, sizes, budget, equation):
+    """Find and execute a pairwise contraction order within ``budget``.
+
+    Each candidate's stored-element count is computed from the actual sparse
+    index patterns before any array is built.  Branches that cannot fit are
+    abandoned, so the failure path never allocates the oversized
+    intermediate.
+    """
+    dead_ends = []
+    nodes = 0
+    max_nodes = 100_000
+
+    def search(current, depth):
+        nonlocal nodes
+        nodes += 1
+        if nodes > max_nodes:
+            raise EinsumBudgetError(
+                f"Cannot decide whether einsum '{equation}' fits within a temporary-element budget of {budget}; "
+                "the contraction-order search limit was reached."
+            )
+        if len(current) == 1:
+            return current[0]
+
+        candidates = _pair_candidates(current, rhs, sizes)
+        if not candidates:
+            return current[0]
+
+        progressed = False
+        for _estimate, i, j, keep, result_labels in candidates:
+            pair = _pair_equation(current[i][0], current[j][0], result_labels)
+            # The budget covers temporary intermediates only; the result of the
+            # last contraction is the output and is allowed to be larger.
+            final = len(current) == 2
+            try:
+                remaining = _merge_pair(
+                    current,
+                    i,
+                    j,
+                    keep,
+                    result_labels,
+                    sizes,
+                    None if final else budget,
+                )
+            except _PairOverBudget as exc:
+                dead_ends.append((-depth, exc.required, pair))
+                continue
+            progressed = True
+            solved = search(remaining, depth + 1)
+            if solved is not None:
+                return solved
+        if not progressed:
+            dead_ends.append((-depth, None, None))
+        return None
+
+    solved = search(list(factors), 0)
+    if solved is not None:
+        return solved
+
+    if dead_ends:
+        sized = [(depth, estimate, pair) for depth, estimate, pair in dead_ends if estimate is not None]
+        if sized:
+            _, estimate, pair = builtins.min(sized, key=lambda item: (item[0], item[1]))
+            raise EinsumBudgetError(
+                f"Cannot complete einsum '{equation}' within a temporary-element budget of {budget} stored elements. "
+                f"The contraction '{pair}' requires at least {estimate} stored elements"
+                f" ({estimate - budget} over budget); no budget-feasible contraction order exists."
+            )
+
+    raise EinsumBudgetError(
+        f"Cannot complete einsum '{equation}' within a temporary-element budget of {budget} stored elements; "
+        "no budget-feasible contraction order exists."
+    )
+
+
+def _einsum_output_format(operands):
+    from ._compressed import GCXS
+    from ._dok import DOK
+
+    sparse_operands = [operand for operand in operands if isinstance(operand, SparseArray)]
+    if sparse_operands and builtins.all(isinstance(operand, DOK) for operand in sparse_operands):
+        return DOK, {}
+    if sparse_operands and builtins.all(isinstance(operand, GCXS) for operand in sparse_operands):
+        if len({operand.compressed_axes for operand in sparse_operands}) == 1:
+            return GCXS, {"compressed_axes": sparse_operands[0].compressed_axes}
+        return GCXS, {}
+    return COO, {}
+
+
 def einsum(*operands, **kwargs):
     """
     Perform the equivalent of [`numpy.einsum`][].
@@ -1426,6 +1921,18 @@ def einsum(*operands, **kwargs):
     dtype : data-type, optional
         If provided, forces the calculation to use the data type specified.
         Default is `None`.
+    temp_elements : int, optional
+        Maximum number of stored elements allowed in any temporary
+        intermediate produced while contracting several operands.  The
+        aliases ``max_temp_elements``, ``temporary_elements``,
+        ``max_intermediate_elements``, ``element_budget``, ``max_elements``,
+        ``memory_limit`` and ``budget`` are accepted as well.  If no
+        contraction order fits, [`EinsumBudgetError`][] is raised before the
+        oversized intermediate is allocated.
+    optimize : bool or {"greedy", "auto", "optimal"}, optional
+        If true, plan a pairwise contraction order with the smallest
+        estimated intermediate instead of building one outer product over all
+        operands.  No budget is enforced in this mode.
     **kwargs : dict, optional
         Any additional arguments to pass to the function.
 
@@ -1433,6 +1940,13 @@ def einsum(*operands, **kwargs):
     -------
     output : SparseArray
         The calculation based on the Einstein summation convention.
+
+    Raises
+    ------
+    EinsumBudgetError
+        If a temporary-element budget was supplied and no pairwise
+        contraction order stays within it.  The exception names the
+        contraction that cannot be completed and is also a [`MemoryError`][].
     """
 
     lhs, rhs, operands = _parse_einsum_input(operands)  # Parse input
@@ -1442,8 +1956,46 @@ def einsum(*operands, **kwargs):
     if "dtype" in kwargs and kwargs["dtype"] is not None:
         operands = [o.astype(kwargs["dtype"]) for o in operands]
 
+    temp_elements = _pop_temp_element_budget(kwargs)
+    optimize = kwargs.pop("optimize", False)
+    if optimize is None:
+        optimize = False
+    if isinstance(optimize, str):
+        if optimize not in {"greedy", "auto", "optimal"}:
+            raise ValueError(f"Invalid einsum optimize strategy: {optimize!r}.")
+        optimize = True
+    if optimize not in (True, False):
+        raise TypeError(f"`optimize` must be a bool or strategy name, not {optimize!r}.")
+
     if len(operands) == 1:
         return _einsum_single(lhs, rhs, operands[0])
+
+    pairwise = temp_elements is not None or optimize
+
+    if pairwise and builtins.any(isinstance(operand, SparseArray) for operand in operands):
+        # Contract pairwise, inspecting the actual sparse index patterns.  The
+        # old path below forms one product over all shared indices before any
+        # reduction, which can materialise an enormous `ijkl` intermediate even
+        # though each pairwise contraction is small.
+        terms = lhs.split(",")
+        factors, sizes = _prepare_einsum_factors(terms, rhs, operands)
+        if temp_elements is not None:
+            out_labels, result = _budgeted_einsum_factors(
+                factors,
+                rhs,
+                sizes,
+                temp_elements,
+                lhs + "->" + rhs,
+            )
+        else:
+            out_labels, result = _greedy_einsum_factors(factors, rhs, sizes)
+        out_term = "".join(out_labels)
+        if set(out_term) != set(rhs) or len(out_term) != len(rhs):
+            raise ValueError(f"Inconsistent shape for index '{out_term}'.")
+        if out_term != rhs:
+            result = _einsum_single(out_term, rhs, result)
+        out_type, out_kwargs = _einsum_output_format(operands)
+        return result.asformat(out_type, **out_kwargs)
 
     # if multiple arrays: align, broadcast multiply and then use single einsum
     # for example:
