@@ -224,6 +224,18 @@ class SQLStream(Stream, abc.ABC):
             A SQLAlchemy Select object.
         """
         if self.ABORT_AT_RECORD_COUNT is not None:
+            # During an output-based dry run in RECORD mode, source rows may be
+            # filtered out by stream maps, so a source-level limit could stop the
+            # run before the output streams collect their full sample. Limiting
+            # happens in _sync_records() once the mapped outputs are satisfied
+            # instead. BATCH mode keeps the source-level limit since records go
+            # to a batcher rather than through the per-output message writer.
+            if (
+                self._dry_run_writer is not None
+                and self._has_dry_run_outputs()
+                and self.get_batch_config(self.config) is None
+            ):
+                return query
             # Limit record count to one greater than the abort threshold. This ensures
             # `MaxRecordsLimitException` exception is properly raised by caller
             # `Stream._sync_records()` if more records are available than can be

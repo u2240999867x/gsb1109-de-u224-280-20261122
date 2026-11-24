@@ -24,6 +24,7 @@ __lazy_modules__ = {
 
 import abc
 import contextlib
+import copy
 import sys
 import typing as t
 import warnings
@@ -68,6 +69,19 @@ if t.TYPE_CHECKING:
     from singer_sdk.streams import Stream
 
 STREAM_MAPS_CONFIG = "stream_maps"
+
+
+class _NullStateWriter(StateWriter):
+    """State writer that swallows STATE messages during a dry run."""
+
+    @override
+    def write_state(self, state: types.TapState) -> None:
+        """Drop the state message instead of writing it.
+
+        Args:
+            state: The current tap state (ignored).
+        """
+        return
 
 
 class CliTestOptionValue(Enum):
@@ -295,13 +309,31 @@ class Tap(BaseSingerWriter, abc.ABC):  # noqa: PLR0904
         dry_run_record_limit: int | None = 1,
         streams: t.Iterable[Stream] | None = None,
     ) -> bool:
-        """Run connection test.
+        """Run a dry run sync, capped per mapped output stream.
 
-        Exceptions of type `MaxRecordsLimitException` and
-        `PartialSyncSuccessException` will be ignored.
+        The record limit applies to records actually delivered through each
+        stream map output rather than to source records. Source rows that a
+        stream map filters out do not consume any output stream's quota, so a
+        single source stream that fans out into several output streams delivers
+        up to ``dry_run_record_limit`` records to each one. Scanning a stream
+        ends once all of its mapped outputs have their full sample, while other
+        streams can still collect theirs.
+
+        The dry run is isolated from the tap's real sync:
+
+        - STATE messages are swallowed and the in-memory state (including
+          bookmarks and progress markers) is restored afterwards, so the tap's
+          sync progress remains exactly where it was before the dry run.
+        - The message writer is restored to the original writer and every
+          stream's record limit and selection flags are reset, leaving the tap
+          ready for a normal :meth:`sync_all` on the same instance.
+
+        Exceptions of type `AbortedSyncFailedException` and
+        `AbortedSyncPausedException` will be ignored.
 
         Args:
-            dry_run_record_limit: The max number of records to sync per stream object.
+            dry_run_record_limit: The max number of records to deliver per
+                mapped output stream.
             streams: The streams to test. If omitted, all streams will be tested.
 
         Returns:
@@ -309,31 +341,64 @@ class Tap(BaseSingerWriter, abc.ABC):  # noqa: PLR0904
         """
         if streams is None:
             streams = self.streams.values()
+        streams = list(streams)
 
-        for stream in streams:
-            # Apply the record limit to every stream so that both parent and child
-            # streams are capped.  Child-stream aborts are caught in _sync_children
-            # so they do not prevent the parent from emitting its own records.
-            stream.ABORT_AT_RECORD_COUNT = dry_run_record_limit
+        # Remember the configuration the dry run temporarily overrides.
+        saved_state = copy.deepcopy(self.state)
+        saved_state_writer = self._state_writer
+        saved_message_writer = self.message_writer
+        saved_limits = {
+            stream: stream.ABORT_AT_RECORD_COUNT for stream in streams
+        }
+        saved_selection = {stream: stream.selected for stream in streams}
 
-            # Force selection of streams.
-            stream.selected = True
+        # Never emit STATE messages or advance the real bookmarks during a dry run.
+        self._state_writer = _NullStateWriter(self.message_writer)
 
-        for stream in streams:
-            if stream.parent_stream_type:
-                self.logger.debug(
-                    "Child stream '%s' should be called by "
-                    "parent stream '%s'. "
-                    "Skipping direct invocation.",
-                    type(stream).__name__,
-                    stream.parent_stream_type.__name__,
-                )
-                continue
-            with contextlib.suppress(
-                AbortedSyncFailedException,
-                AbortedSyncPausedException,
-            ):
-                stream.sync()
+        try:
+            for stream in streams:
+                # Apply the record limit to every stream so that both parent and
+                # child streams are capped. Child-stream interruptions are caught
+                # in _sync_children so they do not prevent the parent from
+                # emitting its own records.
+                stream.ABORT_AT_RECORD_COUNT = dry_run_record_limit
+
+                # Force selection of streams.
+                stream.selected = True
+
+                # Wrap the message writer so each mapped output stream is capped
+                # by records actually delivered, ignoring filtered source rows.
+                # The writer is shared across streams for continuous quotas.
+                stream.activate_dry_run(dry_run_record_limit)
+
+            for stream in streams:
+                if stream.parent_stream_type:
+                    self.logger.debug(
+                        "Child stream '%s' should be called by "
+                        "parent stream '%s'. "
+                        "Skipping direct invocation.",
+                        type(stream).__name__,
+                        stream.parent_stream_type.__name__,
+                    )
+                    continue
+                with contextlib.suppress(
+                    AbortedSyncFailedException,
+                    AbortedSyncPausedException,
+                ):
+                    stream.sync()
+        finally:
+            # Restore everything a real sync still depends on. The state is
+            # mutated in place because streams hold a shared reference to this
+            # dictionary, so replacing the object would orphan their bookmarks.
+            state = t.cast("dict[str, t.Any]", self._state)
+            state.clear()
+            state.update(saved_state)
+            self._state_writer = saved_state_writer
+            self.message_writer = saved_message_writer
+            for stream in streams:
+                stream.deactivate_dry_run()
+                stream.ABORT_AT_RECORD_COUNT = saved_limits[stream]
+                stream.selected = saved_selection[stream]
         return True
 
     @t.final

@@ -421,7 +421,8 @@ def test_preprocess_context_removes_large_payload(
 
 def test_parent_records_emitted_when_child_hits_record_limit():
     """Parent records are written before child sync so they appear even if a child
-    stream aborts after reaching max_records_limit (dry-run record cap)."""
+    stream reaches its dry-run cap. The dry run cap is a global per output stream
+    sample limit, not a per-parent-context limit."""
 
     class ParentStream(Stream):
         name = "parent_limited"
@@ -487,7 +488,7 @@ def test_parent_records_emitted_when_child_hits_record_limit():
     tap = TapLimited()
     buf = io.StringIO()
     with redirect_stdout(buf):
-        # Limit child to 2 records; the 3rd would trigger AbortedSyncPausedException
+        # Each output stream gets at most 2 records across all parent contexts.
         tap.run_sync_dry_run(dry_run_record_limit=2)
 
     buf.seek(0)
@@ -498,14 +499,14 @@ def test_parent_records_emitted_when_child_hits_record_limit():
         if m["type"] == "RECORD":
             tally[m["stream"]] += 1
 
-    msg = "At least one parent record must be emitted even when the child stream hits its dry-run record limit."  # noqa: E501
+    msg = "At least one parent record must be emitted even when the child stream reaches its dry-run cap."  # noqa: E501
     assert tally["parent_limited"] >= 1, msg
 
-    msg = "Only 2 (for each parent) child records should be emitted"
-    assert tally["child_limited"] == 4, msg
+    msg = "The dry run cap is global per output stream, so child gets 2 records total"
+    assert tally["child_limited"] == 2, msg
 
-    msg = "Sibling records should also be emitted"
-    assert tally["sibling"] == 4, msg
+    msg = "Sibling records share the same global per-output-stream cap"
+    assert tally["sibling"] == 2, msg
 
 
 @time_machine.travel(DATETIME, tick=False)

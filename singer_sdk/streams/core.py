@@ -69,6 +69,7 @@ from singer_sdk.singerlib.catalog import (
     REPLICATION_INCREMENTAL,
     REPLICATION_LOG_BASED,  # noqa: F401
 )
+from singer_sdk.singerlib.encoding import DryRunSingerWriter
 from singer_sdk.streams._state import StreamStateManager
 
 if t.TYPE_CHECKING:
@@ -177,6 +178,7 @@ class Stream(abc.ABC):  # noqa: PLR0904
         self._tap_input_catalog: singer.Catalog | None = None
         self._input_schema: dict | None = None
         self._stream_maps: list[StreamMap] | None = None
+        self._dry_run_writer: DryRunSingerWriter | None = None
         self.forced_replication_method: str | None = None
         self._replication_key: str | None = None
         self._primary_keys: KeyProperties | None = None
@@ -1061,6 +1063,101 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 ),
             )
 
+    def activate_dry_run(self, record_limit: int | None) -> None:
+        """Enable dry-run delivery limits for this stream's mapped outputs.
+
+        Wraps the tap's message writer so that each mapped output stream receives
+        at most ``record_limit`` actually delivered RECORD messages. Records a
+        stream map filters out (including a primary ``__filter__`` rule) never
+        reach the writer and therefore do not consume any output stream's quota.
+        The same writer is shared across every stream in the tap so that a
+        multi-projection output stream keeps a single, continuous sample count.
+
+        Args:
+            record_limit: Max number of records delivered per output stream, or
+                None for no limit.
+        """
+        if record_limit is None:
+            return
+        if self._dry_run_writer is None:
+            writer = self._tap.message_writer
+            if not isinstance(writer, DryRunSingerWriter):
+                writer = DryRunSingerWriter(writer, record_limit=record_limit)
+                self._tap.message_writer = writer
+            self._dry_run_writer = writer
+
+    def deactivate_dry_run(self) -> None:
+        """Restore the tap's regular message writer after a dry run."""
+        if self._dry_run_writer is not None:
+            self._tap.message_writer = self._dry_run_writer.wrapped_writer
+            self._dry_run_writer = None
+
+    def _has_dry_run_outputs(self) -> bool:
+        """Whether this stream has at least one record-producing mapped output."""
+        return any(
+            not isinstance(stream_map, RemoveRecordTransform)
+            for stream_map in self.stream_maps
+        )
+
+    def _dry_run_outputs_satisfied(self) -> bool:
+        """Whether every mapped output stream has its full dry run sample.
+
+        Returns:
+            True if each of this stream's mapped outputs has already delivered
+            the configured number of records, in which case scanning further
+            source records cannot produce any additional samples. Streams whose
+            records are all removed by the mapper fall back to source-based
+            limiting (return False) so they still drive their child streams.
+        """
+        if self._dry_run_writer is None or self.ABORT_AT_RECORD_COUNT is None:
+            return False
+        outputs = [
+            stream_map
+            for stream_map in self.stream_maps
+            if not isinstance(stream_map, RemoveRecordTransform)
+        ]
+        if not outputs:
+            return False
+        emitted = self._dry_run_writer.records_emitted
+        return all(
+            emitted.get(stream_map.stream_alias, 0) >= self.ABORT_AT_RECORD_COUNT
+            for stream_map in outputs
+        )
+
+    def _dry_run_gate_blocks(
+        self,
+        *,
+        current_record_index: int,
+        write_messages: bool,
+    ) -> bool:
+        """Gate the next source record of a dry run sync.
+
+        In a dry run that writes mapped records directly, limiting is based on
+        records actually delivered, so source rows a map filters out neither
+        consume output quota nor trigger an abort. Scanning stops once every
+        mapped output has its full sample. Other modes (no record output, or
+        batch mode which feeds a batcher instead of the writer) keep the legacy
+        source-based record limit via :meth:`_check_max_record_limit`.
+
+        Args:
+            current_record_index: The zero-based index of the next source record.
+            write_messages: Whether this sync writes Singer messages directly.
+
+        Returns:
+            True if scanning should stop before the next source record.
+        """
+        output_limited = (
+            write_messages
+            and self._dry_run_writer is not None
+            and self._has_dry_run_outputs()
+        )
+        if not output_limited:
+            self._check_max_record_limit(
+                current_record_index=current_record_index,
+            )
+            return False
+        return self._dry_run_outputs_satisfied()
+
     def _abort_sync(self, abort_reason: Exception) -> None:
         """Handle a sync operation being aborted.
 
@@ -1159,7 +1256,7 @@ class Stream(abc.ABC):  # noqa: PLR0904
             if self.stream_maps[0].get_filter_result(record):
                 self._sync_children(copy.copy(context))
 
-    def _sync_records(  # noqa: C901
+    def _sync_records(  # noqa: C901, PLR0912
         self,
         context: types.Context | None = None,
         *,
@@ -1207,7 +1304,14 @@ class Stream(abc.ABC):  # noqa: PLR0904
                 )
 
                 for idx, record_result in enumerate(self.get_records(current_context)):
-                    self._check_max_record_limit(current_record_index=record_index)
+                    # Dry runs cap by actually-delivered output samples (and fall
+                    # back to source-based limiting for batch or output-less
+                    # streams); normal syncs enforce the source record limit here.
+                    if self._dry_run_gate_blocks(
+                        current_record_index=record_index,
+                        write_messages=write_messages,
+                    ):
+                        break
 
                     if isinstance(record_result, tuple):  # pragma: no cover
                         # Tuple items should be the record and the child context

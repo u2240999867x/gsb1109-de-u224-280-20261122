@@ -18,6 +18,9 @@ if sys.version_info < (3, 11):
 
     MonkeyPatch.patch_fromisoformat()
 
+if t.TYPE_CHECKING:
+    from singer_sdk.singerlib.encoding.simple import RecordMessage
+
 __all__ = [
     "GenericSingerReader",
     "GenericSingerWriter",
@@ -145,3 +148,70 @@ class GenericSingerWriter(abc.ABC, t.Generic[_WT, M]):
     @abc.abstractmethod
     def write_message(self, message: M) -> None:
         """Write a message to stdout."""
+
+
+class DryRunSingerWriter(GenericSingerWriter[_WT, M]):
+    """Writer for tap dry runs that caps each output stream's record delivery.
+
+    Non-record messages (SCHEMA, STATE, ACTIVATE_VERSION, BATCH) pass through to
+    the wrapped writer unchanged. RECORD messages are delivered as long as every
+    mapped output stream in the message still has sample budget left, based on the
+    configured per-stream record limit. Once an output stream's quota is full its
+    further records are silently dropped, and the dry run continues scanning source
+    records so that other output streams can still collect their own samples.
+
+    Args:
+        writer: The writer used for messages that pass the limit.
+        record_limit: Max number of records delivered per output stream, or None
+            for no limit.
+    """
+
+    def __init__(
+        self,
+        writer: GenericSingerWriter[_WT, M],
+        *,
+        record_limit: int | None,
+    ) -> None:
+        """Initialize the dry run writer."""
+        self._writer: GenericSingerWriter[_WT, M] = writer
+        self._record_limit = record_limit
+        self._records_emitted: Counter[str] = Counter()
+
+    @property
+    def records_emitted(self) -> dict[str, int]:
+        """Number of records delivered per output stream."""
+        return dict(self._records_emitted)
+
+    @property
+    def wrapped_writer(self) -> GenericSingerWriter[_WT, M]:
+        """The underlying writer messages that pass the limit are sent to."""
+        return self._writer
+
+    def _record_stream(self, message: M) -> str | None:
+        """Return the output stream name for a record message, if applicable."""
+        # TYPE_CHECKING-only cast keeps the concrete Message subclass out of the
+        # runtime import cycle (simple.py imports this base module).
+        msg = t.cast("RecordMessage", message)
+        if msg.type == SingerMessageType.RECORD:
+            return msg.stream
+        return None
+
+    def serialize_message(self, message: M) -> _WT:
+        """Serialize a message into a line of json."""
+        return self._writer.serialize_message(message)
+
+    def write_message(self, message: M) -> None:
+        """Write a message, dropping records past the per-stream dry run limit."""
+        stream_name = self._record_stream(message)
+        if stream_name is not None and self._is_limit_reached(stream_name):
+            return
+        self._writer.write_message(message)
+        if stream_name is not None:
+            self._records_emitted[stream_name] += 1
+
+    def _is_limit_reached(self, stream_name: str) -> bool:
+        """Whether the output stream has already received its full sample quota."""
+        return (
+            self._record_limit is not None
+            and self._records_emitted[stream_name] >= self._record_limit
+        )

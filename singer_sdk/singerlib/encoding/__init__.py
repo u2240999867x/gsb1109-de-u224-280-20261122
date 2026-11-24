@@ -8,6 +8,7 @@ __lazy_modules__ = {
 }
 
 from singer_sdk.singerlib.encoding.base import (
+    DryRunSingerWriter,
     GenericSingerReader,
     GenericSingerWriter,
     SingerMessageType,
@@ -15,6 +16,7 @@ from singer_sdk.singerlib.encoding.base import (
 from singer_sdk.singerlib.encoding.simple import SimpleSingerReader, SimpleSingerWriter
 
 __all__ = [
+    "DryRunSingerWriter",
     "GenericSingerReader",
     "GenericSingerWriter",
     "SimpleSingerReader",
