@@ -48,7 +48,9 @@ def reset_lock():
     _lock = threading.Lock()
 
 
-async def _runner(event, coro, result, timeout=None):
+async def _runner(event, coro, result, timeout=None, started=None):
+    if started is not None:
+        started.set()
     timeout = timeout if timeout else None  # convert 0 or 0.0 to None
     if timeout is not None:
         coro = asyncio.wait_for(coro, timeout=timeout)
@@ -91,7 +93,10 @@ def sync(loop, func, *args, timeout=None, **kwargs):
     coro = func(*args, **kwargs)
     result = [None]
     event = threading.Event()
-    asyncio.run_coroutine_threadsafe(_runner(event, coro, result, timeout), loop)
+    started = threading.Event()
+    future = asyncio.run_coroutine_threadsafe(
+        _runner(event, coro, result, timeout, started), loop
+    )
     while True:
         # this loops allows thread to get interrupted
         if event.wait(1):
@@ -99,6 +104,14 @@ def sync(loop, func, *args, timeout=None, **kwargs):
         if timeout is not None:
             timeout -= 1
             if timeout < 0:
+                # The coroutine has overrun its timeout. Ask for it to be
+                # cancelled, but do not return while it may still be
+                # running: it can be executing synchronous work in a worker
+                # thread (e.g. writing to a destination file that the
+                # caller will delete or reuse as soon as this raises).
+                future.cancel()
+                if started.is_set():
+                    event.wait()
                 raise FSTimeoutError
 
     return_result = result[0]
