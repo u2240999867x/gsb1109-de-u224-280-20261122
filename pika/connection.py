@@ -11,6 +11,7 @@ import math
 import numbers
 import platform
 import ssl
+from collections import deque
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -34,6 +35,7 @@ import pika.credentials
 import pika.heartbeat
 from pika import exceptions, frame, spec, validators
 from pika._utils import override
+from pika.streaming_publish import StreamingPublish, StreamingPublishState
 
 if TYPE_CHECKING:
     from pika import amqp_object
@@ -1070,6 +1072,17 @@ class Connection(abc.ABC):
     CONNECTION_OPEN = 5
     CONNECTION_CLOSING = 6  # client-initiated close in progress
 
+    # Body frames one streaming publish may emit in a single pump pass. The cap
+    # bounds the share of an I/O loop iteration one message takes, so a stream
+    # on another channel gets a turn in the same pass.
+    STREAM_PUMP_FRAMES_PER_ROUND = 32
+    # Pause a stream once the transport's outbound buffer reaches this many
+    # bytes; the pump resumes after the socket drains it.
+    STREAM_PUMP_BUFFER_HIGH_WATER = 8 * 1024 * 1024
+    # Delay before retrying a source that returned no bytes, in seconds. Zero
+    # would busy-spin the I/O loop; a short timer still re-polls promptly.
+    STREAM_SOURCE_RETRY_INTERVAL = 0.01
+
     _STATE_NAMES: ClassVar[dict[int, str]] = {
         CONNECTION_CLOSED: 'CLOSED',
         CONNECTION_INIT: 'INIT',
@@ -1157,6 +1170,12 @@ class Connection(abc.ABC):
         self._processing_frame_buffer: bool = False
         self._channels: dict[int, Channel] = {}
 
+        # Streaming publishes, in registration order across all channels. A
+        # stream leaves the deque on settlement. See `pika.streaming_publish`.
+        self._stream_publishes: deque[StreamingPublish] = deque()
+        self._stream_pump_scheduled: bool = False
+        self._stream_retry_timer: object | None = None
+
         self._init_connection_state()
 
         # Add the on connection error callback
@@ -1206,6 +1225,13 @@ class Connection(abc.ABC):
 
         # Dict of open channels
         self._channels = {}
+
+        # Streaming publish pump state
+        self._stream_publishes.clear()
+        self._stream_pump_scheduled = False
+        if self._stream_retry_timer is not None:
+            self._adapter_remove_timeout(self._stream_retry_timer)
+            self._stream_retry_timer = None
 
         # Data used for Heartbeat checking
         self.bytes_sent = 0
@@ -2619,3 +2645,127 @@ class Connection(abc.ABC):
             self.bytes_sent += len(marshaled_frame)
             self.frames_sent += 1
             self._adapter_emit_data(marshaled_frame)
+
+    def _adapter_get_write_buffer_size(self) -> int:
+        """
+        Report bytes the transport has accepted but not sent to the socket yet.
+
+        Adapters without a reportable buffer (the Twisted transport) return 0, which disables the
+        streaming pump's buffer high-water mark rather than misreporting it.
+        """
+        return 0
+
+    def _register_stream_publish(self,
+                                 stream_publish: StreamingPublish) -> None:
+        """
+        Add an activated streaming publish to the pump's round-robin deque.
+
+        Called on the I/O loop thread by `Channel`, after the method and header frames have been
+        emitted.
+
+        :param stream_publish: The publish whose body frames need pumping.
+        """
+        if self._stream_retry_timer is not None:
+            self._adapter_remove_timeout(self._stream_retry_timer)
+            self._stream_retry_timer = None
+        self._stream_publishes.append(stream_publish)
+        self._schedule_stream_pump()
+
+    def _on_stream_publish_settled(self,
+                                   stream_publish: StreamingPublish) -> None:
+        """
+        Remove a settled streaming publish from the pump deque.
+
+        A pump pass rotates the deque itself, so a miss here means the stream was popped for its
+        turn and is not going to be re-queued because it settled.
+        """
+        try:
+            self._stream_publishes.remove(stream_publish)
+        except ValueError:
+            pass
+        if not self._stream_publishes and self._stream_retry_timer is not None:
+            self._adapter_remove_timeout(self._stream_retry_timer)
+            self._stream_retry_timer = None
+
+    def _request_stream_publish_failure(
+            self, stream_publish: StreamingPublish,
+            reason: BaseException) -> None:
+        """
+        Settle a streaming publish as failed and tear the connection down.
+
+        A content header already promised a fixed-length body and AMQP 0-9-1 has no frame to
+        retract it, so the only legal response to a dead source is closing the connection. The
+        termination path settles every other in-flight stream as aborted through the channel close
+        callbacks, leaving each job a per-message result to reissue by business identifier.
+        """
+        if stream_publish.is_settled:
+            return
+        stream_publish._settle(StreamingPublishState.FAILED, reason)
+        # `_error` may already be set by a sibling stream failing in the same
+        # pump pass; only the first failure tears the transport down.
+        if self._error is None and self.is_open:
+            self._terminate_stream(
+                exceptions.MessageSourceUnavailable(
+                    stream_publish.message_id,
+                    reason,
+                    host=self.params.host,
+                    port=self.params.port))
+
+    def _schedule_stream_pump(self) -> None:
+        """Queue a pump pass unless one is already queued or no stream remains."""
+        if (self._stream_pump_scheduled or not self._stream_publishes or
+                not self.is_open or self._error is not None):
+            return
+        self._stream_pump_scheduled = True
+        self._adapter_add_callback_threadsafe(self._run_stream_pump)
+
+    def _on_stream_retry_timer(self) -> None:
+        """Retry a pump that made no progress because every source was empty."""
+        self._stream_retry_timer = None
+        self._schedule_stream_pump()
+
+    def _run_stream_pump(self) -> None:
+        """
+        Give each active streaming publish one fair turn on the I/O loop.
+
+        The deque is rotated per turn, so a stream that yields because its source is temporarily
+        empty or the outbound buffer is full moves behind the others: small messages and
+        heartbeats on other channels keep flowing while a large object waits. A pass with any
+        progress is re-queued immediately; a pass where every source was empty parks on a short
+        retry timer instead of busy-spinning.
+        """
+        self._stream_pump_scheduled = False
+        if self._error is not None or not self.is_open or not self._stream_publishes:
+            return
+
+        made_progress = False
+        for _ in range(len(self._stream_publishes)):
+            stream_publish = self._stream_publishes.popleft()
+            if stream_publish.is_settled:
+                continue
+            emitted = stream_publish._pump(self._should_pause_stream_pump)
+            if emitted:
+                made_progress = True
+            if not stream_publish.is_settled:
+                self._stream_publishes.append(stream_publish)
+            if self._error is not None:
+                # A source failure inside _pump began teardown synchronously
+                # (`_terminate_stream` sets `_error` at once). Stop emitting;
+                # the remaining streams are aborted through channel close.
+                return
+
+        if not self._stream_publishes:
+            return
+        if made_progress:
+            self._schedule_stream_pump()
+        elif self._stream_retry_timer is None:
+            self._stream_retry_timer = self._adapter_call_later(
+                self.STREAM_SOURCE_RETRY_INTERVAL,
+                self._on_stream_retry_timer)
+
+    def _should_pause_stream_pump(self, frames_emitted: int) -> bool:
+        """Whether a streaming publish should end its current pump turn."""
+        if frames_emitted >= self.STREAM_PUMP_FRAMES_PER_ROUND:
+            return True
+        return (self._adapter_get_write_buffer_size() >=
+                self.STREAM_PUMP_BUFFER_HIGH_WATER)

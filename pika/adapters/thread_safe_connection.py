@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from typing_extensions import Literal, Self
 
     import pika.channel
+    from pika.streaming_publish import StreamingPublishState
 
 from pika import frame, spec, validators
 from pika.adapters.select_connection import SelectConnection
@@ -450,6 +451,115 @@ class _BoundedWorkPool:
             return not thread.is_alive()
         thread.join(timeout=timeout)
         return not thread.is_alive()
+
+
+class StreamingPublishHandle:
+    """
+    Thread-safe handle for one streaming publish started through
+    [`Channel.basic_publish_stream`][pika.adapters.thread_safe_connection.Channel.basic_publish_stream].
+
+    The handle exists before the I/O loop thread has bound the underlying
+    [`pika.streaming_publish.StreamingPublish`][pika.streaming_publish.StreamingPublish], so a
+    producer thread can register interest immediately. All reads and `failure` are safe from any
+    thread; the actual frame pump stays on the I/O loop thread.
+    """
+
+    def __init__(self, wrapper_channel: Channel) -> None:
+        self._wrapper_channel = wrapper_channel
+        self._settled = threading.Event()
+        self._lock = threading.Lock()
+        self._impl = None
+        self._state: StreamingPublishState | None = None
+        self._reason: BaseException | None = None
+        self._message_id = None
+
+    def _bind(self, impl) -> None:
+        """Attach the I/O-loop object once the publish has started."""
+        with self._lock:
+            self._impl = impl
+            self._message_id = impl.message_id
+
+    def _record_settlement(self,
+                           state: StreamingPublishState,
+                           reason: BaseException | None) -> None:
+        """Record the terminal result; invoked once on the I/O loop thread."""
+        with self._lock:
+            self._state = state
+            self._reason = reason
+        self._settled.set()
+
+    @property
+    def message_id(self):
+        """The business identifier given to `basic_publish_stream`."""
+        with self._lock:
+            return self._message_id
+
+    @property
+    def state(self) -> StreamingPublishState | None:
+        """The terminal state once settled, or ``None`` while in progress."""
+        with self._lock:
+            return self._state
+
+    @property
+    def reason(self) -> BaseException | None:
+        """The failure reason in a failed or aborted state, otherwise ``None``."""
+        with self._lock:
+            return self._reason
+
+    @property
+    def is_settled(self) -> bool:
+        """True once the streaming publish reached a terminal state."""
+        return self._settled.is_set()
+
+    def bytes_sent(self) -> int:
+        """Body bytes handed to body frames so far; zero before the I/O loop binds the publish."""
+        with self._lock:
+            if self._impl is None:
+                return 0
+            return self._impl.bytes_sent
+
+    def failure(self, reason: BaseException) -> None:
+        """
+        Report a permanent source failure from any thread.
+
+        Schedules the failure on the I/O loop thread; the connection then settles this publish as
+        failed and tears down. A settled handle ignores the call.
+
+        :param reason: Exception describing the failure.
+        :raises TypeError: if *reason* is not an exception instance.
+        """
+        if not isinstance(reason, BaseException):
+            raise TypeError('reason must be an exception instance, '
+                            f'but got {reason!r}')
+        with self._lock:
+            impl = self._impl
+        if impl is None:
+            # The start callback has not run yet; park the report so the I/O
+            # loop applies it immediately after binding.
+            def _fail_after_bind():
+                with self._lock:
+                    bound = self._impl
+                if bound is not None and not bound.is_settled:
+                    bound.failure(reason)
+
+            self._wrapper_channel._wrapper._schedule_unchecked(
+                _fail_after_bind)
+            return
+        impl.failure(reason)
+
+    def wait(self, timeout: float | None = None) -> StreamingPublishState:
+        """
+        Block until the body finishes, the source fails, or the connection closes.
+
+        :param timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+        :returns: The terminal `StreamingPublishState`.
+        :raises TimeoutError: if *timeout* expires before settlement.
+        """
+        if not self._settled.wait(timeout=timeout):
+            raise TimeoutError(
+                f'streaming publish did not settle within {timeout} seconds')
+        assert self._state is not None
+        return self._state
 
 
 class Channel:
@@ -987,6 +1097,94 @@ class Channel:
                                         self._next_publish_seq_no)
 
         self._wrapper._schedule_unchecked(_publish)
+
+    def basic_publish_stream(self,
+                             exchange,
+                             routing_key,
+                             body_size,
+                             source,
+                             properties=None,
+                             mandatory: bool = False,
+                             message_id=None,
+                             on_settled=None,
+                             timeout: float | None = DEFAULT_RPC_TIMEOUT
+                             ) -> StreamingPublishHandle:
+        """
+        Begin a streaming publish on the I/O loop thread and return a thread-safe handle.
+
+        The body stays on the I/O loop thread: it is pulled from *source* by offset as the socket
+        accepts the bytes, so the caller never materializes the whole body and other channels keep
+        flowing while a large object is in flight. See
+        [`pika.channel.Channel.basic_publish_stream`][pika.channel.Channel.basic_publish_stream] for
+        the frame ordering and source contract.
+
+        The call blocks only until the method and header frames have been issued and the
+        [`StreamingPublishHandle`][pika.adapters.thread_safe_connection.StreamingPublishHandle]
+        exists; body frames stream afterwards. Use the handle's `wait` to block until the body is
+        fully handed to the transport, or its `failure` to report a dead source from any thread.
+        Publisher confirms, when enabled, still arrive through the `confirm_delivery` callback and
+        are a separate, later signal.
+
+        :param on_settled: Optional callback run on the channel's worker thread with the handle,
+            a `pika.streaming_publish.StreamingPublishState` and the failure reason (``None`` on
+            completion). Slow callbacks there do not stall the I/O loop.
+        :param timeout: Seconds to wait for the I/O loop thread to start the publish.
+        :raises Exception: if the connection is closed, the arguments are invalid, or the start
+            fails on the I/O loop thread.
+        :raises TimeoutError: if *timeout* expires before the publish starts.
+        """
+        if not isinstance(body_size, int) or body_size < 0:
+            raise TypeError(
+                'body_size must be a non-negative int, '
+                f'but got {body_size!r}')
+        if not callable(getattr(source, 'read', None)):
+            raise TypeError(
+                'source must implement read(offset, length), '
+                f'but got {source!r}')
+        if on_settled is not None:
+            validators.require_callback(on_settled, 'on_settled')
+        self._check_not_closed()
+
+        handle = StreamingPublishHandle(self)
+        started = threading.Event()
+        start_error: list[BaseException | None] = [None]
+
+        def _dispatch_user_settled(impl_handle, state, reason):
+            _submit_or_terminate(
+                self._consumer_work_pool, self._wrapper._connection,
+                'Streaming publish settlement dropped: work pool shut down',
+                self._safe_dispatch, 'streaming publish settlement callback',
+                on_settled, impl_handle, state, reason)
+
+        def _on_settled(impl, state, reason):
+            handle._record_settlement(state, reason)
+            if on_settled is not None:
+                _dispatch_user_settled(handle, state, reason)
+
+        def _start():
+            try:
+                impl = self._channel.basic_publish_stream(
+                    exchange=exchange,
+                    routing_key=routing_key,
+                    body_size=body_size,
+                    source=source,
+                    properties=properties,
+                    mandatory=mandatory,
+                    message_id=message_id,
+                    on_settled=_on_settled)
+                handle._bind(impl)
+            except BaseException as exc:
+                start_error[0] = exc
+            finally:
+                started.set()
+
+        self._wrapper._schedule_unchecked(_start)
+        if not started.wait(timeout=timeout):
+            raise TimeoutError(
+                f'basic_publish_stream start timed out after {timeout} seconds')
+        if start_error[0] is not None:
+            raise start_error[0]
+        return handle
 
     def basic_ack(self, delivery_tag: int = 0, multiple: bool = False) -> None:
         """

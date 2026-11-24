@@ -14,6 +14,11 @@ from pika.connection import ConnectionParameters, SSLOptions, URLParameters
 from pika.credentials import PlainCredentials
 from pika.delivery_mode import DeliveryMode
 from pika.spec import BasicProperties
+from pika.streaming_publish import (
+    MessageBodySource,
+    StreamingPublish,
+    StreamingPublishState,
+)
 
 __all__ = [
     'AMQPConnectionWorkflow',
@@ -23,9 +28,12 @@ __all__ = [
     'Connection',
     'ConnectionParameters',
     'DeliveryMode',
+    'MessageBodySource',
     'PlainCredentials',
     'SSLOptions',
     'SelectConnection',
+    'StreamingPublish',
+    'StreamingPublishState',
     'URLParameters',
     'adapters',
     'frame',

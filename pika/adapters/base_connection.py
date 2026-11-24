@@ -410,6 +410,13 @@ class BaseConnection(connection.Connection):
         assert self._transport is not None
         self._transport.write(data)
 
+    @override
+    def _adapter_get_write_buffer_size(self) -> int:
+        """Bytes accepted by the transport but not yet written to the socket."""
+        if self._transport is None:
+            return 0
+        return self._transport.get_write_buffer_size()
+
     def _proto_connection_made(
             self, transport: nbio_interface.AbstractStreamTransport) -> None:
         """

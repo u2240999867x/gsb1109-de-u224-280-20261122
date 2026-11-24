@@ -112,6 +112,7 @@ Either flag is enough on its own. `durable=True` is the usual answer; `exclusive
 | `basic_consumer_threaded.py` | Consuming with `Connection` worker threads |
 | `basic_publisher_threaded.py` | Publishing from multiple threads with `Connection` |
 | `publisher_confirms_threaded.py` | Publisher confirms with `Connection` (ack/nack on a worker thread) |
+| `streaming_publish_threaded.py` | Streaming a large fixed-length body from a re-readable source with `Connection` |
 | `long_running_publisher.py` | Background publisher thread with `BlockingConnection` |
 | `long_running_publisher_threaded.py` | Long-running publisher with `Connection` (no `process_data_events` loop) |
 | `consumer_queued.py` | Threaded consumer buffering messages for batch processing |

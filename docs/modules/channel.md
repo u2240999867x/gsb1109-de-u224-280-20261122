@@ -30,6 +30,10 @@ Each delivery that arrives before its `Basic.CancelOk` reaches the consumer call
 
 Pika 2.0 removes the asynchronous adapters, leaving [`Connection`](adapters/thread_safe.md) and its `Channel` as the only close path, so the gap is retired rather than fixed.
 
+## Streaming a large message body
+
+`Channel.basic_publish_stream` publishes a fixed-length body pulled from a re-readable source by offset, instead of buffering the whole body. A source that is temporarily empty yields the I/O loop, so other channels and heartbeats keep flowing while a large object is in flight; streams on one channel stay strictly FIFO and a source failure settles each in-flight publish with its business identifier. See [Streaming Publish](streaming_publish.md) for the source contract and settlement semantics.
+
 ::: pika.channel
 
 ## Channel

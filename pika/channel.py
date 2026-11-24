@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Union
 from pika import exceptions, frame, spec, validators
 from pika._utils import as_bytes, override
 from pika.exchange_type import ExchangeType
+from pika.streaming_publish import (
+    MessageBodySource,
+    OnSettledCallback,
+    StreamingPublish,
+    StreamingPublishState,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -139,6 +145,11 @@ class Channel:
         # Deliveries dropped by `_on_deliver` because the channel was no longer
         # open, reported once on the transition to CLOSED.
         self._discarded_while_closing: int = 0
+
+        # Streaming publishes waiting behind the active one on this channel,
+        # in call order. Only the head may emit frames, so a second large object
+        # cannot interleave its frames with the first's.
+        self._stream_publishes: deque[StreamingPublish] = deque()
 
     def __int__(self) -> int:
         """Return the channel object as its channel number."""
@@ -569,8 +580,15 @@ class Channel:
         :param properties: Basic.properties
         :param mandatory: The mandatory flag
         :raises TypeError: if *body* is not `bytes` or `str`, or a header key is not a string
+        :raises exceptions.ChannelWrongStateError: if a streaming publish opened with
+            `basic_publish_stream` is still in progress on this channel; its content body frame
+            sequence must not be interleaved with another content body
         """
         self._raise_if_not_open()
+        if self._stream_publishes:
+            raise exceptions.ChannelWrongStateError(
+                'a streaming publish is in progress on this channel; publish '
+                'after it settles or from another channel')
         self._publish_marshaled(
             self._marshal_publish(exchange, routing_key, body, properties,
                                   mandatory))
@@ -607,6 +625,107 @@ class Channel:
         """
         self._raise_if_not_open()
         self.connection._output_marshaled_frames(marshaled_frames)
+
+    def basic_publish_stream(
+            self,
+            exchange: str,
+            routing_key: str,
+            body_size: int,
+            source: MessageBodySource,
+            properties: spec.BasicProperties | None = None,
+            mandatory: bool = False,
+            message_id: Any = None,
+            on_settled: OnSettledCallback | None = None) -> StreamingPublish:
+        """
+        Begin publishing a message whose body is streamed from *source*.
+
+        Unlike `basic_publish`, the body is never held whole: the method and header frames go out
+        immediately advertising *body_size*, and the connection's I/O loop pulls body frames from
+        *source* by absolute offset as the socket accepts them. A source that is temporarily empty
+        returns empty `bytes` from `read`, so other channels' frames and heartbeats keep flowing
+        instead of waiting on this message.
+
+        Streaming publishes on one channel are serialized: a second call queues behind the first
+        in PENDING state and emits no frame until the first settles, so two content bodies can
+        never interleave. A regular `basic_publish`, which is another content body, is refused
+        while any stream is queued; send it after the streams settle or from another channel.
+
+        :param exchange: The exchange to publish to
+        :param routing_key: The routing key to bind on
+        :param body_size: Total body size in bytes; the source must eventually supply exactly this
+            many bytes.
+        :param source: Re-readable body source implementing `MessageBodySource`.
+        :param properties: Basic.properties
+        :param mandatory: The mandatory flag
+        :param message_id: Opaque business identifier echoed by the returned object and the
+            settlement callback, used to reissue this exact object after a failure.
+        :param on_settled: Optional callback invoked once on the I/O loop thread with the
+            `StreamingPublish`, its terminal state and failure reason.
+        :returns: The `StreamingPublish` handle for this message.
+        :raises TypeError: if *source* does not provide a callable `read` or *body_size* is not a
+            non-negative integer.
+        """
+        self._raise_if_not_open()
+        if not isinstance(body_size, int) or body_size < 0:
+            raise TypeError(
+                'body_size must be a non-negative int, '
+                f'but got {body_size!r}')
+        if not callable(getattr(source, 'read', None)):
+            raise TypeError(
+                'source must implement MessageBodySource.read(offset, length), '
+                f'but got {source!r}')
+        if on_settled is not None:
+            validators.require_callback(on_settled, 'on_settled')
+
+        stream_publish = StreamingPublish(
+            channel=self,
+            source=source,
+            body_size=body_size,
+            message_id=message_id,
+            on_settled=on_settled,
+            method_frame=spec.Basic.Publish(exchange=exchange,
+                                            routing_key=routing_key,
+                                            mandatory=mandatory),
+            properties=properties or spec.BasicProperties())
+        self._stream_publishes.append(stream_publish)
+        if len(self._stream_publishes) == 1:
+            try:
+                stream_publish._activate()
+            except BaseException as exc:
+                self._stream_publishes.remove(stream_publish)
+                self.connection._request_stream_publish_failure(
+                    stream_publish, exc)
+        return stream_publish
+
+    def _on_stream_publish_settled(
+            self, stream_publish: StreamingPublish) -> None:
+        """
+        Advance this channel's streaming publish FIFO after a settlement.
+
+        Only the head may be active; the next queued stream activates only once the head completed
+        and left the deque, which keeps each content body's frame sequence contiguous. A failed or
+        aborted head tears the connection or channel down, so the rest settle as aborted instead.
+        """
+        try:
+            self._stream_publishes.remove(stream_publish)
+        except ValueError:
+            return
+        self.connection._on_stream_publish_settled(stream_publish)
+        if (stream_publish.state == StreamingPublishState.COMPLETED and
+                self._stream_publishes and self.is_open):
+            try:
+                self._stream_publishes[0]._activate()
+            except BaseException as exc:
+                head = self._stream_publishes.popleft()
+                self.connection._request_stream_publish_failure(head, exc)
+
+    def _abort_stream_publishes(self, reason: BaseException | None) -> None:
+        """Settle every queued streaming publish as aborted during teardown.
+
+        Iterates a snapshot because each settle callback mutates the deque.
+        """
+        for stream_publish in list(self._stream_publishes):
+            stream_publish._abort(reason)
 
     def basic_qos(self,
                   prefetch_size: int = 0,
@@ -1338,6 +1457,7 @@ class Channel:
                 self._discarded_while_closing, self.channel_number)
             self._discarded_while_closing = 0
 
+        self._abort_stream_publishes(self._closing_reason)
         self._set_state(self.CLOSED)
 
         try:

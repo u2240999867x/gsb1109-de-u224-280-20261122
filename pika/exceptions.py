@@ -486,3 +486,27 @@ class DuplicateGetOkCallback(ChannelError):
         return (
             f'{self.__class__.__name__}: basic_get can only be called again after the callback for '
             'the previous basic_get is executed')
+
+
+class MessageSourceUnavailable(AMQPConnectionError):
+    """A streaming publish's body source could not supply the remaining bytes.
+
+    The content header already promised a body of a fixed length, and AMQP 0-9-1 has no way to
+    retract a content body mid-sequence, so this closes the connection. Every other in-flight
+    streaming publish is settled as aborted and the job is expected to reissue the objects by
+    their application-supplied identifiers.
+    """
+
+    def __init__(self,
+                 message_id: object,
+                 cause: BaseException | None = None,
+                 host: str | None = None,
+                 port: int | None = None) -> None:
+        super().__init__(
+            f'streaming publish source failed for message_id={message_id!r}: '
+            f'{cause!r}',
+            host=host,
+            port=port)
+        self.message_id = message_id
+        if cause is not None:
+            self.__cause__ = cause

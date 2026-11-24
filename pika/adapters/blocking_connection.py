@@ -40,6 +40,7 @@ import pika.channel
 import pika.connection
 import pika.frame
 import pika.spec
+import pika.streaming_publish
 from pika import exceptions, validators
 from pika._utils import override
 
@@ -2435,6 +2436,104 @@ class BlockingChannel:
                                      properties=properties,
                                      mandatory=mandatory)
             self._flush_output()
+
+    def basic_publish_stream(self,
+                             exchange: str,
+                             routing_key: str,
+                             body_size: int,
+                             source,
+                             properties: pika.spec.BasicProperties
+                             | None = None,
+                             mandatory: bool = False,
+                             message_id=None,
+                             on_settled=None
+                             ) -> pika.streaming_publish.StreamingPublish:
+        """
+        Publish a message whose body is streamed from *source*, blocking until the body is fully
+        handed to the transport.
+
+        The body is never held whole: the underlying I/O loop pulls body frames from *source* by
+        offset while this method drives the loop, so a source that is temporarily empty (an empty
+        ``read`` result) simply parks the publish without blocking the connection's other channels
+        or heartbeats. See `pika.channel.Channel.basic_publish_stream` for the source contract and
+        frame ordering.
+
+        In publisher-acknowledgements mode (see `confirm_delivery`) the method additionally waits
+        for the broker's `Basic.Ack`/`Basic.Nack`, raising `NackError` or `UnroutableError` exactly
+        as `basic_publish` does. A source failure or connection loss raises instead, with the
+        connection-level exception carrying the failing message's *message_id*; every other
+        in-flight streaming publish is reported through *on_settled* as aborted so the job can
+        reissue those objects by their identifiers.
+
+        :param source: Object with ``read(offset, length) -> bytes``.
+        :param message_id: Business identifier echoed back on settlement and in failure errors.
+        :param on_settled: Optional callback receiving the underlying
+            `pika.streaming_publish.StreamingPublish`, its terminal state and reason.
+        :returns: The settled `pika.streaming_publish.StreamingPublish`.
+        :raises pika.exceptions.MessageSourceUnavailable: the source failed after the header was
+            sent.
+        :raises Exception: the channel or connection close reason if it closed mid-body.
+        """
+        if not isinstance(body_size, int) or body_size < 0:
+            raise TypeError(
+                'body_size must be a non-negative int, '
+                f'but got {body_size!r}')
+        if not callable(getattr(source, 'read', None)):
+            raise TypeError(
+                'source must implement read(offset, length), '
+                f'but got {source!r}')
+
+        with _CallbackResult[tuple[
+                pika.streaming_publish.StreamingPublishState,
+                BaseException | None]]() as settled_result:
+
+            def _on_settled(stream_publish, state, reason):
+                if on_settled is not None:
+                    on_settled(stream_publish, state, reason)
+                settled_result.set_reply((state, reason))
+
+            stream_publish = self._impl.basic_publish_stream(
+                exchange=exchange,
+                routing_key=routing_key,
+                body_size=body_size,
+                source=source,
+                properties=properties,
+                mandatory=mandatory,
+                message_id=message_id,
+                on_settled=_on_settled)
+
+            self._flush_output(settled_result.is_ready)
+            state, reason = settled_result.value
+
+        if state in (pika.streaming_publish.StreamingPublishState.FAILED,
+                     pika.streaming_publish.StreamingPublishState.ABORTED):
+            if reason is None:
+                reason = exceptions.AMQPError(
+                    f'streaming publish {message_id!r} ended in state {state}')
+            raise reason
+
+        if self._delivery_confirmation:
+            # Reset first: a previous publish's Ack would otherwise satisfy the
+            # flush waiter before this message's confirm arrives. The `with`
+            # block re-resets on exit, including when the Nack/return raises.
+            with self._message_confirmation_result:
+                self._message_confirmation_result.reset()
+                self._flush_output(self._message_confirmation_result.is_ready)
+                conf_method = (
+                    self._message_confirmation_result.value.method_frame.method)
+                if isinstance(conf_method, pika.spec.Basic.Nack):
+                    if self._puback_return is not None:
+                        returned_messages = [self._puback_return]
+                        self._puback_return = None
+                    else:
+                        returned_messages = []
+                    raise exceptions.NackError(returned_messages)
+                if self._puback_return is not None:
+                    messages = [self._puback_return]
+                    self._puback_return = None
+                    raise exceptions.UnroutableError(messages)
+
+        return stream_publish
 
     def basic_qos(self,
                   prefetch_size: int = 0,

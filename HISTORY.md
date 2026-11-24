@@ -2,6 +2,12 @@
 
 Notes for each release are also published on the [GitHub releases page](https://github.com/pika/pika/releases), generated from the pull requests and issues the release contains.
 
+## Unreleased
+
+### Streaming large message bodies without materializing them
+
+`Channel.basic_publish_stream` publishes a message whose body is pulled from a re-readable source by offset instead of being buffered whole. The method and content header frames go out first with the fixed body size, and body frames are streamed as the socket accepts them. A source that is temporarily empty returns empty `bytes` from `read`; the pump yields the I/O loop so other channels' frames and heartbeats keep flowing. Streams on one channel are strictly FIFO and a regular `basic_publish` is refused while one is queued, so content bodies never interleave. A permanently failed source settles that publish as `FAILED`, closes the connection, and settles every other in-flight stream as `ABORTED` with its application-supplied `message_id`, so jobs can reissue the affected objects. `BlockingChannel.basic_publish_stream` and the thread-safe `pika.Connection` `Channel.basic_publish_stream` wrap the same mechanism.
+
 ## Upgrading to 1.5.0
 
 Twelve changes are worth reading before you upgrade. One adds `pika.Connection`, three can turn a passing build red, two change what a working application observes when it cancels a consumer or closes a channel, one lets RabbitMQ close a channel sooner after a consumer timeout, one refuses messages larger than 64 MiB, one changes what the Twisted adapter reports when a connection closes, one closes the connection when a consumer or reply callback raises `BlockingIOError`, one changes the Python types that field-table numbers decode to, and one makes URL `ssl_options` verify the broker.

@@ -141,6 +141,7 @@ nav:
       - Field Tables: modules/data.md
       - Parameters: modules/parameters.md
       - Specification: modules/spec.md
+      - Streaming Publish: modules/streaming_publish.md
   - Examples:
       - Overview: examples.md
       - URLParameters: examples/using_urlparameters.md
