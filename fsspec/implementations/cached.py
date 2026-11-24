@@ -11,7 +11,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from hashlib import sha256
-from shutil import rmtree
+from shutil import copyfile, rmtree
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from fsspec import filesystem
@@ -19,7 +19,7 @@ from fsspec.asyn import _run_coros_in_chunks
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.compression import compr
 from fsspec.core import BaseCache, MMapCache
-from fsspec.exceptions import BlocksizeMismatchError
+from fsspec.exceptions import BlocksizeMismatchError, UnconfirmedWriteError
 from fsspec.implementations.cache_mapper import create_cache_mapper
 from fsspec.implementations.cache_metadata import CacheMetadata
 from fsspec.implementations.chained import ChainedFileSystem
@@ -73,25 +73,107 @@ def _atomic_get(fs, rpaths, lpaths, callback=DEFAULT_CALLBACK):
 class WriteCachedTransaction(Transaction):
     def complete(self, commit=True):
         if not commit:
-            return super().complete(commit=False)
-        rpaths = [f.path for f in self.files]
-        lpaths = [f.fn for f in self.files]
+            fs = self.fs
+            try:
+                return super().complete(commit=False)
+            finally:
+                if fs is not None:
+                    fs._cleanup_staging()
+        # repeated writes to one target share a staged file, so the bulk upload
+        # and its reconciliation consider every target exactly once
+        fs = self.fs
+        staged = {}
+        for f in self.files:
+            staged.setdefault(f.path, f.fn)
+        rpaths = list(staged)
+        lpaths = list(staged.values())
         try:
-            self.fs.put(lpaths, rpaths)
-        except BaseException:
-            # A failed bulk upload may have published some remote files, but the
-            # remaining local writes must not keep this filesystem in a dead
-            # transaction. The base cleanup discards staged files and always
-            # resets transaction state, including when a discard fails.
+            fs.put(lpaths, rpaths)
+        except BaseException as exc:
+            # interrupts propagate immediately: no extra backend round trips
+            if not isinstance(exc, Exception):
+                try:
+                    super().complete(commit=False)
+                except Exception:
+                    logger.debug("Discarding failed cached transaction", exc_info=True)
+                fs._cleanup_staging()
+                raise
+            # A failed bulk upload may still have published some remote files.
+            # Reconcile the cache against the backend before the base cleanup
+            # discards the staged copies, so confirmed publications stay
+            # readable locally and unconfirmed targets stop serving stale data.
+            try:
+                outcomes = self._reconcile_failed_upload(rpaths, lpaths)
+            except Exception as reconcile_exc:
+                # never leave a dead transaction or a leaked staging directory
+                try:
+                    super().complete(commit=False)
+                except Exception:
+                    logger.debug("Discarding failed cached transaction", exc_info=True)
+                fs._cleanup_staging()
+                raise exc from reconcile_exc
+            # The remaining local writes must not keep this filesystem in a
+            # dead transaction. The base cleanup discards staged files and
+            # always resets transaction state, including when a discard fails.
             try:
                 super().complete(commit=False)
             except Exception:
                 logger.debug("Discarding failed cached transaction", exc_info=True)
+            fs._cleanup_staging()
+            fs._annotate_upload_failure(exc, rpaths, outcomes)
             raise
+        # the bulk upload is confirmed: keep the published bytes readable from
+        # the writable cache, ahead of any read-only pre-warmed copies
+        for rpath, lpath in zip(rpaths, lpaths):
+            fs._publish_cache_file(rpath, lpath)
+        fs._cleanup_staging()
         self.files.clear()
-        self.fs._intrans = False
-        self.fs._transaction = None
+        fs._intrans = False
+        fs._transaction = None
         self.fs = None  # break cycle
+
+    def _reconcile_failed_upload(self, rpaths, lpaths):
+        """Align the local cache with whatever the partial upload published.
+
+        The backend is queried at most once per target, so each target reports
+        a single outcome: a confirmed publication is republished into the
+        writable cache, a target still holding older data drops its staged
+        copy, and a target that cannot be read is marked unconfirmed until a
+        later backend read resolves it. A definitive "missing" answer means the
+        write never landed, so such a target is simply treated as unchanged.
+        """
+        fs = self.fs
+        missing = fs._missing_exceptions()
+        outcomes = {}
+        for rpath, lpath in zip(rpaths, lpaths):
+            try:
+                with open(lpath, "rb") as f:
+                    staged = f.read()
+                remote = fs.fs.cat_file(rpath)
+            except Exception as read_exc:
+                if isinstance(read_exc, tuple(missing)):
+                    # the backend answered definitively: no file was published
+                    fs._clear_unconfirmed(rpath)
+                    with suppress(FileNotFoundError):
+                        os.remove(lpath)
+                    outcomes[rpath] = "unchanged"
+                else:
+                    fs._mark_unconfirmed(rpath, read_exc)
+                    outcomes[rpath] = "unconfirmed"
+                continue
+            if remote == staged:
+                # the upload landed even though the bulk commit failed: keep a
+                # readable copy of the published bytes in the writable cache
+                fs._publish_cache_file(rpath, lpath)
+                outcomes[rpath] = "published"
+            else:
+                # the target still holds an older version: never shadow it with
+                # the staged write, and resolve any earlier uncertainty
+                fs._clear_unconfirmed(rpath)
+                with suppress(FileNotFoundError):
+                    os.remove(lpath)
+                outcomes[rpath] = "unchanged"
+        return outcomes
 
 
 class CachingFileSystem(ChainedFileSystem):
@@ -563,6 +645,20 @@ class CachingFileSystem(ChainedFileSystem):
             "pipe",
             "start_transaction",
             "end_transaction",
+            "_staged_path",
+            "_unconfirmed_marker",
+            "_has_unconfirmed_marker",
+            "_mark_unconfirmed",
+            "_clear_unconfirmed",
+            "_unconfirmed_error",
+            "_recover_unconfirmed",
+            "_recover_unconfirmed_async",
+            "_local_cached_file",
+            "_local_check",
+            "_missing_exceptions",
+            "_publish_cache_file",
+            "_cleanup_staging",
+            "_annotate_upload_failure",
         }:
             # all the methods defined in this class. Note `open` here, since
             # it calls `_open`, but is actually in superclass
@@ -577,7 +673,13 @@ class CachingFileSystem(ChainedFileSystem):
         if item in ["transaction"]:
             # property
             return type(self).transaction.__get__(self)
-        if item in {"_cache", "transaction_type", "protocol"}:
+        if item in {
+            "_cache",
+            "transaction_type",
+            "protocol",
+            "staging_dirname",
+            "unconfirmed_dirname",
+        }:
             # class attributes
             return getattr(type(self), item)
         if item == "__class__":
@@ -931,14 +1033,46 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         logger.debug("async cat ranges %s", paths)
         # _local_paths_for_ranges, but the validity check is a coroutine here
         paths = [self._strip_protocol(p) for p in paths]
+        if not isinstance(starts, list):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, list):
+            ends = [ends] * len(paths)
         lpaths = []
         local = {}
         need = {}
+        check_errors = {}
         for p in paths:
             if p not in local:
-                local[p] = await self._check_file_async(p) or need.setdefault(
-                    p, os.path.join(self.storage[-1], self._mapper(p))
-                )
+                try:
+                    local[p] = await self._check_file_async(p) or need.setdefault(
+                        p, os.path.join(self.storage[-1], self._mapper(p))
+                    )
+                except Exception as exc:
+                    # an unconfirmed simplecache write gets one chance to be
+                    # resolved through the asynchronous backend
+                    if isinstance(exc, UnconfirmedWriteError) and hasattr(
+                        self, "_recover_unconfirmed_async"
+                    ):
+                        try:
+                            await self._recover_unconfirmed_async(p)
+                        except Exception as recover_exc:
+                            if isinstance(recover_exc, self._missing_exceptions()):
+                                # definitive "missing": the write never landed
+                                self._clear_unconfirmed(p)
+                                if on_error == "raise":
+                                    raise
+                                check_errors[p] = recover_exc
+                                local[p] = recover_exc
+                                lpaths.append(local[p])
+                                continue
+                        else:
+                            local[p] = await self._check_file_async(p)
+                            lpaths.append(local[p])
+                            continue
+                    if on_error == "raise":
+                        raise
+                    check_errors[p] = exc
+                    local[p] = exc
             lpaths.append(local[p])
         errors = {}
         if need:
@@ -953,12 +1087,29 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             if errors and on_error == "raise":
                 raise next(iter(errors.values()))
 
-        out = LocalFileSystem().cat_ranges(
-            lpaths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
-        )
+        readable = [
+            i
+            for i, p in enumerate(paths)
+            if p not in errors and not isinstance(lpaths[i], Exception)
+        ]
+        out = [None] * len(paths)
+        if readable:
+            values = LocalFileSystem().cat_ranges(
+                [lpaths[i] for i in readable],
+                [starts[i] for i in readable],
+                [ends[i] for i in readable],
+                max_gap=max_gap,
+                on_error=on_error,
+                **kwargs,
+            )
+            for i, value in zip(readable, values):
+                out[i] = value
         if on_error == "return":
-            # report the download error, not the missing local copy
-            out = [errors.get(p, o) for p, o in zip(paths, out)]
+            # report the check/download error, not the missing local copy
+            for i, p in enumerate(paths):
+                error = check_errors.get(p) or errors.get(p)
+                if error is not None:
+                    out[i] = error
         return out
 
 
@@ -982,6 +1133,15 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
     local_file = True
     transaction_type = WriteCachedTransaction
 
+    #: directory, inside the writable cache, holding files staged by an open
+    #: transaction; it is removed again when that transaction finishes
+    staging_dirname = ".fsspec-staging"
+    #: directory, inside the writable cache, holding a marker file per target
+    #: whose last bulk upload could not be confirmed. Markers survive process
+    #: and instance restarts, so independently constructed readers sharing the
+    #: cache directories refuse stale copies until the backend is reachable.
+    unconfirmed_dirname = ".fsspec-unconfirmed"
+
     def __init__(self, **kwargs):
         kw = kwargs.copy()
         for key in ["cache_check", "expiry_time", "check_files"]:
@@ -991,13 +1151,148 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
             if not os.path.exists(storage):
                 self._makedirs(storage)
 
-    def _check_file(self, path):
-        self._check_cache()
+    def _staged_path(self, path):
+        path = self._strip_protocol(path)
+        return os.path.join(self.storage[-1], self.staging_dirname, self._mapper(path))
+
+    def _unconfirmed_marker(self, path):
+        path = self._strip_protocol(path)
+        return os.path.join(
+            self.storage[-1], self.unconfirmed_dirname, self._mapper(path)
+        )
+
+    def _mark_unconfirmed(self, path, exc):
+        path = self._strip_protocol(path)
+        marker = self._unconfirmed_marker(path)
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with _tempfile(marker) as tmp, open(tmp, "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}")
+
+    def _clear_unconfirmed(self, path):
+        with suppress(FileNotFoundError):
+            os.remove(self._unconfirmed_marker(path))
+
+    def _has_unconfirmed_marker(self, path):
+        return os.path.exists(self._unconfirmed_marker(self._strip_protocol(path)))
+
+    def _unconfirmed_error(self, path):
+        try:
+            with open(self._unconfirmed_marker(path)) as f:
+                detail = f.read()
+        except OSError:
+            detail = "unknown backend error"
+        return UnconfirmedWriteError(
+            f"write to {self._strip_protocol(path)} could not be confirmed: {detail}"
+        )
+
+    def _recover_unconfirmed(self, path):
+        """Resolve an unconfirmed target with one successful backend read.
+
+        Downloads the version that actually landed into the writable cache and
+        drops the marker. Raises if the backend still cannot be read, in which
+        case the marker is retained.
+        """
+        self._get_cached_file_before_open(path)
+        self._clear_unconfirmed(path)
+
+    async def _recover_unconfirmed_async(self, path):
+        # async counterpart of ``_recover_unconfirmed`` for backends that only
+        # expose asynchronous reads
+        fn = os.path.join(self.storage[-1], self._mapper(path))
+        await self._download_async(path, fn)
+        self._clear_unconfirmed(path)
+
+    def _local_cached_file(self, path):
+        """Return a local cached path without any remote I/O, or ``None``."""
         sha = self._mapper(path)
-        for storage in self.storage:
+        # the writable cache shadows the read-only, possibly pre-warmed caches
+        for storage in reversed(self.storage):
             fn = os.path.join(storage, sha)
             if os.path.exists(fn):
                 return fn
+
+    def _publish_cache_file(self, rpath, lpath):
+        """Make a staged or staged-like local copy the cached version."""
+        rpath = self._strip_protocol(rpath)
+        target = os.path.join(self.storage[-1], self._mapper(rpath))
+        self._mkcache()
+        with _tempfile(target) as tmp:
+            copyfile(lpath, tmp)
+        self._clear_unconfirmed(rpath)
+        self._cache_size = None
+
+    def _cleanup_staging(self):
+        with suppress(OSError):
+            rmtree(os.path.join(self.storage[-1], self.staging_dirname))
+
+    def _missing_exceptions(self):
+        return getattr(
+            self.fs,
+            "missing_exceptions",
+            (FileNotFoundError, IsADirectoryError, NotADirectoryError),
+        )
+
+    def _check_file(self, path):
+        self._check_cache()
+        path = self._strip_protocol(path)
+        # an open transaction always reads its own staged writes first, even if
+        # the same target is still marked unconfirmed from a previous upload
+        if self._intrans:
+            staged = self._staged_path(path)
+            if os.path.exists(staged):
+                return staged
+        # an unconfirmed target gets one backend read to prove which version
+        # was published before any local copy is served
+        if self._has_unconfirmed_marker(path):
+            try:
+                self._recover_unconfirmed(path)
+            except Exception as exc:
+                if isinstance(exc, self._missing_exceptions()):
+                    # a definitive "missing" answer resolves the uncertainty:
+                    # nothing was published, so drop the marker and report the
+                    # ordinary missing-file error
+                    self._clear_unconfirmed(path)
+                    raise
+                raise self._unconfirmed_error(path) from exc
+        return self._local_check(path)
+
+    def _local_check(self, path):
+        """Local-only cache lookup, staging aware, without any remote I/O."""
+        path = self._strip_protocol(path)
+        # an open transaction always reads its own staged writes
+        if self._intrans:
+            staged = self._staged_path(path)
+            if os.path.exists(staged):
+                return staged
+        # refuse every local copy of an unconfirmed target
+        if self._has_unconfirmed_marker(path):
+            raise self._unconfirmed_error(path)
+        return self._local_cached_file(path)
+
+    async def _check_file_async(self, path):
+        # existence-based, no remote I/O: an unconfirmed target is reported as
+        # an error here and recovered, if possible, by the async cat paths
+        return self._local_check(path)
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        path = self._strip_protocol(path)
+        if self._has_unconfirmed_marker(path):
+            try:
+                await self._recover_unconfirmed_async(path)
+            except Exception as exc:
+                if isinstance(exc, self._missing_exceptions()):
+                    self._clear_unconfirmed(path)
+                    raise
+                raise self._unconfirmed_error(path) from exc
+        return await super()._cat_file(path, start, end, **kwargs)
+
+    def _annotate_upload_failure(self, exc, rpaths, outcomes):
+        # keep the original upload exception object, but record one outcome per
+        # target so callers can tell published, unconfirmed and unchanged files
+        exc.upload_outcomes = dict(outcomes)
+        summary = ", ".join(f"{path} {state}" for path, state in outcomes.items())
+        exc.add_note(f"upload outcomes: {summary}")
+        return exc
 
     def save_cache(self):
         pass
@@ -1110,12 +1405,58 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
         self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
     ):
         logger.debug("cat ranges %s", paths)
-        lpaths, rpaths, download = self._local_paths_for_ranges(paths)
+        paths = [self._strip_protocol(p) for p in paths]
+        if not isinstance(starts, list):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, list):
+            ends = [ends] * len(paths)
+        lpaths, rpaths, download = self._local_paths_for_ranges(
+            paths, on_error=on_error
+        )
         if download:
             _atomic_get(self.fs, rpaths, download, callback=self.callback)
-        return LocalFileSystem().cat_ranges(
-            lpaths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
-        )
+        # unconfirmed targets surface as exceptions instead of local paths;
+        # keep them in their original position in the result
+        out = [None] * len(paths)
+        ok = [i for i, fn in enumerate(lpaths) if not isinstance(fn, Exception)]
+        if ok:
+            values = LocalFileSystem().cat_ranges(
+                [lpaths[i] for i in ok],
+                [starts[i] for i in ok],
+                [ends[i] for i in ok],
+                max_gap=max_gap,
+                on_error=on_error,
+                **kwargs,
+            )
+            for i, value in zip(ok, values):
+                out[i] = value
+        for i, fn in enumerate(lpaths):
+            if isinstance(fn, Exception):
+                out[i] = fn
+        return out
+
+    def _local_paths_for_ranges(self, paths, on_error="return"):
+        lpaths = []
+        local = {}
+        download = []
+        rpaths = []
+        for p in paths:
+            if p not in local:
+                try:
+                    fn = self._check_file(p)
+                except Exception as exc:
+                    if on_error == "raise":
+                        raise
+                    local[p] = exc
+                    lpaths.append(exc)
+                    continue
+                if not fn:
+                    fn = os.path.join(self.storage[-1], self._mapper(p))
+                    download.append(fn)
+                    rpaths.append(p)
+                local[p] = fn
+            lpaths.append(local[p])
+        return lpaths, rpaths, download
 
     def _get_cached_file_before_open(self, path, **kwargs):
         sha = self._mapper(path)
@@ -1151,23 +1492,41 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
 
     def _open(self, path, mode="rb", **kwargs):
         path = self._strip_protocol(path)
-        sha = self._mapper(path)
+
+        # writes inside a transaction are staged out of the cache directories,
+        # so other instances and the read-only caches never see uncommitted
+        # bytes; standalone writes keep using the final writable cache path
+        staging = self._intrans and not ("r" in mode and "+" not in mode)
+        if staging:
+            fn = self._staged_path(path)
+            os.makedirs(os.path.dirname(fn), exist_ok=True)
+            # append/update modes need the current contents before they can be
+            # extended or modified in place
+            if ("a" in mode or "+" in mode) and not os.path.exists(fn):
+                cached = self._check_file(path)
+                if cached:
+                    copyfile(cached, fn)
+                elif self.fs.exists(path):
+                    self._mkcache()
+                    with _tempfile(fn) as tmp:
+                        self.fs.get_file(path, tmp, callback=self.callback)
+        else:
+            sha = self._mapper(path)
+            fn = os.path.join(self.storage[-1], sha)
 
         # For read (or append), (try) download from remote
         if "r" in mode or "a" in mode:
-            if not self._check_file(path):
+            cached = self._check_file(path)
+            if not staging and not cached:
                 # append does not require an existing file but read does
                 if self.fs.exists(path):
                     self._get_cached_file_before_open(path, **kwargs)
+                    cached = self._check_file(path)
                 elif "r" in mode:
                     raise FileNotFoundError(path)
+            if "r" in mode and "+" not in mode:
+                return open(cached, mode)
 
-        fn = self._check_file(path)
-        # Just reading does not need special file handling
-        if "r" in mode and "+" not in mode:
-            return open(fn, mode)
-
-        fn = os.path.join(self.storage[-1], sha)
         user_specified_kwargs = {
             k: v
             for k, v in kwargs.items()

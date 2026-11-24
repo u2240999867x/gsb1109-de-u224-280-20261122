@@ -80,6 +80,14 @@ Fixes
 - Close local transactional write handles before deleting their temporary files
   during rollback, avoiding Windows sharing errors and leaked handles.
 
+- Reconcile a failed ``simplecache`` bulk upload against the backend instead of
+  discarding every staged write: confirmed publications stay readable from the
+  writable cache, targets still holding older data keep their previous value,
+  and targets that cannot be confirmed raise ``UnconfirmedWriteError`` until a
+  successful backend read resolves them. Transactional writes are now staged in
+  an isolated directory, and with multiple cache locations the writable cache
+  shadows read-only, pre-warmed ones.
+
 - Omit unreachable references from ``ReferenceFileSystem.cat`` results when
   ``on_error="omit"``.
 

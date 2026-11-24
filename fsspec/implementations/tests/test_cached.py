@@ -12,7 +12,7 @@ import pytest
 
 import fsspec
 from fsspec.compression import compr
-from fsspec.exceptions import BlocksizeMismatchError
+from fsspec.exceptions import BlocksizeMismatchError, UnconfirmedWriteError
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.implementations.cache_mapper import (
     BasenameCacheMapper,
@@ -870,8 +870,7 @@ def test_filecache_multicache():
         assert f.read() == data * 2
 
 
-@pytest.mark.parametrize("impl", ["filecache", "simplecache"])
-def test_filecache_multicache_with_same_file_different_data_reads_from_first(impl):
+def test_filecache_multicache_with_same_file_different_data_reads_from_first():
     import tempfile
 
     origin = tempfile.mkdtemp()
@@ -883,23 +882,55 @@ def test_filecache_multicache_with_same_file_different_data_reads_from_first(imp
         f.write(data)
 
     # populate first cache
-    fs1 = fsspec.filesystem(impl, target_protocol="file", cache_storage=cache1)
+    fs1 = fsspec.filesystem("filecache", target_protocol="file", cache_storage=cache1)
     assert fs1.cat(f1) == data
 
     with open(f1, "wb") as f:
         f.write(data * 2)
 
     # populate second cache
-    fs2 = fsspec.filesystem(impl, target_protocol="file", cache_storage=cache2)
+    fs2 = fsspec.filesystem("filecache", target_protocol="file", cache_storage=cache2)
 
     assert fs2.cat(f1) == data * 2
 
     # the filenames in each cache are the same, but the data is different
     assert sorted(os.listdir(cache1)) == sorted(os.listdir(cache2))
 
-    fs = fsspec.filesystem(impl, target_protocol="file", cache_storage=[cache1, cache2])
+    fs = fsspec.filesystem(
+        "filecache", target_protocol="file", cache_storage=[cache1, cache2]
+    )
 
     assert fs.cat(f1) == data
+
+
+def test_simplecache_multicache_writable_cache_shadows_read_only():
+    import tempfile
+
+    origin = tempfile.mkdtemp()
+    cache1 = tempfile.mkdtemp()
+    cache2 = tempfile.mkdtemp()
+    data = b"test data"
+    f1 = os.path.join(origin, "afile")
+    with open(f1, "wb") as f:
+        f.write(data)
+
+    # pre-warm the read-only first cache with the original data
+    fs1 = fsspec.filesystem("simplecache", target_protocol="file", cache_storage=cache1)
+    assert fs1.cat(f1) == data
+
+    with open(f1, "wb") as f:
+        f.write(data * 2)
+
+    # fill the writable (last) cache from the updated origin
+    fs2 = fsspec.filesystem("simplecache", target_protocol="file", cache_storage=cache2)
+    assert fs2.cat(f1) == data * 2
+
+    # the writable cache wins, so published writes are never masked by a
+    # stale read-only pre-warmed copy
+    fs = fsspec.filesystem(
+        "simplecache", target_protocol="file", cache_storage=[cache1, cache2]
+    )
+    assert fs.cat(f1) == data * 2
 
 
 def test_filecache_with_checks():
@@ -1650,7 +1681,13 @@ def test_write_transaction_abort(tmp_path, m, existing, writes, mode):
 
     assert not fs._intrans
     assert fs._transaction is None
-    assert not list(tmp_path.iterdir())
+    if existing:
+        # the pre-warmed cache copy of the original survives the rollback;
+        # only the isolated staging files are discarded
+        assert fs.cat(path) == b"original"
+        assert len(list(tmp_path.iterdir())) == 1
+    else:
+        assert not list(tmp_path.iterdir())
     fresh = fsspec.filesystem(
         "simplecache", fs=m, cache_storage=str(tmp_path), skip_instance_cache=True
     )
@@ -2200,7 +2237,23 @@ def test_write_transaction_failed_upload_ends_transaction(
     assert not transaction.files
     # Cached filesystem instances must also be usable through a later lookup.
     assert fsspec.filesystem("simplecache", fs=m, cache_storage=str(tmp_path)) is fs
-    assert not list(tmp_path.iterdir())
+    if error_type is KeyboardInterrupt:
+        # interrupts skip the backend reconciliation entirely
+        assert not hasattr(raised.value, "upload_outcomes")
+        assert not list(tmp_path.iterdir())
+    else:
+        outcomes = raised.value.upload_outcomes
+        if uploaded:
+            assert outcomes == {"/first": "published", "/second": "unchanged"}
+            # the confirmed publication is kept readable in the writable cache
+            assert fs.cat("/first") == b"first"
+            assert len(list(tmp_path.iterdir())) == 1
+        else:
+            assert outcomes == {
+                "/first": "unchanged",
+                "/second": "unchanged",
+            }
+            assert not list(tmp_path.iterdir())
     if cleanup_error:
         assert set(discards) == {"/first", "/second"}
     # Bulk transfers are not atomic: do not delete already-uploaded remote files.
@@ -2215,3 +2268,150 @@ def test_write_transaction_failed_upload_ends_transaction(
     with fs.transaction:
         fs.pipe("/next-transaction", b"committed")
     assert m.cat("/next-transaction") == b"committed"
+
+
+class _UncertainBackend(MemoryFileSystem):
+    """Memory backend whose bulk upload can lose its acknowledgement.
+
+    Reads of paths in ``unreadable`` keep failing until the backend is
+    "recovered", modelling a write whose publication cannot yet be confirmed.
+    """
+
+    protocol = "uncertainmem"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.offline = False
+        self.unreadable = set()
+        self.upload_error = None
+
+    def _guard(self, path):
+        path = self._strip_protocol(path)
+        if self.offline or path in self.unreadable:
+            raise ConnectionError(f"cannot confirm read of {path}")
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self._guard(path)
+        return super().cat_file(path, start, end, **kwargs)
+
+    def get_file(self, rpath, lpath, *args, **kwargs):
+        self._guard(rpath)
+        return super().get_file(rpath, lpath, *args, **kwargs)
+
+    def info(self, path, *args, **kwargs):
+        self._guard(path)
+        return super().info(path, *args, **kwargs)
+
+    def exists(self, path, *args, **kwargs):
+        self._guard(path)
+        return super().exists(path, *args, **kwargs)
+
+    def put(self, lpaths, rpaths, **kwargs):
+        if self.upload_error is None:
+            return super().put(lpaths, rpaths, **kwargs)
+        error = self.upload_error
+        for lpath, rpath in zip(lpaths, rpaths):
+            if rpath == "/w":
+                # x and y really landed, but the bulk acknowledgement is lost
+                # before w; reads of the just-written y can no longer confirm
+                self.unreadable.add("/y")
+                raise error
+            super().put([lpath], [rpath], **kwargs)
+
+
+def _simplecache(storage, backend):
+    return fsspec.filesystem(
+        "simplecache",
+        fs=backend,
+        cache_storage=list(storage),
+        skip_instance_cache=True,
+    )
+
+
+def test_simplecache_failed_bulk_upload_keeps_validator_consistent(tmp_path):
+    seed = tmp_path / "seed"
+    work = tmp_path / "work"
+    seed.mkdir()
+    work.mkdir()
+
+    backend = _UncertainBackend(skip_instance_cache=True)
+    backend.pipe({"/x": b"X0", "/y": b"Y0", "/w": b"W0", "/z": b"Z0"})
+
+    # pre-warm the read-only seed directory
+    warmer = _simplecache([str(seed)], backend)
+    for path in ("/x", "/y", "/w", "/z"):
+        warmer.cat(path)
+    seed_snapshot = {name: (seed / name).read_bytes() for name in os.listdir(seed)}
+
+    writer = _simplecache([str(seed), str(work)], backend)
+    validator = _simplecache([str(seed), str(work)], backend)
+
+    upload_error = ConnectionError("bulk upload acknowledgement lost")
+    backend.upload_error = upload_error
+    try:
+        with writer.transaction:
+            writer.pipe("/x", b"Xm")
+            writer.pipe("/x", b"X1")
+            writer.pipe("/y", b"Y1")
+            writer.pipe("/w", b"W1")
+            # the writer observes its own staged latest value ...
+            assert writer.cat("/x") == b"X1"
+            # ... while another instance still sees the committed value
+            assert validator.cat("/x") == b"X0"
+    except Exception as exc:
+        assert exc is upload_error  # original upload exception is preserved
+        # one outcome per target, reported a single time
+        assert exc.upload_outcomes == {
+            "/x": "published",
+            "/y": "unconfirmed",
+            "/w": "unchanged",
+        }
+    else:
+        raise AssertionError("the bulk upload was expected to fail")
+    backend.upload_error = None
+
+    # x was published, w never left its old value
+    assert validator.cat("/x") == b"X1"
+    assert validator.cat("/w") == b"W0"
+    # y cannot be confirmed, so no local copy is served
+    with pytest.raises(UnconfirmedWriteError):
+        validator.cat("/y")
+
+    # a freshly constructed validator gets the same treatment via the shared
+    # cache directories, even with the backend fully offline
+    backend.offline = True
+    rebuilt = _simplecache([str(seed), str(work)], backend)
+    result = rebuilt.cat_ranges(
+        ["/x", "/y", "/w", "/z"], [0, 0, 0, 0], [2, 2, 2, 2], on_error="return"
+    )
+    assert result[0] == b"X1"
+    assert isinstance(result[1], UnconfirmedWriteError)
+    assert result[2] == b"W0"
+    assert result[3] == b"Z0"
+
+    # a later, aborted transaction must neither publish nor resolve the marker
+    with pytest.raises(RuntimeError, match="abort"):
+        with writer.transaction:
+            writer.pipe("/y", b"Y2")
+            assert writer.cat("/y") == b"Y2"
+            raise RuntimeError("abort")
+    with pytest.raises(UnconfirmedWriteError):
+        validator.cat("/y")
+
+    # once the backend recovers, an ordinary read resolves the published value
+    backend.offline = False
+    backend.unreadable.clear()
+    assert validator.cat("/y") == b"Y1"
+
+    # the resolved copies survive another outage for a brand new validator
+    backend.offline = True
+    offline_reader = _simplecache([str(seed), str(work)], backend)
+    assert offline_reader.cat("/x") == b"X1"
+    assert offline_reader.cat("/y") == b"Y1"
+    # z never joined a transaction and stays readable from the seed
+    assert offline_reader.cat("/z") == b"Z0"
+
+    # the read-only seed directory was never modified
+    assert seed_snapshot == {
+        name: (seed / name).read_bytes() for name in os.listdir(seed)
+    }
