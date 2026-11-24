@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 from datetime import UTC, datetime
 from errno import ENOTEMPTY
@@ -9,9 +10,41 @@ from typing import Any
 
 from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.transaction import Transaction
 from fsspec.utils import stringify_path, tokenize
 
 logger = logging.getLogger("fsspec.memoryfs")
+
+
+class MemoryFileConflictError(FileExistsError, RuntimeError, ValueError):
+    """A stale handle or transaction tried to modify a replaced path."""
+
+
+# Descriptive alias.
+ConflictError = MemoryFileConflictError
+
+
+class _AppendBatch:
+    """Ordered append writes deferred by one filesystem transaction."""
+
+    __slots__ = ("entry", "data", "committed")
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.data = bytearray()
+        self.committed = False
+
+
+class MemoryTransaction(Transaction):
+    """Transaction which keeps append increments ordered by write call."""
+
+    def __init__(self, fs, **kwargs):
+        super().__init__(fs, **kwargs)
+        self.append_batches: dict[str, _AppendBatch] = {}
+
+    def start(self):
+        super().start()
+        self.append_batches = {}
 
 
 class MemoryFileSystem(AbstractFileSystem):
@@ -26,6 +59,7 @@ class MemoryFileSystem(AbstractFileSystem):
     pseudo_dirs = [""]  # shared by default
     protocol = "memory"
     root_marker = "/"
+    transaction_type = MemoryTransaction
 
     def __init__(self, *args, global_store=True, **kwargs):
         """Create a memory filesystem.
@@ -318,41 +352,106 @@ class MemoryFileSystem(AbstractFileSystem):
             parent = self._parent(parent)
             if self.isfile(parent):
                 raise FileExistsError(parent)
-        if mode in ["rb", "ab", "r+b", "a+b"]:
-            if path in self.store:
-                f = self.store[path]
-                if self._intrans and "a" in mode:
-                    # append to a copy so the store is unchanged until commit
-                    f = MemoryFile(self, path, f.getvalue())
-                    f.created = self.store[path].created
-                if "a" in mode:
-                    # position at the end of file
-                    f.seek(0, 2)
-                else:
-                    # position at the beginning of file
-                    f.seek(0)
-                return f
-            elif "a" in mode:
-                # append modes create the file if it does not exist, matching
-                # builtin open() and LocalFileSystem
-                m = MemoryFile(self, path, kwargs.get("data"))
-                if not self._intrans:
-                    m.commit()
-                # position at the end of file, like the existing-file path above
-                m.seek(0, 2)
-                return m
-            else:
+        defer = bool(self._intrans) or not autocommit
+        if mode == "rb":
+            if path not in self.store:
                 raise FileNotFoundError(path)
+            return self._open_reader(path, self.store[path])
+        elif mode in ["ab", "a+b"]:
+            return self._open_append(path, kwargs.get("data"), defer)
+        elif mode == "r+b":
+            entry = self.store.get(path)
+            if entry is None:
+                raise FileNotFoundError(path)
+            handle = self._open_reader(path, entry)
+            handle._write_through = True
+            return handle
         elif mode in {"wb", "w+b", "xb", "x+b"}:
             if "x" in mode and self.exists(path):
                 raise FileExistsError
             m = MemoryFile(self, path, kwargs.get("data"))
-            if not self._intrans:
+            if not defer:
                 m.commit()
             return m
         else:
             name = self.__class__.__name__
             raise ValueError(f"unsupported file mode for {name}: {mode!r}")
+
+    def _open_reader(self, path, entry):
+        # Each open reader gets its own cursor and a snapshot of the bytes that
+        # were published when it was opened.
+        reader = MemoryFile(self, path, entry.getvalue())
+        reader.created = entry.created
+        reader.modified = entry.modified
+        reader._entry = entry
+        reader.seek(0)
+        return reader
+
+    def _open_append(self, path, data, defer):
+        entry = self.store.get(path)
+        if entry is None:
+            if defer:
+                handle = MemoryFile(self, path, data)
+                handle._append_mode = True
+                batch = self._append_batch(path, None)
+                handle._append_batch = batch
+                if data:
+                    batch.data.extend(data)
+                handle.seek(0, 2)
+                return handle
+
+            # Append modes create missing paths, matching builtin open().
+            entry = MemoryFile(self, path, data)
+            entry.commit()
+
+        handle = MemoryFile(self, path, entry.getvalue())
+        handle.created = entry.created
+        handle.modified = entry.modified
+        handle._entry = entry
+        handle._append_mode = True
+        if defer:
+            handle._append_batch = self._append_batch(path, entry)
+        handle.seek(0, 2)
+        return handle
+
+    def _append_batch(self, path, entry):
+        transaction = self.transaction
+        if not isinstance(transaction, MemoryTransaction):
+            raise TypeError("MemoryFileSystem expected a MemoryTransaction")
+        batches = transaction.append_batches
+        batch = batches.get(path)
+        if batch is None:
+            batch = _AppendBatch(entry)
+            batches[path] = batch
+        return batch
+
+    def _commit_append_batch(self, path, batch):
+        if batch.committed:
+            return
+
+        current = self.store.get(path)
+        if batch.entry is None and current is not None:
+            # The path appeared while the transaction was open. Append to the
+            # current entity rather than overwriting its published bytes.
+            batch.entry = current
+
+        if batch.entry is None:
+            entry = MemoryFile(self, path, bytes(batch.data))
+            self.store[path] = entry
+        else:
+            if current is not batch.entry:
+                raise MemoryFileConflictError(
+                    errno.EEXIST,
+                    f"Stale memory file conflict for {path}: the path was "
+                    "deleted and recreated or replaced after this transaction "
+                    "opened",
+                    path,
+                )
+            if batch.data:
+                current.seek(0, 2)
+                current.write(batch.data)
+
+        batch.committed = True
 
     def cp_file(self, path1, path2, **kwargs):
         path1 = self._strip_protocol(path1)
@@ -451,6 +550,10 @@ class MemoryFile(BytesIO):
         self.path = path
         self.created = datetime.now(tz=UTC)
         self.modified = datetime.now(tz=UTC)
+        self._entry = None
+        self._write_through = False
+        self._append_mode = False
+        self._append_batch = None
         if data:
             super().__init__(data)
             self.seek(0)
@@ -460,9 +563,67 @@ class MemoryFile(BytesIO):
         return self.getbuffer().nbytes
 
     def write(self, data):
+        if self._append_mode:
+            return self._write_append(data)
+
+        fs = self.fs if isinstance(self.fs, MemoryFileSystem) else None
+        entry = self._entry if fs is not None and self._write_through else None
+        if entry is not None and self._append_batch is None:
+            self._check_current_entry(fs, entry)
+            position = self.tell()
+            written = super().write(data)
+            if written:
+                now = datetime.now(tz=UTC)
+                part = data[:written]
+                entry.seek(position)
+                entry.write(part)
+                self.modified = entry.modified = now
+            return written
+
         written = super().write(data)
         if written:
             self.modified = datetime.now(tz=UTC)
+        return written
+
+    def _check_current_entry(self, fs=None, entry=None):
+        fs = fs or self.fs
+        entry = entry or self._entry
+        if not isinstance(fs, MemoryFileSystem) or entry is None:
+            return
+        if fs.store.get(self.path) is not entry:
+            raise MemoryFileConflictError(
+                errno.EEXIST,
+                f"Stale memory file conflict for {self.path}: the path was "
+                "deleted and recreated or replaced after this handle opened",
+                self.path,
+            )
+
+    def _write_append(self, data):
+        fs = self.fs if isinstance(self.fs, MemoryFileSystem) else None
+        if fs is not None and self._append_batch is None:
+            self._check_current_entry(fs, self._entry)
+
+        # BytesIO's position is per handle. Seeking to the end here ensures that
+        # a prior seek() can only change reads, never the append location.
+        super().seek(0, 2)
+        written = super().write(data)
+        if not written:
+            return 0
+
+        now = datetime.now(tz=UTC)
+        self.modified = now
+        part = data[:written]
+
+        if self._append_batch is not None:
+            # Keep one path-ordered batch shared by all handles in this
+            # transaction. The store is intentionally untouched until commit.
+            self._append_batch.data.extend(part)
+        elif fs is not None:
+            entry = self._entry
+            entry.seek(0, 2)
+            entry.write(part)
+            self.modified = entry.modified = now
+
         return written
 
     def writelines(self, lines):
@@ -470,6 +631,15 @@ class MemoryFile(BytesIO):
             self.write(line)
 
     def truncate(self, size=None):
+        fs = self.fs if isinstance(self.fs, MemoryFileSystem) else None
+        entry = self._entry if fs is not None and self._write_through else None
+        if entry is not None and self._append_batch is None:
+            self._check_current_entry(fs, entry)
+            size = super().truncate(size)
+            entry.truncate(size)
+            self.modified = entry.modified = datetime.now(tz=UTC)
+            return size
+
         size = super().truncate(size)
         self.modified = datetime.now(tz=UTC)
         return size
@@ -481,8 +651,22 @@ class MemoryFile(BytesIO):
         pass
 
     def discard(self):
-        pass
+        if self._append_batch is not None:
+            self._append_batch.data.clear()
 
     def commit(self):
+        if self._append_mode:
+            if self._append_batch is not None:
+                self.fs._commit_append_batch(self.path, self._append_batch)
+            else:
+                self._check_current_entry()
+            # Autocommitted appends publish each write immediately; do not
+            # replace the canonical entity with this handle's cursor snapshot.
+            return
+        if self._entry is not None:
+            if self._write_through:
+                self._check_current_entry()
+            # Read snapshots and write-through handles are not store entities.
+            return
         self.fs.store[self.path] = self
         self.modified = datetime.now(tz=UTC)
