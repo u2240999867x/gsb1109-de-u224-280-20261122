@@ -18,7 +18,11 @@ from typing import (
     Any,
     NamedTuple,
     Optional,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from etlhelper.attachments import AttachmentArchive
 
 from etlhelper.abort import (
     raise_for_abort,
@@ -376,6 +380,7 @@ def copy_rows(
         on_error: Optional[Callable] = None,
         commit_chunks: bool = True,
         chunk_size: int = CHUNKSIZE,
+        attachments: Optional["AttachmentArchive"] = None,
         ) -> tuple[int, int]:
     """
     Copy rows from source_conn to dest_conn.  select_query and insert_query
@@ -396,6 +401,16 @@ def copy_rows(
     tuples.  on_error is a function that is called at the end of each chunk,
     with the list as the only argument.
 
+    If the optional attachments parameter is given (an
+    etlhelper.attachments.AttachmentArchive), large attachments are streamed
+    from locators in the source rows into an attachment table in the
+    destination SQLite database, with identical content stored only once.
+    In this mode the destination connection is never committed or rolled
+    back (commit_chunks is ignored); each row is processed inside a
+    savepoint so failed rows leave nothing behind and the caller controls
+    the final commit or rollback.  Calls without attachments behave exactly
+    as before.
+
     :param select_query: SQL query to select data
     :param source_conn: dbapi connection
     :param insert_query: SQL query to insert data
@@ -408,8 +423,18 @@ def copy_rows(
     :param on_error: function to be applied to failed rows in each chunk
     :param commit_chunks: commit after each chunk (see executemany)
     :param chunk_size: size of chunks to group data by
+    :param attachments: optional AttachmentArchive describing how to archive
+                        large attachments into the destination database
     :return: the number of rows processed and the number of rows failed
     """
+    if attachments is not None:
+        # Imported here to avoid a circular import at module load time
+        from etlhelper.attachments import copy_rows_with_attachments
+        return copy_rows_with_attachments(
+            select_query, source_conn, insert_query, dest_conn, attachments,
+            parameters=parameters, row_factory=row_factory,
+            transform=transform, on_error=on_error, chunk_size=chunk_size)
+
     rows_generator = iter_rows(select_query, source_conn,
                                parameters=parameters, row_factory=row_factory,
                                transform=transform, chunk_size=chunk_size)

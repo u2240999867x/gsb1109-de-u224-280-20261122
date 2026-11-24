@@ -28,6 +28,18 @@ class ETLHelperInsertError(ETLHelperError):
     """Exception raised when inserting data."""
 
 
+class ETLHelperAttachmentError(ETLHelperError):
+    """Exception raised when archiving an attachment fails."""
+
+
+class ETLHelperAttachmentLengthError(ETLHelperAttachmentError):
+    """Exception raised when an attachment's byte count is wrong."""
+
+
+class ETLHelperAttachmentDigestError(ETLHelperAttachmentError):
+    """Exception raised when an attachment's SHA-256 digest is wrong."""
+
+
 class ETLHelperAbort(ETLHelperError):
     """Exception raised when `abort` is called."""
 

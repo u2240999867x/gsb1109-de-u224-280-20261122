@@ -11,6 +11,10 @@ from typing import TextIO
 
 # Import helper functions here for more convenient access
 from etlhelper.abort import abort_etlhelper_threads
+from etlhelper.attachments import (
+    AttachmentArchive,
+    AttachmentColumn,
+)
 from etlhelper.db_params import DbParams
 from etlhelper.etl import (
     copy_rows,
@@ -82,6 +86,8 @@ def log_to_console(
 
 
 __all__ = [
+    "AttachmentArchive",
+    "AttachmentColumn",
     "DbParams",
     "abort_etlhelper_threads",
     "connect",

@@ -50,3 +50,47 @@ auto-generated values via the INSERT query.
 ``commit_chunks``, ``chunk_size`` and ``on_error`` options can be set.
 
 A tuple of rows processed and failed is returned.
+
+Archiving large attachments
+---------------------------
+
+``copy_rows`` can optionally archive large attachments (e.g. Oracle BLOB
+locators) into an attachment table in a destination SQLite database,
+storing identical content only once.  Pass an
+:class:`AttachmentArchive <etlhelper.attachments.AttachmentArchive>`
+describing the attachment table and one
+:class:`AttachmentColumn <etlhelper.attachments.AttachmentColumn>` per
+attachment position::
+
+    from etlhelper import AttachmentArchive, AttachmentColumn, copy_rows
+
+    attachments = AttachmentArchive(
+        table="attachments",
+        columns=(
+            AttachmentColumn(locator="att1_locator", target="attachment1_id",
+                             size="att1_size", sha256="att1_sha"),
+            AttachmentColumn(locator="att2_locator", target="attachment2_id",
+                             size="att2_size", sha256="att2_sha"),
+        ),
+    )
+
+    copy_rows(select_sql, oracle_conn, insert_sql, sqlite_conn,
+              attachments=attachments, on_error=my_error_handler)
+
+Each non-null locator is read fully via its 1-based
+``read(offset, amount)`` method and verified against the expected byte
+count and, if given, the expected SHA-256 digest.  Bodies are streamed in
+1 MiB chunks and written with SQLite incremental BLOB I/O, so attachments
+larger than 256 MiB never need to be held in memory.  A NULL locator
+stores a NULL reference, while a zero-length attachment stores a reference
+to a shared zero-byte body.
+
+In this mode the destination connection is never committed or rolled back
+(``commit_chunks`` is ignored).  Each row is processed inside a savepoint:
+rows whose attachments fail verification are reported via ``on_error``
+(with :class:`ETLHelperAttachmentLengthError
+<etlhelper.exceptions.ETLHelperAttachmentLengthError>` or
+:class:`ETLHelperAttachmentDigestError
+<etlhelper.exceptions.ETLHelperAttachmentDigestError>`) and leave no
+complete or partial bodies behind, while the caller's surrounding
+transaction is preserved.
