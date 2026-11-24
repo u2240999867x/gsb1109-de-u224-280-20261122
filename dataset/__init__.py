@@ -2,6 +2,15 @@ import os
 import warnings
 from typing import Any
 
+from dataset.collect import (
+    BatchResult,
+    CollectImportError,
+    CollectionImportError,
+    ConflictError,
+    IngestionError,
+    ReadingResult,
+    RevisionConflictError,
+)
 from dataset.database import Database
 from dataset.table import Table
 from dataset.util import DatasetError, OutRow, QueryError, RowFactory, row_factory
@@ -13,10 +22,17 @@ warnings.filterwarnings(
 )
 
 __all__ = [
+    "BatchResult",
+    "CollectImportError",
+    "CollectionImportError",
+    "ConflictError",
     "Database",
     "DatasetError",
+    "IngestionError",
     "OutRow",
     "QueryError",
+    "ReadingResult",
+    "RevisionConflictError",
     "RowFactory",
     "Table",
     "connect",

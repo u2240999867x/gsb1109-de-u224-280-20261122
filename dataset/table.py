@@ -1,7 +1,7 @@
 import logging
 import threading
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import false, func, select
@@ -347,22 +347,81 @@ class Table:
     def upsert_many(
         self,
         rows: Sequence[WriteRow],
-        keys: Sequence[str],
-        chunk_size: int = 1000,
+        keys: Sequence[str] | str | None = None,
+        chunk_size: int | bool | str = 1000,
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
-    ) -> None:
+        collect: bool | str | Mapping[str, Any] | None = None,
+        **collection_options: Any,
+    ) -> Any:
         """
         Sorts multiple input rows into upserts and inserts. Inserts are passed
         to insert and upserts are updated.
 
         See :py:meth:`upsert() <dataset.Table.upsert>` and
         :py:meth:`insert_many() <dataset.Table.insert_many>`.
+
+        Pass an explicit collection/intake flag (for example
+        ``collect=True``) to atomically ingest mixed readings and effective
+        handovers with source/revision deduplication and device attribution.
+        That mode returns reading results in input order; ordinary calls keep
+        their historical ``None`` return value and behavior.
         """
+        from dataset.collect import (
+            MODE_VALUES,
+            CollectionImporter,
+            collection_enabled,
+        )
+        from dataset.util import normalize_column_key
+
+        if collect is not None:
+            collection_options["collect"] = collect
+        mode_keys = {normalize_column_key(value) for value in MODE_VALUES}
+        positional_mode = chunk_size is True or (
+            isinstance(chunk_size, str)
+            and normalize_column_key(chunk_size) in mode_keys
+        ) or isinstance(chunk_size, Mapping)
+        enabled, options = collection_enabled(collection_options)
+        if positional_mode:
+            enabled = True
+            if isinstance(chunk_size, Mapping):
+                options.update(dict(chunk_size))
+                options.setdefault("collect_mode", True)
+            else:
+                options.setdefault("collect", chunk_size)
+
+        if enabled:
+            if isinstance(keys, bool):
+                options.setdefault("collect", keys)
+                keys = None
+            importer = CollectionImporter(
+                self,
+                rows,
+                keys,
+                ensure,
+                types,
+                options,
+            )
+            try:
+                self.db.begin()
+                result = importer.run()
+            except BaseException:
+                self.db.rollback()
+                raise
+            else:
+                self.db.commit()
+            return result
+
+        if keys is None:
+            raise TypeError(
+                "upsert_many() requires 'keys' unless collection mode is enabled"
+            )
+
         # Removing a bulk implementation in 5e09aba401. Doing this one by one
         # is incredibly slow, but doesn't run into issues with column creation.
         for row in rows:
             self.upsert(row, keys, ensure=ensure, types=types)
+        return None
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.
@@ -579,7 +638,10 @@ class Table:
         return args, row_
 
     def create_column(
-        self, name: str, type: ColumnType, **kwargs: object  # noqa: A002
+        self,
+        name: str,
+        type: ColumnType,
+        **kwargs: object,  # noqa: A002
     ) -> None:
         """Create a new column ``name`` of a specified type.
         ::
