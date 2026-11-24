@@ -746,6 +746,133 @@ def test_concatenate():
     assert_eq(np.concatenate([x, y, z], axis=-1), sparse.concatenate([xx, yy, zz], axis=-1))
 
 
+def test_concatenate_mixed_fill_values():
+    # Old stations report the daily background as 0, new stations as -999;
+    # both may explicitly store the other convention's background value.
+    old = COO(
+        np.array([[0, 1, 3], [1, 0, 2]]),
+        np.array([5, -999, 7]),
+        shape=(4, 3),
+        fill_value=0,
+    )
+    new = COO(
+        np.array([[0, 2], [2, 1]]),
+        np.array([0, 9]),
+        shape=(3, 3),
+        fill_value=-999,
+    )
+
+    cat = sparse.concatenate([old, new], axis=0)
+    assert isinstance(cat, sparse.BlockwiseArray)
+    assert cat.shape == (7, 3)
+    assert cat.nnz == old.nnz + new.nnz
+    assert cat.boundaries == (4,)
+
+    expected = np.concatenate([old.todense(), new.todense()], axis=0)
+    assert_eq(cat, expected)
+
+    # Swap axes first, then take a reversed window crossing the boundary.
+    window = cat.T[:, 5:0:-1]
+    assert_eq(window, expected.T[:, 5:0:-1])
+
+    got = window.todense()
+    # The explicit cross-background values survive at their positions.
+    assert got[2, 1] == 0  # new station's explicit 0, old cat[4, 2]
+    assert got[0, 4] == -999  # old station's explicit -999, old cat[1, 0]
+
+    # Missing cells are counted by the background of the day block they
+    # belong to.
+    (boundary,) = cat.boundaries
+    for j in range(got.shape[1]):
+        row = 5 - j
+        background = 0 if row < boundary else -999
+        assert np.sum(got[:, j] == background) == {0: 3, 1: 2, 2: 2, 3: 3, 4: 2}[j]
+
+    # Scalar lookups across the boundary.
+    assert cat[1, 0] == -999
+    assert cat[4, 2] == 0
+    assert cat[5, 0] == -999
+    assert cat[0, 1] == 5
+
+    # Chained concatenation absorbs the blocks instead of nesting.
+    cat2 = sparse.concatenate([cat, new], axis=0)
+    assert isinstance(cat2, sparse.BlockwiseArray)
+    assert len(cat2.blocks) == 3
+    assert_eq(cat2, np.concatenate([expected, new.todense()], axis=0))
+
+
+def test_concatenate_mixed_fill_values_huge_block():
+    # A full-background day block with 1e8 cells must not be materialized
+    # by concatenation, transposition, or window slicing.
+    small = COO(np.array([[0], [0]]), np.array([1]), shape=(1, 2), fill_value=0)
+    big = COO(
+        np.empty((2, 0), dtype=np.intp),
+        np.empty(0, dtype=np.int64),
+        shape=(100_000_000, 2),
+        fill_value=-999,
+    )
+
+    cat = sparse.concatenate([small, big], axis=0)
+    assert cat.shape == (100_000_001, 2)
+    assert cat.nnz == 1
+
+    transposed = cat.T
+    assert transposed.shape == (2, 100_000_001)
+    assert transposed.nnz == 1
+
+    window = transposed[:, :5]
+    assert window.nnz == 1
+    dense = window.todense()
+    assert dense[0, 0] == 1
+    assert_eq(dense[:, 1:], np.full((2, 4), -999))
+
+
+@pytest.mark.parametrize(
+    "sl",
+    [
+        slice(None),
+        slice(2, 6),
+        slice(6, 1, -1),
+        slice(None, None, 2),
+        slice(None, None, -2),
+        slice(8, 2, -3),
+        slice(1, 9, 3),
+        slice(0, 0),
+        slice(4, 4),
+        slice(-3, None),
+    ],
+)
+def test_concatenate_mixed_fill_values_slicing(sl):
+    rng = np.random.default_rng(42)
+    blocks = []
+    dense_blocks = []
+    for i, fv in enumerate([0, -999, 5]):
+        d = rng.integers(-5, 10, size=(3 + i, 4)).astype(np.int64)
+        blocks.append(COO.from_numpy(d, fill_value=fv))
+        dense_blocks.append(d)
+
+    cat = sparse.concatenate(blocks, axis=0)
+    expected = np.concatenate(dense_blocks, axis=0)
+
+    assert_eq(cat[sl, :], expected[sl, :])
+    assert_eq(cat.T[:, sl], expected.T[:, sl])
+    assert_eq(cat[:, ::-1][sl, :], expected[:, ::-1][sl, :])
+    assert_eq(cat[None, sl, :], expected[None, sl, :])
+
+
+def test_stack_mixed_fill_values():
+    x = COO.from_numpy(np.array([[0, 2], [3, 0]]), fill_value=0)
+    y = COO.from_numpy(np.array([[-999, 1], [0, -999]]), fill_value=-999)
+
+    s = sparse.stack([x, y], axis=1)
+    assert isinstance(s, sparse.BlockwiseArray)
+    expected = np.stack([x.todense(), y.todense()], axis=1)
+    assert_eq(s, expected)
+    assert_eq(s.T, expected.T)
+    assert_eq(s[:, 1, :], expected[:, 1, :])
+
+
+
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("func", [sparse.stack, sparse.concatenate])
 def test_concatenate_mixed(func, axis):
@@ -1494,8 +1621,10 @@ class TestFailFillValue:
         xs = sparse.random((3, 4), density=0.5, fill_value=1)
         ys = sparse.random((3, 4), density=0.5, fill_value=2)
 
-        with pytest.raises(ValueError):
-            sparse.concatenate([xs, ys])
+        # Mixed fill-values no longer raise; the blocks are concatenated
+        # lazily, each keeping its own background.
+        out = sparse.concatenate([xs, ys])
+        assert_eq(out, np.concatenate([xs.todense(), ys.todense()], axis=0))
 
 
 def test_pickle():

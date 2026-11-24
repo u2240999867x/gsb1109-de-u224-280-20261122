@@ -136,6 +136,7 @@ from ._common import (
     zeros,
     zeros_like,
 )
+from ._blockwise import BlockwiseArray
 from ._compressed import GCXS
 from ._coo import COO, as_coo
 from ._coo.common import (
@@ -179,6 +180,7 @@ from ._utils import random
 __all__ = [
     "COO",
     "DOK",
+    "BlockwiseArray",
     "GCXS",
     "SparseArray",
     "abs",

@@ -5,6 +5,7 @@ def test_namespace():
     from sparse.numba_backend._settings import IS_NUMPY2
 
     all_set = {
+        "BlockwiseArray",
         "COO",
         "DOK",
         "GCXS",

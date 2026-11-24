@@ -11,8 +11,8 @@ import numpy as np
 from .._sparse_array import SparseArray
 from .._utils import (
     can_store,
-    check_consistent_fill_value,
     check_zero_fill_value,
+    equivalent,
     is_unsigned_dtype,
     normalize_axis,
 )
@@ -143,27 +143,57 @@ def concatenate(arrays, axis=0):
     Returns
     -------
     COO
-        The output concatenated array.
+        The output concatenated array, if all inputs share the same
+        fill-value.
+    BlockwiseArray
+        A lazy block-wise concatenation, if the inputs have different
+        fill-values. Every input keeps its own fill-value (background);
+        only the stored value exceptions and the block boundaries are
+        kept, so transposing and slicing never materialize background
+        cells.
 
     Raises
     ------
     ValueError
-        If all elements of `arrays` don't have the same fill-value.
+        If `arrays` is empty or contains non-sparse arrays.
 
     See Also
     --------
     [`numpy.concatenate`][] : NumPy equivalent function
     """
+    from .._blockwise import BlockwiseArray
+    from .._sparse_array import SparseArray
     from .core import COO
 
-    check_consistent_fill_value(arrays)
+    arrays = list(arrays)
+    if len(arrays) == 0:
+        raise ValueError("At least one array required.")
+    if not all(isinstance(x, SparseArray) for x in arrays):
+        raise ValueError("All arrays must be instances of SparseArray.")
 
     if axis is None:
         axis = 0
         arrays = [x.flatten() for x in arrays]
 
-    arrays = [x if isinstance(x, COO) else COO(x) for x in arrays]
     axis = normalize_axis(axis, arrays[0].ndim)
+
+    # Absorb nested block-wise arrays joined along the same axis.
+    if any(isinstance(x, BlockwiseArray) for x in arrays):
+        absorbed = []
+        for x in arrays:
+            if isinstance(x, BlockwiseArray) and x.axis == axis:
+                absorbed.extend(x.blocks)
+            else:
+                absorbed.append(x)
+        arrays = absorbed
+
+    if not all(equivalent(x.fill_value, arrays[0].fill_value) for x in arrays):
+        # The blocks have different backgrounds; keep them lazy instead of
+        # materializing one block's background as stored values.
+        arrays = [x if isinstance(x, COO | BlockwiseArray) else COO(x) for x in arrays]
+        return BlockwiseArray(arrays, axis=axis)
+
+    arrays = [x if isinstance(x, COO) else COO(x) for x in arrays]
     assert all(x.shape[ax] == arrays[0].shape[ax] for x in arrays for ax in set(range(arrays[0].ndim)) - {axis})
     nnz = 0
     dim = sum(x.shape[axis] for x in arrays)
@@ -206,22 +236,38 @@ def stack(arrays, axis=0):
     Returns
     -------
     COO
-        The output stacked array.
+        The output stacked array, if all inputs share the same fill-value.
+    BlockwiseArray
+        A lazy block-wise stack, if the inputs have different fill-values.
 
     Raises
     ------
     ValueError
-        If all elements of `arrays` don't have the same fill-value.
+        If `arrays` is empty or contains non-sparse arrays.
 
     See Also
     --------
     [`numpy.stack`][] : NumPy equivalent function
     """
+    from .._blockwise import BlockwiseArray
+    from .._sparse_array import SparseArray
     from .core import COO
 
-    check_consistent_fill_value(arrays)
+    arrays = list(arrays)
+    if len(arrays) == 0:
+        raise ValueError("At least one array required.")
+    if not all(isinstance(x, SparseArray) for x in arrays):
+        raise ValueError("All arrays must be instances of SparseArray.")
 
     assert len({x.shape for x in arrays}) == 1
+
+    if not all(equivalent(x.fill_value, arrays[0].fill_value) for x in arrays):
+        # Stack along a new size-one axis per block, then lazily concatenate.
+        arrays = [x if isinstance(x, COO) else COO(x) for x in arrays]
+        axis = normalize_axis(axis, arrays[0].ndim + 1)
+        arrays = [x.reshape(x.shape[:axis] + (1,) + x.shape[axis:]) for x in arrays]
+        return BlockwiseArray(arrays, axis=axis)
+
     arrays = [x if isinstance(x, COO) else COO(x) for x in arrays]
     axis = normalize_axis(axis, arrays[0].ndim + 1)
     data = np.concatenate([x.data for x in arrays])

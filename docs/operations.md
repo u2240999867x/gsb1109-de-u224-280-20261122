@@ -307,6 +307,8 @@ You can view the full list on the [API reference page](../../api/).
 
 !!! note
 
-    Some operations require zero fill-values (such as [`sparse.COO.nonzero`][])
-    and others (such as [`sparse.concatenate`][]) require that all inputs have consistent fill-values.
+    Some operations require zero fill-values (such as [`sparse.COO.nonzero`][]).
+    [`sparse.concatenate`][] and [`sparse.stack`][] accept inputs with different
+    fill-values, returning a lazy [`sparse.BlockwiseArray`][] that keeps every
+    input's own background.
     For details, check the API reference.

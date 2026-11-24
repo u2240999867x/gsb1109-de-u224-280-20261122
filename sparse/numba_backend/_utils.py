@@ -73,6 +73,16 @@ def assert_gcxs_slicing(s, x):
 
 
 def assert_nnz(s, x):
+    from ._blockwise import BlockwiseArray
+
+    if isinstance(s, BlockwiseArray):
+        # Every block's background is its own fill-value.
+        sl = [slice(None)] * s.ndim
+        for block, lo, hi in zip(s.blocks, s.offsets[:-1], s.offsets[1:], strict=True):
+            sl[s.axis] = slice(int(lo), int(hi))
+            assert_nnz(block, x[tuple(sl)])
+        return
+
     fill_value = s.fill_value if hasattr(s, "fill_value") else _zero_of_dtype(s.dtype)
 
     assert np.sum(~equivalent(x, fill_value)) == s.nnz
