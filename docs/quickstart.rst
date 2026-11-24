@@ -199,6 +199,41 @@ programmatic construction of more complex queries::
    statement = table.select(table.c.name.like('%John%'))
    result = db.query(statement)
 
+Tracking committed changes
+--------------------------
+
+For audit-style reporting, ``dataset`` can optionally record the committed
+effects of ``insert``, ``update`` and ``delete`` in a change log. Enable it
+when connecting::
+
+   db = dataset.connect('sqlite:///mydatabase.db', track_changes=True)
+
+Readers can then fetch the net row-level differences produced by each
+committed transaction. Values are reported as finally stored in the
+database, so generated primary keys, column defaults and trigger-modified
+values are reflected. Changes from a still-open transaction are not
+visible, rolled back transactions leave no trace, and rows created and
+deleted within a single commit do not appear at all::
+
+   with db:
+       db['stations'].insert({'name': 's1', 'status': 'new'})
+       db['stations'].update({'id': 1, 'status': 'active'}, ['id'])
+
+   result = db['stations'].changes()
+   for change in result:
+       print(change['op'], change['pk'], change['row'])
+   # insert {'id': 1} {'id': 1, 'name': 's1', 'status': 'active'}
+
+Each read returns a ``bookmark``. Once a read has been confirmed, the
+bookmark can be handed to another reader to resume from the same commit
+position::
+
+   follow_up = db['stations'].changes(since=result.bookmark)
+
+Use :py:meth:`db.changes() <dataset.Database.changes>` to read changes
+across all tracked tables, or :py:meth:`table.changes()
+<dataset.Table.changes>` for a single table.
+
 Limitations of dataset
 ----------------------
 

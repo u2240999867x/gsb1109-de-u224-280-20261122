@@ -11,7 +11,7 @@ Database
 --------
 
 .. autoclass:: dataset.Database
-   :members: tables, views, has_table, get_table, create_table, load_table, query, begin, commit, rollback, close
+   :members: tables, views, has_table, get_table, create_table, load_table, query, begin, commit, rollback, close, changes
    :special-members:
 
 
@@ -19,8 +19,15 @@ Table
 -----
 
 .. autoclass:: dataset.Table
-   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, update, update_many, upsert, upsert_many, delete, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index
+   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, update, update_many, upsert, upsert_many, delete, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index, changes
    :special-members: __len__, __iter__
+
+
+Change tracking
+---------------
+
+.. autoclass:: dataset.ChangeSet
+   :members:
 
 
 Data Export

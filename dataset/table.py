@@ -16,6 +16,13 @@ from sqlalchemy.sql.expression import (
     bindparam,
 )
 
+from dataset.changes import (
+    OP_DELETE,
+    OP_INSERT,
+    OP_UPDATE,
+    ChangeSet,
+    read_changes,
+)
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
@@ -155,7 +162,10 @@ class Table:
         Returns the inserted row's primary key.
         """
         row = self._sync_columns(row, ensure, types=types)
+        self.db._ensure_changes()
         res = self.db.executable.execute(self.table.insert().values(row))
+        if self.db.track_changes:
+            self._track_insert(res, row)
         self.db._auto_commit()
         if res.inserted_primary_key is not None and len(res.inserted_primary_key) > 0:
             return res.inserted_primary_key[0]
@@ -267,7 +277,10 @@ class Table:
         if not len(row):
             return self.count(clause)
         stmt = self.table.update().where(clause).values(row)
+        self.db._ensure_changes()
         rp = self.db.executable.execute(stmt)
+        if self.db.track_changes:
+            self._track_update(clause)
         self.db._auto_commit()
         if rp.supports_sane_rowcount():
             return rp.rowcount
@@ -378,10 +391,75 @@ class Table:
         if not self.exists:
             return False
         clause = self._args_to_clause(filters, clauses=clauses)
+        doomed: list[dict[str, Any]] = []
+        if self.db.track_changes:
+            self.db._ensure_changes()
+            doomed = self._select_rows(clause)
         stmt = self.table.delete().where(clause)
         rp = self.db.executable.execute(stmt)
+        if doomed:
+            self.db._log_changes(
+                self.name, OP_DELETE, [(self._row_pk(row), row) for row in doomed]
+            )
         self.db._auto_commit()
         return rp.rowcount > 0
+
+    def changes(self, since: int | ChangeSet | None = None) -> ChangeSet:
+        """Read committed changes for this table.
+
+        Returns a :py:class:`ChangeSet <dataset.changes.ChangeSet>` with the
+        net row-level differences of every outer transaction committed since
+        the ``since`` bookmark (or since the beginning, if omitted). Each
+        change reports the values as finally stored in the database, so
+        generated primary keys, column defaults and trigger-modified values
+        are reflected. Rows created and removed within a single commit, and
+        changes rolled back by nested or outer transactions, do not appear.
+
+        Pass a returned set's ``bookmark`` (or the
+        :py:class:`ChangeSet <dataset.changes.ChangeSet>` itself) as
+        ``since`` to resume reading from the same commit position.
+        """
+        if not self.db.track_changes:
+            raise DatasetError(
+                "Change tracking is not enabled; pass track_changes=True "
+                "when connecting to the database."
+            )
+        return read_changes(self.db, since=since, table_name=self.name)
+
+    def _row_pk(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract the primary key values from a full row."""
+        pk_columns = [c.name for c in self.table.primary_key.columns]
+        if not pk_columns:
+            return None
+        return {name: row[name] for name in pk_columns}
+
+    def _select_rows(self, clause: ColumnElement[bool]) -> list[dict[str, Any]]:
+        """Read full rows matching ``clause`` from the database."""
+        res = self.db.executable.execute(self.table.select().where(clause))
+        return [dict(r._mapping) for r in res.fetchall()]
+
+    def _track_insert(self, res: Any, row: MutableRow) -> None:
+        """Log an insert, reading back the row as stored in the database."""
+        pk_columns = [c.name for c in self.table.primary_key.columns]
+        ipk = res.inserted_primary_key
+        pk: dict[str, Any] | None = None
+        stored: dict[str, Any] | None = None
+        if pk_columns and ipk is not None and len(ipk) == len(pk_columns):
+            pk = dict(zip(pk_columns, ipk, strict=True))
+            clause = and_(True, *[self.table.c[k] == v for k, v in pk.items()])
+            rows = self._select_rows(clause)
+            if rows:
+                stored = rows[0]
+        if stored is None:
+            stored = dict(row)
+        self.db._log_changes(self.name, OP_INSERT, [(pk, stored)])
+
+    def _track_update(self, clause: ColumnElement[bool]) -> None:
+        """Log an update, reading back the rows as stored in the database."""
+        rows = self._select_rows(clause)
+        self.db._log_changes(
+            self.name, OP_UPDATE, [(self._row_pk(row), row) for row in rows]
+        )
 
     def _reflect_table(self) -> None:
         """Load the tables definition from the database."""

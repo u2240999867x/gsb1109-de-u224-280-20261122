@@ -3,6 +3,8 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **Change tracking**: Optional committed-change reading via `track_changes=True` on `dataset.connect()`; `db.changes()` and `table.changes()` report the net row differences of each committed transaction with values as finally stored in the database, and return a `bookmark` to resume reading from the same commit position
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

@@ -2,19 +2,31 @@ import logging
 import threading
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import Connection, Engine, create_engine, event, inspect
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.schema import MetaData
+from sqlalchemy.schema import Table as SQLATable
 from sqlalchemy.sql import text
 from sqlalchemy.sql.expression import Executable
 
+from dataset.changes import (
+    CHANGE_TABLE_NAME,
+    ChangeEntry,
+    ChangeOp,
+    ChangeSet,
+    ensure_change_table,
+    log_changes,
+    read_changes,
+)
 from dataset.table import Table
 from dataset.types import ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
+    DatasetError,
     ResultIter,
     RowFactory,
     normalize_table_name,
@@ -37,6 +49,7 @@ class Database:
         row_type: RowFactory = row_factory,
         sqlite_wal_mode: bool = True,
         on_connect_statements: list[str] | None = None,
+        track_changes: bool = False,
     ) -> None:
         """Configure and connect to the database."""
         if engine_kwargs is None:
@@ -86,6 +99,8 @@ class Database:
         self.url = url
         self.row_type: RowFactory = row_type
         self.ensure_schema = ensure_schema
+        self.track_changes = track_changes
+        self._changes_table: SQLATable | None = None
         self._tables: dict[str, Table] = {}
 
     @property
@@ -137,6 +152,9 @@ class Database:
         """Clear the table metadata after transaction rollbacks."""
         for table in self._tables.values():
             table._table = None
+        # The change log table may have been created inside the rolled back
+        # transaction, so re-check its existence on next use.
+        self._changes_table = None
 
     def _auto_commit(self) -> None:
         """Commit pending changes when not in an explicit transaction.
@@ -176,6 +194,7 @@ class Database:
                     tx.commit()
                 else:
                     self.executable.commit()
+                self.local.change_tx_id = None
                 self._release_connection()
 
     def rollback(self) -> None:
@@ -190,8 +209,62 @@ class Database:
                     tx.rollback()
                 else:
                     self.executable.rollback()
+                self.local.change_tx_id = None
                 self._release_connection()
             self._flush_tables()
+
+    def _change_tx_id(self) -> str:
+        """Get the change log transaction id for the current transaction.
+
+        All changes logged inside one explicit outer transaction share a
+        single id, so readers can group them into one commit. Outside of an
+        explicit transaction every statement is committed individually and
+        gets its own id.
+        """
+        if self.in_transaction:
+            tx_id = getattr(self.local, "change_tx_id", None)
+            if tx_id is None:
+                tx_id = uuid4().hex
+                self.local.change_tx_id = tx_id
+            return tx_id
+        return uuid4().hex
+
+    def _current_change_tx_id(self) -> str | None:
+        """Get the change transaction id of the open transaction, if any."""
+        if self.in_transaction:
+            return getattr(self.local, "change_tx_id", None)
+        return None
+
+    def _ensure_changes(self) -> None:
+        """Create the change log table if change tracking is enabled."""
+        if self.track_changes:
+            ensure_change_table(self)
+
+    def _log_changes(
+        self, table_name: str, op: ChangeOp, entries: list[ChangeEntry]
+    ) -> None:
+        """Record change log entries for a write, if tracking is enabled."""
+        if not self.track_changes or table_name == CHANGE_TABLE_NAME:
+            return
+        log_changes(self, table_name, op, entries)
+
+    def changes(self, since: int | ChangeSet | None = None) -> ChangeSet:
+        """Read committed changes across all tracked tables.
+
+        Returns a :py:class:`ChangeSet <dataset.changes.ChangeSet>` with the
+        net row-level differences of every outer transaction committed since
+        the ``since`` bookmark (or since the beginning, if omitted). Changes
+        made by a still-open transaction are not visible yet, and a rolled
+        back transaction leaves no trace. Pass a returned set's ``bookmark``
+        (or the :py:class:`ChangeSet <dataset.changes.ChangeSet>` itself) as
+        ``since`` to resume reading from the same commit position.
+        """
+        if not self.track_changes:
+            raise DatasetError(
+                "Change tracking is not enabled; pass track_changes=True "
+                "when connecting to the database."
+            )
+        return read_changes(self, since=since)
 
     def __enter__(self) -> "Database":
         """Start a transaction."""
