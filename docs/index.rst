@@ -200,6 +200,7 @@ few:
 
     extending.rst
     inspect.rst
+    contracts.rst
     perf-tips.rst
 
 .. toctree::

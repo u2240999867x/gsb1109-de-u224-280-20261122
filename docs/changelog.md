@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add the experimental `msgspec.contracts` module for generating per-channel,
+  executable field contracts from msgspec types. Contracts honor include/exclude
+  rules, retain declared primary keys at every level, project tagged unions and
+  mixed-tag arrays using each member's own contract, and reject columns a
+  channel must not see. A channel that hides a tagged discriminator raises
+  `ContractConflict` with structured diagnostics instead of emitting a contract
+  no normal row can satisfy.
 - Fix `Encoder.encode_into` shrinking the buffer's capacity when passed an
   `offset` inside the buffer. An `offset` past the end of the buffer now fills
   the gap with zeros instead of leaving it uninitialized, and a failed encode no

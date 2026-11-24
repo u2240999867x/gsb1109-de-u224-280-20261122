@@ -183,6 +183,35 @@ Inspect
 .. autoclass:: StructType
 
 
+Field Contracts
+---------------
+
+.. currentmodule:: msgspec.contracts
+
+.. autofunction:: contract
+.. autofunction:: build_contract
+.. autofunction:: field_contract
+.. autofunction:: check_contract
+.. autofunction:: build_contracts
+.. autofunction:: build_channels
+.. autofunction:: export
+
+.. autoclass:: FieldContract
+    :members: export, export_many, encode, decode, validate, convert, schema,
+              to_schema, describe, columns, type_info
+
+.. autoclass:: AccessPolicy
+    :members: rule_for, field_is_primary, with_primary_keys
+
+.. autoclass:: FieldRule
+    :members: allows, allows_tag_field
+
+.. autoclass:: Conflict
+    :members: to_dict
+
+.. autoexception:: ContractConflict
+
+
 Exceptions
 ----------
 
