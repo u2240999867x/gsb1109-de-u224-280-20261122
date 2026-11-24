@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Fixed
+
+* Settle transactions on task cancellation: a cancelled `BEGIN` leaves no transaction or connection references behind, a `COMMIT`/`RELEASE SAVEPOINT` that already reached the database is treated as completed with the cancellation propagating only after the cleanup settles, and a commit cancelled before its statement was sent rolls the transaction back. The same connection remains usable for subsequent transactions.
+
 ## 0.9.0 (February 23th, 2024)
 
 ### Changed

@@ -98,6 +98,20 @@ async def create_users(request):
     ...
 ```
 
+Transactions settle cleanly if the surrounding task is cancelled, even in
+the window where the driver has already executed a statement but the await
+has not returned:
+
+* A cancelled `BEGIN` leaves no transaction or connection references behind.
+* A `COMMIT`/`RELEASE SAVEPOINT` that already reached the database is
+  treated as completed; the cancellation propagates only after the result
+  and the cleanup have settled.
+* If the cancelling statement had not been sent yet, the transaction is
+  rolled back instead.
+
+In all cases the original cancellation reaches the caller, and the same
+connection keeps working for subsequent transactions.
+
 Transaction state is tied to the connection used in the currently executing asynchronous task.
 If you would like to influence an active transaction from another task, the connection must be
 shared. This state is _inherited_ by tasks that share the same connection:

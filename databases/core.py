@@ -451,9 +451,20 @@ class Transaction:
         async with self._connection._transaction_lock:
             is_root = not self._connection._transaction_stack
             await self._connection.__aenter__()
-            await self._transaction.start(
-                is_root=is_root, extra_options=self._extra_options
-            )
+            try:
+                transaction = self._transaction
+                assert transaction is not None
+                await transaction.start(
+                    is_root=is_root, extra_options=self._extra_options
+                )
+            except BaseException:
+                # The BEGIN/SAVEPOINT may already have been executed by the
+                # driver, even if the await did not return, e.g. when the
+                # task was cancelled. Settle the transaction and release
+                # the connection, so that a failed start leaves no
+                # transaction or connection references behind.
+                await self._settle()
+                raise
             self._connection._transaction_stack.append(self)
         return self
 
@@ -461,8 +472,16 @@ class Transaction:
         async with self._connection._transaction_lock:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
-            assert self._transaction is not None
-            await self._transaction.commit()
+            transaction = self._transaction
+            assert transaction is not None
+            try:
+                await transaction.commit()
+            except asyncio.CancelledError:
+                # The COMMIT/RELEASE was in flight when the task was
+                # cancelled. Settle the transaction and wait for the
+                # cleanup to complete before propagating the cancellation.
+                await self._settle()
+                raise
             await self._connection.__aexit__()
             self._transaction = None
 
@@ -470,10 +489,38 @@ class Transaction:
         async with self._connection._transaction_lock:
             assert self._connection._transaction_stack[-1] is self
             self._connection._transaction_stack.pop()
-            assert self._transaction is not None
-            await self._transaction.rollback()
+            transaction = self._transaction
+            assert transaction is not None
+            try:
+                await transaction.rollback()
+            except asyncio.CancelledError:
+                # The ROLLBACK was in flight when the task was cancelled.
+                # Settle the transaction and wait for the cleanup to
+                # complete before propagating the cancellation.
+                await self._settle()
+                raise
             await self._connection.__aexit__()
             self._transaction = None
+
+    async def _settle(self) -> None:
+        """
+        Settle a transaction whose statement was interrupted mid-flight,
+        e.g. by task cancellation in the window where the driver has
+        already executed the SQL but the await has not returned.
+
+        The transaction is rolled back to reach a settled state: if the
+        interrupted statement never reached the database this undoes the
+        transaction, and if the statement already completed (e.g. a
+        RELEASE SAVEPOINT that already merged) the rollback is a harmless
+        no-op. The connection reference is then released, so subsequent
+        transactions on the same connection start from a clean state.
+        """
+        transaction = self._transaction
+        if transaction is not None:
+            with contextlib.suppress(BaseException):
+                await transaction.rollback()
+        await self._connection.__aexit__()
+        self._transaction = None
 
 
 class _EmptyNetloc(str):
