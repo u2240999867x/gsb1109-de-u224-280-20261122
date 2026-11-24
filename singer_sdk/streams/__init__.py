@@ -16,10 +16,22 @@ import warnings
 
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning
 from singer_sdk.streams.core import Stream
-from singer_sdk.streams.graphql import GraphQLStream
+from singer_sdk.streams.graphql import (
+    GraphQLRootPaginator,
+    GraphQLRootTracker,
+    GraphQLStream,
+    MultiRootGraphQLStream,
+)
 from singer_sdk.streams.rest import RESTStream
 
-__all__ = ["GraphQLStream", "RESTStream", "Stream"]
+__all__ = [
+    "GraphQLRootPaginator",
+    "GraphQLRootTracker",
+    "GraphQLStream",
+    "MultiRootGraphQLStream",
+    "RESTStream",
+    "Stream",
+]
 
 
 def __getattr__(name: str) -> t.Any:  # noqa: ANN401

@@ -30,7 +30,12 @@ from singer_sdk.schema.source import (
     StreamSchema,
 )
 from singer_sdk.sinks import BatchSink, RecordSink, Sink
-from singer_sdk.streams import GraphQLStream, RESTStream, Stream
+from singer_sdk.streams import (
+    GraphQLStream,
+    MultiRootGraphQLStream,
+    RESTStream,
+    Stream,
+)
 from singer_sdk.tap_base import Tap
 from singer_sdk.target_base import Target
 
@@ -47,6 +52,7 @@ __all__ = [
     "BatchSink",
     "GraphQLStream",
     "InlineMapper",
+    "MultiRootGraphQLStream",
     "OpenAPISchema",
     "PluginBase",
     "RESTStream",
