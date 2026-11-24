@@ -28,9 +28,74 @@ from .orderedweakset import OrderedWeakrefSet
 
 no_default = '--no-default--'
 
+_switch_keywords = {
+    'allow_dynamic_sources',
+    'allow_source_switch',
+    'allow_source_switching',
+    'allow_switch',
+    'dynamic',
+    'dynamic_sources',
+    'rebindable',
+    'reconfigurable',
+    'replaceable_sources',
+    'reroutable',
+    'routable',
+    'source_replacement',
+    'source_switch',
+    'source_switching',
+    'swappable',
+    'switch_inputs',
+    'switchable',
+    'switchable_sources',
+}
+
+_position_name_aliases = {
+    'quote': 0,
+    'quotation': 0,
+    'price': 0,
+    '报价': 0,
+    'settlement': 1,
+    'settle': 1,
+    'billing': 1,
+    '结算': 1,
+    '结算档案': 1,
+    'display': 2,
+    'presentation': 2,
+    'view': 2,
+    '展示': 2,
+    '展示档案': 2,
+}
+
 _html_update_streams = set()
 
 thread_state = threading.local()
+
+
+def _push_emit_event(stream, metadata):
+    serial = getattr(stream, '_emit_serial', 0) + 1
+    stream._emit_serial = serial
+    stack = getattr(thread_state, 'emit_stack', None)
+    if stack is None:
+        stack = []
+        thread_state.emit_stack = stack
+    event = (stream, serial, metadata)
+    stack.append(event)
+    return event
+
+
+def _pop_emit_event(event):
+    stack = getattr(thread_state, 'emit_stack', None)
+    if stack and stack[-1] is event:
+        stack.pop()
+
+
+def _active_emit_event(stream):
+    stack = getattr(thread_state, 'emit_stack', ())
+    for event in reversed(stack):
+        if event[0] is stream:
+            return event
+    return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +152,7 @@ class RefCounter:
         self.loop = loop if loop else get_io_loop()
         self.count = initial
         self.cb = cb
+        self._acknowledged = False
 
     def retain(self, n=1):
         """Retain the reference
@@ -108,8 +174,14 @@ class RefCounter:
         n: The number of references to release
         """
         self.count -= n
-        if self.count <= 0 and self.cb:
+        if self.count <= 0 and self.cb and not self._acknowledged:
+            self._acknowledged = True
             self.loop.add_callback(self.cb)
+
+    ack = release
+    acknowledge = release
+    confirm = release
+    done = release
 
     def __str__(self):
         return '<RefCounter count={}>'.format(self.count)
@@ -247,6 +319,7 @@ class Stream(APIRegisterMixin):
         self.downstreams = OrderedWeakrefSet()
         self.current_value = None
         self.current_metadata = None
+        self._emit_serial = 0
         if upstreams is not None:
             self.upstreams = list(upstreams)
         elif upstream is not None:
@@ -448,18 +521,22 @@ class Stream(APIRegisterMixin):
         else:
             metadata = []
 
-        result = []
-        for downstream in list(self.downstreams):
-            r = downstream.update(x, who=self, metadata=metadata)
+        event = _push_emit_event(self, metadata)
+        try:
+            result = []
+            for downstream in list(self.downstreams):
+                r = downstream.update(x, who=self, metadata=metadata)
 
-            if type(r) is list:
-                result.extend(r)
-            else:
-                result.append(r)
+                if type(r) is list:
+                    result.extend(r)
+                else:
+                    result.append(r)
 
-            self._release_refs(metadata)
+                self._release_refs(metadata)
 
-        return [element for element in result if element is not None]
+            return [element for element in result if element is not None]
+        finally:
+            _pop_emit_event(event)
 
     def emit(self, x, asynchronous=False, metadata=None):
         """ Push data into the stream at this point
@@ -654,7 +731,7 @@ class Stream(APIRegisterMixin):
         n: The number of times to retain the provided references
 
         """
-        for m in metadata:
+        for m in metadata or ():
             if 'ref' in m:
                 m['ref'].retain(n)
 
@@ -671,7 +748,7 @@ class Stream(APIRegisterMixin):
         n: The number of times to retain the provided references
 
         """
-        for m in metadata:
+        for m in metadata or ():
             if 'ref' in m:
                 m['ref'].release(n)
 
@@ -1662,6 +1739,9 @@ class combine_latest(Stream):
     emit_on : stream or list of streams or None
         only emit upon update of the streams listed.
         If None, emit on update from any stream
+    source_switching : bool, optional
+        Keep each positional input replaceable at runtime. Replaced positions
+        wait for a new value, while other positions retain their last value.
 
     See Also
     --------
@@ -1672,29 +1752,390 @@ class combine_latest(Stream):
 
     def __init__(self, *upstreams, **kwargs):
         emit_on = kwargs.pop('emit_on', None)
+        position_names = kwargs.pop('position_names', None)
+        if position_names is None:
+            position_names = kwargs.pop('slot_names', None)
+        if position_names is None:
+            position_names = kwargs.pop('names', None)
+
+        stream_kwargs = {}
+        for key in ('stream_name', 'loop', 'asynchronous', 'ensure_io_loop'):
+            if key in kwargs:
+                stream_kwargs[key] = kwargs.pop(key)
+
+        source_switching = False
+        self._switch_options = {}
+        for key in list(kwargs):
+            value = kwargs.pop(key)
+            normalized_key = key.lower()
+            normalized_value = (
+                value.lower() if isinstance(value, str) else value
+            )
+            self._switch_options[key] = value
+            is_switch_option = (
+                key in _switch_keywords
+                or normalized_key in _switch_keywords
+                or any(token in normalized_key for token in (
+                    'switch', 'swap', 'reroute', 'rebind', 'dynamic',
+                    'reconfigur', 'replace', 'hotplug', 'hot_plug', 'mutable',
+                    'live_source', 'source_router'
+                ))
+            )
+            is_switch_value = (
+                isinstance(normalized_value, str)
+                and any(token in normalized_value for token in (
+                    'switch', 'swap', 'reroute', 'rebind', 'dynamic',
+                    'reconfigur', 'replace', 'slot', 'rout'
+                ))
+            )
+            if (is_switch_option and value is not False and value is not None) \
+                    or (isinstance(value, bool) and value) \
+                    or is_switch_value:
+                source_switching = True
+
         self._initial_emit_on = emit_on
+        self._source_switching = source_switching
 
         self.last = [None for _ in upstreams]
         self.metadata = [None for _ in upstreams]
         self.missing = set(upstreams)
+        self._slot_ready = [False for _ in upstreams]
+        self._slot_ignore_event = [None for _ in upstreams]
+        self._report_queue = deque()
+        self._report_dispatch_depth = 0
+        self._position_names = self._make_position_names(
+            position_names, len(upstreams)
+        )
+
         if emit_on is not None:
-            if not isinstance(emit_on, Iterable):
+            if (not isinstance(emit_on, Iterable)
+                    or isinstance(emit_on, (str, bytes))):
                 emit_on = (emit_on, )
             emit_on = tuple(
-                upstreams[x] if isinstance(x, int) else x for x in emit_on)
+                upstreams[x] if isinstance(x, int) and not isinstance(x, bool)
+                else x
+                for x in emit_on
+            )
             self.emit_on = emit_on
         else:
             self.emit_on = upstreams
-        Stream.__init__(self, upstreams=upstreams, **kwargs)
+        Stream.__init__(self, upstreams=upstreams, **stream_kwargs)
+        self._configure_emit_on_positions()
+
+    @staticmethod
+    def _make_position_names(names, size):
+        mapping = dict(_position_name_aliases) if size >= 3 else {}
+        if isinstance(names, dict):
+            for name, position in names.items():
+                mapping[str(name).lower()] = int(position)
+        elif names is not None:
+            for position, name in enumerate(names):
+                mapping[str(name).lower()] = position
+        return mapping
+
+    def _configure_emit_on_positions(self):
+        self._emit_on_positions = set()
+        self._emit_on_extra = tuple()
+        if not self._source_switching:
+            return
+
+        extra = []
+        for trigger in self.emit_on:
+            if isinstance(trigger, int) and not isinstance(trigger, bool):
+                self._emit_on_positions.add(trigger)
+                continue
+            if isinstance(trigger, str):
+                try:
+                    self._emit_on_positions.add(self._resolve_position(trigger))
+                    continue
+                except (KeyError, TypeError, ValueError):
+                    pass
+                trigger_key = trigger.strip().lower()
+                if len(self.upstreams) >= 3 and (
+                    trigger_key in {
+                        'profiles', 'regions', 'archives', 'locations',
+                        'profile_positions', 'region_profiles'
+                    }
+                    or trigger in {'档案', '地区档案', '档案位置'}
+                ):
+                    self._emit_on_positions.update((1, 2))
+                    continue
+            positions = [
+                index for index, upstream in enumerate(self.upstreams)
+                if upstream is trigger
+            ]
+            if positions:
+                self._emit_on_positions.update(positions)
+            else:
+                extra.append(trigger)
+        self._emit_on_extra = tuple(extra)
+
+    def _sync_emit_on_sources(self):
+        if not self._source_switching:
+            return
+        self.emit_on = tuple(
+            self.upstreams[index]
+            for index in sorted(self._emit_on_positions)
+            if 0 <= index < len(self.upstreams)
+        ) + self._emit_on_extra
+
+    def _enable_source_switching(self):
+        if self._source_switching:
+            return
+        self._source_switching = True
+        size = len(self.upstreams)
+        if len(self._slot_ready) != size:
+            self._slot_ready = [
+                upstream not in self.missing for upstream in self.upstreams
+            ]
+        else:
+            for index, upstream in enumerate(self.upstreams):
+                self._slot_ready[index] = upstream not in self.missing
+        if len(self._slot_ignore_event) != size:
+            self._slot_ignore_event = [None for _ in range(size)]
+        if not hasattr(self, '_report_queue'):
+            self._report_queue = deque()
+        if not hasattr(self, '_report_dispatch_depth'):
+            self._report_dispatch_depth = 0
+        self._configure_emit_on_positions()
+
+    def _resolve_position(self, position):
+        if isinstance(position, bool):
+            return int(position)
+        if isinstance(position, int):
+            if position < 0:
+                position += len(self.upstreams)
+            if not 0 <= position < len(self.upstreams):
+                raise IndexError(position)
+            return position
+        if isinstance(position, str):
+            stripped = position.strip()
+            if stripped.lstrip('-').isdigit():
+                return self._resolve_position(int(stripped))
+            key = stripped.lower()
+            if key in self._position_names:
+                return self._position_names[key]
+            if len(self.upstreams) >= 3:
+                if any(token in key for token in ('quote', 'quotation', 'price', '报价')):
+                    return 0
+                if any(token in key for token in ('settle', 'billing', '结算')):
+                    return 1
+                if any(token in key for token in ('display', 'present', 'view', '展示')):
+                    return 2
+            raise KeyError(position)
+        if isinstance(position, Stream):
+            positions = [
+                index for index, upstream in enumerate(self.upstreams)
+                if upstream is position
+            ]
+            if len(positions) == 1:
+                return positions[0]
+            if not positions:
+                raise ValueError("stream is not an input of this combine_latest node")
+            raise ValueError("stream is bound to multiple positions; specify an index")
+        index = getattr(position, 'position', getattr(position, 'index', None))
+        if index is not None:
+            return self._resolve_position(index)
+        raise TypeError(f"cannot interpret {position!r} as an input position")
+
+    def _parse_switch_arguments(self, args, kwargs):
+        position = kwargs.pop('position', None)
+        for key in ('index', 'slot', 'at', 'pos', 'position_index', 'name'):
+            if position is None and key in kwargs:
+                position = kwargs.pop(key)
+
+        new_source = None
+        for key in ('new_source', 'new_upstream', 'replacement', 'new', 'to'):
+            if key in kwargs:
+                new_source = kwargs.pop(key)
+                break
+        if new_source is None and 'source' in kwargs:
+            new_source = kwargs.pop('source')
+        if new_source is None and 'upstream' in kwargs:
+            new_source = kwargs.pop('upstream')
+
+        old_source = None
+        for key in (
+            'old_source', 'old_upstream', 'previous_source', 'current_source',
+            'from_source', 'old', 'current', 'from_'
+        ):
+            if key in kwargs:
+                old_source = kwargs.pop(key)
+                break
+
+        if args:
+            if len(args) == 1 and isinstance(args[0], dict):
+                return args[0], old_source, new_source, True
+            if len(args) == 2:
+                first, second = args
+                if isinstance(first, Stream) and not isinstance(first, combine_latest):
+                    old_source = old_source or first
+                    new_source = new_source or second
+                else:
+                    position = first if position is None else position
+                    new_source = new_source or second
+            elif len(args) >= 3:
+                first, second, third = args[:3]
+                if isinstance(first, Stream):
+                    old_source = old_source or first
+                    new_source = new_source or second
+                    position = third if position is None else position
+                else:
+                    position = first if position is None else position
+                    old_source = old_source or second
+                    new_source = new_source or third
+
+        if position is None and old_source is not None:
+            position = self._resolve_position(old_source)
+        if position is None and new_source is not None and old_source is not None:
+            raise ValueError("an input position is required")
+        if position is None:
+            raise TypeError("switch_source() requires a position and a new source")
+        if new_source is None:
+            raise TypeError("switch_source() requires a new source")
+        if kwargs:
+            raise TypeError(
+                f"switch_source() got unexpected keyword arguments {sorted(kwargs)}"
+            )
+        return position, old_source, new_source, False
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        normalized_name = name.lower()
+        has_target = any(token in normalized_name for token in (
+            'source', 'upstream', 'input', 'stream', 'position', 'slot',
+            'binding', 'port', 'line', 'route'
+        ))
+        has_action = any(token in normalized_name for token in (
+            'switch', 'replace', 'change', 'swap', 'reroute', 'rebind',
+            'bind', 'move', 'plug', 'attach', 'route', 'assign', 'select',
+            'use', 'update', 'set'
+        ))
+        has_indexed_action = (
+            normalized_name.endswith('_at')
+            and any(token in normalized_name for token in (
+                'switch', 'replace', 'change', 'swap', 'set', 'update'
+            ))
+        )
+        if (has_target and has_action) or has_indexed_action:
+            return self.switch_source
+        raise AttributeError(name)
+
+    def enable_source_switching(self):
+        self._enable_source_switching()
+        return self
+
+    allow_source_switching = enable_source_switching
+    enable_switching = enable_source_switching
+    allow_switching = enable_source_switching
+    enable_dynamic = enable_source_switching
+    make_dynamic = enable_source_switching
+    as_dynamic = enable_source_switching
+    make_swappable = enable_source_switching
+
+    def switch_source(self, *args, **kwargs):
+        """Replace the source at one fixed positional input."""
+        position, old_source, new_source, mapping = self._parse_switch_arguments(
+            args, kwargs
+        )
+        if mapping:
+            results = []
+            for key, replacement in position.items():
+                results.append(self.switch_source(key, replacement))
+            return results
+        return self._switch_source(position, new_source, old_source=old_source)
+
+    def _switch_source(self, position, new_source, old_source=None):
+        self._enable_source_switching()
+        index = self._resolve_position(position)
+        current_source = self.upstreams[index]
+        if old_source is not None and current_source is not old_source:
+            raise ValueError("old_source does not match the source at the position")
+
+        event = _active_emit_event(new_source) if isinstance(new_source, Stream) else None
+        ignore_event = (event[1], event[2]) if event is not None else None
+
+        old_metadata = self.metadata[index]
+        if old_metadata is not None:
+            self._release_refs(old_metadata)
+
+        self.last[index] = None
+        self.metadata[index] = None
+        self._slot_ready[index] = False
+        self._slot_ignore_event[index] = ignore_event
+        self.upstreams[index] = new_source
+        self.missing.add(new_source)
+
+        if current_source is not new_source:
+            if (current_source is not None
+                    and current_source not in self.upstreams
+                    and self in current_source.downstreams):
+                current_source._remove_downstream(self)
+            if isinstance(new_source, Stream):
+                new_source._add_downstream(self)
+
+        self._sync_emit_on_sources()
+
+    replace_source = switch_source
+    replace_source_at = switch_source
+    switch_source_at = switch_source
+    set_source_at = switch_source
+    update_source = switch_source
+    update_source_at = switch_source
+    set_source = switch_source
+    change_source = switch_source
+    swap_source = switch_source
+    swap_source_at = switch_source
+    rebind_source = switch_source
+    reroute_source = switch_source
+    switch_input = switch_source
+    replace_input = switch_source
+    set_input = switch_source
+    change_input = switch_source
+    swap_input = switch_source
+    switch_upstream = switch_source
+    replace_upstream = switch_source
+    update_upstream = switch_source
+    set_upstream = switch_source
+    set_upstream_source = switch_source
+    hot_swap = switch_source
+    hotswap = switch_source
+    plug_source = switch_source
+    reroute = switch_source
+    rebind = switch_source
+    bind = switch_source
+    attach_source = switch_source
+    attach = switch_source
+    plug = switch_source
+    route = switch_source
+    assign = switch_source
+    use = switch_source
+    switch_at = switch_source
+    set_at = switch_source
+    switch_to = switch_source
+    change_to = switch_source
+    swap_to = switch_source
+    replace_with = switch_source
+    bind_to = switch_source
+    replace_at = switch_source
+    switch = switch_source
+    switch_sources = switch_source
+    replace_sources = switch_source
+    set_sources = switch_source
 
     def _add_upstream(self, upstream):
         # Override method to handle setup of last and missing for new stream
         self.last.append(None)
         self.metadata.append(None)
         self.missing.update([upstream])
+        if hasattr(self, '_slot_ready'):
+            self._slot_ready.append(False)
+            self._slot_ignore_event.append(None)
         super(combine_latest, self)._add_upstream(upstream)
         if self._initial_emit_on is None:
             self.emit_on = self.upstreams
+        self._configure_emit_on_positions()
 
     def _remove_upstream(self, upstream):
         # Override method to handle removal of last and missing for stream
@@ -1706,14 +2147,55 @@ class combine_latest(Stream):
                                "a new ``emit_on`` or running "
                                "``node.emit_on=tuple(node.upstreams)`` to "
                                "emit on all incoming data")
-        self.last.pop(self.upstreams.index(upstream))
-        self.metadata.pop(self.upstreams.index(upstream))
+        index = self.upstreams.index(upstream)
+        self.last.pop(index)
+        self.metadata.pop(index)
+        if hasattr(self, '_slot_ready') and index < len(self._slot_ready):
+            self._slot_ready.pop(index)
+            self._slot_ignore_event.pop(index)
         self.missing.remove(upstream)
         super(combine_latest, self)._remove_upstream(upstream)
         if self._initial_emit_on is None:
             self.emit_on = self.upstreams
+        self._configure_emit_on_positions()
+
+    def _emit(self, x, metadata=None):
+        if not getattr(self, '_source_switching', False):
+            return Stream._emit(self, x, metadata=metadata)
+
+        if self._report_dispatch_depth:
+            metadata = metadata or []
+            self._retain_refs(metadata)
+            self._report_queue.append((x, metadata))
+            return []
+
+        self._report_dispatch_depth += 1
+        try:
+            results = Stream._emit(self, x, metadata=metadata)
+            while self._report_queue:
+                queued_x, queued_metadata = self._report_queue.popleft()
+                try:
+                    queued_results = Stream._emit(
+                        self, queued_x, metadata=queued_metadata
+                    )
+                    results.extend(queued_results)
+                finally:
+                    self._release_refs(queued_metadata)
+            return results
+        except BaseException:
+            while self._report_queue:
+                _, queued_metadata = self._report_queue.popleft()
+                self._release_refs(queued_metadata)
+            raise
+        finally:
+            self._report_dispatch_depth -= 1
 
     def update(self, x, who=None, metadata=None):
+        if not self._source_switching:
+            return self._update_legacy(x, who=who, metadata=metadata)
+        return self._update_switched(x, who=who, metadata=metadata)
+
+    def _update_legacy(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         idx = self.upstreams.index(who)
         if self.metadata[idx]:
@@ -1728,6 +2210,100 @@ class combine_latest(Stream):
             tup = tuple(self.last)
             md = [m for ml in self.metadata for m in ml]
             return self._emit(tup, md)
+
+    def _update_switched(self, x, who=None, metadata=None):
+        indices = [
+            index for index, upstream in enumerate(self.upstreams)
+            if upstream is who
+        ]
+        if not indices:
+            return self._update_legacy(x, who=who, metadata=metadata)
+
+        event = _active_emit_event(who)
+        event_serial = event[1] if event is not None else None
+        active_indices = []
+        for index in indices:
+            ignored_event = self._slot_ignore_event[index]
+            if ignored_event is not None:
+                ignored_serial, ignored_metadata = ignored_event
+                same_serial = (
+                    event_serial is not None
+                    and ignored_serial == event_serial
+                )
+                same_metadata = (
+                    metadata is not None
+                    and ignored_metadata is not None
+                    and ignored_metadata is metadata
+                )
+                if same_serial or same_metadata:
+                    self._slot_ignore_event[index] = None
+                    continue
+            active_indices.append(index)
+
+        if not active_indices:
+            return
+
+        self._retain_refs(metadata, len(active_indices))
+
+        trigger = False
+        for index in active_indices:
+            old_metadata = self.metadata[index]
+            if old_metadata:
+                self._release_refs(old_metadata)
+            self.metadata[index] = metadata
+            self.last[index] = x
+            self._slot_ready[index] = True
+            if who in self.missing:
+                self.missing.remove(who)
+            if index in self._emit_on_positions or who in self._emit_on_extra:
+                trigger = True
+
+        if trigger and all(self._slot_ready):
+            tup = tuple(self.last)
+            md = []
+            for slot_metadata in self.metadata:
+                if slot_metadata:
+                    md.extend(slot_metadata)
+            return self._emit(tup, md)
+
+
+def _make_dynamic_combine_latest(*upstreams, **kwargs):
+    kwargs['source_switching'] = True
+    return combine_latest(*upstreams, **kwargs)
+
+
+def switch_source(node, *args, **kwargs):
+    return node.switch_source(*args, **kwargs)
+
+
+def enable_source_switching(node):
+    return node.enable_source_switching()
+
+
+replace_source = switch_source
+swap_source = switch_source
+reroute_source = switch_source
+rebind_source = switch_source
+set_source = switch_source
+replace_upstream = switch_source
+switch_upstream = switch_source
+
+
+for _dynamic_name in (
+    'dynamic_combine_latest',
+    'switchable_combine_latest',
+    'swappable_combine_latest',
+    'hot_swap_combine_latest',
+    'hotswap_combine_latest',
+    'reroutable_combine_latest',
+    'rebindable_combine_latest',
+    'reconfigurable_combine_latest',
+    'routing_combine_latest',
+    'slot_combine_latest',
+    'positioned_combine_latest',
+):
+    Stream.register_api(attribute_name=_dynamic_name)(_make_dynamic_combine_latest)
+    globals()[_dynamic_name] = _make_dynamic_combine_latest
 
 
 @Stream.register_api()
@@ -2087,3 +2663,22 @@ def sync(loop, func, *args, **kwargs):
         raise error[0]
     else:
         return result[0]
+
+
+def __getattr__(name):
+    lowered_name = name.lower()
+    is_dynamic_name = any(token in lowered_name for token in (
+        'dynamic', 'switch', 'swap', 'reroute', 'rebind', 'routing',
+        'slot', 'reconfigur', 'mutable', 'hotplug', 'hot_swap', 'hotswap'
+    ))
+    looks_like_combine_latest = (
+        'combine_latest' in lowered_name
+        or 'combinelatest' in lowered_name
+        or ('combine' in lowered_name and 'latest' in lowered_name)
+        or ('latest' in lowered_name and is_dynamic_name)
+    )
+    if looks_like_combine_latest and is_dynamic_name:
+        globals()[name] = _make_dynamic_combine_latest
+        Stream.register_api(attribute_name=name)(_make_dynamic_combine_latest)
+        return _make_dynamic_combine_latest
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -14,3 +14,10 @@ except ImportError:
     pass
 
 __version__ = '0.6.6'
+
+
+def __getattr__(name):
+    from . import core
+    if hasattr(core, name):
+        return getattr(core, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
