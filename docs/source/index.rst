@@ -114,6 +114,7 @@ data streaming systems like `Apache Flink <https://flink.apache.org/>`_,
    :caption: Contents
 
    core.rst
+   checkpoint.rst
    dataframes.rst
    gpu-dataframes.rst
    dask.rst

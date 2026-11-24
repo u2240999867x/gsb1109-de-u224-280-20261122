@@ -67,6 +67,29 @@ Sources
    from_tcp
    from_http_server
 
+Checkpointing
+-------------
+
+.. currentmodule:: streamz
+
+.. autosummary::
+   PositionedSource
+   checkpoint_transform
+   Checkpoint
+   CheckpointManager
+   CheckpointError
+
+.. autoclass:: PositionedSource
+   :members:
+.. autoclass:: checkpoint_transform
+   :members:
+.. autoclass:: Checkpoint
+   :members:
+.. autoclass:: CheckpointManager
+   :members:
+.. autoclass:: CheckpointError
+   :members:
+
 DaskStream
 ----------
 

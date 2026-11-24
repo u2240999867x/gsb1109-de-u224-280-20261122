@@ -675,6 +675,23 @@ class Stream(APIRegisterMixin):
             if 'ref' in m:
                 m['ref'].release(n)
 
+    def _checkpoint_state(self):
+        """Return serialisable node state for a checkpoint, if any.
+
+        The default implementation is stateless so streams that do not
+        participate in checkpointing keep their original behaviour. Stateful
+        nodes override this together with :meth:`_restore_checkpoint_state`.
+        """
+        return None
+
+    def _restore_checkpoint_state(self, state):
+        """Restore node state previously produced by :meth:`_checkpoint_state`.
+
+        The default implementation ignores the state because the base node is
+        stateless. Stateful nodes override this method.
+        """
+        return None
+
 
 @Stream.register_api()
 class map(Stream):
@@ -1024,6 +1041,12 @@ class accumulate(Stream):
                 return self._emit((self.state, result), metadata=metadata)
             else:
                 return self._emit(result, metadata=metadata)
+
+    def _checkpoint_state(self):
+        return {'state': self.state}
+
+    def _restore_checkpoint_state(self, state):
+        self.state = state['state']
 
 
 @Stream.register_api()
@@ -1648,6 +1671,35 @@ class zip(Stream):
             return ret
         elif len(L) > self.maxsize:
             return self.condition.wait()
+
+    def _checkpoint_state(self):
+        names = [upstream.name for upstream in self.upstreams]
+        if any(name is None for name in names):
+            from .checkpoint import CheckpointError
+            raise CheckpointError(
+                "zip checkpointing requires every upstream to have a "
+                "stream_name; got unnamed upstreams"
+            )
+        return {
+            'buffers': {
+                upstream.name: [value for value, _ in self.buffers[upstream]]
+                for upstream in self.upstreams
+            }
+        }
+
+    def _restore_checkpoint_state(self, state):
+        by_name = {upstream.name: upstream for upstream in self.upstreams}
+        for name, values in state['buffers'].items():
+            if name not in by_name:
+                from .checkpoint import CheckpointError
+                raise CheckpointError(
+                    "zip cannot restore buffer for unknown upstream {!r}".format(
+                        name
+                    )
+                )
+            self.buffers[by_name[name]] = deque(
+                (value, []) for value in values
+            )
 
 
 @Stream.register_api()
