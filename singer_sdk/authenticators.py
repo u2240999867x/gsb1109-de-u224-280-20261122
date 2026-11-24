@@ -12,6 +12,7 @@ __lazy_modules__ = {
     "singer_sdk.exceptions",
     "singer_sdk.helpers._util",
     "singer_sdk.streams.rest",
+    "threading",
     "types",
     "urllib.parse",
     "urllib3",
@@ -23,6 +24,7 @@ import datetime
 import logging
 import math
 import sys
+import threading
 import typing as t
 import warnings
 from types import MappingProxyType
@@ -49,6 +51,12 @@ if t.TYPE_CHECKING:
 # network latency against the API's own expiry check. The margin is capped at half
 # of the token's lifetime.
 _DEFAULT_TOKEN_EXPIRY_MARGIN = 300
+
+# Name of the attribute stamped on each authenticated PreparedRequest with the
+# generation of the access token it carries. Allows retry handling to tell
+# whether a late 401 response was produced by the token the authenticator
+# currently holds or by an older token that has since been rotated.
+REQUEST_TOKEN_GENERATION_ATTR = "oauth_token_generation"
 
 
 def _add_parameters(initial_url: str, extra_parameters: dict) -> str:
@@ -534,6 +542,23 @@ class OAuthAuthenticator(APIAuthenticatorBase):
         self.refresh_token: str | None = None
         self.last_refreshed: datetime.datetime | None = None
         self.expires_in: int | None = None
+
+        # Monotonic generation of the current access token. It starts at 0
+        # (no token held yet) and is incremented every time a token response is
+        # applied. Each authenticated request is tagged with the generation of
+        # the token it carries, so stale 401 responses can be distinguished
+        # from rejections of the current token.
+        self.token_generation: int = 0
+
+        # Number of token responses actually applied to this authenticator.
+        # Concurrent callers waiting on a refresh do not increment it.
+        self.refresh_count: int = 0
+
+        # Serializes token updates. Reentrant so a refresh triggered while
+        # another update path holds the lock (e.g. from authenticate_request)
+        # does not deadlock.
+        self._token_lock = threading.RLock()
+
         self._session = requests.Session()
         self._session.mount(
             "https://",
@@ -552,17 +577,22 @@ class OAuthAuthenticator(APIAuthenticatorBase):
     ) -> requests.PreparedRequest:
         """Authenticate an OAuth request.
 
+        The request is tagged with the generation of the access token used, so
+        a later 401 can be attributed to that exact token rather than whatever
+        token the authenticator holds when the response arrives.
+
         Args:
             request: A :class:`requests.PreparedRequest` object.
 
         Returns:
             The authenticated request object.
         """
-        if not self.is_token_valid():
-            self.update_access_token()
+        self.ensure_valid_token()
 
         self.auth_headers["Authorization"] = f"Bearer {self.access_token}"
-        return super().authenticate_request(request)
+        request = super().authenticate_request(request)
+        setattr(request, REQUEST_TOKEN_GENERATION_ATTR, self.token_generation)
+        return request
 
     @property
     def auth_endpoint(self) -> str:
@@ -640,51 +670,107 @@ class OAuthAuthenticator(APIAuthenticatorBase):
         return self.expires_in - margin > elapsed
 
     # Authentication and refresh
+    def ensure_valid_token(self) -> None:
+        """Refresh the access token if it is missing or expired.
+
+        Concurrent callers sharing this authenticator block on a single
+        refresh: only the first caller performs the token request, the others
+        reuse the freshly applied token. Authenticators with different scopes
+        are separate instances, so their refreshes remain independent.
+        """
+        with self._token_lock:
+            if not self.is_token_valid():
+                self.update_access_token()
+
+    def refresh_if_stale(self, token_generation: int | None) -> bool:
+        """Refresh the token when the rejected one is no longer current.
+
+        Called from retry handling after a 401 response. If the token carried
+        by the failed request is older than the token currently held (or the
+        request predates token tracking), another request has already rotated
+        the token, so the current token is left untouched and this method only
+        waits for any in-flight refresh to finish. A refresh happens only when
+        the failed request used the current generation, i.e. a genuinely new
+        token was rejected.
+
+        Args:
+            token_generation: Generation stamped on the failed request, or
+                ``None`` if it was not tagged.
+
+        Returns:
+            ``True`` if a token refresh was performed by this caller.
+        """
+        with self._token_lock:
+            if (
+                token_generation is not None
+                and token_generation >= self.token_generation
+            ):
+                self.update_access_token()
+                return True
+            self.logger.debug(
+                "Skipping token refresh: request used generation %s but current "
+                "generation is %s",
+                token_generation,
+                self.token_generation,
+            )
+            return False
+
     def update_access_token(self) -> None:
         """Update tokens along with: `last_refreshed` and `expires_in`.
+
+        The token response is applied under the authenticator's lock and each
+        successful application advances :attr:`token_generation` and
+        :attr:`refresh_count` exactly once. Prefer :meth:`ensure_valid_token`
+        or :meth:`refresh_if_stale` for refresh-on-expiry and refresh-on-401
+        flows so concurrent callers deduplicate their refreshes.
 
         Raises:
             AuthenticationError: When OAuth login fails.
         """
-        self.logger.info("Requesting new access token")
-        request_time = utc_now()
-        auth_request_payload = self.oauth_request_payload
-        token_response = self._session.post(
-            self.auth_endpoint,
-            headers=self._oauth_headers,
-            data=auth_request_payload,
-            timeout=60,
-        )
-        try:
-            token_response.raise_for_status()
-        except requests.HTTPError as ex:
-            text, status_code = (
-                (ex.response.text, ex.response.status_code)
-                if ex.response is not None
-                else ("Error", None)
+        with self._token_lock:
+            self.logger.info("Requesting new access token")
+            request_time = utc_now()
+            auth_request_payload = self.oauth_request_payload
+            token_response = self._session.post(
+                self.auth_endpoint,
+                headers=self._oauth_headers,
+                data=auth_request_payload,
+                timeout=60,
             )
-            self.handle_error(
-                content=text,
-                status_code=status_code,
-            )
-            msg = f"Failed to update access token (status={status_code or 'Unknown'})"
-            raise AuthenticationError(msg) from ex
+            try:
+                token_response.raise_for_status()
+            except requests.HTTPError as ex:
+                text, status_code = (
+                    (ex.response.text, ex.response.status_code)
+                    if ex.response is not None
+                    else ("Error", None)
+                )
+                self.handle_error(
+                    content=text,
+                    status_code=status_code,
+                )
+                msg = (
+                    f"Failed to update access token (status={status_code or 'Unknown'})"
+                )
+                raise AuthenticationError(msg) from ex
 
-        self.logger.debug("OAuth authorization attempt was successful")
+            self.logger.debug("OAuth authorization attempt was successful")
 
-        token_json = token_response.json()
-        self.access_token = token_json["access_token"]
-        if refresh_token := token_json.get("refresh_token"):
-            self.refresh_token = refresh_token
-        expiration = token_json.get("expires_in", self._default_expiration)
-        self.expires_in = int(expiration) if expiration else None
-        if self.expires_in is None:
-            self.logger.debug(
-                "No expires_in received in OAuth response and no "
-                "default_expiration set. Token will be treated as if it never "
-                "expires.",
-            )
-        self.last_refreshed = request_time
+            token_json = token_response.json()
+            self.access_token = token_json["access_token"]
+            if refresh_token := token_json.get("refresh_token"):
+                self.refresh_token = refresh_token
+            expiration = token_json.get("expires_in", self._default_expiration)
+            self.expires_in = int(expiration) if expiration else None
+            if self.expires_in is None:
+                self.logger.debug(
+                    "No expires_in received in OAuth response and no "
+                    "default_expiration set. Token will be treated as if it never "
+                    "expires.",
+                )
+            self.last_refreshed = request_time
+            self.token_generation += 1
+            self.refresh_count += 1
 
     def handle_error(self, *, content: str, status_code: int | None) -> None:
         """Handle an OAuth error.

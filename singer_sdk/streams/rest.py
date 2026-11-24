@@ -43,8 +43,16 @@ import requests
 import requests.exceptions
 
 from singer_sdk import metrics
-from singer_sdk.authenticators import SimpleAuthenticator
-from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
+from singer_sdk.authenticators import (
+    REQUEST_TOKEN_GENERATION_ATTR,
+    OAuthAuthenticator,
+    SimpleAuthenticator,
+)
+from singer_sdk.exceptions import (
+    FatalAPIError,
+    RetriableAPIError,
+    RetriableAuthAPIError,
+)
 from singer_sdk.helpers._compat import SingerSDKDeprecationWarning
 from singer_sdk.helpers._packaging import get_sdk_version
 from singer_sdk.helpers.jsonpath import extract_jsonpath
@@ -349,6 +357,8 @@ class _HTTPStream(Stream, abc.ABC, t.Generic[_TToken]):  # noqa: PLR0904
         Raises:
             FatalAPIError: If the request is not retriable.
             RetriableAPIError: If the request is retriable.
+            RetriableAuthAPIError: If an OAuth-authenticated request is rejected
+                with a 401, so the request can be retried after a token refresh.
         """
         if (
             response.status_code in self.extra_retry_statuses
@@ -357,6 +367,22 @@ class _HTTPStream(Stream, abc.ABC, t.Generic[_TToken]):  # noqa: PLR0904
         ):
             msg = self.response_error_message(response)
             raise RetriableAPIError(msg, response)
+
+        if response.status_code == HTTPStatus.UNAUTHORIZED and isinstance(
+            self.authenticator,
+            OAuthAuthenticator,
+        ):
+            msg = self.response_error_message(response)
+            token_generation = getattr(
+                response.request,
+                REQUEST_TOKEN_GENERATION_ATTR,
+                None,
+            )
+            raise RetriableAuthAPIError(
+                msg,
+                response,
+                token_generation=token_generation,
+            )
 
         if (
             HTTPStatus.BAD_REQUEST  # 400
@@ -418,6 +444,7 @@ class _HTTPStream(Stream, abc.ABC, t.Generic[_TToken]):  # noqa: PLR0904
             self.backoff_wait_generator,
             (
                 ConnectionResetError,
+                RetriableAuthAPIError,
                 RetriableAPIError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
@@ -425,11 +452,31 @@ class _HTTPStream(Stream, abc.ABC, t.Generic[_TToken]):  # noqa: PLR0904
                 requests.exceptions.ContentDecodingError,
             ),
             max_tries=self.backoff_max_tries,
-            on_backoff=self.backoff_handler,
+            on_backoff=self._on_backoff,
             jitter=self.backoff_jitter,
             logger=self.logger,
         )(func)
         return decorator
+
+    def _on_backoff(self, details: Details) -> None:
+        """Refresh an OAuth token before retrying, then delegate to logging.
+
+        A 401 retry refreshes the token only when the failed request used the
+        token generation the authenticator currently holds. If a concurrent or
+        earlier request has already rotated the token, the response is simply
+        retried with the current token instead of discarding it.
+
+        Args:
+            details: backoff invocation details.
+        """
+        exception = details.get("exception")
+        if isinstance(exception, RetriableAuthAPIError) and isinstance(
+            self.authenticator,
+            OAuthAuthenticator,
+        ):
+            self.authenticator.refresh_if_stale(exception.token_generation)
+
+        self.backoff_handler(details)
 
     def _request(
         self,

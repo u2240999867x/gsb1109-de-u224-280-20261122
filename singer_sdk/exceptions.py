@@ -46,6 +46,7 @@ __all__ = [  # noqa: RUF022
     # Sync — retriable
     "RetriableSyncError",
     "RetriableAPIError",
+    "RetriableAuthAPIError",
     # Sync — ignorable
     "SkippableSyncError",
     "SkippableAPIError",
@@ -266,6 +267,34 @@ class RetriableAPIError(RetriableSyncError):
         """
         super().__init__(message)
         self.response = response
+
+
+class RetriableAuthAPIError(RetriableAPIError):
+    """A retriable 401 response that should trigger an OAuth token refresh.
+
+    Raised when a request authenticated with an OAuth access token is rejected
+    with HTTP 401. The request is retried by the standard backoff machinery,
+    and the OAuth authenticator refreshes the access token before the retry
+    when the rejected token is no longer the current one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        response: requests.Response | None = None,
+        *,
+        token_generation: int | None = None,
+    ) -> None:
+        """Extends the default with the generation of the rejected token.
+
+        Args:
+            message (str): The Error Message
+            response (requests.Response): The response object.
+            token_generation: Generation of the access token used by the failed
+                request, or ``None`` if the request was not tagged.
+        """
+        super().__init__(message, response)
+        self.token_generation = token_generation
 
 
 # ---------------------------------------------------------------------------

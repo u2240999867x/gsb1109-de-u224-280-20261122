@@ -5,7 +5,11 @@ import pytest
 from singer_sdk.batch import import_batch_dependency
 from singer_sdk.exceptions import (
     ConfigurationError,
+    FatalAPIError,
     MissingDependencyError,
+    RetriableAPIError,
+    RetriableAuthAPIError,
+    RetriableSyncError,
     SingerSDKError,
 )
 
@@ -14,6 +18,12 @@ def test_missing_dependency_error_hierarchy() -> None:
     assert issubclass(MissingDependencyError, ConfigurationError)
     assert issubclass(MissingDependencyError, SingerSDKError)
     assert issubclass(MissingDependencyError, ImportError)
+
+
+def test_retriable_auth_api_error_hierarchy() -> None:
+    assert issubclass(RetriableAuthAPIError, RetriableAPIError)
+    assert issubclass(RetriableAuthAPIError, RetriableSyncError)
+    assert not issubclass(RetriableAuthAPIError, FatalAPIError)
 
 
 def test_missing_dependency_error_message() -> None:
