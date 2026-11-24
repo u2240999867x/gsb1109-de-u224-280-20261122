@@ -15,7 +15,7 @@ from bisect import bisect
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from functools import lru_cache, partial, reduce, wraps
-from itertools import product, zip_longest
+from itertools import chain, product, zip_longest
 from numbers import Integral, Number
 from operator import add, mul
 from threading import Lock
@@ -28,7 +28,7 @@ from tlz import accumulate, concat, first, partition
 from toolz import frequencies
 
 from dask import compute, config, core
-from dask._task_spec import Alias, List, Task, TaskRef
+from dask._task_spec import Alias, DataNode, GraphNode, List, Task, TaskRef
 from dask.array import chunk
 from dask.array.chunk import getitem
 from dask.array.chunk_types import is_valid_array_chunk, is_valid_chunk_type
@@ -56,7 +56,7 @@ from dask.base import (
     persist,
     tokenize,
 )
-from dask.blockwise import BlockwiseDep, broadcast_dimensions
+from dask.blockwise import Blockwise, BlockwiseDep, broadcast_dimensions
 from dask.blockwise import blockwise as core_blockwise
 from dask.context import globalmethod
 from dask.core import flatten, quote, reshapelist
@@ -64,7 +64,7 @@ from dask.delayed import Delayed, delayed
 from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
 from dask.layers import ArrayBlockIdDep, ArraySliceDep, ArrayValuesDep
 from dask.sizeof import sizeof
-from dask.typing import Graph, NestedKeys
+from dask.typing import Graph, Key, NestedKeys
 from dask.utils import (
     IndexCallable,
     SerializableLock,
@@ -1080,6 +1080,316 @@ def broadcast_chunks(*chunkss):
     return tuple(result)
 
 
+def _is_backing_object(value: Any) -> bool:
+    """Whether ``value`` looks like storage that chunks could be read from.
+
+    Deliberately broader than :func:`is_arraylike` so that array-likes without
+    the NumPy ``__array_function__`` protocol (h5py/zarr datasets, custom lazy
+    stores, ...) are recognised too.
+    """
+    return (
+        not isinstance(value, (GraphNode, str, bytes, tuple, list, dict, set))
+        and hasattr(value, "shape")
+        and hasattr(value, "dtype")
+        and hasattr(value, "__getitem__")
+    )
+
+
+def _iter_store_backing_objects(source: Array) -> Iterator:
+    """Yield array-like objects embedded in ``source``'s graph that back its chunks.
+
+    These are the objects that are actually read when the source's chunks are
+    computed, e.g. a lazily indexed h5py/zarr dataset, a ``memoryview`` or an
+    array that was inlined into the graph. Eagerly materialized NumPy chunks are
+    yielded as well. Duplicate objects are only yielded once.
+    """
+    seen: set[int] = set()
+
+    def remember(value: Any) -> Iterator:
+        if _is_backing_object(value):
+            identity = id(value)
+            if identity not in seen:
+                seen.add(identity)
+                yield value
+
+    for layer in source.dask.layers.values():
+        if isinstance(layer, Blockwise):
+            # Lazy array-likes are passed as constant inputs (index ``None``) by
+            # ``graph_from_arraylike`` when they are inlined into the blockwise
+            # layer. Non-inlined ones are referenced by TaskRef and live in a
+            # MaterializedLayer that is handled below.
+            for arg, index in layer.indices:
+                if index is None and not isinstance(arg, (str, TaskRef)):
+                    yield from remember(arg)
+        elif isinstance(layer, MaterializedLayer):
+            for node in layer.mapping.values():
+                if isinstance(node, DataNode):
+                    yield from remember(node.value)
+                elif isinstance(node, Task):
+                    for value in chain(node.args, node.kwargs.values()):
+                        yield from remember(value)
+                else:
+                    yield from remember(node)
+
+
+def _store_shares_backing(backing: Any, target: Any) -> bool:
+    """Whether reads from ``backing`` could observe writes to ``target``."""
+    if backing is target:
+        return True
+    try:
+        return bool(np.shares_memory(backing, target))
+    except (TypeError, AttributeError):
+        return False
+
+
+def _requires_inplace_store(
+    sources: Collection[Array], targets: Collection[ArrayLike | Delayed]
+) -> bool:
+    """Detect sources and targets that read from and write to the same storage.
+
+    When a chunk that is read from one backing store is also (partly) the target
+    of a write, the independent store tasks cannot be scheduled concurrently: a
+    write may overwrite a value before a still-pending read captured it.
+    """
+    material_targets = [t for t in targets if not isinstance(t, Delayed)]
+    if not material_targets:
+        return False
+    for source in sources:
+        for backing in _iter_store_backing_objects(source):
+            for target in material_targets:
+                if _store_shares_backing(backing, target):
+                    return True
+    return False
+
+
+def _snapshot_chunk(x: Any) -> Any:
+    """Copy a single chunk into block-sized temporary storage.
+
+    Reading through this snapshot instead of the shared backing store means a
+    later in-place write can no longer corrupt the value, even if the read
+    returned a live view. Only the one chunk passed to the task is copied; the
+    graph never holds a container collecting every source block.
+    """
+    if hasattr(x, "copy"):
+        snapshot = x.copy()
+        if snapshot is x:
+            # Some array-likes return themselves from ``copy``; force a copy.
+            snapshot = np.array(x, copy=True)
+        return snapshot
+    return np.array(x, copy=True)
+
+
+def _store_marker(_: Any) -> None:
+    """Return ``None`` after its snapshot argument has been computed.
+
+    Markers encode a scheduling dependency without carrying the snapshot's data.
+    A write can therefore wait on many snapshots without collecting their
+    contents: only the cheap ``None`` markers meet at the write, mirroring the
+    map->reduce trick used by ``dask.graph_manipulation.checkpoint``.
+    """
+    return None
+
+
+def _inplace_store_chunk(
+    x: Any,
+    out: Any,
+    index: slice | None,
+    region: slice | None,
+    lock: Any,
+    return_stored: bool,
+    load_stored: bool,
+    _markers: Any = (),
+) -> Any:
+    """Store a snapshot chunk, ignoring the dependency-only ``_markers`` arg.
+
+    ``_markers`` is a list of ``None`` markers whose sole purpose is to force
+    every snapshot of the backing store to be computed before this write runs.
+    The only data consumed here is the chunk's own snapshot ``x``.
+    """
+    return load_store_chunk(
+        x, out, index, region, lock, return_stored, load_stored
+    )
+
+
+def _backing_root_key(obj: Any) -> tuple[str, int]:
+    """Stable identity for the buffer backing ``obj``.
+
+    NumPy views are followed to their root array so that distinct sub-slices of
+    one buffer map to the same key. When a NumPy-style ``__array_interface__`` is
+    available the root buffer's data pointer is used, which also groups distinct
+    wrapper objects around the same buffer. Other array-likes fall back to their
+    object id. The string tag keeps the two namespaces apart.
+    """
+    root = obj
+    while getattr(root, "base", None) is not None:
+        root = root.base
+    interface = getattr(root, "__array_interface__", None)
+    if isinstance(interface, dict) and interface.get("data"):
+        return ("buffer", int(interface["data"][0]))
+    return ("object", id(root))
+
+
+def _inplace_store_graph(
+    sources: Sequence[Array],
+    targets: Sequence[ArrayLike | Delayed],
+    regions_list: Sequence[tuple[slice, ...] | None],
+    lock: Any,
+    return_stored: bool,
+    load_stored: bool,
+) -> list[Array]:
+    """Build a store graph that is safe for reads and writes to shared storage.
+
+    Each source chunk is first copied by an independent block-sized snapshot
+    task. Moves whose sources and targets touch the same backing store form a
+    group; every write in a group waits for all of the group's snapshots. All
+    reads therefore capture the storage content at the start of the job before
+    any overlapping write runs, while temporary storage stays one block at a
+    time and there is no task that gathers the whole store or every source
+    block. Groups backed by distinct stores run independently and in parallel.
+    The dependency edges only flow from snapshots to writes, so the graph is
+    always acyclic.
+    """
+    store_token = tokenize(
+        "inplace-store",
+        [
+            (source.name, tokenize(target), region)
+            for source, target, region in zip(sources, targets, regions_list)
+        ],
+        lock,
+        return_stored,
+        load_stored,
+    )
+
+    merged = HighLevelGraph.merge(*(source.dask for source in sources))
+    layers = dict(merged.layers)
+    dependencies = dict(merged.dependencies)
+
+    # One snapshot task per source chunk, plus a None-valued marker per
+    # snapshot. The marker is what writes wait on, so the dependency edges never
+    # carry the snapshot's data into a fan-in task.
+    snapshot_layer_name = f"store-snapshot-{store_token}"
+    marker_layer_name = f"store-snapshot-marker-{store_token}"
+    snapshot_mapping: dict[Key, Task] = {}
+    marker_mapping: dict[Key, Task] = {}
+    snapshot_keys_by_source: list[list[Key]] = []
+    marker_keys_by_source: list[list[Key]] = []
+    for source_index, source in enumerate(sources):
+        flat_keys = list(flatten(source.__dask_keys__()))
+        these_snapshots: list[Key] = []
+        these_markers: list[Key] = []
+        for source_key in flat_keys:
+            suffix = source_key[1:]
+            snapshot_key = (snapshot_layer_name, source_index, *suffix)
+            snapshot_mapping[snapshot_key] = Task(
+                snapshot_key, _snapshot_chunk, TaskRef(source_key)
+            )
+            marker_key = (marker_layer_name, source_index, *suffix)
+            marker_mapping[marker_key] = Task(
+                marker_key, _store_marker, TaskRef(snapshot_key)
+            )
+            these_snapshots.append(snapshot_key)
+            these_markers.append(marker_key)
+        snapshot_keys_by_source.append(these_snapshots)
+        marker_keys_by_source.append(these_markers)
+    layers[snapshot_layer_name] = MaterializedLayer(snapshot_mapping)
+    layers[marker_layer_name] = MaterializedLayer(marker_mapping)
+    source_layer_names = set().union(
+        *(set(source.__dask_layers__()) for source in sources)
+    )
+    dependencies[snapshot_layer_name] = source_layer_names
+    dependencies[marker_layer_name] = {snapshot_layer_name}
+
+    # Group moves by the backing stores they touch (target buffer together with
+    # every buffer the source reads from). Moves sharing a buffer end up in the
+    # same group so that all relevant snapshots precede their writes.
+    n_moves = len(sources)
+    union_parent = list(range(n_moves))
+
+    def find(i: int) -> int:
+        while union_parent[i] != i:
+            union_parent[i] = union_parent[union_parent[i]]
+            i = union_parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            union_parent[max(ra, rb)] = min(ra, rb)
+
+    roots_by_move: list[set[int]] = []
+    for source, target in zip(sources, targets):
+        roots = {_backing_root_key(target)}
+        for backing in _iter_store_backing_objects(source):
+            roots.add(_backing_root_key(backing))
+        roots_by_move.append(roots)
+    root_to_move: dict[int, int] = {}
+    for i, roots in enumerate(roots_by_move):
+        for root in roots:
+            if root in root_to_move:
+                union(i, root_to_move[root])
+            else:
+                root_to_move[root] = i
+    for root, i in list(root_to_move.items()):
+        root_to_move[root] = find(i)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i in range(n_moves):
+        groups[find(i)].append(i)
+    group_markers: dict[int, list[Key]] = {}
+    for representative, members in groups.items():
+        keys: list[Key] = []
+        seen: set[Key] = set()
+        for i in members:
+            for marker_key in marker_keys_by_source[i]:
+                if marker_key not in seen:
+                    seen.add(marker_key)
+                    keys.append(marker_key)
+        group_markers[representative] = keys
+
+    arrays: list[Array] = []
+    for source_index, (source, target, region) in enumerate(
+        zip(sources, targets, regions_list)
+    ):
+        name = f"store-write-{store_token}-{source_index}"
+        block_indices = list(
+            product(*(range(len(dim)) for dim in source.chunks))
+        )
+        slice_dep = ArraySliceDep(source.chunks)
+        group_key = find(source_index)
+        ordering = [TaskRef(k) for k in group_markers[group_key]]
+
+        mapping = {}
+        for block_index, snapshot_key in zip(
+            block_indices, snapshot_keys_by_source[source_index], strict=True
+        ):
+            key = (name, *block_index)
+            mapping[key] = Task(
+                key,
+                _inplace_store_chunk,
+                TaskRef(snapshot_key),
+                target,
+                slice_dep[block_index],
+                region,
+                lock,
+                return_stored,
+                load_stored,
+                _markers=List(*ordering),
+            )
+        layers[name] = MaterializedLayer(mapping)
+        # The write tasks reference their own snapshot and the group's markers;
+        # the snapshot layer already pulls in every source layer transitively.
+        dependencies[name] = {snapshot_layer_name, marker_layer_name}
+        arrays.append(
+            Array(
+                HighLevelGraph(layers, dependencies),
+                name,
+                source.chunks,
+                meta=source._meta,
+            )
+        )
+    return arrays
+
+
 def store(
     sources: Array | Collection[Array],
     targets: ArrayLike | Delayed | Collection[ArrayLike | Delayed],
@@ -1099,6 +1409,15 @@ def store(
 
     If your data fits in memory then you may prefer calling
     ``np.array(myarray)`` instead.
+
+    When a source reads from the same backing storage that a target writes to
+    (for example rotating adjacent blocks of one array in place), ``store``
+    detects the overlap and schedules the moves safely. Each affected chunk is
+    copied into block-sized temporary storage before any overlapping write runs,
+    so the written values reflect the storage content at the start of the
+    computation regardless of task ordering or thread interleaving. The whole
+    backing store is never collected into memory. Stores that target disjoint
+    storage keep their original, fully parallel behaviour.
 
     Parameters
     ----------
@@ -1190,23 +1509,36 @@ def store(
     if lock is True:
         lock = get_scheduler_lock(collection=Array, scheduler=kwargs.get("scheduler"))
 
-    arrays = []
-    for s, t, r in zip(sources, targets, regions_list):
-        slices = ArraySliceDep(s.chunks)
-        arrays.append(
-            s.map_blocks(
-                load_store_chunk,  # type: ignore[arg-type]
-                t,
-                # Note: slices / BlockwiseDep have to be passed by arg, not by kwarg
-                slices,
-                region=r,
-                lock=lock,
-                return_stored=return_stored,
-                load_stored=load_stored,
-                token="store-map",
-                meta=s._meta,
-            )
+    if _requires_inplace_store(sources, targets):
+        # Sources and targets read from / write to a shared backing store. Build
+        # a snapshot -> ordering-marker -> write graph so that every value is
+        # copied out before any overlapping write can mutate it.
+        arrays = _inplace_store_graph(
+            sources,
+            targets,
+            regions_list,
+            lock=lock,
+            return_stored=return_stored,
+            load_stored=load_stored,
         )
+    else:
+        arrays = []
+        for s, t, r in zip(sources, targets, regions_list):
+            slices = ArraySliceDep(s.chunks)
+            arrays.append(
+                s.map_blocks(
+                    load_store_chunk,  # type: ignore[arg-type]
+                    t,
+                    # Note: slices / BlockwiseDep have to be passed by arg, not by kwarg
+                    slices,
+                    region=r,
+                    lock=lock,
+                    return_stored=return_stored,
+                    load_stored=load_stored,
+                    token="store-map",
+                    meta=s._meta,
+                )
+            )
 
     if compute:
         if not return_stored:

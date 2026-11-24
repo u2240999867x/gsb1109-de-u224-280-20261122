@@ -2294,6 +2294,205 @@ def test_store_nocompute_regions():
         assert l.name != r.name
 
 
+class InPlaceBackingStore:
+    """Array-like over a NumPy buffer that reads lazily.
+
+    ``da.from_array`` keeps the whole object in the graph (it is not a NumPy
+    array), so chunks are read at task execution time. Exposing
+    ``__array_interface__`` lets ``np.shares_memory`` relate it to NumPy views
+    of the same buffer, which is how the in-place store is detected.
+    """
+
+    def __init__(self, array, delay=0.0):
+        self._array = array
+        self._delay = delay
+        self.dtype = array.dtype
+        self.shape = array.shape
+        self.ndim = array.ndim
+
+    @property
+    def __array_interface__(self):
+        return self._array.__array_interface__
+
+    def __getitem__(self, index):
+        if self._delay:
+            time.sleep(self._delay)
+        return np.asarray(self._array[index]).copy()
+
+    def __setitem__(self, index, value):
+        self._array[index] = value
+
+
+def _cyclic_inplace_setup(delay=0.0):
+    # Four adjacent regions in one backing buffer:
+    # A = [0:3], B = [3:6], C = [6:9], D = [9:12].
+    buffer = np.arange(12, dtype=np.float64)
+    original = buffer.copy()
+    backing = InPlaceBackingStore(buffer, delay=delay)
+    base = da.from_array(backing, chunks=3)
+
+    # Uneven input chunks.
+    sources = [
+        base.blocks[0].rechunk((2, 1)),  # old A -> B
+        base.blocks[1],  # old B -> C
+        base.blocks[2].rechunk((1, 2)),  # old C -> A
+        base.blocks[2][0:2],  # old C tail -> D (does not overlap A/B/C moves)
+    ]
+    targets = [buffer[3:6], buffer[6:9], buffer[0:3], buffer[9:12]]
+    return buffer, original, sources, targets
+
+
+def _cyclic_inplace_expected(original):
+    expected = original.copy()
+    expected[0:3] = original[6:9]  # A receives old C
+    expected[3:6] = original[0:3]  # B receives old A
+    expected[6:9] = original[3:6]  # C receives old B
+    expected[9:11] = original[6:8]  # D receives old C tail
+    # D only fills two of its three elements; the last one is never touched.
+    expected[11] = original[11]
+    return expected
+
+
+@pytest.mark.parametrize("scheduler", ["single-threaded", "threads"])
+def test_store_inplace_cyclic_rotation(scheduler):
+    buffer, original, sources, targets = _cyclic_inplace_setup()
+    store(sources, targets, lock=False, scheduler=scheduler, num_workers=4)
+    assert np.array_equal(buffer, _cyclic_inplace_expected(original))
+
+
+def test_store_inplace_forced_race():
+    # Slow reads make writes eligible before all reads finish. The barrier must
+    # still guarantee every value is captured before any write lands.
+    for _ in range(5):
+        buffer, original, sources, targets = _cyclic_inplace_setup(delay=0.01)
+        store(sources, targets, lock=False, scheduler="threads", num_workers=8)
+        assert np.array_equal(buffer, _cyclic_inplace_expected(original))
+
+
+def test_store_inplace_detection():
+    from dask.array.core import _requires_inplace_store
+
+    buffer, _, sources, targets = _cyclic_inplace_setup()
+    assert _requires_inplace_store(sources, targets)
+
+    other = np.arange(12.0)
+    disjoint_source = da.from_array(other, chunks=3)
+    assert not _requires_inplace_store([disjoint_source], [np.zeros(12)])
+
+
+def test_store_inplace_graph_structure():
+    _, _, sources, targets = _cyclic_inplace_setup()
+    arrays = store(sources, targets, lock=False, compute=False)
+    low = dict(dask.optimize(*arrays)[0].dask)
+
+    def layer_name(key):
+        return key[0] if isinstance(key, tuple) else key
+
+    def is_snapshot(key):
+        return str(layer_name(key)).startswith("store-snapshot-") and not is_marker(key)
+
+    def is_marker(key):
+        return str(layer_name(key)).startswith("store-snapshot-marker-")
+
+    def is_write(key):
+        return str(layer_name(key)).startswith("store-write-")
+
+    snapshot_keys = [key for key in low if is_snapshot(key)]
+    marker_keys = [key for key in low if is_marker(key)]
+    write_keys = [key for key in low if is_write(key)]
+
+    # One block-sized snapshot per source chunk, each with a None marker.
+    n_chunks = sum(
+        math.prod(map(len, source.chunks)) for source in sources
+    )
+    assert len(snapshot_keys) == n_chunks
+    assert len(marker_keys) == n_chunks
+    assert write_keys
+
+    # Markers only carry ordering (None); no source block data is gathered.
+    for marker_key in marker_keys:
+        assert dask.get(low, marker_key) is None
+
+    # Every write consumes exactly one snapshot as data (its own chunk) and
+    # waits on the group's markers instead of collecting snapshot arrays.
+    for write_key in write_keys:
+        dependencies = low[write_key].dependencies
+        assert sum(is_snapshot(dep) for dep in dependencies) == 1
+        assert any(is_marker(dep) for dep in dependencies)
+
+    # Edges only flow from snapshots/markers towards writes, so the graph is
+    # acyclic even for a logical permutation cycle.
+    for key, node in low.items():
+        if is_snapshot(key) or is_marker(key):
+            assert not any(is_write(dep) for dep in node.dependencies)
+
+
+def test_store_inplace_compute_false_uses_start_values():
+    buffer, _, sources, targets = _cyclic_inplace_setup()
+    arrays = store(sources, targets, lock=False, compute=False)
+
+    # Data written externally between graph construction and computation is part
+    # of the starting storage and must be captured.
+    buffer[0:3] = 100.0
+    dask.compute(*arrays, scheduler="threads", num_workers=4)
+
+    expected = np.array(
+        [6, 7, 8, 100, 100, 100, 3, 4, 5, 6, 7, 11], dtype=np.float64
+    )
+    assert np.array_equal(buffer, expected)
+
+
+@pytest.mark.parametrize("compute", [False, True])
+def test_store_inplace_return_stored(compute):
+    buffer, original, sources, targets = _cyclic_inplace_setup()
+    stored = store(
+        sources,
+        targets,
+        lock=False,
+        compute=compute,
+        return_stored=True,
+        scheduler="threads",
+        num_workers=4,
+    )
+    assert len(stored) == len(sources)
+    assert all(isinstance(array, Array) for array in stored)
+
+    returned = dask.compute(*stored, scheduler="single-threaded")
+    assert np.array_equal(returned[0], original[0:3])  # B holds old A
+    assert np.array_equal(returned[1], original[3:6])  # C holds old B
+    assert np.array_equal(returned[2], original[6:9])  # A holds old C
+    assert np.array_equal(returned[3], original[6:8])  # D holds old C tail
+    assert np.array_equal(buffer, _cyclic_inplace_expected(original))
+
+
+def test_store_inplace_regions():
+    buffer = np.arange(16, dtype=np.float64).reshape(4, 4)
+    original = buffer.copy()
+    backing = InPlaceBackingStore(buffer)
+    source = da.from_array(backing, chunks=(2, 2))
+
+    top = source[0:2, :]
+    bottom = source[2:4, :]
+    store(
+        [top, bottom],
+        [buffer, buffer],
+        regions=[(slice(2, 4), slice(None)), (slice(0, 2), slice(None))],
+        lock=False,
+        scheduler="single-threaded",
+    )
+    assert np.array_equal(buffer, np.concatenate([original[2:4], original[0:2]]))
+
+
+def test_store_disjoint_uses_independent_tasks():
+    source = da.ones((4, 4), chunks=(2, 2))
+    target = np.zeros((4, 4))
+    result = store(source, target, compute=False)
+    layer_names = set().union(*(set(array.dask.layers) for array in result))
+    assert not any(name.startswith("store-barrier") for name in layer_names)
+    assert not any(name.startswith("store-write") for name in layer_names)
+    assert any("store-map" in name for name in layer_names)
+
+
 class ThreadSafetyError(Exception):
     pass
 
