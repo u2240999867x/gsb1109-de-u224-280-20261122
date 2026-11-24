@@ -143,6 +143,61 @@ If a message doesn't match the expected type, an error is raised.
       File "<stdin>", line 1, in <module>
     msgspec.ValidationError: Expected `str`, got `int` - at `$.groups[1]`
 
+.. _yaml-provenance:
+
+YAML Anchors and Merge Keys
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+YAML documents often share configuration between records using anchors and
+``<<`` merge keys. When typed decoding fails inside such a shared template,
+`msgspec.yaml.decode` reports the *logical* table path, the document line where
+the value that was actually used is written, and each merge/alias site
+traversed to reach it.
+
+.. code-block:: yaml
+
+    defaults: &defaults
+      rate: bad
+      decimals: 2
+    suppliers:
+      alpha:
+        <<: *defaults
+        name: alpha
+
+.. code-block:: python
+
+    >>> class Column(msgspec.Struct):
+    ...     rate: float
+    ...     decimals: int
+    ...     name: str
+
+    >>> msgspec.yaml.decode(msg, type=dict[str, Column])
+    Traceback (most recent call last):
+      File "<stdin>", line 1, in <module>
+    msgspec.ValidationError: Expected `float`, got `str` - at `$.suppliers.alpha.rate`; table `alpha`, value at line 2, inherited from &defaults at line 6
+
+The raised `msgspec.ValidationError` also exposes structured details:
+
+- ``path``: the logical path, e.g. ``"$.suppliers.alpha.rate"``.
+- ``table``: the logical record (top-level or nested mapping key) that owns the
+  failing value.
+- ``line`` / ``column``: the 1-based document position of the value that was
+  actually used (the value inside the template, not the record that inherited
+  it).
+- ``sites``: a tuple of use sites, in the order traversed from the record to the
+  value. Each has ``relation`` (``"merge"``, ``"alias"``, or ``"recursive"``),
+  ``anchor``, ``line``, ``column``, and ``target_line``. ``inherited_from`` and
+  ``recursive`` contain the same sites split by kind.
+- ``origin``: an object combining all of the above, with ``as_dict()`` for
+  structured reporting, plus ``table_path`` and ``anchors`` summaries.
+
+Values overridden by a later merge or by an explicit key are attributed to the
+key that wins, so an overriding template can make a record decode successfully.
+Resolution follows the effective mapping for each logical path, so swapping the
+declaration order of sibling records doesn't change which record a failure is
+attributed to. A recursive merge or alias is reported with its use site, and
+other records in the same document are still diagnosed normally.
+
 .. _strict-vs-lax:
 
 "Strict" vs "Lax" Mode

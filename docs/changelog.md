@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Enrich `msgspec.yaml` validation errors from typed decodes with the logical
+  table path, the document line of the value that was actually used, and the
+  YAML anchor/merge sites traversed to reach it. Overridden values are attributed
+  to the winning key, declaration order doesn't change attribution, and
+  recursive aliases report their use site while other records are diagnosed
+  normally.
 - Fix `Encoder.encode_into` shrinking the buffer's capacity when passed an
   `offset` inside the buffer. An `offset` past the end of the buffer now fills
   the gap with zeros instead of leaving it uninitialized, and a failed encode no
