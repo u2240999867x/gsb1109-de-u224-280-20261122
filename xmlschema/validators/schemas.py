@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from functools import cached_property
 from operator import attrgetter
 from pathlib import Path
-from typing import Any, cast, Optional, Union
+from typing import Any, cast, Iterable, Optional, Union
 from urllib.request import OpenerDirector
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
@@ -57,6 +57,7 @@ from xmlschema import dataobjects
 from .exceptions import XMLSchemaValidationError, XMLSchemaEncodeError, \
     XMLSchemaStopValidation
 from .validation import ValidationContext, DecodeContext, EncodeContext
+from .incremental import IncrementalAssertionValidator, AssertionRevalidationResult
 from .helpers import parse_xsd_derivation, get_schema_annotations, qname_validator, \
     parse_xpath_default_namespace, parse_target_namespace
 from .xsdbase import XSD_ELEMENT_DERIVATIONS, XsdValidator, XsdComponent, XsdAnnotation
@@ -1281,6 +1282,48 @@ class XMLSchemaBase(XsdValidator, ElementPathMixin[Union[SchemaType, XsdElement]
                                       namespaces, max_depth, extra_validator,
                                       validation_hook, allow_empty, use_location_hints), None)
         return error is None
+
+    def increment(self, source: Union[XMLSourceType, XMLResource],
+                  errors: Optional[Iterable[XMLSchemaValidationError]] = None,
+                  namespaces: Optional[NsmapType] = None, **kwargs: Any) \
+            -> 'IncrementalAssertionValidator':
+        """
+        Creates an incremental validator for revalidating the XSD 1.1 assertions
+        of an already loaded XML tree after a batch of local corrections.
+
+        :param source: the XML resource/tree containing the corrected document. \
+        A lazy resource is not accepted because its untouched subtrees are not \
+        available after the first iteration.
+        :param errors: the errors of the previous validation.  If omitted, an \
+        initial assertion-only validation pass is performed.
+        :param namespaces: an optional namespace mapping.
+        :return: an :class:`IncrementalAssertionValidator` session.
+        """
+        return IncrementalAssertionValidator(
+            self, source, errors=errors, namespaces=namespaces, **kwargs
+        )
+
+    incremental_validate = increment
+
+    def revalidate_assertions(self, source: Union[XMLSourceType, XMLResource],
+                              changes: Optional[Any] = None,
+                              errors: Optional[Iterable[XMLSchemaValidationError]] = None,
+                              namespaces: Optional[NsmapType] = None, **kwargs: Any) \
+            -> 'AssertionRevalidationResult':
+        """
+        Revalidates only the XSD 1.1 assertions affected by a batch of XML changes.
+
+        :param source: the XML resource/tree containing the corrected document.
+        :param changes: the changed elements, ``(element, attribute)`` pairs or \
+        absolute paths.  The XML tree must already contain the final corrections.
+        :param errors: the errors of the previous validation.
+        :param namespaces: an optional namespace mapping.
+        :return: an :class:`AssertionRevalidationResult`.
+        """
+        validator = IncrementalAssertionValidator(
+            self, source, errors=errors, namespaces=namespaces, **kwargs
+        )
+        return validator.revalidate(changes)
 
     def iter_errors(self, source: Union[XMLSourceType, XMLResource],
                     path: Optional[str] = None,

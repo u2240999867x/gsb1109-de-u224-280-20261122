@@ -2,6 +2,13 @@
 CHANGELOG
 *********
 
+`v4.4.0`_ (unreleased)
+======================
+* Add incremental revalidation of XSD 1.1 assertions on already loaded XML trees
+  (`XMLSchema11.increment()`, `IncrementalAssertionValidator`) with support for
+  first non-cancelled item and filtered amount sum assertions, stale error removal
+  and full-revalidation reporting for unsupported XPath expressions
+
 `v4.3.2`_ (2026-06-30)
 ======================
 * Fix for issues #473, #474 and #475
@@ -809,3 +816,4 @@ v0.9.6 (2017-05-05)
 .. _v4.3.0: https://github.com/brunato/xmlschema/compare/v4.2.0...v4.3.0
 .. _v4.3.1: https://github.com/brunato/xmlschema/compare/v4.3.0...v4.3.1
 .. _v4.3.2: https://github.com/brunato/xmlschema/compare/v4.3.1...v4.3.2
+.. _v4.4.0: https://github.com/brunato/xmlschema/compare/v4.3.2...v4.4.0

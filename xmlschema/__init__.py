@@ -30,7 +30,10 @@ from .validators import (
     XMLSchemaDecodeError, XMLSchemaEncodeError, XMLSchemaChildrenValidationError,
     XMLSchemaStopValidation, XMLSchemaIncludeWarning, XMLSchemaImportWarning,
     XMLSchemaTypeTableWarning, XMLSchemaAssertPathWarning, XsdGlobals, XMLSchemaBase,
-    XMLSchema, XMLSchema10, XMLSchema11, XsdComponent, XsdType, XsdElement, XsdAttribute
+    XMLSchema, XMLSchema10, XMLSchema11, XsdComponent, XsdType, XsdElement, XsdAttribute,
+    IncrementalAssertionValidator, AssertionRevalidator, AssertionRevalidationSession,
+    AssertionRevalidationResult, FullRevalidationRequirement,
+    FullRevalidationRequired, revalidate_assertions
 )
 
 __version__ = '4.3.2'
@@ -59,4 +62,8 @@ __all__ = [
     'XMLSchemaTypeTableWarning', 'XMLSchemaAssertPathWarning',
     'XsdGlobals', 'XMLSchemaBase', 'XMLSchema', 'XMLSchema10', 'XMLSchema11',
     'XsdComponent', 'XsdType', 'XsdElement', 'XsdAttribute',
+    'IncrementalAssertionValidator', 'AssertionRevalidator',
+    'AssertionRevalidationSession', 'AssertionRevalidationResult',
+    'FullRevalidationRequirement', 'FullRevalidationRequired',
+    'revalidate_assertions',
 ]

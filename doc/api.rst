@@ -51,6 +51,17 @@ Document level API
 .. autofunction:: xmlschema.from_json
 
 
+.. _incremental-assertions-api:
+
+Incremental assertions API
+==========================
+
+.. autoclass:: xmlschema.IncrementalAssertionValidator
+.. autoclass:: xmlschema.AssertionRevalidationResult
+.. autoclass:: xmlschema.FullRevalidationRequirement
+.. autofunction:: xmlschema.revalidate_assertions
+
+
 .. _schema-level-api:
 
 Schema level API

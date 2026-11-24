@@ -652,6 +652,47 @@ validation_hook
     also stop validation suddenly raising a `XMLSchemaStopValidation` exception.
 
 
+Incremental assertion revalidation
+----------------------------------
+
+XSD 1.1 assertions are normally evaluated while an XML document is validated.
+When a large document was already validated and only a small part is corrected,
+:meth:`xmlschema.XMLSchema11.increment` creates a session that re-evaluates only
+the assertions on the changed paths:
+
+.. code-block:: pycon
+
+    >>> import xmlschema
+    >>> schema = xmlschema.XMLSchema11('tests/test_cases/examples/collection/collection.xsd')
+    >>> resource = xmlschema.XMLResource(xml_source)
+    >>> validator = schema.increment(resource)
+    >>> # apply the corrections to resource.root ...
+    >>> result = validator.revalidate([(changed_elem, '@amount')])
+    >>> result.errors          # current validation errors
+    >>> result.removed         # assertion errors fixed by the correction
+    >>> result.retained        # previous errors that are still present
+
+Changes are provided as elements, ``(element, attribute)`` pairs or absolute
+paths. A batch is applied to the final XML tree before evaluating the assertions,
+so a cancellation and a following amount correction are checked with their final
+values and not at an intermediate state. Assertions on untouched subtrees are
+reported in ``result.skipped`` and are not re-evaluated.
+
+The incremental evaluator supports the two common assertion shapes based on the
+first non-cancelled item and on a filtered attribute sum (for example
+``waybill[not(@cancelled = true())][1]/@id = @first`` and
+``sum(area/waybill[not(@cancelled = true())]/@amount) = @total``). An XPath
+expression outside that subset is not guessed: it is reported in
+``result.full_revalidation`` (see :class:`xmlschema.validators.FullRevalidationRequirement`)
+so that a complete validation can be run. Lazy resources are not accepted by
+:meth:`xmlschema.XMLSchema11.increment` because their untouched subtrees are
+not available after the first iteration.
+
+The same feature is available through
+:func:`xmlschema.validators.revalidate_assertions` and the
+:class:`xmlschema.validators.IncrementalAssertionValidator` class.
+
+
 Decoding to JSON
 ================
 

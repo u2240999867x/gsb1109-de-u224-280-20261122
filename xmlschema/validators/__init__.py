@@ -18,6 +18,9 @@ from .validation import ValidationContext, DecodeContext, EncodeContext, Validat
 from .xsdbase import XsdValidator, XsdComponent, XsdAnnotation, XsdType
 from .particles import ParticleMixin
 from .assertions import XsdAssert
+from .incremental import IncrementalAssertionValidator, AssertionRevalidator, \
+    AssertionRevalidationSession, AssertionRevalidationResult, \
+    FullRevalidationRequirement, FullRevalidationRequired, revalidate_assertions
 from .notations import XsdNotation
 from .identities import XsdSelector, XsdFieldSelector, XsdIdentity, XsdKeyref, XsdKey, \
     XsdUnique, Xsd11Keyref, Xsd11Key, Xsd11Unique
@@ -49,6 +52,9 @@ __all__ = [
     'XMLSchemaTypeTableWarning', 'XMLSchemaAssertPathWarning',
     'XsdValidator', 'XsdComponent', 'XsdAnnotation', 'XsdType',
     'ParticleMixin', 'XsdAssert', 'XsdNotation', 'XsdSelector', 'XsdFieldSelector',
+    'IncrementalAssertionValidator', 'AssertionRevalidator',
+    'AssertionRevalidationSession', 'AssertionRevalidationResult',
+    'FullRevalidationRequirement', 'FullRevalidationRequired', 'revalidate_assertions',
     'XsdIdentity', 'XsdKeyref', 'XsdKey', 'XsdUnique', 'Xsd11Keyref', 'Xsd11Key',
     'Xsd11Unique', 'XsdFacet', 'XsdWhiteSpaceFacet', 'XsdLengthFacet', 'XsdMinLengthFacet',
     'XsdMaxLengthFacet', 'XsdMinExclusiveFacet', 'XsdMinInclusiveFacet',
