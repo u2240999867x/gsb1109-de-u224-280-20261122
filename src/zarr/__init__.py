@@ -181,3 +181,12 @@ __all__ = [
     "zeros",
     "zeros_like",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if "Handoff" in name or name in {"coerce_manifest", "validate_plan"}:
+        from importlib import import_module
+
+        handoff = import_module("zarr.metadata.handoff")
+        return getattr(handoff, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

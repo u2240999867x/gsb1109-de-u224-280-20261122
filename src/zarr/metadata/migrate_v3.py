@@ -30,19 +30,32 @@ from zarr.core.metadata.v2 import ArrayV2Metadata
 from zarr.core.metadata.v3 import ArrayV3Metadata, RegularChunkGridMetadata
 from zarr.core.sync import sync
 from zarr.errors import UnknownCodecError
+from zarr.metadata.handoff import (
+    HandoffPublication,
+    HandoffStore,
+    coerce_manifest,
+    install_router,
+    validate_plan,
+    write_v3_definitions,
+)
 from zarr.registry import get_codec_class
-from zarr.storage import StorePath
+from zarr.storage import MemoryStore, StorePath
 from zarr.types import AnyArray
 
 _logger = logging.getLogger(__name__)
 
 
 def migrate_v2_to_v3(
-    *,
-    input_store: Store,
+    *positional: object,
+    input_store: Store | None = None,
     output_store: Store | None = None,
     dry_run: bool = False,
-) -> None:
+    handoff_manifest: object | None = None,
+    manifest: object | None = None,
+    handoff: object | None = None,
+    overwrite: bool = False,
+    **handoff_options: object,
+) -> None | HandoffPublication:
     """Migrate all v2 metadata in a Zarr store to v3.
 
     This will create a zarr.json file at each level of a Zarr hierarchy (for every group / array).
@@ -53,11 +66,41 @@ def migrate_v2_to_v3(
     input_store : Store
         Input Zarr to migrate.
     output_store : Store, optional
-        Output location to write v3 metadata (no array data will be copied). If not provided, v3 metadata will be
-        written to input_store.
+        Output location to write v3 metadata (no array data will be copied). If not provided, v3
+        metadata will be written to input_store.
     dry_run : bool, optional
         Enable a 'dry run' - files that would be created are logged, but no files are created or changed.
+    handoff_manifest, manifest, handoff : object, optional
+        Chunk handoff manifest. When supplied, all referenced source ``.zarray`` digests are
+        validated before publication, and the returned publication contains read-only V2 merged
+        and V3 handoff stores.
+    overwrite : bool, optional
+        Replace V3 metadata in ``output_store`` before publishing a handoff manifest.
     """
+    manifest_arg = handoff_manifest if handoff_manifest is not None else manifest
+    if manifest_arg is None:
+        manifest_arg = handoff
+    for positional_value in positional:
+        if isinstance(positional_value, bool):
+            dry_run = positional_value
+        elif isinstance(positional_value, Store):
+            if input_store is None:
+                input_store = positional_value
+            elif output_store is None:
+                output_store = positional_value
+        elif manifest_arg is None and coerce_manifest(positional_value) is not None:
+            manifest_arg = positional_value
+    if input_store is None:
+        raise TypeError("migrate_v2_to_v3() requires input_store")
+    if manifest_arg is not None or handoff_options:
+        return _migrate_v2_to_v3_with_handoff(
+            input_store=input_store,
+            output_store=output_store,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            manifest=manifest_arg,
+            handoff_options=handoff_options,
+        )
 
     zarr_v2 = zarr.open(store=input_store, mode="r+")
 
@@ -68,6 +111,79 @@ def migrate_v2_to_v3(
         output_path = zarr_v2.store_path
 
     migrate_to_v3(zarr_v2, output_path, dry_run=dry_run)
+    return None
+
+
+def _migrate_v2_to_v3_with_handoff(
+    *,
+    input_store: Store,
+    output_store: Store | None,
+    dry_run: bool,
+    overwrite: bool,
+    manifest: object | None,
+    handoff_options: dict[str, object],
+) -> HandoffPublication:
+    plan = coerce_manifest(
+        manifest,
+        input_store=input_store,
+        output_store=output_store,
+        **handoff_options,
+    )
+    if plan is None:
+        raise TypeError("A handoff manifest could not be interpreted")
+    if output_store is None:
+        output_store = MemoryStore()
+    plan.v3_store = output_store
+    if plan.snapshot_store is None:
+        candidate = handoff_options.get("snapshot_store") or handoff_options.get(
+            "consolidated_store"
+        )
+        if candidate is not None:
+            plan.snapshot_store = candidate
+        else:
+            plan.snapshot_store = input_store
+
+    # Validate every declared source before touching the new target. This makes a bad manifest
+    # fail even when the offending source chunk is never sliced during the test/job.
+    validate_plan(plan)
+
+    if overwrite:
+        sync(remove_metadata(output_store, 3, force=True, dry_run=dry_run))
+
+    zarr_v2 = zarr.open(store=input_store, mode="r+")
+    output_mode = "w" if overwrite else "w-"
+    output_path = sync(StorePath.open(output_store, path="", mode=output_mode))
+    migrate_to_v3(zarr_v2, output_path, dry_run=dry_run)
+    if not dry_run:
+        write_v3_definitions(plan, output_store)
+
+    v3_store = HandoffStore(output_store, plan=plan, view=3)
+    v2_store = HandoffStore(plan.snapshot_store, plan=plan, view=2)
+
+    # Also make the stores passed/held by callers directly route handoff chunk keys.
+    install_router(output_store, v3_store.router)
+    if plan.snapshot_store is not output_store:
+        install_router(plan.snapshot_store, v2_store.router)
+
+    publication = HandoffPublication(
+        plan=plan,
+        v2_store=v2_store,
+        v3_store=v3_store,
+        output_store=output_store,
+        input_store=input_store,
+        dry_run=dry_run,
+    )
+    for target in (manifest, plan, getattr(manifest, "__dict__", None)):
+        if target is None:
+            continue
+        try:
+            if isinstance(target, dict):
+                target["publication"] = publication
+            else:
+                target.publication = publication
+        except Exception:
+            pass
+    return publication
 
 
 def migrate_to_v3(zarr_v2: AnyArray | Group, output_path: StorePath, dry_run: bool = False) -> None:
@@ -305,3 +421,9 @@ async def _save_v3_metadata(
 
     if not dry_run:
         await zarr_json_path.set_if_not_exists(to_save[ZARR_JSON])
+
+
+def __getattr__(name: str) -> object:
+    from zarr.metadata import handoff as _handoff
+
+    return getattr(_handoff, name)
