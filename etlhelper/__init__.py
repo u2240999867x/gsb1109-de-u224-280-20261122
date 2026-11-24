@@ -29,6 +29,12 @@ from etlhelper.connect import (
     get_connection_string,
     get_sqlalchemy_connection_string,
 )
+from etlhelper.settlement_archive import (
+    ArchiveReceipt,
+    BatchReceipt,
+    ManifestEntry,
+    archive_settlement,
+)
 from etlhelper.utils import (
     table_info,
 )
@@ -82,8 +88,12 @@ def log_to_console(
 
 
 __all__ = [
+    "ArchiveReceipt",
+    "BatchReceipt",
     "DbParams",
+    "ManifestEntry",
     "abort_etlhelper_threads",
+    "archive_settlement",
     "connect",
     "copy_rows",
     "copy_table_rows",

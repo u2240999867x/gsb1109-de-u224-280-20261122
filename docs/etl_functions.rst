@@ -9,3 +9,4 @@ ETL functions
    etl_functions/load.rst
    etl_functions/copy.rst
    etl_functions/error_handling.rst
+   etl_functions/settlement_archive.rst

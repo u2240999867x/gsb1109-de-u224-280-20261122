@@ -32,6 +32,10 @@ class ETLHelperAbort(ETLHelperError):
     """Exception raised when `abort` is called."""
 
 
+class ETLHelperArchiveError(ETLHelperError):
+    """Exception raised when a settlement archive run fails fatally."""
+
+
 class ETLHelperHelperError(ETLHelperError):
     """Exception raised when helper selection fails."""
 
