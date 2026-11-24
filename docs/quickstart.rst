@@ -199,6 +199,59 @@ programmatic construction of more complex queries::
    statement = table.select(table.c.name.like('%John%'))
    result = db.query(statement)
 
+Importing related records atomically
+------------------------------------
+
+Some data arrives as one hand-off stream of records that are numbered by an
+old system and refer to each other. The :py:class:`Handoff
+<dataset.Handoff>` loader reads the stream once, assigns the target
+database's own primary keys, and writes both tables in one batch::
+
+   records = [
+       {
+           "type": "site",
+           "vendor": "A",
+           "number": 7,
+           "references": {
+               "collector_id": {"vendor": "A", "type": "collector", "number": 7}
+           },
+       },
+       {
+           "type": "collector",
+           "vendor": "A",
+           "number": 7,
+           "asset_number": "A-100",
+           "references": {"site_id": {"vendor": "A", "type": "site", "number": 7}},
+       },
+   ]
+   result = db.import_handoff(records)
+
+   # Legacy identifiers resolve to the real target primary keys:
+   site_id = result.id_for("site", "A", 7)
+   collector_id = result.id_for("collector", "A", 7)
+
+Records may appear in any order, because the ``sites`` and ``collectors``
+tables use mutually dependent ``DEFERRABLE INITIALLY DEFERRED`` foreign keys.
+References may point at records elsewhere in the same stream or at rows
+already in the database. An incoming record that carries a permanent asset
+number is matched to the existing row with that asset number, so the old
+primary key is reused instead of a duplicate being inserted.
+
+If any reference cannot be resolved, nothing from the batch is written and
+:py:class:`UnresolvedReferenceError <dataset.UnresolvedReferenceError>` lists
+each offending original record with the referenced vendor, type and number::
+
+   from dataset import UnresolvedReferenceError
+
+   try:
+      db.import_handoff(records)
+   except UnresolvedReferenceError as error:
+      for item in error.references:
+          print(item.table, item.column, item.vendor, item.type, item.number)
+
+Previously committed data is left untouched, and a failed batch contributes
+no old-to-new identifier mapping.
+
 Limitations of dataset
 ----------------------
 

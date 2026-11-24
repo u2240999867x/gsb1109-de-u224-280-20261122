@@ -3,6 +3,24 @@ import warnings
 from typing import Any
 
 from dataset.database import Database
+from dataset.handoff import (
+    AssetKey,
+    Handoff,
+    HandoffConflictError,
+    HandoffError,
+    HandoffImporter,
+    HandoffImportError,
+    HandoffLoader,
+    HandoffRecord,
+    HandoffResult,
+    Reference,
+    UnresolvedReference,
+    UnresolvedReferenceError,
+    create_handoff_tables,
+    import_handoff,
+    load_handoff,
+    try_import_handoff,
+)
 from dataset.table import Table
 from dataset.util import DatasetError, OutRow, QueryError, RowFactory, row_factory
 
@@ -13,13 +31,29 @@ warnings.filterwarnings(
 )
 
 __all__ = [
+    "AssetKey",
     "Database",
     "DatasetError",
+    "Handoff",
+    "HandoffConflictError",
+    "HandoffError",
+    "HandoffImportError",
+    "HandoffImporter",
+    "HandoffLoader",
+    "HandoffRecord",
+    "HandoffResult",
     "OutRow",
     "QueryError",
+    "Reference",
     "RowFactory",
     "Table",
+    "UnresolvedReference",
+    "UnresolvedReferenceError",
     "connect",
+    "create_handoff_tables",
+    "import_handoff",
+    "load_handoff",
+    "try_import_handoff",
 ]
 __version__ = "2.0.0"
 

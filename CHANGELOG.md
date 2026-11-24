@@ -3,6 +3,13 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **Handoff import**: Added :py:class:`dataset.Handoff` / ``db.import_handoff()`` for
+    landing a read-once stream of related site and collector records into two
+    tables in one batch. Legacy identifiers are scoped by vendor and type,
+    references resolve in any order through deferred foreign keys, existing
+    rows are matched by permanent asset number, and a failed batch writes
+    nothing while reporting every unresolved reference with its source record.
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

@@ -23,6 +23,23 @@ Table
    :special-members: __len__, __iter__
 
 
+Handoff import
+--------------
+
+.. autoclass:: dataset.Handoff
+   :members: load, create_tables, site_table, collector_table
+
+.. autoclass:: dataset.HandoffResult
+   :members: id_for, mapping_for, as_dict, old_to_new, site_ids, collector_ids
+
+.. autoexception:: dataset.UnresolvedReferenceError
+   :members: references, unresolved, to_dict
+
+.. autofunction:: dataset.import_handoff
+
+.. autofunction:: dataset.create_handoff_tables
+
+
 Data Export
 -----------
 

@@ -342,6 +342,34 @@ class Database:
         """Get a given table."""
         return self.get_table(table_name)
 
+    def handoff(self, **kwargs: Any) -> Any:
+        """Return a loader for an atomic site/collector hand-off batch.
+
+        See :py:class:`dataset.Handoff` for the accepted record format.  The
+        loader resolves legacy identifiers and deferred cross-references
+        before writing anything.
+        ::
+
+            result = db.handoff().load(records)
+        """
+        from dataset.handoff import Handoff
+
+        return Handoff(self, **kwargs)
+
+    def import_handoff(self, records: Any, **kwargs: Any) -> Any:
+        """Import a read-once hand-off stream in one atomic batch.
+
+        Pass ``raise_on_error=False`` to receive the unresolved references in
+        the result instead of an exception.
+        """
+        from dataset.handoff import import_handoff
+
+        return import_handoff(self, records, **kwargs)
+
+    def load_handoff(self, records: Any, **kwargs: Any) -> Any:
+        """Alias for :meth:`import_handoff`."""
+        return self.import_handoff(records, **kwargs)
+
     def _ipython_key_completions_(self) -> list[str]:
         """Completion for table names with IPython."""
         return self.tables
