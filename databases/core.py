@@ -227,6 +227,33 @@ class Database:
     ) -> "Transaction":
         return Transaction(self.connection, force_rollback=force_rollback, **kwargs)
 
+    def extraction_round(self, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        from databases.extraction import ExtractionRound
+
+        return ExtractionRound(self, *args, **kwargs)
+
+    async def begin_extraction(
+        self, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        from databases.extraction import start_extraction
+
+        return await start_extraction(self, *args, **kwargs)
+
+    async def start_extraction(
+        self, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        return await self.begin_extraction(*args, **kwargs)
+
+    async def extract_changes(
+        self, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        return await self.begin_extraction(*args, **kwargs)
+
+    def extraction_entry(self, **defaults: typing.Any) -> typing.Any:
+        from databases.extraction import ExtractionEntry
+
+        return ExtractionEntry(self, **defaults)
+
     @contextlib.contextmanager
     def force_rollback(self) -> typing.Iterator[None]:
         initial = self._force_rollback
