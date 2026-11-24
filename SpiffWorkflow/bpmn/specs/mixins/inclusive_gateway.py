@@ -17,7 +17,11 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301  USA
 
+from uuid import UUID
+
 from SpiffWorkflow.bpmn.exceptions import WorkflowTaskException
+from SpiffWorkflow.bpmn.specs.bpmn_task_spec import BpmnTaskSpec
+from SpiffWorkflow.util.deep_merge import DeepMerge
 from SpiffWorkflow.util.task import TaskState
 from SpiffWorkflow.specs.MultiChoice import MultiChoice
 from .unstructured_join import UnstructuredJoin
@@ -68,7 +72,92 @@ class InclusiveGateway(MultiChoice, UnstructuredJoin):
         MultiChoice.test(self)
         UnstructuredJoin.test(self)
 
-    def _check_threshold_unstructured(self, my_task):
+    def _is_join(self):
+        """Only gateways with multiple inputs can merge branches."""
+        return len(self.inputs) > 1
+
+    def _is_split(self):
+        """Gateways that can select more than one output start a new branch set."""
+        return len(self.cond_task_specs) > 1
+
+    def _get_split_task(self, my_task, token):
+        try:
+            return my_task.workflow.tasks.get(UUID(token))
+        except (TypeError, ValueError):
+            return None
+
+    def _get_expected_branches(self, split_task):
+        """Returns the branches this split instance selected that can reach this gateway."""
+        selected = split_task.internal_data.get('inclusive_split_outputs')
+        if selected is None:
+            return None
+
+        expected = []
+        for name in selected:
+            spec = split_task.workflow.spec.task_specs.get(name)
+            if spec is not None and spec not in expected and self._can_reach(spec):
+                expected.append(spec)
+        return expected
+
+    def _can_reach(self, spec):
+        """Checks whether a task spec has a path to this gateway in the process graph."""
+        if spec == self:
+            return True
+        seen, pending = set(), [spec]
+        while pending:
+            current = pending.pop(0)
+            if current == self:
+                return True
+            if current.name in seen:
+                continue
+            seen.add(current.name)
+            pending.extend(current.outputs)
+        return False
+
+    def _get_correlated_split(self, my_task):
+        """Finds the innermost open split with a branch that can reach this gateway."""
+        for token in reversed(my_task.get_open_branch_tokens()):
+            split_task = self._get_split_task(my_task, token)
+            if split_task is not None and self._get_expected_branches(split_task):
+                return split_task
+        return None
+
+    def _matching_tasks(self, my_task, token=None, state=TaskState.ANY_MASK):
+        """Find tasks of this spec that belong to the same split instance."""
+        if token is None:
+            tokens = my_task.get_open_branch_tokens()
+            return [
+                task for task in my_task.workflow.tasks.values()
+                if task.task_spec == self
+                and task.has_state(state)
+                and task.get_open_branch_tokens() == tokens
+            ]
+        return [
+            task for task in my_task.workflow.tasks.values()
+            if task.task_spec == self
+            and task.has_state(state)
+            and token in task.get_open_branch_tokens()
+        ]
+
+    def _check_threshold_token(self, my_task, split_task, expected):
+        """Wait only for branches selected by the split that produced this token."""
+        token = str(split_task.id)
+        join_tasks = self._matching_tasks(my_task, token, TaskState.NOT_FINISHED_MASK)
+        for branch in expected:
+            branch_task = next((c for c in split_task.children if c.task_spec == branch), None)
+            if branch_task is None:
+                return False
+            arrived = any(
+                task.parent is not None
+                and task.parent.has_state(TaskState.FINISHED_MASK)
+                and task.is_descendant_of(branch_task)
+                for task in join_tasks
+            )
+            if not arrived:
+                return False
+        return True
+
+    def _check_threshold_legacy(self, my_task):
         # Look at the tree to find all places where this task is used and unfinished tasks that may be ancestors
         # If there are any, we may have to check whether this gateway is reachable from any of them.
         tasks, sources = [], []
@@ -121,12 +210,93 @@ class InclusiveGateway(MultiChoice, UnstructuredJoin):
 
         return complete
 
+    def _check_threshold_unstructured(self, my_task):
+        if not self._is_join():
+            return True
+
+        if not my_task.get_open_branch_tokens():
+            return self._check_threshold_legacy(my_task)
+
+        split_task = self._get_correlated_split(my_task)
+        expected = self._get_expected_branches(split_task) if split_task is not None else None
+        if expected is None:
+            # The token did not come from an inclusive split we know about; use the
+            # legacy behavior for workflows that only use inclusive gateways as joins.
+            return self._check_threshold_legacy(my_task)
+
+        return self._check_threshold_token(my_task, split_task, expected)
+
+    def _update_hook(self, my_task):
+        if not self._is_join():
+            # A diverging gateway never waits for other branches; the generic join
+            # bookkeeping would look at every instance of this spec, including
+            # unrelated concurrent tokens.
+            return BpmnTaskSpec._update_hook(self, my_task)
+
+        if not my_task.get_open_branch_tokens():
+            return super()._update_hook(my_task)
+
+        split_task = self._get_correlated_split(my_task)
+        may_fire = self._check_threshold_unstructured(my_task)
+        if split_task is not None:
+            for task in self._matching_tasks(my_task, str(split_task.id), TaskState.WAITING):
+                if task != my_task:
+                    task.cancel()
+        if not may_fire:
+            my_task._set_state(TaskState.WAITING)
+        else:
+            my_task._inherit_data()
+        return may_fire
+
+    def _merge_token_branches(self, my_task):
+        """Merge data from the branches of this token only."""
+        split_task = self._get_correlated_split(my_task)
+        token = str(split_task.id) if split_task is not None else None
+        for task in sorted(self._matching_tasks(my_task, token), key=lambda t: t.last_state_change):
+            if task.parent is None or task == my_task:
+                continue
+            if my_task.is_descendant_of(task) or task.is_descendant_of(my_task):
+                continue
+            if not task.parent.has_state(TaskState.COMPLETED):
+                continue
+            # By inheriting directly from parent tasks, we avoid copying previously merged data.
+            DeepMerge.merge(my_task.data, task.parent.data)
+            if task.has_state(TaskState.COMPLETED):
+                task._drop_children(force=True)
+        # My task is not finished, so won't be included above.
+        my_task._inherit_data()
+
+    def _set_child_tokens(self, my_task, selected):
+        """Propagate or start token lineages on the selected outgoing branches."""
+        tokens = my_task.get_branch_tokens()
+        open_tokens = my_task.get_open_branch_tokens()
+        if self._is_join():
+            split_task = self._get_correlated_split(my_task)
+            if split_task is not None:
+                open_tokens = [token for token in open_tokens if token != str(split_task.id)]
+        if self._is_split():
+            tokens = tokens + [str(my_task.id)]
+            open_tokens = open_tokens + [str(my_task.id)]
+            my_task.internal_data['inclusive_split_outputs'] = [spec.name for spec in selected]
+
+        names = {spec.name for spec in selected}
+        for child in my_task.children:
+            if child.task_spec.name in names:
+                child._set_branch_tokens(tokens, open_tokens)
+
     def _run_hook(self, my_task):
-        UnstructuredJoin._run_hook(self, my_task)
+        if self._is_join():
+            if self._get_correlated_split(my_task) is not None:
+                self._merge_token_branches(my_task)
+            else:
+                UnstructuredJoin._run_hook(self, my_task)
+
         matches, defaults = self._get_matching_outputs(my_task)
         if len(matches + defaults) == 0:
             raise WorkflowTaskException('No conditions satisfied on gateway', task=my_task)
-        my_task._sync_children(matches or defaults, TaskState.FUTURE)
+        selected = matches or defaults
+        my_task._sync_children(selected, TaskState.FUTURE)
+        self._set_child_tokens(my_task, selected)
         for child in my_task.children:
             child.task_spec._predict(child, mask=TaskState.FUTURE|TaskState.PREDICTED_MASK)
         return True

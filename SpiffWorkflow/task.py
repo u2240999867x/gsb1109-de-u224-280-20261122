@@ -338,6 +338,42 @@ class Task:
         """Retrieves an internal data field."""
         return self.internal_data.get(name, default)
 
+    def get_branch_tokens(self) -> list:
+        """Returns the identifiers of the splits that produced this token.
+
+        Each inclusive split records a new entry in the token lineage of its
+        outgoing branches.  Joins use the lineage to correlate only tokens
+        that originate from the same split instance; multiple executions of a
+        gateway are otherwise indistinguishable from one another.
+        """
+        task = self
+        while task is not None:
+            tokens = task.internal_data.get('branch_tokens')
+            if tokens is not None:
+                return list(tokens)
+            task = task.parent
+        return []
+
+    def get_open_branch_tokens(self) -> list:
+        """Returns the split instances whose branches have not merged yet.
+
+        A join consumes the split instance it merges; the full lineage remains
+        available through `get_branch_tokens` so downstream tasks can still be
+        traced back to the split that produced them.
+        """
+        task = self
+        while task is not None:
+            tokens = task.internal_data.get('open_branch_tokens')
+            if tokens is not None:
+                return list(tokens)
+            task = task.parent
+        return []
+
+    def _set_branch_tokens(self, tokens: list, open_tokens: Optional[list] = None) -> None:
+        """Assigns this task's token lineage."""
+        self.internal_data['branch_tokens'] = list(tokens)
+        self.internal_data['open_branch_tokens'] = list(tokens if open_tokens is None else open_tokens)
+
     def _ready(self) -> None:
         """Marks the task as ready for execution."""
         if self.has_state(TaskState.COMPLETED) or self.has_state(TaskState.CANCELLED):

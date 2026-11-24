@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_ConcurrentBatches" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="concurrent_batches" name="Concurrent Inclusive Batches" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>flow_to_input_split</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="input_split" gatewayDirection="Diverging">
+      <bpmn:incoming>flow_to_input_split</bpmn:incoming>
+      <bpmn:outgoing>flow_to_batch_1</bpmn:outgoing>
+      <bpmn:outgoing>flow_to_batch_2</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="batch_1_input" name="Batch 1 Input">
+      <bpmn:incoming>flow_to_batch_1</bpmn:incoming>
+      <bpmn:outgoing>flow_batch_1_to_merge</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="batch_2_input" name="Batch 2 Input">
+      <bpmn:incoming>flow_to_batch_2</bpmn:incoming>
+      <bpmn:outgoing>flow_batch_2_to_merge</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="batch_merge" name="Batch Merge" gatewayDirection="Converging" default="flow_to_route">
+      <bpmn:incoming>flow_batch_1_to_merge</bpmn:incoming>
+      <bpmn:incoming>flow_batch_2_to_merge</bpmn:incoming>
+      <bpmn:outgoing>flow_to_route</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:inclusiveGateway id="route" name="Route" gatewayDirection="Diverging" default="flow_route_default">
+      <bpmn:incoming>flow_to_route</bpmn:incoming>
+      <bpmn:outgoing>flow_route_content</bpmn:outgoing>
+      <bpmn:outgoing>flow_route_checklist</bpmn:outgoing>
+      <bpmn:outgoing>flow_route_default</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:userTask id="content" name="Content">
+      <bpmn:incoming>flow_route_content</bpmn:incoming>
+      <bpmn:outgoing>flow_content_to_join</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="checklist" name="Checklist">
+      <bpmn:incoming>flow_route_checklist</bpmn:incoming>
+      <bpmn:outgoing>flow_checklist_to_join</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="default_work" name="Default Work">
+      <bpmn:incoming>flow_route_default</bpmn:incoming>
+      <bpmn:outgoing>flow_default_to_join</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:inclusiveGateway id="publish_join" name="Publish Join" gatewayDirection="Converging">
+      <bpmn:incoming>flow_content_to_join</bpmn:incoming>
+      <bpmn:incoming>flow_checklist_to_join</bpmn:incoming>
+      <bpmn:incoming>flow_default_to_join</bpmn:incoming>
+      <bpmn:outgoing>flow_to_publish</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:userTask id="publish" name="Publish">
+      <bpmn:incoming>flow_to_publish</bpmn:incoming>
+      <bpmn:outgoing>flow_to_successor</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="successor" name="Successor">
+      <bpmn:incoming>flow_to_successor</bpmn:incoming>
+      <bpmn:outgoing>flow_to_end</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>flow_to_end</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="flow_to_input_split" sourceRef="start" targetRef="input_split"/>
+    <bpmn:sequenceFlow id="flow_to_batch_1" sourceRef="input_split" targetRef="batch_1_input"/>
+    <bpmn:sequenceFlow id="flow_to_batch_2" sourceRef="input_split" targetRef="batch_2_input"/>
+    <bpmn:sequenceFlow id="flow_batch_1_to_merge" sourceRef="batch_1_input" targetRef="batch_merge"/>
+    <bpmn:sequenceFlow id="flow_batch_2_to_merge" sourceRef="batch_2_input" targetRef="batch_merge"/>
+    <bpmn:sequenceFlow id="flow_to_route" sourceRef="batch_merge" targetRef="route"/>
+    <bpmn:sequenceFlow id="flow_route_content" name="Content" sourceRef="route" targetRef="content">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">include_content</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="flow_route_checklist" name="Checklist" sourceRef="route" targetRef="checklist">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">include_checklist</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="flow_route_default" name="Default" sourceRef="route" targetRef="default_work"/>
+    <bpmn:sequenceFlow id="flow_content_to_join" sourceRef="content" targetRef="publish_join"/>
+    <bpmn:sequenceFlow id="flow_checklist_to_join" sourceRef="checklist" targetRef="publish_join"/>
+    <bpmn:sequenceFlow id="flow_default_to_join" sourceRef="default_work" targetRef="publish_join"/>
+    <bpmn:sequenceFlow id="flow_to_publish" sourceRef="publish_join" targetRef="publish"/>
+    <bpmn:sequenceFlow id="flow_to_successor" sourceRef="publish" targetRef="successor"/>
+    <bpmn:sequenceFlow id="flow_to_end" sourceRef="successor" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>
