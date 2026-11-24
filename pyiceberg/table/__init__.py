@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import math
 import random
@@ -212,6 +213,7 @@ class TableProperties:
     DELETE_MODE_DEFAULT = DELETE_MODE_COPY_ON_WRITE
 
     DEFAULT_NAME_MAPPING = "schema.name-mapping.default"
+    ADD_FILES_FIELD_ID_MAPPING = "add-files.field-id-mapping"
     FORMAT_VERSION = "format-version"
     DEFAULT_FORMAT_VERSION: TableVersion = 2
 
@@ -1059,20 +1061,37 @@ class Transaction:
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         check_duplicate_files: bool = True,
         branch: str | None = MAIN_BRANCH,
+        field_id_mappings: dict[str, dict[str, int]] | None = None,
     ) -> None:
         """
         Shorthand API for adding files as data files to the table transaction.
 
         Args:
             file_paths: The list of full file paths to be added as data files to the table
+            snapshot_properties: Custom properties to be added to the snapshot summary
+            check_duplicate_files: Whether to reject files that the table already references
+            branch: Branch reference to append the snapshot to
+            field_id_mappings: A mapping from each full file path to a mapping of that file's physical
+                column path to Iceberg field ID. It is used for Parquet files that have no field IDs so
+                each file resolves its columns with its own association instead of the current names.
+                The association is stored on the table and reused whenever the file is read.
 
         Raises:
             FileNotFoundError: If the file does not exist.
             ValueError: Raises a ValueError given file_paths contains duplicate files
             ValueError: Raises a ValueError given file_paths already referenced by table
+            ValueError: Raises a ValueError when a physical column is mapped to more than one field ID
         """
         if len(file_paths) != len(set(file_paths)):
             raise ValueError("File paths must be unique")
+
+        field_id_mappings = field_id_mappings or {}
+        unknown_paths = set(field_id_mappings) - set(file_paths)
+        if unknown_paths:
+            raise ValueError(
+                "Field ID mappings are only allowed for the files that are added, unknown file paths: "
+                + ", ".join(sorted(unknown_paths))
+            )
 
         if check_duplicate_files:
             referenced_files = self._find_referenced_data_files(file_paths)
@@ -1083,9 +1102,20 @@ class Transaction:
             self.set_properties(
                 **{TableProperties.DEFAULT_NAME_MAPPING: self.table_metadata.schema().name_mapping.model_dump_json()}
             )
+
+        if field_id_mappings:
+            # Persist the association before the snapshot is committed so a reader that reopens the
+            # table resolves every file with the mapping it was registered with.
+            stored_mappings = self.table_metadata.field_id_mappings()
+            stored_mappings.update(field_id_mappings)
+            self.set_properties(**{TableProperties.ADD_FILES_FIELD_ID_MAPPING: json.dumps(stored_mappings)})
+
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             data_files = _parquet_files_to_data_files(
-                table_metadata=self.table_metadata, file_paths=file_paths, io=self._table.io
+                table_metadata=self.table_metadata,
+                file_paths=file_paths,
+                io=self._table.io,
+                field_id_mappings=field_id_mappings,
             )
             for data_file in data_files:
                 append_files.append_data_file(data_file)
@@ -1917,12 +1947,18 @@ class Table:
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         check_duplicate_files: bool = True,
         branch: str | None = MAIN_BRANCH,
+        field_id_mappings: dict[str, dict[str, int]] | None = None,
     ) -> None:
         """
         Shorthand API for adding files as data files to the table.
 
         Args:
             file_paths: The list of full file paths to be added as data files to the table
+            snapshot_properties: Custom properties to be added to the snapshot summary
+            check_duplicate_files: Whether to reject files that the table already references
+            branch: Branch reference to append the snapshot to
+            field_id_mappings: A mapping from each full file path to a mapping of that file's physical
+                column path to Iceberg field ID, for files that have no field IDs of their own.
 
         Raises:
             FileNotFoundError: If the file does not exist.
@@ -1933,6 +1969,7 @@ class Table:
                 snapshot_properties=snapshot_properties,
                 check_duplicate_files=check_duplicate_files,
                 branch=branch,
+                field_id_mappings=field_id_mappings,
             )
 
     def update_spec(self, case_sensitive: bool = True) -> UpdateSpec:
@@ -3109,7 +3146,12 @@ class WriteTask:
         return f"00000-{self.task_id}-{self.write_uuid}.{extension}"
 
 
-def _parquet_files_to_data_files(table_metadata: TableMetadata, file_paths: list[str], io: FileIO) -> Iterable[DataFile]:
+def _parquet_files_to_data_files(
+    table_metadata: TableMetadata,
+    file_paths: list[str],
+    io: FileIO,
+    field_id_mappings: dict[str, dict[str, int]] | None = None,
+) -> Iterable[DataFile]:
     """Convert a list files into DataFiles.
 
     Returns:
@@ -3117,7 +3159,20 @@ def _parquet_files_to_data_files(table_metadata: TableMetadata, file_paths: list
     """
     from pyiceberg.io.pyarrow import parquet_file_to_data_file
 
+    field_id_mappings = field_id_mappings or {}
     executor = ExecutorFactory.get_or_create()
-    futures = [executor.submit(parquet_file_to_data_file, io, table_metadata, file_path) for file_path in file_paths]
+    if field_id_mappings:
+        futures = [
+            executor.submit(
+                parquet_file_to_data_file,
+                io,
+                table_metadata,
+                file_path,
+                field_id_mappings.get(file_path),
+            )
+            for file_path in file_paths
+        ]
+    else:
+        futures = [executor.submit(parquet_file_to_data_file, io, table_metadata, file_path) for file_path in file_paths]
 
     return [f.result() for f in futures if f.result()]

@@ -43,6 +43,7 @@ from packaging import version
 from pyarrow.fs import AwsDefaultS3RetryStrategy, FileType, LocalFileSystem, S3FileSystem
 from pyroaring import BitMap
 
+from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTDeleteFile, RESTFileScanTask, RESTPositionDeleteFile
 from pyiceberg.conversions import to_bytes
 from pyiceberg.encryption.key_metadata import StandardKeyMetadata
@@ -6725,3 +6726,169 @@ def test_dictionary_columns_produces_dict_encoded_output(tmpdir: str) -> None:
 
     # Values must be identical
     assert result_plain.column("label").to_pylist() == result_dict.column("label").to_pylist()
+
+
+def _write_meter_billing_parquet(
+    io: Any,
+    file_path: str,
+    meter_code: str,
+    billing_code: str,
+    with_ids: bool = False,
+    meter_struct_id: int = 1,
+    meter_code_id: int = 2,
+    billing_struct_id: int = 3,
+    billing_code_id: int = 4,
+) -> None:
+    schema = pa.schema(
+        [
+            pa.field(
+                "meter",
+                pa.struct(
+                    [
+                        pa.field(
+                            "code",
+                            pa.string(),
+                            metadata={b"PARQUET:field_id": str(meter_code_id).encode()} if with_ids else None,
+                        )
+                    ]
+                ),
+                metadata={b"PARQUET:field_id": str(meter_struct_id).encode()} if with_ids else None,
+            ),
+            pa.field(
+                "billing",
+                pa.struct(
+                    [
+                        pa.field(
+                            "code",
+                            pa.string(),
+                            metadata={b"PARQUET:field_id": str(billing_code_id).encode()} if with_ids else None,
+                        )
+                    ]
+                ),
+                metadata={b"PARQUET:field_id": str(billing_struct_id).encode()} if with_ids else None,
+            ),
+        ]
+    )
+    table = pa.Table.from_pylist([{"meter": {"code": meter_code}, "billing": {"code": billing_code}}], schema=schema)
+    with io.new_output(file_path).create(overwrite=True) as fos:
+        pq.write_table(table, fos)
+
+
+def test_add_files_per_file_field_id_mapping_survives_reopen(catalog_with_warehouse: Catalog, tmp_path: Path) -> None:
+    """A file without field IDs resolves its columns with the association it was registered with."""
+    catalog_with_warehouse.create_namespace("default")
+    table = catalog_with_warehouse.create_table(
+        "default.meter_billing",
+        schema=Schema(
+            NestedField(1, "meter", StructType(NestedField(2, "code", StringType(), required=False)), required=False),
+            NestedField(4, "billing", StructType(NestedField(5, "code", StringType(), required=False)), required=False),
+        ),
+        properties={"format-version": "2"},
+    )
+    with table.update_schema() as update:
+        update.rename_column("meter.code", "serial")
+    with table.update_schema() as update:
+        update.add_column(("meter", "code"), StringType(), required=False)
+
+    serial_id = table.schema().find_field("meter.serial").field_id
+    rate_id = table.schema().find_field("meter.code").field_id
+    billing_id = table.schema().find_field("billing.code").field_id
+
+    old_path = str(tmp_path / "old.parquet")
+    new_path = str(tmp_path / "new.parquet")
+    _write_meter_billing_parquet(table.io, old_path, meter_code="X", billing_code="X")
+    _write_meter_billing_parquet(table.io, new_path, meter_code="Y", billing_code="Z")
+
+    with table.transaction() as tx:
+        tx.add_files(
+            [old_path, new_path],
+            field_id_mappings={
+                old_path: {"meter.code": serial_id, "billing.code": billing_id},
+                new_path: {"meter.code": rate_id, "billing.code": billing_id},
+            },
+        )
+
+    table = catalog_with_warehouse.load_table("default.meter_billing")
+    assert table.metadata.field_id_mappings()[old_path] == {"meter.code": serial_id, "billing.code": billing_id}
+    assert table.metadata.field_id_mappings()[new_path] == {"meter.code": rate_id, "billing.code": billing_id}
+
+    serial_rows = table.scan(row_filter=EqualTo("meter.serial", "X"), selected_fields=("meter.code",)).to_arrow()
+    assert serial_rows.to_pylist() == [{"meter": {"code": None}}]
+
+    billing_rows = table.scan(row_filter=EqualTo("billing.code", "X"), selected_fields=("meter.serial", "meter.code")).to_arrow()
+    assert billing_rows.to_pylist() == [{"meter": {"serial": "X", "code": None}}]
+
+    rows = table.scan().to_arrow().to_pylist()
+    assert rows == [
+        {"meter": {"serial": "X", "code": None}, "billing": {"code": "X"}},
+        {"meter": {"serial": None, "code": "Y"}, "billing": {"code": "Z"}},
+    ]
+
+    # Manifest metrics are keyed by each file's own association: the old file records its meter.code
+    # statistics under the serial field ID, while the new file records them under the rate field ID.
+    stats_by_file = {
+        entry.data_file.file_path: entry.data_file
+        for manifest in table.current_snapshot().manifests(table.io)
+        for entry in manifest.fetch_manifest_entry(table.io)
+    }
+    assert set(stats_by_file[old_path].value_counts) == {serial_id, billing_id}
+    assert set(stats_by_file[new_path].value_counts) == {rate_id, billing_id}
+
+
+def test_add_files_field_id_mapping_rejects_duplicate_target(catalog_with_warehouse: Catalog, tmp_path: Path) -> None:
+    catalog_with_warehouse.create_namespace("default")
+    table = catalog_with_warehouse.create_table(
+        "default.meter_billing_dup",
+        schema=Schema(
+            NestedField(1, "meter", StructType(NestedField(2, "serial", StringType(), required=False)), required=False),
+            NestedField(3, "billing", StructType(NestedField(4, "code", StringType(), required=False)), required=False),
+        ),
+    )
+    serial_id = table.schema().find_field("meter.serial").field_id
+    billing_id = table.schema().find_field("billing.code").field_id
+
+    third_path = str(tmp_path / "third.parquet")
+    _write_meter_billing_parquet(table.io, third_path, meter_code="Q", billing_code="Q")
+
+    with pytest.raises(ValueError, match="Cannot map multiple columns to field ID") as exc_info:
+        table.add_files(
+            [third_path],
+            field_id_mappings={third_path: {"meter.code": serial_id, "billing.code": billing_id, "meter.serial": serial_id}},
+        )
+    assert "meter.code" in str(exc_info.value)
+    assert "meter.serial" in str(exc_info.value)
+
+
+def test_add_files_field_id_mapping_keeps_physical_ids(catalog_with_warehouse: Catalog, tmp_path: Path) -> None:
+    """A file with a valid physical field ID keeps its own association instead of the supplied mapping."""
+    catalog_with_warehouse.create_namespace("default")
+    table = catalog_with_warehouse.create_table(
+        "default.meter_billing_physical",
+        schema=Schema(
+            NestedField(1, "meter", StructType(NestedField(2, "serial", StringType(), required=False)), required=False),
+            NestedField(3, "billing", StructType(NestedField(4, "code", StringType(), required=False)), required=False),
+        ),
+    )
+    file_path = str(tmp_path / "ids.parquet")
+    serial_id = table.schema().find_field("meter.serial").field_id
+    billing_struct_id = table.schema().find_field("billing").field_id
+    billing_id = table.schema().find_field("billing.code").field_id
+    # meter.code physically carries the ID of meter.serial, so the supplied mapping must not win.
+    _write_meter_billing_parquet(
+        table.io,
+        file_path,
+        meter_code="PHYS",
+        billing_code="B",
+        with_ids=True,
+        meter_struct_id=1,
+        meter_code_id=serial_id,
+        billing_struct_id=billing_struct_id,
+        billing_code_id=billing_id,
+    )
+
+    table.add_files(
+        [file_path],
+        field_id_mappings={file_path: {"meter.code": 2, "billing.code": billing_id}},
+    )
+
+    assert table.scan().to_arrow().to_pylist() == [{"meter": {"serial": "PHYS"}, "billing": {"code": "B"}}]

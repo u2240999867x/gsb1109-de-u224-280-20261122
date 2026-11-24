@@ -38,7 +38,7 @@ import re
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -1260,17 +1260,187 @@ def _combine_positional_deletes(positional_deletes: list[pa.ChunkedArray], start
     return pc.subtract(result, pa.scalar(start_index))
 
 
+def _arrow_container_kind(arrow_type: pa.DataType) -> str | None:
+    if pa.types.is_struct(arrow_type):
+        return "struct"
+    elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
+        return "list"
+    elif pa.types.is_map(arrow_type):
+        return "map"
+    return None
+
+
+def _iceberg_container_kind(iceberg_type: IcebergType | None) -> str | None:
+    if isinstance(iceberg_type, StructType):
+        return "struct"
+    elif isinstance(iceberg_type, ListType):
+        return "list"
+    elif isinstance(iceberg_type, MapType):
+        return "map"
+    return None
+
+
+def _schema_has_field_id(schema: Schema, field_id: int) -> bool:
+    try:
+        schema.find_field(field_id)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_field_id_mapping(field_id_mapping: Mapping[str | tuple[str, ...], int]) -> dict[str, int]:
+    """Normalize a physical path mapping to dotted strings."""
+    return {".".join(path) if isinstance(path, tuple) else path: field_id for path, field_id in field_id_mapping.items()}
+
+
+def _resolve_field_id_mapping(
+    schema: pa.Schema, field_id_mapping: Mapping[str | tuple[str, ...], int], table_schema: Schema
+) -> dict[str, int]:
+    """Resolve the physical path to field ID mapping for every column of a Parquet file.
+
+    The caller supplies the associations of the physical columns. Parent struct, list, and map
+    columns may be left out; their field IDs are derived from the field IDs of their children, not
+    from their names. Fields that already carry a physical field ID keep it, and the mapping cannot
+    rewrite that association.
+    """
+    field_id_mapping = _normalize_field_id_mapping(field_id_mapping)
+    resolved = dict(field_id_mapping)
+    unresolved: list[str] = []
+
+    unknown_field_ids = {
+        field_id for column_path, field_id in field_id_mapping.items() if not _schema_has_field_id(table_schema, field_id)
+    }
+    if unknown_field_ids:
+        raise ValueError(
+            "The field ID mapping refers to fields that are not in the table schema: "
+            + ", ".join(str(field_id) for field_id in sorted(unknown_field_ids))
+        )
+
+    def _infer_container_id(arrow_type: pa.DataType, child_ids: list[int]) -> int | None:
+        if not child_ids:
+            return None
+        parent_ids = {table_schema._lazy_id_to_parent.get(child_id) for child_id in child_ids}
+        parent_ids.discard(None)
+        if len(parent_ids) != 1:
+            return None
+        parent_id = next(iter(parent_ids))
+        if _iceberg_container_kind(table_schema.find_type(parent_id)) != _arrow_container_kind(arrow_type):
+            return None
+        return parent_id
+
+    def _resolve_field(field: pa.Field, path: str) -> int | None:
+        field_id = _get_field_id(field)
+        if field_id is not None:
+            # A valid physical ID always wins over a supplied association.
+            resolved[path] = field_id
+        else:
+            field_id = resolved.get(path)
+
+        child_ids: list[int] = []
+        arrow_type = field.type
+        if pa.types.is_struct(arrow_type):
+            for child in cast(pa.StructType, arrow_type):
+                if (child_id := _resolve_field(child, f"{path}.{child.name}")) is not None:
+                    child_ids.append(child_id)
+        elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
+            element = cast(pa.ListType, arrow_type).value_field
+            if (element_id := _resolve_field(element, f"{path}.list.element")) is not None:
+                child_ids.append(element_id)
+        elif pa.types.is_map(arrow_type):
+            map_type = cast(pa.MapType, arrow_type)
+            if (key_id := _resolve_field(map_type.key_field, f"{path}.key_value.key")) is not None:
+                child_ids.append(key_id)
+            if (value_id := _resolve_field(map_type.item_field, f"{path}.key_value.value")) is not None:
+                child_ids.append(value_id)
+
+        if field_id is None and child_ids:
+            field_id = _infer_container_id(arrow_type, child_ids)
+            if field_id is not None:
+                resolved[path] = field_id
+
+        if field_id is None and path in resolved:
+            # Leaf fields must be associated, but a parent struct that is not part of the table schema
+            # (for example a container whose children are all projected) is harmless to leave out.
+            return field_id
+        if field_id is None and _arrow_container_kind(arrow_type) is None:
+            unresolved.append(path)
+        return field_id
+
+    for field in schema:
+        _resolve_field(field, field.name)
+
+    if unresolved:
+        raise ValueError("The field ID mapping does not cover the physical columns: " + ", ".join(sorted(unresolved)))
+
+    # Two physical columns must not resolve to the same target field. A column that keeps its own
+    # physical ID does not take part, because the supplied mapping did not assign that association.
+    target_sources: dict[int, str] = {}
+    for column_path, field_id in resolved.items():
+        if target_sources.setdefault(field_id, column_path) != column_path:
+            raise ValueError(f"Cannot map multiple columns to field ID {field_id}: {target_sources[field_id]} and {column_path}")
+    return resolved
+
+
+def _assign_arrow_field_ids(schema: pa.Schema, field_id_mapping: dict[str, int]) -> pa.Schema:
+    """Attach field IDs from an explicit physical path mapping to an Arrow schema.
+
+    Only fields that do not already carry a physical field ID are assigned one, so a field with a
+    valid physical ID keeps its own association and the mapping cannot rewrite it.
+    """
+
+    def _apply_field(field: pa.Field, path: str) -> pa.Field:
+        arrow_type = field.type
+        if pa.types.is_struct(arrow_type):
+            struct_type = cast(pa.StructType, arrow_type)
+            field = field.with_type(pa.struct([_apply_field(child, f"{path}.{child.name}") for child in struct_type]))
+        elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
+            list_type = cast(pa.ListType, arrow_type)
+            element = _apply_field(list_type.value_field, f"{path}.list.element")
+            if pa.types.is_large_list(arrow_type):
+                field = field.with_type(pa.large_list(element))
+            elif pa.types.is_fixed_size_list(arrow_type):
+                field = field.with_type(pa.list_(element, list_size=list_type.list_size))
+            else:
+                field = field.with_type(pa.list_(element))
+        elif pa.types.is_map(arrow_type):
+            map_type = cast(pa.MapType, arrow_type)
+            key = _apply_field(map_type.key_field, f"{path}.key_value.key")
+            value = _apply_field(map_type.item_field, f"{path}.key_value.value")
+            field = field.with_type(pa.map_(key, value))
+
+        if _get_field_id(field) is None and path in field_id_mapping:
+            metadata = dict(field.metadata or {})
+            metadata[PYARROW_PARQUET_FIELD_ID_KEY] = str(field_id_mapping[path]).encode()
+            field = field.with_metadata(metadata)
+        return field
+
+    return pa.schema([_apply_field(field, field.name) for field in schema], metadata=schema.metadata)
+
+
 def pyarrow_to_schema(
     schema: pa.Schema,
     name_mapping: NameMapping | None = None,
     downcast_ns_timestamp_to_us: bool = False,
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+    field_id_mapping: dict[str, int] | None = None,
+    table_schema: Schema | None = None,
 ) -> Schema:
+    if field_id_mapping is not None:
+        # The caller supplied the physical path to field ID association of this specific file. It takes
+        # precedence over the table's name mapping, which would resolve columns by their current names.
+        if table_schema is not None:
+            field_id_mapping = _resolve_field_id_mapping(schema, field_id_mapping, table_schema)
+        schema = _assign_arrow_field_ids(schema, field_id_mapping)
+
     has_ids = visit_pyarrow(schema, _HasIds())
     if has_ids:
         return visit_pyarrow(
             schema, _ConvertToIceberg(downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version)
         )
+    elif field_id_mapping is not None:
+        # The explicit mapping is authoritative; falling back to the current name mapping would infer the
+        # association from the current column names, which is exactly what the mapping is meant to avoid.
+        raise ValueError("The field ID mapping could not be applied to the Parquet file")
     elif name_mapping is not None:
         schema_without_ids = _pyarrow_to_schema_without_ids(
             schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version
@@ -1762,6 +1932,7 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
+    table_metadata: TableMetadata | None = None,
 ) -> Iterator[pa.RecordBatch]:
     _check_encryption_supported(task.file)
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
@@ -1779,7 +1950,12 @@ def _task_to_record_batches(
             downcast_ns_timestamp_to_us if downcast_ns_timestamp_to_us is not None else format_version <= 2
         )
         file_schema = pyarrow_to_schema(
-            physical_schema, name_mapping, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version
+            physical_schema,
+            name_mapping,
+            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+            format_version=format_version,
+            field_id_mapping=table_metadata.field_id_mapping(task.file.file_path) if table_metadata is not None else None,
+            table_schema=table_metadata.schema() if table_metadata is not None else None,
         )
 
         # Apply column projection rules: https://iceberg.apache.org/spec/#column-projection
@@ -2068,6 +2244,7 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
+                self._table_metadata,
             )
             for batch in batches:
                 if self._limit is not None:
@@ -2726,6 +2903,34 @@ def parquet_path_to_id_mapping(
     return result
 
 
+def _arrow_schema_to_parquet_path_id_mapping(schema: pa.Schema) -> dict[str, int]:
+    """Compute the parquet column path to field ID mapping of a file from its own Arrow schema.
+
+    The paths follow the same conventions as :func:`parquet_path_to_id_mapping`, but they are taken
+    from the columns that are actually present in the file instead of from the table schema. Fields
+    without a field ID are left out.
+    """
+
+    def _visit(field: pa.Field, path: str, result: dict[str, int]) -> None:
+        if (field_id := _get_field_id(field)) is not None:
+            result[path] = field_id
+        arrow_type = field.type
+        if pa.types.is_struct(arrow_type):
+            for child in cast(pa.StructType, arrow_type):
+                _visit(child, f"{path}.{child.name}", result)
+        elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
+            _visit(cast(pa.ListType, arrow_type).value_field, f"{path}.list.element", result)
+        elif pa.types.is_map(arrow_type):
+            map_type = cast(pa.MapType, arrow_type)
+            _visit(map_type.key_field, f"{path}.key_value.key", result)
+            _visit(map_type.item_field, f"{path}.key_value.value", result)
+
+    result: dict[str, int] = {}
+    for field in schema:
+        _visit(field, field.name, result)
+    return result
+
+
 def _nan_value_counts_from_arrow(table: pa.Table, stats_columns: dict[int, StatisticsCollector]) -> dict[int, int]:
     """Count the non-null NaN values of the top-level float and double columns.
 
@@ -3115,11 +3320,14 @@ def _check_pyarrow_schema_compatible(
     provided_schema: pa.Schema,
     downcast_ns_timestamp_to_us: bool = False,
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+    field_id_mapping: dict[str, int] | None = None,
 ) -> None:
     """
     Check if the `requested_schema` is compatible with `provided_schema`.
 
     Two schemas are considered compatible when they are equal in terms of the Iceberg Schema type.
+    When `field_id_mapping` is provided, it resolves the physical columns of the file instead of the
+    table's name mapping.
 
     Raises:
         ValueError: If the schemas are not compatible.
@@ -3132,8 +3340,14 @@ def _check_pyarrow_schema_compatible(
             name_mapping=name_mapping,
             downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
             format_version=format_version,
+            field_id_mapping=field_id_mapping,
+            table_schema=requested_schema if field_id_mapping is not None else None,
         )
     except ValueError as e:
+        if field_id_mapping is not None:
+            # The explicit per-file association is authoritative, so a failure to resolve it is not a
+            # name mismatch against the table schema.
+            raise
         provided_schema = _pyarrow_to_schema_without_ids(
             provided_schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version
         )
@@ -3145,13 +3359,28 @@ def _check_pyarrow_schema_compatible(
     _check_schema_compatible(requested_schema, provided_schema)
 
 
-def parquet_files_to_data_files(io: FileIO, table_metadata: TableMetadata, file_paths: Iterator[str]) -> Iterator[DataFile]:
+def parquet_files_to_data_files(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    file_paths: Iterator[str],
+    field_id_mappings: dict[str, dict[str, int]] | None = None,
+) -> Iterator[DataFile]:
     for file_path in file_paths:
-        data_file = parquet_file_to_data_file(io=io, table_metadata=table_metadata, file_path=file_path)
+        data_file = parquet_file_to_data_file(
+            io=io,
+            table_metadata=table_metadata,
+            file_path=file_path,
+            field_id_mapping=(field_id_mappings or {}).get(file_path),
+        )
         yield data_file
 
 
-def parquet_file_to_data_file(io: FileIO, table_metadata: TableMetadata, file_path: str) -> DataFile:
+def parquet_file_to_data_file(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    file_path: str,
+    field_id_mapping: dict[str, int] | None = None,
+) -> DataFile:
     input_file = io.new_input(file_path)
     with input_file.open() as input_stream:
         parquet_metadata = pq.read_metadata(input_stream)
@@ -3159,13 +3388,25 @@ def parquet_file_to_data_file(io: FileIO, table_metadata: TableMetadata, file_pa
     arrow_schema = parquet_metadata.schema.to_arrow_schema()
 
     schema = table_metadata.schema()
-    _check_pyarrow_schema_compatible(schema, arrow_schema, format_version=table_metadata.format_version)
+    # A file keeps the association it was registered with. When the caller does not supply one, use the
+    # association stored for this file, so reopening the table does not fall back to the current names.
+    field_id_mapping = field_id_mapping if field_id_mapping is not None else table_metadata.field_id_mapping(file_path)
+    _check_pyarrow_schema_compatible(
+        schema, arrow_schema, format_version=table_metadata.format_version, field_id_mapping=field_id_mapping
+    )
+
+    if field_id_mapping is not None:
+        resolved_mapping = _resolve_field_id_mapping(arrow_schema, field_id_mapping, schema)
+        statistics_mapping = _arrow_schema_to_parquet_path_id_mapping(_assign_arrow_field_ids(arrow_schema, resolved_mapping))
+    else:
+        statistics_mapping = parquet_path_to_id_mapping(schema)
 
     statistics = data_file_statistics_from_parquet_metadata(
         parquet_metadata=parquet_metadata,
         stats_columns=compute_statistics_plan(schema, table_metadata.properties),
-        parquet_column_mapping=parquet_path_to_id_mapping(schema),
+        parquet_column_mapping=statistics_mapping,
     )
+
     data_file = DataFile.from_args(
         content=DataFileContent.DATA,
         file_path=file_path,

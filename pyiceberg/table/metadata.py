@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import json
 import uuid
 from collections.abc import Iterable
 from copy import copy
@@ -289,6 +290,30 @@ class TableMetadataCommonFields(IcebergBaseModel):
             return parse_mapping_from_json(name_mapping_json)
         else:
             return None
+
+    def field_id_mappings(self) -> dict[str, dict[str, int]]:
+        """Return the per-file physical column path to field ID associations.
+
+        The associations are recorded when files without field IDs are added and are keyed by the
+        full path of the data file. A file keeps its own association after the table is reopened,
+        even when the current table schema uses the same column name for another field.
+        """
+        from pyiceberg.table import TableProperties
+
+        raw = self.properties.get(TableProperties.ADD_FILES_FIELD_ID_MAPPING)
+        if not raw:
+            return {}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Invalid {TableProperties.ADD_FILES_FIELD_ID_MAPPING}: expected a JSON object")
+        return {
+            file_path: {str(column_path): int(field_id) for column_path, field_id in mapping.items()}
+            for file_path, mapping in parsed.items()
+        }
+
+    def field_id_mapping(self, file_path: str) -> dict[str, int] | None:
+        """Return the physical column path to field ID association recorded for a data file."""
+        return self.field_id_mappings().get(file_path)
 
     def spec(self) -> PartitionSpec:
         """Return the partition spec of this table."""
