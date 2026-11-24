@@ -1157,6 +1157,12 @@ def path(
     return sorted(nx.all_simple_edge_paths(g, start, end, cutoff=cutoff), key=len)
 
 
+def first_not_none_delivery(*values):
+    for value in values:
+        if value is not None:
+            return value
+
+
 def auto_pipeline(
     url: str | BaseData,
     outtype: str | tuple[str] = "",
@@ -1164,6 +1170,22 @@ def auto_pipeline(
     avoid: list[str] | None = None,
     prefer: list[str] | None = None,
     exclude: list[str] | None = None,
+    deliveries=None,
+    delivery=None,
+    deliver=None,
+    names=None,
+    outputs=None,
+    requested=None,
+    existing=None,
+    available=None,
+    artifacts=None,
+    batch_id=None,
+    fx_version=None,
+    copy_cost=3,
+    candidates=None,
+    plugins=None,
+    execute: bool = False,
+    **joint_kwargs,
 ) -> Pipeline:
     """Create pipeline from given URL to desired output type
 
@@ -1187,6 +1209,36 @@ def auto_pipeline(
         Example: ``exclude=["Spark", "Ray"]``.
     """
     from intake.readers.datatypes import recommend
+
+    delivery_request = first_not_none_delivery(
+        deliveries,
+        delivery,
+        deliver,
+        names,
+        outputs,
+        requested,
+        joint_kwargs.get("delivery_names"),
+        joint_kwargs.get("delivery_requests"),
+        joint_kwargs.get("requests"),
+        joint_kwargs.get("targets"),
+    )
+    if delivery_request is None and isinstance(outtype, (list, dict)):
+        delivery_request = outtype
+    if delivery_request is not None:
+        from intake.readers.delivery import plan_deliveries
+
+        plan = plan_deliveries(
+            url,
+            delivery_request,
+            candidates if candidates is not None else plugins,
+            existing=existing if existing is not None else available if available is not None else artifacts,
+            batch_id=batch_id,
+            fx_version=fx_version,
+            copy_cost=copy_cost,
+            discover=joint_kwargs.pop("discover", candidates is None and plugins is None),
+            **joint_kwargs,
+        )
+        return plan.execute() if execute else plan
 
     if isinstance(url, str):
         if storage_options:

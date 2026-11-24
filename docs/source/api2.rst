@@ -11,6 +11,9 @@ User Functions
     intake.config.Config
     intake.readers.datatypes.recommend
     intake.readers.convert.auto_pipeline
+    intake.readers.delivery.plan_deliveries
+    intake.readers.delivery.DeliveryPlanner
+    intake.readers.delivery.JointPlan
     intake.readers.convert.path
     intake.readers.entry.Catalog
     intake.readers.entry.DataDescription
@@ -25,6 +28,14 @@ User Functions
 .. autofunction:: intake.readers.datatypes.recommend
 
 .. autofunction:: intake.readers.convert.auto_pipeline
+
+.. autofunction:: intake.readers.delivery.plan_deliveries
+
+.. autoclass:: intake.readers.delivery.DeliveryPlanner
+    :members:
+
+.. autoclass:: intake.readers.delivery.JointPlan
+    :members:
 
 .. autoclass:: intake.readers.entry.Catalog
     :members:

@@ -27,6 +27,14 @@ class BaseReader(Tokenizable, PipelineMixin):
     func: str = "builtins:NotImplementedError"  #: function name for loading data
     func_doc: str = None  #: docstring origin if not from func
     output_instance: str = None  #: type the reader produces
+    delivery_provides: str | tuple | dict | None = None
+    delivery_requires: str | tuple | dict | None = None
+    delivery_cost: int | float | None = None
+    declared_cost: int | float | None = None
+    coverage: str | None = None
+    materialized: bool | None = None
+    mutates_input: bool = False
+    is_copy: bool = False
     other_funcs: set[str] = set()  #: function names to recognise when matching user calls
     prefer_for_inspect: bool = True
     """Whether this reader should be preferred by :func:`inspect_dataset`.
@@ -116,13 +124,22 @@ class BaseReader(Tokenizable, PipelineMixin):
             return import_name(self.func)
         return self.func
 
-    def read(self, *args, **kwargs):
+    def read(self, *args, deliveries=None, **kwargs):
         """Produce data artefact
 
         Any of the arguments encoded in the data instance can be overridden.
 
         Output type is given by the .output_instance attribute
         """
+        if deliveries is None:
+            deliveries = kwargs.pop("delivery_names", None)
+        if deliveries is None:
+            deliveries = kwargs.pop("delivery", None)
+        if deliveries is None:
+            deliveries = kwargs.pop("deliver", None)
+        if deliveries is not None:
+            execute = kwargs.pop("execute", True)
+            return self.deliver(deliveries, execute=execute, **kwargs)
         logger.debug("Reading %s", self)
         kw = self.kwargs.copy()
         kw.update(kwargs)
@@ -175,6 +192,39 @@ class BaseReader(Tokenizable, PipelineMixin):
         from intake import auto_pipeline
 
         return auto_pipeline(self, outtype=outtype, avoid=avoid, prefer=prefer, exclude=exclude)
+
+    def plan_deliveries(self, deliveries=None, candidates=None, **kwargs):
+        from intake.readers.delivery import plan_deliveries
+
+        if candidates is None:
+            candidates = kwargs.pop("plugins", None) or kwargs.pop("readers", None)
+        kwargs.setdefault("discover", candidates is None)
+        return plan_deliveries(
+            source=self,
+            deliveries=deliveries if deliveries is not None else kwargs.pop("names", None),
+            candidates=candidates,
+            **kwargs,
+        )
+
+    plan_delivery = plan_deliveries
+    plan = plan_deliveries
+    joint_plan = plan_deliveries
+    plan_joint = plan_deliveries
+
+    def deliver(self, *names, execute: bool = True, **kwargs):
+        deliveries = kwargs.pop("deliveries", None)
+        if deliveries is None and names:
+            deliveries = names[0] if len(names) == 1 and isinstance(names[0], (list, tuple, set)) else names
+        plan = self.plan_deliveries(deliveries, **kwargs)
+        return plan.execute() if execute else plan
+
+    deliver_many = deliver
+    request = deliver
+    request_deliveries = deliver
+    read_deliveries = deliver
+
+    def multi_read(self, deliveries=None, **kwargs):
+        return self.deliver(deliveries, **kwargs)
 
     @classmethod
     def is_ok(cls, data) -> bool:
