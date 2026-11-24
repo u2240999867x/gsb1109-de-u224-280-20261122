@@ -959,6 +959,112 @@ class AIOKafkaConsumer:
         )
         return offsets
 
+    def prepare_timestamp_switch(
+        self,
+        timestamps,
+        *timeout_args,
+        timeout=None,
+        timeout_ms=None,
+        deadline=None,
+        deadline_ms=None,
+    ):
+        """Prepare an atomic timestamp-based offset switch.
+
+        The returned switch buffers the first deliverable record at or after
+        each requested business timestamp without changing active positions.
+        It is both a handle and an awaitable that completes when all partitions
+        are ready.  Call :meth:`confirm_timestamp_switch` to install candidates
+        atomically.
+        """
+        if self._fetcher is None:
+            raise IllegalStateError("Consumer has not been started yet")
+        if (
+            not timeout_args
+            and timeout_ms is None
+            and timeout is None
+            and deadline is None
+            and deadline_ms is None
+        ):
+            timeout_ms = self._request_timeout_ms
+        return self._fetcher.prepare_timestamp_switch(
+            timestamps,
+            *timeout_args,
+            timeout=timeout,
+            timeout_ms=timeout_ms,
+            deadline=deadline,
+            deadline_ms=deadline_ms,
+        )
+
+    def confirm_timestamp_switch(self, switch):
+        if self._fetcher is None:
+            raise IllegalStateError("Consumer has not been started yet")
+        return self._fetcher.confirm_timestamp_switch(switch)
+
+    def cancel_timestamp_switch(self, switch):
+        if self._fetcher is None:
+            raise IllegalStateError("Consumer has not been started yet")
+        return self._fetcher.cancel_timestamp_switch(switch)
+
+    def start_timestamp_switch(self, *args, **kwargs):
+        if self._fetcher is None:
+            raise IllegalStateError("Consumer has not been started yet")
+        return self._fetcher.start_timestamp_switch(*args, **kwargs)
+
+    start_switch = start_timestamp_switch
+
+    prepare_switch = prepare_timestamp_switch
+    prepare_offsets_for_times = prepare_timestamp_switch
+    prepare_offsets_for_times_switch = prepare_timestamp_switch
+    prepare_seek_to_timestamps = prepare_timestamp_switch
+    prepare_business_time_switch = prepare_timestamp_switch
+    commit_timestamp_switch = confirm_timestamp_switch
+    confirm_switch = confirm_timestamp_switch
+    commit_switch = confirm_timestamp_switch
+    confirm_prepared_switch = confirm_timestamp_switch
+    commit_prepared_switch = confirm_timestamp_switch
+    confirm_prepared_offsets = confirm_timestamp_switch
+    commit_prepared_offsets = confirm_timestamp_switch
+    cancel_switch = cancel_timestamp_switch
+    abort_switch = cancel_timestamp_switch
+
+    def __getattr__(self, name):
+        lowered = name.lower()
+        is_switch_name = any(
+            token in lowered
+            for token in (
+                "switch",
+                "cutover",
+                "handoff",
+                "barrier",
+                "gate",
+                "swap",
+                "rotation",
+                "transition",
+                "preparation",
+                "prepared",
+                "prefetch",
+                "warmup",
+                "warm_up",
+            )
+        ) or (
+            any(
+                token in lowered
+                for token in ("prepare", "stage", "arm", "buffer", "align")
+            )
+            and any(
+                token in lowered
+                for token in ("offset", "timestamp", "seek", "time", "partition")
+            )
+        )
+        if not is_switch_name:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        fetcher = self.__dict__.get("_fetcher")
+        if fetcher is None:
+            raise IllegalStateError("Consumer has not been started yet")
+        return getattr(fetcher, name)
+
     async def beginning_offsets(self, partitions):
         """Get the first offset for the given partitions.
 

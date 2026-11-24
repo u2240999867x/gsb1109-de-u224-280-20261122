@@ -463,6 +463,7 @@ class TopicPartitionState:
         self.timestamp = None  # timestamp of last poll
         self._position = None  # The current position of the topic
         self._position_fut = create_future()
+        self.position_revision = 0
 
         # Will be set by `seek_to_beginning` or `seek_to_end` if called by user
         # or by Fetcher after confirming that current position is no longer
@@ -506,6 +507,7 @@ class TopicPartitionState:
         """
         self._reset_strategy = strategy
         self._position = None
+        self.position_revision += 1
         if self._position_fut.done():
             self._position_fut = create_future()
         self._status = PartitionStatus.AWAITING_RESET
@@ -548,6 +550,7 @@ class TopicPartitionState:
         self._position = position
         self._reset_strategy = None
         self._status = PartitionStatus.CONSUMING
+        self.position_revision += 1
         if not self._position_fut.done():
             self._position_fut.set_result(None)
 

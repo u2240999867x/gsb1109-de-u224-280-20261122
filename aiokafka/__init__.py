@@ -3,6 +3,12 @@ __version__ = "0.15.0"
 from .abc import ConsumerRebalanceListener
 from .client import AIOKafkaClient
 from .consumer import AIOKafkaConsumer
+from .consumer.switch import (
+    PreparedOffsetSwitch,
+    PreparedTimestampSwitch,
+    TimestampSwitchInvalidated,
+    TimestampSwitchTimeout,
+)
 from .errors import ConsumerStoppedError, IllegalOperation
 from .listeners import ProducerListener
 from .producer import AIOKafkaProducer
@@ -18,6 +24,10 @@ __all__ = [  # noqa: RUF022
     "AIOKafkaProducer",
     "AIOKafkaConsumer",
     "AIOKafkaClient",
+    "PreparedTimestampSwitch",
+    "PreparedOffsetSwitch",
+    "TimestampSwitchTimeout",
+    "TimestampSwitchInvalidated",
     # Event listeners
     "ProducerListener",
     # ABC's

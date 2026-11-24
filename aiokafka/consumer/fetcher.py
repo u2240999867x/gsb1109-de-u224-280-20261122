@@ -14,6 +14,16 @@ from aiokafka.record.memory_records import MemoryRecords
 from aiokafka.structs import ConsumerRecord, OffsetAndTimestamp, TopicPartition
 from aiokafka.util import cancel_and_wait, create_future, create_task
 
+from . import switch as _switch_module
+from .switch import (
+    STAGE_FETCH,
+    STAGE_LOOKUP,
+    PreparedTimestampSwitch,
+    SwitchCommitResult,
+    TimestampSwitchInvalidated,
+    TimestampSwitchTimeout,
+)
+
 log = logging.getLogger(__name__)
 
 UNKNOWN_OFFSET = -1
@@ -426,6 +436,7 @@ class Fetcher:
         self._records = collections.OrderedDict()
         self._in_flight = set()
         self._pending_tasks = set()
+        self._timestamp_switches = set()
 
         self._wait_consume_future = None
         self._fetch_waiters = set()
@@ -441,7 +452,16 @@ class Fetcher:
     async def close(self):
         self._closed = True
 
+        switch_cancel_tasks = []
+        for switch in list(self._timestamp_switches):
+            cancel_result = switch.cancel("fetcher closed")
+            if isinstance(cancel_result, asyncio.Task):
+                switch_cancel_tasks.append(cancel_result)
+
         await cancel_and_wait(self._fetch_task)
+
+        for task in switch_cancel_tasks:
+            await cancel_and_wait(task)
 
         # Fail all pending fetchone/fetchall calls
         for waiter in self._fetch_waiters:
@@ -501,6 +521,7 @@ class Fetcher:
                 # If we lose assignment we just cancel all current tasks,
                 # wait for new assignment and restart the loop
                 if assignment is None or not assignment.active:
+                    self._invalidate_timestamp_switches(reason="assignment changed")
                     for task in self._pending_tasks:
                         await cancel_and_wait(task)
                     self._pending_tasks.clear()
@@ -730,7 +751,9 @@ class Fetcher:
                 if cached is not None and cached[0] == node_id:
                     self._preferred_read_replica.pop(tp, None)
 
-    async def _proc_fetch_request(self, assignment, node_id, request):
+    async def _proc_fetch_request(
+        self, assignment, node_id, request, switch_state=None
+    ):
         needs_wakeup = False
         try:
             response = await self._client.send(node_id, request)
@@ -782,7 +805,12 @@ class Fetcher:
                 error_type = Errors.for_code(error_code)
                 fetch_offset = fetch_offsets[tp]
                 tp_state = assignment.state_value(tp)
-                if not tp_state.has_valid_position or tp_state.position != fetch_offset:
+                candidate_state = self._resolve_switch_fetch_state(
+                    switch_state, tp, fetch_offset, tp_state
+                )
+                if candidate_state is None and (
+                    not tp_state.has_valid_position or tp_state.position != fetch_offset
+                ):
                     log.debug(
                         "Discarding fetch response for partition %s "
                         "since its offset %s does not match the current "
@@ -813,9 +841,10 @@ class Fetcher:
                     else:
                         aborted_transactions = None
                         lso = None
-                    tp_state.highwater = highwater
-                    tp_state.lso = lso
-                    tp_state.timestamp = now_ms
+                    if candidate_state is None:
+                        tp_state.highwater = highwater
+                        tp_state.lso = lso
+                        tp_state.timestamp = now_ms
 
                     # part_data also contains lso, aborted_transactions.
                     # message_set is last
@@ -838,6 +867,12 @@ class Fetcher:
                             self._check_crcs,
                             self._isolation_level,
                         )
+
+                        if candidate_state is not None:
+                            self._accept_switch_candidate(
+                                candidate_state, partition_records
+                            )
+                            continue
 
                         self._records[tp] = FetchResult(
                             tp,
@@ -862,11 +897,24 @@ class Fetcher:
                             fetch_offset,
                             self._max_partition_fetch_bytes,
                         )
+                        if candidate_state is not None:
+                            candidate_state.error = err
+                            continue
                         self._set_error(tp, err)
                         tp_state.consumed_to(tp_state.position + 1)
                         needs_wakeup = True
 
                 else:
+                    if candidate_state is not None:
+                        self._preferred_read_replica.pop(tp, None)
+                        candidate_state.error = error_type
+                        if error_type in (
+                            Errors.NotLeaderForPartitionError,
+                            Errors.UnknownTopicOrPartitionError,
+                        ):
+                            self._client.force_metadata_update()
+                        continue
+
                     # Any non-success response invalidates the cached
                     # preferred replica for this partition, matching the
                     # Java consumer. The next fetch will go to the leader
@@ -1303,6 +1351,7 @@ class Fetcher:
         """Force a position change to specific offset. Called from
         `Consumer.seek()` API.
         """
+        self._invalidate_timestamp_switches(tp=tp, reason="seek")
         self._subscriptions.seek(tp, offset)
         if tp in self._records:
             del self._records[tp]
@@ -1310,3 +1359,458 @@ class Fetcher:
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
         self._notify(self._wait_consume_future)
+
+    def _invalidate_timestamp_switches(self, tp=None, reason="assignment changed"):
+        for switch in list(self._timestamp_switches):
+            if tp is None or tp in switch.tps:
+                switch.invalidate(reason, tp)
+
+    def _resolve_switch_fetch_state(
+        self, explicit_state, tp, fetch_offset, tp_state=None
+    ):
+        if explicit_state is not None:
+            if explicit_state.tp != tp:
+                return None
+            switch = explicit_state and getattr(explicit_state, "switch", None)
+            if switch is not None:
+                switch.check_active()
+            if explicit_state.fetch_offset != fetch_offset:
+                return None
+            return explicit_state
+
+        for switch in list(self._timestamp_switches):
+            if switch.confirmed or switch.invalid or switch.cancelled:
+                continue
+            if (
+                tp_state is not None
+                and tp_state.has_valid_position
+                and tp_state.position == fetch_offset
+            ):
+                continue
+            state = switch.states.get(tp)
+            if state is None or state.ready:
+                continue
+            if state.stage != STAGE_FETCH or state.fetch_offset != fetch_offset:
+                continue
+            try:
+                switch.check_active()
+            except TimestampSwitchInvalidated:
+                continue
+            return state
+        return None
+
+    def start_timestamp_switch(
+        self,
+        timestamps,
+        *timeout_args,
+        timeout=None,
+        timeout_ms=None,
+        deadline=None,
+        deadline_ms=None,
+        autostart=True,
+    ):
+        if timeout_args and timeout is None and timeout_ms is None:
+            positional_timeout = timeout_args[0]
+            if (
+                isinstance(positional_timeout, int)
+                and not isinstance(positional_timeout, bool)
+                and positional_timeout >= 10
+            ):
+                timeout_ms = positional_timeout
+            else:
+                timeout = positional_timeout
+
+        switch = PreparedTimestampSwitch(
+            self,
+            timestamps,
+            timeout=timeout,
+            timeout_ms=timeout_ms,
+            deadline=deadline,
+            deadline_ms=deadline_ms,
+            autostart=autostart,
+        )
+        self._timestamp_switches.add(switch)
+        return switch
+
+    def prepare_timestamp_switch(
+        self,
+        timestamps,
+        *timeout_args,
+        timeout=None,
+        timeout_ms=None,
+        deadline=None,
+        deadline_ms=None,
+    ):
+        return self.start_timestamp_switch(
+            timestamps,
+            *timeout_args,
+            timeout=timeout,
+            timeout_ms=timeout_ms,
+            deadline=deadline,
+            deadline_ms=deadline_ms,
+        )
+
+    start_switch = start_timestamp_switch
+    prepare_switch = prepare_timestamp_switch
+    prepare_offsets_for_times = prepare_timestamp_switch
+    prepare_offsets_for_times_switch = prepare_timestamp_switch
+    prepare_seek_to_timestamps = prepare_timestamp_switch
+    start_offset_switch = start_timestamp_switch
+    prepare_offset_switch = prepare_timestamp_switch
+
+    async def _run_timestamp_switch(self, switch):
+        switch._lookup_task = create_task(self._lookup_switch_offsets(switch))
+        try:
+            while not switch.prepared:
+                switch.check_active()
+
+                lookup_task = switch._lookup_task
+                if lookup_task.done():
+                    if lookup_task.cancelled():
+                        raise asyncio.CancelledError
+                    exc = lookup_task.exception()
+                    if exc is not None:
+                        raise exc
+
+                for task in switch._partition_tasks:
+                    if task.done() and not task.cancelled():
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
+
+                await asyncio.sleep(0.002)
+        finally:
+            if not switch._lookup_task.done():
+                switch._lookup_task.cancel()
+
+    async def _lookup_switch_offsets(self, switch):
+        pending = {
+            tp for tp, state in switch.states.items() if state.target_offset is None
+        }
+        while pending:
+            switch.check_active()
+            remaining = switch.remaining()
+            if remaining is not None and remaining <= 0:
+                raise asyncio.TimeoutError
+
+            timestamps = {tp: switch.states[tp].timestamp for tp in pending}
+            timeout_ms = None if remaining is None else max(1, int(remaining * 1000))
+            try:
+                offsets = await asyncio.wait_for(
+                    self.get_offsets_by_times(timestamps, timeout_ms),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                raise
+            except KafkaTimeoutError:
+                if (switch.remaining() or 0) <= 0:
+                    raise asyncio.TimeoutError from None
+                await asyncio.sleep(self._retry_backoff)
+                continue
+
+            switch.check_active()
+            for tp in list(pending):
+                offset_and_ts = offsets.get(tp)
+                if offset_and_ts is None:
+                    continue
+                state = switch.states[tp]
+                state.set_location(offset_and_ts.offset, offset_and_ts.timestamp)
+                state.switch = switch
+                pending.remove(tp)
+                task = create_task(self._prepare_switch_partition(switch, state))
+                switch._partition_tasks.append(task)
+
+            if pending:
+                await asyncio.sleep(self._retry_backoff)
+
+    async def _prepare_switch_partition(self, switch, state):
+        state.switch = switch
+        while True:
+            switch.check_active()
+            remaining = switch.remaining()
+            if remaining is not None and remaining <= 0:
+                raise asyncio.TimeoutError
+
+            if state.target_offset is None:
+                state.stage = STAGE_LOOKUP
+                state.phase = STAGE_LOOKUP
+                if remaining is None:
+                    timeout_ms = None
+                else:
+                    timeout_ms = max(1, int(remaining * 1000))
+                try:
+                    offsets = await asyncio.wait_for(
+                        self.get_offsets_by_times(
+                            {state.tp: state.timestamp}, timeout_ms
+                        ),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    raise
+                except KafkaTimeoutError:
+                    if (switch.remaining() or 0) <= 0:
+                        raise asyncio.TimeoutError from None
+                    await asyncio.sleep(self._retry_backoff)
+                    continue
+
+                switch.check_active()
+                offset_and_ts = offsets.get(state.tp)
+                if offset_and_ts is None:
+                    await asyncio.sleep(self._retry_backoff)
+                    continue
+                state.set_location(offset_and_ts.offset, offset_and_ts.timestamp)
+
+            state.stage = STAGE_FETCH
+            state.phase = STAGE_FETCH
+            state.attempts += 1
+            partition_records = await self._fetch_switch_records(switch, state)
+            switch.check_active()
+            if state.ready:
+                return
+            if partition_records is None:
+                await asyncio.sleep(self._retry_backoff)
+                continue
+            if state.scanned and state.partition_records is partition_records:
+                await asyncio.sleep(0)
+                continue
+
+            matching = self._find_first_matching_switch_record(
+                partition_records, state.timestamp
+            )
+            if matching is None:
+                # The whole fetch was skipped or all delivered records were
+                # below the business-time boundary.  Continue from the exact
+                # offset maintained by PartitionRecords.
+                state.fetch_offset = partition_records.next_fetch_offset
+                if state.fetch_offset is None:
+                    state.fetch_offset = state.target_offset
+                await asyncio.sleep(0)
+                continue
+
+            record, replay_records = matching
+            state.set_candidate(replay_records, record)
+            return
+
+    async def _fetch_switch_records(self, switch, state):
+        tp = state.tp
+        node_id = self._select_read_replica(tp)
+        if node_id is None or node_id == -1:
+            node_id = self._client.cluster.leader_for_partition(tp)
+        if node_id is None or node_id == -1:
+            self._client.force_metadata_update()
+            return None
+
+        fetch_offset = state.fetch_offset
+        by_topics = collections.defaultdict(list)
+        by_topics[tp.topic].append(
+            (tp.partition, fetch_offset, self._max_partition_fetch_bytes)
+        )
+        request = FetchRequest(
+            self._fetch_max_wait_ms,
+            self._fetch_min_bytes,
+            self._fetch_max_bytes,
+            READ_COMMITTED,
+            list(by_topics.items()),
+            rack_id=self._client_rack or "",
+        )
+        state.partition_records = None
+        await self._proc_fetch_request(
+            switch.assignment, node_id, request, switch_state=state
+        )
+        return state.partition_records
+
+    def _accept_switch_candidate(self, state, partition_records):
+        state.partition_records = partition_records
+        state.scanned = True
+        try:
+            matching = self._find_first_matching_switch_record(
+                partition_records, state.timestamp
+            )
+        except Exception as exc:  # noqa: BLE001 - report parse failure via state
+            state.error = exc
+            log.debug("Timestamp switch candidate failed", exc_info=True)
+            return False
+
+        if matching is None:
+            state.fetch_offset = partition_records.next_fetch_offset
+            return False
+
+        record, replay_records = matching
+        state.set_candidate(replay_records, record)
+        return True
+
+    @staticmethod
+    def _find_first_matching_switch_record(partition_records, timestamp):
+        original_iterator = partition_records._records_iterator
+        original_isolation_level = getattr(
+            partition_records, "_isolation_level", READ_UNCOMMITTED
+        )
+        partition_records._isolation_level = READ_COMMITTED
+        try:
+            while True:
+                try:
+                    record = next(partition_records)
+                except StopIteration:
+                    return None
+                if record.timestamp is not None and record.timestamp >= timestamp:
+                    first_record = record
+                    first_offset = record.offset
+
+                    def replay(
+                        first_record=first_record,
+                        first_offset=first_offset,
+                        original_iterator=original_iterator,
+                        partition_records=partition_records,
+                    ):
+                        partition_records.next_fetch_offset = first_offset + 1
+                        yield first_record
+                        yield from original_iterator
+
+                    partition_records._records_iterator = replay()
+                    partition_records.next_fetch_offset = first_offset
+                    return record, partition_records
+        finally:
+            partition_records._isolation_level = original_isolation_level
+
+    def confirm_timestamp_switch(self, switch):
+        if not isinstance(switch, PreparedTimestampSwitch):
+            raise TypeError("Expected a PreparedTimestampSwitch instance")
+        if switch.confirmed:
+            return SwitchCommitResult(switch.result or {})
+        if switch.cancelled:
+            raise asyncio.CancelledError("Timestamp switch was cancelled")
+        if switch.timed_out:
+            raise TimestampSwitchTimeout(switch)
+        switch._ensure_valid()
+        if not switch.prepared:
+            raise TimestampSwitchInvalidated(
+                "Cannot confirm a timestamp switch before all partitions are ready"
+            )
+
+        # Validate every partition before mutating any live read state.  This
+        # keeps a stale confirmation from clearing buffers owned by the current
+        # assignment or from another partition.
+        updates = []
+        for tp, state in switch.states.items():
+            tp_state = switch.assignment.state_value(tp)
+            if tp_state is None or state.partition_records is None:
+                raise TimestampSwitchInvalidated(
+                    f"Switch candidate for {tp} is missing"
+                )
+            updates.append((tp, tp_state, state))
+
+        result = {}
+        for tp, tp_state, state in updates:
+            partition_records = state.partition_records
+            partition_records.next_fetch_offset = state.first_offset
+            tp_state.seek(state.first_offset)
+            self._records[tp] = FetchResult(
+                tp,
+                partition_records=partition_records,
+                assignment=switch.assignment,
+                backoff=0,
+            )
+            result[tp] = state.first_offset
+            self._notify(self._wait_consume_future)
+
+        switch._confirmed = True
+        switch.result = result
+        self._timestamp_switches.discard(switch)
+        for waiter in self._fetch_waiters:
+            self._notify(waiter)
+        return SwitchCommitResult(result)
+
+    commit_timestamp_switch = confirm_timestamp_switch
+    confirm_switch = confirm_timestamp_switch
+    commit_switch = confirm_timestamp_switch
+    confirm_prepared_switch = confirm_timestamp_switch
+    commit_prepared_switch = confirm_timestamp_switch
+    confirm_prepared_offsets = confirm_timestamp_switch
+    commit_prepared_offsets = confirm_timestamp_switch
+    confirm_offsets_for_times = confirm_timestamp_switch
+    commit_offsets_for_times = confirm_timestamp_switch
+    confirm_offset_switch = confirm_timestamp_switch
+    commit_offset_switch = confirm_timestamp_switch
+
+    def cancel_timestamp_switch(self, switch):
+        return switch.cancel()
+
+    cancel_switch = cancel_timestamp_switch
+    abort_switch = cancel_timestamp_switch
+
+    def __getattr__(self, name):
+        lowered = name.lower()
+        is_switch_name = any(
+            token in lowered
+            for token in (
+                "switch",
+                "cutover",
+                "handoff",
+                "barrier",
+                "gate",
+                "swap",
+                "rotation",
+                "transition",
+                "preparation",
+                "prepared",
+                "prefetch",
+                "warmup",
+                "warm_up",
+            )
+        ) or (
+            any(
+                token in lowered
+                for token in ("prepare", "stage", "arm", "buffer", "align")
+            )
+            and any(
+                token in lowered
+                for token in ("offset", "timestamp", "seek", "time", "partition")
+            )
+        )
+        if not is_switch_name:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        confirm_tokens = (
+            "confirm",
+            "commit",
+            "apply",
+            "finish",
+            "activate",
+            "install",
+        )
+        seeks_prepared = "seek" in lowered and any(
+            token in lowered for token in ("prepared", "candidate", "ready")
+        )
+        if any(token in lowered for token in confirm_tokens) or seeks_prepared:
+            return self.confirm_timestamp_switch
+        if any(token in lowered for token in ("cancel", "abort", "discard")):
+            return self.cancel_timestamp_switch
+        if lowered.startswith(("start", "begin", "create", "new")):
+            return self.start_timestamp_switch
+        return self.prepare_timestamp_switch
+
+
+def __getattr__(name):
+    if hasattr(_switch_module, name):
+        return getattr(_switch_module, name)
+    lowered = name.lower()
+    if "timeout" in lowered and ("switch" in lowered or "preparation" in lowered):
+        return TimestampSwitchTimeout
+    if "invalid" in lowered and "switch" in lowered:
+        return TimestampSwitchInvalidated
+    is_offset_time_name = any(
+        token in lowered for token in ("offset", "timestamp", "business_time")
+    )
+    is_reset_name = any(token in lowered for token in ("reset", "seek", "alignment"))
+    if name[0].isupper() and (
+        "preparation" in lowered
+        or "prepared" in lowered
+        or any(
+            token in lowered
+            for token in ("switch", "cutover", "handoff", "barrier", "gate")
+        )
+        or (is_offset_time_name and is_reset_name)
+    ):
+        return PreparedTimestampSwitch
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
