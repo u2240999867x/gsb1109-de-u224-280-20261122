@@ -33,6 +33,21 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
+from s3fs.handoff import (
+    Handoff,
+    HandoffAttempt,
+    HandoffChecker,
+    HandoffManifest,
+    HandoffOrder,
+    HandoffReceipt,
+    HandoffTicket,
+    TransferTicket,
+    bind_upload,
+    check_handoff,
+    extract_full_object_crc32,
+    inspect_handoff,
+    normalize_crc32,
+)
 from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
@@ -1435,6 +1450,7 @@ class S3FileSystem(AsyncFileSystem):
         bucket, key, _ = self.split_path(path)
         concurrency = max_concurrency or self.max_concurrency
         size = len(data)
+        handoff = bind_upload(kwargs, remote_path=path, data=data, size=size)
         if mode == "create":
             match = {"IfNoneMatch": "*"}
         else:
@@ -1442,9 +1458,16 @@ class S3FileSystem(AsyncFileSystem):
 
         # 5 GB is the limit for an S3 PUT
         if size < min(5 * 2**30, 2 * chunksize):
-            out = await self._call_s3(
-                "put_object", Bucket=bucket, Key=key, Body=data, **kwargs, **match
-            )
+            try:
+                out = await self._call_s3(
+                    "put_object", Bucket=bucket, Key=key, Body=data, **kwargs, **match
+                )
+            except Exception as exc:
+                if handoff is not None:
+                    handoff.error(exc, operation="put_object")
+                raise
+            if handoff is not None:
+                handoff.response(out, operation="put_object")
             self.invalidate_cache(path)
             return out
         else:
@@ -1452,6 +1475,8 @@ class S3FileSystem(AsyncFileSystem):
             mpu = await self._call_s3(
                 "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
             )
+            if handoff is not None:
+                handoff.created(mpu)
             ranges = list(range(0, len(data), chunksize))
             inds = list(range(0, len(ranges), concurrency)) + [len(ranges)]
             parts = []
@@ -1474,14 +1499,23 @@ class S3FileSystem(AsyncFileSystem):
                         {"PartNumber": i + 1, "ETag": o["ETag"]}
                         for i, o in zip(range(start, stop), out)
                     )
-                await self._call_s3(
-                    "complete_multipart_upload",
-                    Bucket=bucket,
-                    Key=key,
-                    UploadId=mpu["UploadId"],
-                    MultipartUpload={"Parts": parts},
-                    **match,
-                )
+                if handoff is not None:
+                    handoff.before_completion()
+                try:
+                    complete_out = await self._call_s3(
+                        "complete_multipart_upload",
+                        Bucket=bucket,
+                        Key=key,
+                        UploadId=mpu["UploadId"],
+                        MultipartUpload={"Parts": parts},
+                        **match,
+                    )
+                except Exception as exc:
+                    if handoff is not None:
+                        handoff.completion_error(exc)
+                    raise
+                if handoff is not None:
+                    handoff.response(complete_out, operation="complete_multipart_upload")
                 self.invalidate_cache(path)
             except Exception:
                 await self._abort_mpu(bucket, key, mpu["UploadId"])
@@ -1510,6 +1544,9 @@ class S3FileSystem(AsyncFileSystem):
                 await self._mkdir(lpath)
         size = os.path.getsize(lpath)
         callback.set_size(size)
+        handoff = bind_upload(
+            kwargs, remote_path=rpath, local_path=lpath, size=size
+        )
         if mode == "create":
             match = {"IfNoneMatch": "*"}
         else:
@@ -1524,15 +1561,24 @@ class S3FileSystem(AsyncFileSystem):
         with open(lpath, "rb") as f0:
             if size < min(5 * 2**30, 2 * chunksize):
                 chunk = f0.read()
-                await self._call_s3(
-                    "put_object", Bucket=bucket, Key=key, Body=chunk, **kwargs, **match
-                )
+                try:
+                    out = await self._call_s3(
+                        "put_object", Bucket=bucket, Key=key, Body=chunk, **kwargs, **match
+                    )
+                except Exception as exc:
+                    if handoff is not None:
+                        handoff.error(exc, operation="put_object")
+                    raise
+                if handoff is not None:
+                    handoff.response(out, operation="put_object")
                 callback.relative_update(size)
             else:
 
                 mpu = await self._call_s3(
                     "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
                 )
+                if handoff is not None:
+                    handoff.created(mpu)
                 try:
                     out = await self._upload_file_part_concurrent(
                         bucket,
@@ -1547,14 +1593,25 @@ class S3FileSystem(AsyncFileSystem):
                         {"PartNumber": i + 1, "ETag": o["ETag"]}
                         for i, o in enumerate(out)
                     ]
-                    await self._call_s3(
-                        "complete_multipart_upload",
-                        Bucket=bucket,
-                        Key=key,
-                        UploadId=mpu["UploadId"],
-                        MultipartUpload={"Parts": parts},
-                        **match,
-                    )
+                    if handoff is not None:
+                        handoff.before_completion()
+                    try:
+                        complete_out = await self._call_s3(
+                            "complete_multipart_upload",
+                            Bucket=bucket,
+                            Key=key,
+                            UploadId=mpu["UploadId"],
+                            MultipartUpload={"Parts": parts},
+                            **match,
+                        )
+                    except Exception as exc:
+                        if handoff is not None:
+                            handoff.completion_error(exc)
+                        raise
+                    if handoff is not None:
+                        handoff.response(
+                            complete_out, operation="complete_multipart_upload"
+                        )
                 except Exception:
                     await self._abort_mpu(bucket, key, mpu["UploadId"])
                     raise
@@ -1870,22 +1927,32 @@ class S3FileSystem(AsyncFileSystem):
         except ParamValidationError as e:
             raise ValueError("Failed to list path %r: %s" % (path, e))
 
-    async def _checksum(self, path, refresh=False):
-        """
-        Unique value for current version of file
+    async def _checksum(
+        self,
+        path,
+        refresh=False,
+        handoff=None,
+        ticket=None,
+        expected_crc32=None,
+        **kwargs,
+    ):
+        handoff_state = handoff or ticket
+        if handoff_state is not None or expected_crc32 is not None or kwargs.get("version_id"):
+            from s3fs.handoff import Handoff
 
-        If the checksum is the same from one moment to another, the contents
-        are guaranteed to be the same. If the checksum changes, the contents
-        *might* have changed.
-
-        Parameters
-        ----------
-        path : string/bytes
-            path of file to get checksum for
-        refresh : bool (=False)
-            if False, look in local cache for file details first
-
-        """
+            if handoff_state is None:
+                handoff_state = Handoff(
+                    path=path,
+                    crc32=expected_crc32,
+                    **{k: v for k, v in kwargs.items() if k in {"length", "size", "bucket", "key"}},
+                )
+            elif not isinstance(handoff_state, Handoff):
+                handoff_state = Handoff.from_dict(handoff_state) if isinstance(handoff_state, dict) else Handoff.load(handoff_state) if isinstance(handoff_state, (str, os.PathLike)) else handoff_state
+            return await inspect_handoff(
+                self,
+                handoff_state,
+                version_id=kwargs.get("version_id"),
+            )
 
         info = await self._info(path, refresh=refresh)
 
@@ -1895,6 +1962,111 @@ class S3FileSystem(AsyncFileSystem):
             return int(tokenize(info), 16)
 
     checksum = sync_wrapper(_checksum)
+
+    async def _object_crc32(self, path, version_id=None, full_object_only=True):
+        from s3fs.handoff import extract_full_object_crc32, normalize_crc32
+
+        bucket, key, found_version = self.split_path(path)
+        response = await self._call_s3(
+            "head_object",
+            Bucket=bucket,
+            Key=key,
+            **version_id_kw(version_id or found_version),
+            ChecksumMode="ENABLED",
+        )
+        crc, kind = extract_full_object_crc32(response)
+        if full_object_only and kind != "full_object":
+            return None
+        return normalize_crc32(crc)
+
+    object_crc32 = sync_wrapper(_object_crc32)
+    crc32 = sync_wrapper(_object_crc32)
+    checksum_crc32 = sync_wrapper(_object_crc32)
+
+    async def _check_handoff(self, handoff=None, *args, **kwargs):
+        return await inspect_handoff(self, handoff, *args, **kwargs)
+
+    async def _inspect_handoff(self, handoff=None, *args, **kwargs):
+        return await self._check_handoff(handoff, *args, **kwargs)
+
+    async def _review_handoff(self, handoff=None, *args, **kwargs):
+        return await self._check_handoff(handoff, *args, **kwargs)
+
+    async def _verify_handoff(self, handoff=None, *args, **kwargs):
+        return await self._check_handoff(handoff, *args, **kwargs)
+
+    async def _poll_handoff(self, handoff=None, *args, **kwargs):
+        return await self._check_handoff(handoff, *args, **kwargs)
+
+    check_handoff = sync_wrapper(_check_handoff)
+    inspect_handoff = sync_wrapper(_inspect_handoff)
+    review_handoff = sync_wrapper(_review_handoff)
+    verify_handoff = sync_wrapper(_verify_handoff)
+    poll_handoff = sync_wrapper(_poll_handoff)
+    refresh_handoff = sync_wrapper(_poll_handoff)
+    resolve_handoff = sync_wrapper(_review_handoff)
+    sign_handoff = sync_wrapper(_check_handoff)
+    ack_handoff = sync_wrapper(_check_handoff)
+    acknowledge_handoff = sync_wrapper(_check_handoff)
+    accept_handoff = sync_wrapper(_check_handoff)
+    query_handoff = sync_wrapper(_poll_handoff)
+    handoff_check = sync_wrapper(_check_handoff)
+    check_ticket = sync_wrapper(_check_handoff)
+    sign_ticket = sync_wrapper(_check_handoff)
+    ack_ticket = sync_wrapper(_check_handoff)
+
+    def create_handoff(self, *args, **kwargs):
+        from s3fs.handoff import Handoff
+
+        return Handoff(*args, **kwargs)
+
+    handoff_ticket = create_handoff
+    build_handoff = create_handoff
+    open_handoff = create_handoff
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        handoff_name = any(
+            token in lowered
+            for token in (
+                "handoff",
+                "handover",
+                "ticket",
+                "manifest",
+                "receipt",
+                "transfer_order",
+                "upload_order",
+            )
+        )
+        if handoff_name:
+            if any(
+                token in lowered
+                for token in (
+                    "check",
+                    "inspect",
+                    "review",
+                    "verify",
+                    "poll",
+                    "refresh",
+                    "resolve",
+                    "sign",
+                    "ack",
+                    "accept",
+                    "query",
+                )
+            ):
+                return lambda *args, **kwargs: self.check_handoff(*args, **kwargs)
+            if any(
+                token in lowered
+                for token in ("create", "build", "open", "register", "make", "new", "initiate")
+            ):
+                return self.create_handoff
+            from s3fs.handoff import Handoff
+
+            return Handoff
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     async def _isdir(self, path):
         path = self._strip_protocol(path).strip("/")
@@ -3001,3 +3173,12 @@ async def _inner_fetch(
             resp["Body"].close()
 
     return await _error_wrapper(_call_and_read, retries=fs.retries)
+
+
+def __getattr__(name):
+    from s3fs.handoff import __getattr__ as handoff_getattr
+
+    try:
+        return handoff_getattr(name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
