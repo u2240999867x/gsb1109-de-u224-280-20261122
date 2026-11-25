@@ -4,19 +4,36 @@ import copy
 import logging
 import time
 from collections.abc import Sequence
+from typing import NamedTuple
 
 from aiokafka.errors import (
     KafkaTimeoutError,
     LeaderNotAvailableError,
     NotLeaderForPartitionError,
     ProducerClosed,
+    RecordDeliveryUnknownError,
 )
 from aiokafka.listeners import ProducerListener, _collect_callbacks
 from aiokafka.record.default_records import DefaultRecordBatchBuilder
-from aiokafka.structs import RecordMetadata
+from aiokafka.structs import (
+    RecordDelivery,
+    RecordErrorDetail,
+    RecordMetadata,
+    RecordStatus,
+)
 from aiokafka.util import create_future, get_running_loop
 
+from .rejection import rejection_retry_enabled
+
 log = logging.getLogger(__name__)
+
+
+class StoredRecord(NamedTuple):
+    index: int
+    timestamp: int
+    key: bytes | None
+    value: bytes | None
+    headers: tuple[tuple[str, bytes | None], ...]
 
 
 def _call_listeners(callbacks, **kwargs):
@@ -51,6 +68,48 @@ class BatchBuilder:
         self._closed = False
         self._key_serializer = key_serializer
         self._value_serializer = value_serializer
+        self._batch_size = batch_size
+        self._compression_type = compression_type
+        self._is_transactional = is_transactional
+        self._stored_records: list[StoredRecord] = []
+        self._delivery_report_provider = None
+
+    @property
+    def stored_records(self) -> tuple[StoredRecord, ...]:
+        return tuple(self._stored_records)
+
+    @property
+    def record_results(self):
+        provider = self._delivery_report_provider
+        return provider.record_results if provider is not None else ()
+
+    @property
+    def delivery_results(self):
+        return self.record_results
+
+    @property
+    def record_delivery_results(self):
+        return self.record_results
+
+    @property
+    def delivery_report(self):
+        provider = self._delivery_report_provider
+        return provider if provider is not None else None
+
+    @property
+    def results(self):
+        return self.record_results
+
+    def result_for_index(self, index):
+        provider = self._delivery_report_provider
+        return provider._record_states.get(index) if provider is not None else None
+
+    def record_result_for(self, index_or_metadata):
+        index = getattr(index_or_metadata, "offset", index_or_metadata)
+        return self.result_for_index(index)
+
+    get_record_result = record_result_for
+    result_for = record_result_for
 
     def _serialize(self, key, value):
         if self._key_serializer is None:
@@ -99,8 +158,44 @@ class BatchBuilder:
             self.close()
             return None
 
+        index = self._relative_offset
+        self._stored_records.append(
+            StoredRecord(
+                index=index,
+                timestamp=metadata.timestamp,
+                key=key_bytes,
+                value=value_bytes,
+                headers=tuple(headers),
+            )
+        )
         self._relative_offset += 1
         return metadata
+
+    def copy_with_indices(self, indices):
+        """Build an unbuilt copy containing only the given original indices."""
+        indices = tuple(indices)
+        missing = [index for index in indices if index >= len(self._stored_records)]
+        if missing:
+            raise IndexError(f"Record indices are out of range: {missing}")
+
+        copy = BatchBuilder(
+            self._batch_size,
+            self._compression_type,
+            is_transactional=self._is_transactional,
+        )
+        metadata_by_index = {}
+        for new_index, original_index in enumerate(indices):
+            record = self._stored_records[original_index]
+            metadata = copy.append(
+                timestamp=record.timestamp,
+                key=record.key,
+                value=record.value,
+                headers=list(record.headers),
+            )
+            if metadata is None or metadata.offset != new_index:
+                raise RuntimeError("Failed to rebuild rejected-record subset")
+            metadata_by_index[original_index] = metadata
+        return copy, metadata_by_index
 
     def close(self):
         """Close the batch to further updates.
@@ -165,6 +260,114 @@ class MessageBatch:
         # Set when sender takes this batch
         self._drain_waiter = create_future()
         self._retry_count = 0
+        self._record_states: dict[int, RecordDelivery] = {}
+        self._futures_by_index: dict[int, asyncio.Future] = {}
+        self._indices_by_future: dict[asyncio.Future, int] = {}
+        self._original_indices = list(
+            range(len(getattr(builder, "stored_records", ())))
+        )
+        self._delivery_uncertain = False
+        self._raw_record_errors: tuple[RecordErrorDetail, ...] = ()
+        self._rejection_split_applied = False
+        self._retry_rejected_records: bool | None = getattr(
+            builder, "_retry_rejected_records", None
+        )
+        self._producer_id = -1
+        self._producer_epoch = -1
+        self._base_sequence: int | None = None
+
+        for stored_record in getattr(builder, "stored_records", ()):
+            self._ensure_record_state(stored_record.index)
+        if hasattr(builder, "_delivery_report_provider"):
+            builder._delivery_report_provider = self
+
+    def _ensure_record_state(self, index):
+        state = self._record_states.get(index)
+        if state is None:
+            state = RecordDelivery(
+                index=index,
+                topic=self._tp.topic,
+                partition=self._tp.partition,
+                topic_partition=self._tp,
+            )
+            self._record_states[index] = state
+        return state
+
+    def _annotate_record_error(self, error, index):
+        if error is None:
+            return error
+        sequence = (
+            self._base_sequence + index if self._base_sequence is not None else None
+        )
+        for name in (
+            "index",
+            "batch_index",
+            "original_index",
+            "record_index",
+        ):
+            try:
+                setattr(error, name, index)
+            except Exception:
+                pass
+        for name in ("sequence_number", "original_sequence_number", "sequence"):
+            try:
+                setattr(error, name, sequence)
+            except Exception:
+                pass
+        return error
+
+    @property
+    def record_results(self):
+        return tuple(
+            self._record_states[index] for index in sorted(self._record_states)
+        )
+
+    @property
+    def record_states(self):
+        return self.record_results
+
+    @property
+    def delivery_uncertain(self) -> bool:
+        return self._delivery_uncertain or bool(
+            getattr(self, "_unknown_delivery", False)
+            or getattr(self, "_response_lost", False)
+            or getattr(self, "_outcome_unknown", False)
+        )
+
+    @delivery_uncertain.setter
+    def delivery_uncertain(self, value):
+        self._delivery_uncertain = bool(value)
+
+    @property
+    def response_lost(self) -> bool:
+        return self.delivery_uncertain
+
+    @response_lost.setter
+    def response_lost(self, value):
+        self.mark_delivery_uncertain() if value else None
+
+    unknown_delivery = response_lost
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self.delivery_uncertain
+
+    @outcome_unknown.setter
+    def outcome_unknown(self, value):
+        self.delivery_uncertain = value
+
+    @property
+    def rejection_split_applied(self) -> bool:
+        return self._rejection_split_applied
+
+    def mark_delivery_uncertain(self):
+        self._delivery_uncertain = True
+        for state in self._record_states.values():
+            if state.status is RecordStatus.PENDING:
+                state.status = RecordStatus.UNKNOWN
+
+    mark_response_lost = mark_delivery_uncertain
+    note_response_loss = mark_delivery_uncertain
 
     @property
     def tp(self):
@@ -196,8 +399,124 @@ class MessageBatch:
             return None
 
         future = _create_future()
+        index = metadata.offset
         self._msg_futures.append((future, metadata))
+        self._futures_by_index[index] = future
+        self._indices_by_future[future] = index
+        if index >= len(self._original_indices):
+            self._original_indices.append(index)
+        state = self._ensure_record_state(index)
+        if self._base_sequence is not None:
+            state.original_sequence_number = self._base_sequence + index
+            state.sequence_number = state.original_sequence_number
         return future
+
+    def reject_records(self, rejection_by_index, *, error_factory=None):
+        """Resolve rejected message futures and remove those records.
+
+        Returns the number of removed records. The batch's original future is
+        left unfinished so the retained records can complete it.
+        """
+        if self._rejection_split_applied:
+            return 0
+
+        rejected_indices = set(rejection_by_index)
+        for index, detail in rejection_by_index.items():
+            state = self._ensure_record_state(index)
+            message = None
+            error = detail
+            if isinstance(detail, tuple) and len(detail) == 2:
+                error, message = detail
+            elif isinstance(detail, str):
+                message = detail
+                error = error_factory(message) if error_factory else None
+
+            state.status = RecordStatus.REJECTED
+            state.error_message = message or (str(error) if error is not None else None)
+            if error is not None:
+                state.error = error if isinstance(error, BaseException) else error()
+                self._annotate_record_error(state.error, index)
+            if self._base_sequence is not None:
+                state.original_sequence_number = self._base_sequence + index
+                state.sequence_number = state.original_sequence_number
+
+            future = self._futures_by_index.get(index)
+            if future is not None and not future.done() and state.error is not None:
+                future.set_exception(copy.copy(state.error))
+
+        retained_indices = [
+            index
+            for index in range(len(self._builder.stored_records))
+            if index not in rejected_indices
+        ]
+        outer_builder = self._builder
+        rebuilt, metadata_by_index = outer_builder.copy_with_indices(retained_indices)
+        if self._base_sequence is not None:
+            rebuilt._set_producer_state(
+                self._producer_id, self._producer_epoch, self._base_sequence
+            )
+        rebuilt.close()
+        outer_builder._builder = rebuilt._builder
+        outer_builder._buffer = None
+        outer_builder._stored_records = rebuilt._stored_records
+        outer_builder._relative_offset = rebuilt._relative_offset
+        outer_builder._closed = rebuilt._closed
+        outer_builder._delivery_report_provider = self
+
+        new_message_futures = []
+        new_futures_by_index = {}
+        new_indices_by_future = {}
+        for new_index, original_index in enumerate(retained_indices):
+            future = self._futures_by_index.get(original_index)
+            if future is None:
+                continue
+            metadata = metadata_by_index[original_index]
+            new_message_futures.append((future, metadata))
+            new_futures_by_index[new_index] = future
+            new_indices_by_future[future] = original_index
+
+        self._original_indices = retained_indices
+        self._msg_futures = new_message_futures
+        self._futures_by_index = new_futures_by_index
+        self._indices_by_future = new_indices_by_future
+        self._rejection_split_applied = True
+        return len(rejected_indices)
+
+    remove_rejected_records = reject_records
+    split_out_rejected_records = reject_records
+
+    def set_raw_record_errors(self, record_errors):
+        details = []
+        for item in record_errors or ():
+            try:
+                index, message = item
+            except (TypeError, ValueError):
+                index = getattr(item, "batch_index", None)
+                message = getattr(item, "batch_index_error_message", None) or getattr(
+                    item, "error_message", None
+                )
+            details.append(RecordErrorDetail(index, message))
+        self._raw_record_errors = tuple(details)
+        return self._raw_record_errors
+
+    def note_verified_rejection_details(self, rejection_by_index):
+        for index, detail in rejection_by_index.items():
+            state = self._ensure_record_state(index)
+            error = detail
+            message = None
+            if isinstance(detail, tuple) and len(detail) == 2:
+                error, message = detail
+            elif isinstance(detail, str):
+                message = detail
+            if error is not None:
+                state.error = error if isinstance(error, BaseException) else error()
+                self._annotate_record_error(state.error, index)
+            if message is not None:
+                state.error_message = message
+            elif state.error is not None:
+                state.error_message = str(state.error)
+            if not self._delivery_uncertain:
+                state.status = RecordStatus.REJECTED
 
     def done(
         self,
@@ -205,6 +524,8 @@ class MessageBatch:
         timestamp=None,
         log_start_offset=None,
         _record_metadata_class=RecordMetadata,
+        *,
+        duplicate=False,
     ):
         """Resolve all pending futures"""
         tp = self._tp
@@ -215,6 +536,8 @@ class MessageBatch:
         else:
             timestamp_type = 1
 
+        offset_known = base_offset is not None and base_offset >= 0
+        batch_offset = base_offset if offset_known else None
         dispatched_at = self._dispatched_at
         should_report = dispatched_at is not None and not self.future.done()
 
@@ -225,33 +548,53 @@ class MessageBatch:
                     topic,
                     partition,
                     tp,
-                    base_offset,
+                    batch_offset,
                     timestamp,
                     timestamp_type,
                     log_start_offset,
+                    self.record_results,
                 )
             )
 
-        # Set message futures
-        for future, metadata in self._msg_futures:
-            if future.done():
-                continue
-            # If timestamp returned by broker is -1 it means we need to take
-            # the timestamp sent by user.
+        # Set message futures and per-record receipt state.
+        stored_records = getattr(self._builder, "stored_records", ())
+        for compact_offset, stored_record in enumerate(stored_records):
+            original_index = self._original_indices[compact_offset]
+            state = self._ensure_record_state(original_index)
             if timestamp == -1:
-                timestamp = metadata.timestamp
-            offset = base_offset + metadata.offset
-            future.set_result(
-                _record_metadata_class(
-                    topic,
-                    partition,
-                    tp,
-                    offset,
-                    timestamp,
-                    timestamp_type,
-                    log_start_offset,
-                )
+                record_timestamp = stored_record.timestamp
+            else:
+                record_timestamp = timestamp
+
+            record_offset = base_offset + compact_offset if offset_known else None
+            record_metadata = _record_metadata_class(
+                topic,
+                partition,
+                tp,
+                record_offset,
+                record_timestamp,
+                timestamp_type,
+                log_start_offset,
+                (),
             )
+            state.offset = record_offset
+            state.timestamp = record_timestamp
+            state.timestamp_type = timestamp_type
+            state.log_start_offset = log_start_offset
+            state.metadata = record_metadata
+            state.offset_known = offset_known
+            state.duplicate = duplicate and not offset_known
+            if duplicate and not offset_known:
+                state.status = RecordStatus.OFFSET_UNKNOWN
+            else:
+                state.status = RecordStatus.DELIVERED
+            if self._base_sequence is not None:
+                state.sequence_number = self._base_sequence + compact_offset
+
+            future = self._futures_by_index.get(compact_offset)
+            if future is None or future.done():
+                continue
+            future.set_result(record_metadata)
 
         if should_report:
             completed_at = time.monotonic()
@@ -293,14 +636,74 @@ class MessageBatch:
     def failure(self, exception):
         should_report = not self.future.done()
 
+        final_results = []
+        for future, metadata in self._msg_futures:
+            original_index = self._indices_by_future.get(future, metadata.offset)
+            state = self._ensure_record_state(original_index)
+            if state.status is RecordStatus.REJECTED:
+                final_results.append(state)
+                continue
+            if not (self._delivery_uncertain and state.error is not None):
+                state.error = copy.copy(exception)
+            state.status = (
+                RecordStatus.UNKNOWN
+                if self._delivery_uncertain
+                else RecordStatus.FAILED
+            )
+            final_results.append(state)
+
+        for index, state in self._record_states.items():
+            if index not in self._indices_by_future.values() and state.error is None:
+                state.error = copy.copy(exception)
+                state.status = (
+                    RecordStatus.UNKNOWN
+                    if self._delivery_uncertain
+                    else RecordStatus.FAILED
+                )
+            elif self._delivery_uncertain and state.status is RecordStatus.PENDING:
+                state.status = RecordStatus.UNKNOWN
+            elif not self._delivery_uncertain and state.status is RecordStatus.PENDING:
+                state.status = RecordStatus.FAILED
+
+        record_results = self.record_results
+        rejected_details = tuple(
+            RecordErrorDetail(
+                state.index,
+                state.error_message,
+                state.error,
+                state.original_sequence_number or state.sequence_number,
+            )
+            for state in record_results
+            if state.status is RecordStatus.REJECTED
+        )
+        exception.record_results = record_results
+        exception.record_delivery_results = record_results
+        exception.record_error_results = record_results
+        exception.delivery_uncertain = self._delivery_uncertain
+        if self._raw_record_errors:
+            exception.record_errors = self._raw_record_errors
+            exception.record_error_details = self._raw_record_errors
+        elif rejected_details:
+            exception.record_errors = rejected_details
+            exception.record_error_details = rejected_details
+
         if not self.future.done():
             self.future.set_exception(exception)
-        for future, _ in self._msg_futures:
+        for future, metadata in self._msg_futures:
             if future.done():
                 continue
+            original_index = self._indices_by_future.get(future, metadata.offset)
+            state = self._record_states.get(original_index)
+            future_exception = exception
+            if (
+                state is not None
+                and state.status is RecordStatus.REJECTED
+                and state.error
+            ):
+                future_exception = state.error
             # we need to copy exception so traceback is not multiplied
             # https://github.com/aio-libs/aiokafka/issues/246
-            future.set_exception(copy.copy(exception))
+            future.set_exception(copy.copy(future_exception))
 
         # Consume exception to avoid warnings. We delegate this consumption
         # to user only in case of explicit batch API.
@@ -322,6 +725,16 @@ class MessageBatch:
                 record_count=self.record_count,
                 batch_age_seconds=failed_at - self._ctime,
             )
+
+    def fail_unknown_delivery(self, exception=None, *, verified_rejections=None):
+        if exception is None:
+            exception = RecordDeliveryUnknownError(
+                "Produce response was lost; record delivery state is unknown"
+            )
+        self.mark_delivery_uncertain()
+        if verified_rejections:
+            self.reject_records(verified_rejections)
+        self.failure(exception)
 
     async def wait_drain(self, timeout=None):  # noqa: ASYNC109
         """Wait until all message from this batch is processed"""
@@ -371,6 +784,13 @@ class MessageBatch:
 
     def set_producer_state(self, producer_id, producer_epoch, base_sequence):
         assert not self._drain_waiter.done()
+        self._producer_id = producer_id
+        self._producer_epoch = producer_epoch
+        self._base_sequence = base_sequence
+        for index, state in self._record_states.items():
+            state.original_sequence_number = base_sequence + index
+            if state.sequence_number is None:
+                state.sequence_number = state.original_sequence_number
         self._builder._set_producer_state(producer_id, producer_epoch, base_sequence)
 
     def get_data_buffer(self):
@@ -402,7 +822,14 @@ class MessageAccumulator:
         loop=None,
         linger_ms=0,
         listeners=(),
+        retry_rejected_records=False,
+        **record_rejection_options,
     ):
+        self._retry_rejected_records = rejection_retry_enabled(
+            retry_rejected_records, **record_rejection_options
+        )
+        for option_name, option_value in record_rejection_options.items():
+            setattr(self, option_name, option_value)
         if loop is None:
             loop = get_running_loop()
         self._loop = loop
@@ -477,6 +904,8 @@ class MessageAccumulator:
         timeout,  # noqa: ASYNC109
         timestamp_ms=None,
         headers: Sequence = [],
+        retry_rejected_records=None,
+        **record_rejection_options,
     ):
         """Add message to batch by topic-partition
         If batch is already full this method waits (`timeout` seconds maximum)
@@ -501,6 +930,10 @@ class MessageAccumulator:
 
                 future = batch.append(key, value, timestamp_ms, headers=headers)
                 if future is not None:
+                    if retry_rejected_records is not None or record_rejection_options:
+                        batch._retry_rejected_records = rejection_retry_enabled(
+                            retry_rejected_records, **record_rejection_options
+                        )
                     return future
                 # Batch is full, can't append data atm,
                 # wake up the sender loop
@@ -640,20 +1073,31 @@ class MessageAccumulator:
         if not fut.done():
             fut.set_result(None)
 
-    def create_builder(self, key_serializer=None, value_serializer=None):
+    def create_builder(
+        self,
+        key_serializer=None,
+        value_serializer=None,
+        retry_rejected_records=None,
+        **record_rejection_options,
+    ):
         is_transactional = False
         if (
             self._txn_manager is not None
             and self._txn_manager.transactional_id is not None
         ):
             is_transactional = True
-        return BatchBuilder(
+        builder = BatchBuilder(
             self._batch_size,
             self._compression_type,
             is_transactional=is_transactional,
             key_serializer=key_serializer,
             value_serializer=value_serializer,
         )
+        if retry_rejected_records is not None or record_rejection_options:
+            builder._retry_rejected_records = rejection_retry_enabled(
+                retry_rejected_records, **record_rejection_options
+            )
+        return builder
 
     def _append_batch(self, builder, tp):
         # We must do this before actual add takes place to check for errors.
@@ -672,7 +1116,14 @@ class MessageAccumulator:
             self._waiter_future.set_result(None)
         return batch
 
-    async def add_batch(self, builder, tp, timeout):  # noqa: ASYNC109
+    async def add_batch(
+        self,
+        builder,
+        tp,
+        timeout,
+        retry_rejected_records=None,
+        **record_rejection_options,
+    ):  # noqa: ASYNC109
         """Add BatchBuilder to queue by topic-partition.
 
         Arguments:
@@ -709,6 +1160,10 @@ class MessageAccumulator:
                         timeout -= wait_time
                 else:
                     batch = self._append_batch(builder, tp)
+                    if retry_rejected_records is not None or record_rejection_options:
+                        batch._retry_rejected_records = rejection_retry_enabled(
+                            retry_rejected_records, **record_rejection_options
+                        )
                     return asyncio.shield(batch.future)
             raise KafkaTimeoutError()
         finally:

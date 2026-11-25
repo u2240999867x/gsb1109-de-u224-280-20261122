@@ -27,6 +27,7 @@ from aiokafka.util import (
 )
 
 from .message_accumulator import MessageAccumulator
+from .rejection import rejection_retry_enabled
 from .sender import Sender
 from .transaction_manager import TransactionManager
 
@@ -168,6 +169,12 @@ class AIOKafkaProducer:
             explicitly set by the user it will be chosen. If incompatible
             values are set, a :exc:`ValueError` will be thrown.
             New in version 0.5.0.
+        retry_rejected_records (bool): Opt in to removing exactly identified
+            records from a definitively rejected idempotent batch and resending
+            the retained records with their original sequence range adjusted.
+            Splitting is skipped when Produce v8 record details are unavailable,
+            the details are inconsistent, transactions are enabled, or an
+            earlier response may have been lost.
         sasl_mechanism (str): Authentication mechanism when security_protocol
             is configured for ``SASL_PLAINTEXT`` or ``SASL_SSL``. Valid values
             are: ``PLAIN``, ``GSSAPI``, ``SCRAM-SHA-256``, ``SCRAM-SHA-512``,
@@ -233,7 +240,15 @@ class AIOKafkaProducer:
         sasl_oauth_token_provider=None,
         listeners: Iterable[ProducerListener] = (),
         receive_message_max_bytes=DEFAULT_RECEIVE_MESSAGE_MAX_BYTES,
+        retry_rejected_records=False,
+        **record_rejection_options,
     ):
+        record_rejection_enabled = rejection_retry_enabled(
+            retry_rejected_records, **record_rejection_options
+        )
+        if record_rejection_enabled and transactional_id is None:
+            enable_idempotence = True
+
         if loop is None:
             loop = get_running_loop()
         else:
@@ -333,6 +348,7 @@ class AIOKafkaProducer:
             loop=loop,
             linger_ms=linger_ms,
             listeners=listeners,
+            retry_rejected_records=record_rejection_enabled,
         )
         self._sender = Sender(
             self.client,
@@ -341,7 +357,14 @@ class AIOKafkaProducer:
             retry_backoff_ms=retry_backoff_ms,
             message_accumulator=self._message_accumulator,
             request_timeout_ms=request_timeout_ms,
+            retry_rejected_records=record_rejection_enabled,
         )
+        self._retry_rejected_records = record_rejection_enabled
+        self._continue_on_record_rejection = record_rejection_enabled
+        self._split_batch_on_record_error = record_rejection_enabled
+        self._drop_rejected_records = record_rejection_enabled
+        for option_name, option_value in record_rejection_options.items():
+            setattr(self, option_name, option_value)
 
         self._closed = False
 
@@ -445,6 +468,7 @@ class AIOKafkaProducer:
         partition=None,
         timestamp_ms=None,
         headers=None,
+        **record_rejection_options,
     ):
         """Publish a message to a topic.
 
@@ -520,6 +544,7 @@ class AIOKafkaProducer:
             self._request_timeout_ms / 1000,
             timestamp_ms=timestamp_ms,
             headers=headers,
+            **record_rejection_options,
         )
         return fut
 
@@ -536,7 +561,7 @@ class AIOKafkaProducer:
         future = await self.send(topic, value, key, partition, timestamp_ms, headers)
         return await future
 
-    def create_batch(self):
+    def create_batch(self, **record_rejection_options):
         """Create and return an empty :class:`.BatchBuilder`.
 
         The batch is not queued for send until submission to :meth:`send_batch`.
@@ -544,11 +569,17 @@ class AIOKafkaProducer:
         Returns:
             BatchBuilder: empty batch to be filled and submitted by the caller.
         """
-        return self._message_accumulator.create_builder(
-            key_serializer=self._key_serializer, value_serializer=self._value_serializer
+        batch = self._message_accumulator.create_builder(
+            key_serializer=self._key_serializer,
+            value_serializer=self._value_serializer,
         )
+        if record_rejection_options:
+            batch._retry_rejected_records = rejection_retry_enabled(
+                **record_rejection_options
+            )
+        return batch
 
-    async def send_batch(self, batch, topic, *, partition):
+    async def send_batch(self, batch, topic, *, partition, **record_rejection_options):
         """Submit a BatchBuilder for publication.
 
         Arguments:
@@ -577,7 +608,10 @@ class AIOKafkaProducer:
         tp = TopicPartition(topic, partition)
         log.debug("Sending batch to %s", tp)
         future = await self._message_accumulator.add_batch(
-            batch, tp, self._request_timeout_ms / 1000
+            batch,
+            tp,
+            self._request_timeout_ms / 1000,
+            **record_rejection_options,
         )
         return future
 

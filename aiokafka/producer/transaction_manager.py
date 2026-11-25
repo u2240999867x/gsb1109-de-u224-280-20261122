@@ -99,6 +99,12 @@ class TransactionManager:
             seq -= 2**32
         self._sequence_numbers[tp] = seq
 
+    def decrement_sequence_number(self, tp: TopicPartition, decrement: int):
+        self.increment_sequence_number(tp, -decrement)
+
+    def reset_sequence_number(self, tp: TopicPartition, sequence: int):
+        self._sequence_numbers[tp] = sequence
+
     @property
     def producer_id(self):
         return self._pid_and_epoch.pid

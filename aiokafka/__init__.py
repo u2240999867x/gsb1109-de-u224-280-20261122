@@ -10,6 +10,9 @@ from .structs import (
     ConsumerRecord,
     OffsetAndMetadata,
     OffsetAndTimestamp,
+    RecordDelivery,
+    RecordMetadata,
+    RecordStatus,
     TopicPartition,
 )
 
@@ -28,6 +31,9 @@ __all__ = [  # noqa: RUF022
     # Structs
     "ConsumerRecord",
     "TopicPartition",
+    "RecordMetadata",
+    "RecordDelivery",
+    "RecordStatus",
     "OffsetAndTimestamp",
     "OffsetAndMetadata",
 ]

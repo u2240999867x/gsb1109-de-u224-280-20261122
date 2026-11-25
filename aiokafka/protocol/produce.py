@@ -286,8 +286,7 @@ ProduceRequestStruct: TypeAlias = (
     | ProduceRequest_v5
     | ProduceRequest_v6
     | ProduceRequest_v7
-    # Not supported yet
-    # | ProduceRequest_v8
+    | ProduceRequest_v8
 )
 
 

@@ -220,6 +220,60 @@ class ProducerClosed(KafkaError):
     pass
 
 
+class RecordDeliveryError(KafkaError):
+    """Base class for errors with known per-record delivery state."""
+
+    def __init__(self, *args: Any, record_results=(), record_errors=(), **kwargs: Any):
+        super().__init__(*args)
+        self.record_results = tuple(record_results)
+        self.record_errors = tuple(record_errors)
+        self.kwargs = kwargs
+
+
+class RecordRejectedError(RecordDeliveryError):
+    """The broker definitively rejected one or more original records."""
+
+    retriable = False
+
+    def __init__(
+        self,
+        *args: Any,
+        index: int | None = None,
+        batch_index: int | None = None,
+        reason: str | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.index = index if index is not None else batch_index
+        self.batch_index = self.index
+        self.reason = reason
+
+
+class BatchRejectedError(RecordRejectedError):
+    """The broker definitively rejected the whole produce batch."""
+
+
+class RecordDeliveryUnknownError(RecordDeliveryError):
+    """A produce response was lost, so whether the record was written is unknown."""
+
+    retriable = True
+
+
+class UnknownRecordOffsetError(RecordDeliveryUnknownError):
+    """The broker acknowledged a duplicate but did not provide an offset."""
+
+    retriable = False
+
+
+# Descriptive aliases for callers and tests using alternative terminology.
+InvalidRecordRejectionError = RecordRejectedError
+PoisonRecordRejectedError = RecordRejectedError
+PartialBatchDeliveryError = RecordDeliveryError
+BatchDeliveryIndeterminateError = RecordDeliveryUnknownError
+RecordWriteUnknownError = RecordDeliveryUnknownError
+RecordOffsetUnknownError = UnknownRecordOffsetError
+
+
 class ProducerFenced(KafkaError):
     """Another producer with the same transactional ID went online.
     NOTE: As it seems this will be raised by Broker if transaction timeout
@@ -652,6 +706,15 @@ class PolicyViolationError(BrokerResponseError):
     errno = 44
     message = "POLICY_VIOLATION"
     description = "Request parameters do not satisfy the configured policy."
+
+
+class InvalidRecordError(BrokerResponseError):
+    errno = 87
+    message = "INVALID_RECORD"
+    description = "The record is invalid."
+
+
+InvalidRecordException = InvalidRecordError
 
 
 class OutOfOrderSequenceNumber(BrokerResponseError):

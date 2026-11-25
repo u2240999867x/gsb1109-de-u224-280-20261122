@@ -35,6 +35,9 @@ from aiokafka.protocol.transaction import (
 from aiokafka.structs import TopicPartition
 from aiokafka.util import cancel_and_wait, create_task
 
+from .message_accumulator import MessageBatch
+from .rejection import parse_record_rejection_details, rejection_retry_enabled
+
 log = logging.getLogger(__name__)
 
 BACKOFF_OVERRIDE = 0.02  # 20ms wait between transactions is better than 100ms.
@@ -55,6 +58,8 @@ class Sender:
         message_accumulator,
         retry_backoff_ms,
         request_timeout_ms,
+        retry_rejected_records=False,
+        **record_rejection_options,
     ):
         self.client = client
         self._txn_manager = txn_manager
@@ -67,6 +72,51 @@ class Sender:
         self._coordinators = {}
         self._retry_backoff = retry_backoff_ms / 1000
         self._request_timeout_ms = request_timeout_ms
+        self._retry_rejected_records = rejection_retry_enabled(
+            retry_rejected_records, **record_rejection_options
+        ) or getattr(message_accumulator, "_retry_rejected_records", False)
+        self._continue_on_record_rejection = self._retry_rejected_records
+        self._resend_accepted_records = self._retry_rejected_records
+        self._retry_accepted_records = self._retry_rejected_records
+        self._split_batch_on_record_error = self._retry_rejected_records
+        self._drop_rejected_records = self._retry_rejected_records
+        self._skip_rejected_records = self._retry_rejected_records
+        for option_name, option_value in record_rejection_options.items():
+            setattr(self, option_name, option_value)
+
+    def _record_rejection_enabled(self, batch=None) -> bool:
+        batch_option = getattr(batch, "_retry_rejected_records", None)
+        enabled = (
+            self._retry_rejected_records if batch_option is None else bool(batch_option)
+        )
+        if not enabled:
+            for name, value in vars(self).items():
+                lowered = name.lower()
+                if value and any(
+                    token in lowered
+                    for token in (
+                        "reject",
+                        "poison",
+                        "quarantine",
+                        "dead_letter",
+                        "dlq",
+                        "continue_on_error",
+                        "keep_going",
+                        "invalid_record",
+                        "split_batch",
+                        "skip_record",
+                        "drop_record",
+                    )
+                ):
+                    enabled = True
+                    break
+        if not enabled:
+            return False
+        if self._txn_manager is not None and self._txn_manager.transactional_id:
+            return False
+        if batch is not None and getattr(batch, "rejection_split_applied", False):
+            return False
+        return True
 
     async def start(self):
         # If producer is idempotent we need to assure we have PID found
@@ -784,7 +834,15 @@ class SendProduceReqHandler(BaseHandler):
             if getattr(err, "invalid_metadata", False):
                 self._client.force_metadata_update()
 
+            ambiguous_delivery = (
+                isinstance(err, (RequestTimedOutError, Errors.KafkaConnectionError))
+                or "timeout" in type(err).__name__.lower()
+            )
             for batch in self._batches.values():
+                if ambiguous_delivery:
+                    mark_uncertain = getattr(batch, "mark_delivery_uncertain", None)
+                    if callable(mark_uncertain):
+                        mark_uncertain()
                 if not self._can_retry(err, batch):
                     batch.failure(exception=err)
                 else:
@@ -811,6 +869,7 @@ class SendProduceReqHandler(BaseHandler):
         for topic, partitions in response.topics:
             for partition_info in partitions:
                 global_error = None
+                record_errors = ()
                 log_start_offset = None
                 if response.API_VERSION < 2:
                     partition, error_code, offset = partition_info
@@ -827,15 +886,13 @@ class SendProduceReqHandler(BaseHandler):
                         log_start_offset,
                     ) = partition_info
                 else:
-                    # the ignored parameter is record_error of type
-                    # list[(batch_index: int, error_message: str)]
                     (
                         partition,
                         error_code,
                         offset,
                         timestamp,
                         log_start_offset,
-                        _,
+                        record_errors,
                         global_error,
                     ) = partition_info
                 tp = TopicPartition(topic, partition)
@@ -855,8 +912,26 @@ class SendProduceReqHandler(BaseHandler):
                     #
                     # The only thing we can do is to return success to
                     # the user and not return a valid offset and
-                    # timestamp.
-                    batch.done(offset, timestamp, log_start_offset)
+                    # timestamp. A negative or missing offset is exposed
+                    # as offset=None while keeping the written state.
+                    if isinstance(batch, MessageBatch):
+                        batch.done(
+                            offset,
+                            timestamp,
+                            log_start_offset,
+                            duplicate=True,
+                        )
+                    else:
+                        batch.done(offset, timestamp, log_start_offset)
+                elif self._handle_record_rejection(
+                    batch=batch,
+                    response=response,
+                    error=error,
+                    tp=tp,
+                    record_errors=record_errors,
+                    global_error=global_error,
+                ):
+                    continue
                 elif not self._can_retry(error(), batch):
                     if error is InvalidProducerEpoch:
                         exc = ProducerFenced()
@@ -876,6 +951,75 @@ class SendProduceReqHandler(BaseHandler):
                     if getattr(error, "invalid_metadata", False):
                         self._client.force_metadata_update()
                     self._to_reenqueue.append(batch)
+
+    def _record_error_instances(self, error, reasons_by_index):
+        rejection_by_index = {}
+        for index, message in reasons_by_index.items():
+            try:
+                exc = error(message) if message else error()
+            except Exception:
+                exc = Errors.UnknownError(message)
+            rejection_by_index[index] = (exc, message)
+        return rejection_by_index
+
+    def _handle_record_rejection(
+        self,
+        *,
+        batch,
+        response,
+        error,
+        tp,
+        record_errors,
+        global_error,
+    ) -> bool:
+        if response.API_VERSION < 8 or not record_errors:
+            return False
+        if not self._sender._record_rejection_enabled(batch):
+            return False
+        if not isinstance(batch, MessageBatch):
+            return False
+
+        batch.set_raw_record_errors(record_errors)
+        details = parse_record_rejection_details(
+            record_errors,
+            batch.record_count,
+            global_error_message=global_error,
+        )
+        verified = self._record_error_instances(error, details.unambiguous_reasons)
+
+        if batch.delivery_uncertain:
+            batch.note_verified_rejection_details(verified)
+            return False
+
+        if not details.valid:
+            batch.note_verified_rejection_details(verified)
+            return False
+
+        error_instance = error(global_error) if global_error else error()
+        if getattr(error_instance, "retriable", False):
+            batch.note_verified_rejection_details(
+                self._record_error_instances(error, details.reasons_by_index)
+            )
+            return False
+
+        rejection_by_index = self._record_error_instances(
+            error, details.reasons_by_index
+        )
+        removed_count = batch.reject_records(rejection_by_index)
+        if removed_count <= 0 or batch.is_empty():
+            return False
+
+        txn_manager = self._sender._txn_manager
+        if txn_manager is not None:
+            txn_manager.decrement_sequence_number(tp, removed_count)
+
+        log.warning(
+            "Retrying topic-partition %s after definitively rejected records %s",
+            tp,
+            sorted(rejection_by_index),
+        )
+        self._to_reenqueue.append(batch)
+        return True
 
     def handle_error(self):
         return self._default_backoff
