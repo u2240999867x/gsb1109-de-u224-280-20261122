@@ -61,6 +61,9 @@ def _both_indexes(scdf, ocdf, how=False, **kwargs):
 
 def null_types(h):
     h2 = h.copy()
+    if len(h2) == 0 and len(h2.columns):
+        h2 = h2.reindex([0])
+
     for n, d in zip(h, h.dtypes):
         if n in ["Chromosome", "Strand"]:
             continue

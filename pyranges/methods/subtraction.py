@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from ncls import NCLS  # type: ignore
 
@@ -44,9 +45,67 @@ def add_rows_per_group(df):
 #     return scdf[~remove_mask]
 
 
+def _subtraction_python(scdf, ocdf):
+    """Subtract intervals without using coordinate values as internal sentinels."""
+    if ocdf is None or len(ocdf) == 0 or scdf.empty:
+        return scdf
+
+    exclusions = (
+        ocdf[["Start", "End"]]
+        .dropna()
+        .sort_values(["Start", "End"])
+        .itertuples(index=False, name=None)
+    )
+    exclusions = [(int(start), int(end)) for start, end in exclusions if start < end]
+
+    piece_positions = []
+    piece_starts = []
+    piece_ends = []
+
+    for position, row in enumerate(scdf.itertuples(index=False)):
+        start = int(row.Start)
+        end = int(row.End)
+        pieces = [(start, end)]
+
+        for exclusion_start, exclusion_end in exclusions:
+            next_pieces = []
+            for piece_start, piece_end in pieces:
+                if exclusion_end <= piece_start or exclusion_start >= piece_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+
+                if exclusion_start > piece_start:
+                    next_pieces.append((piece_start, min(exclusion_start, piece_end)))
+                if exclusion_end < piece_end:
+                    next_pieces.append((max(exclusion_end, piece_start), piece_end))
+
+            pieces = next_pieces
+
+        for piece_start, piece_end in pieces:
+            if piece_start < piece_end:
+                piece_positions.append(position)
+                piece_starts.append(piece_start)
+                piece_ends.append(piece_end)
+
+    if not piece_positions:
+        return scdf.iloc[0:0].copy()
+
+    result = scdf.iloc[piece_positions].copy()
+    result.index = pd.RangeIndex(len(result))
+    result["Start"] = np.asarray(piece_starts, dtype=scdf.Start.dtype)
+    result["End"] = np.asarray(piece_ends, dtype=scdf.End.dtype)
+    return result
+
+
 def _subtraction(scdf, ocdf, **kwargs):
     if ocdf.empty or scdf.empty:
         return scdf
+
+    # The NCLS helper and the historical result filtering use -1 as a sentinel.
+    # That is ambiguous for odometer/genomic coordinates where negative values
+    # and literal -1 are valid business data.
+    if (scdf["Start"] < 0).any() or (scdf["End"] < 0).any():
+        return _subtraction_python(scdf, ocdf)
 
     strandedness = kwargs["strandedness"]
     strand = True if strandedness else False

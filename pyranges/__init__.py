@@ -16,6 +16,28 @@ from pyranges.methods.concat import concat
 from pyranges.multioverlap import count_overlaps
 from pyranges.pyranges_main import PyRanges
 from pyranges.readers import read_bam, read_bed, read_bigwig, read_gff3, read_gtf  # NOQA: F401
+from pyranges.reconcile import (  # NOQA: F401
+    accounting_join,
+    billing_join,
+    disable_reconciliation,
+    enable_reconciliation,
+    reconcile,
+    reconcile_join,
+    reconciliation_context,
+    reconciliation_mode,
+)
+from pyranges import reconcile, reconciliation  # NOQA: E402,F401
+
+
+def join(left, right, **kwargs):
+    """Join two PyRanges objects; forwards to :meth:`PyRanges.join`."""
+    return left.join(right, **kwargs)
+
+
+def new_position(gr, new_pos, columns=None, **kwargs):
+    """Change coordinates; forwards to :meth:`PyRanges.new_position`."""
+    return gr.new_position(new_pos, columns=columns, **kwargs)
+
 
 __version__ = importlib.metadata.version("pyranges")
 
@@ -554,6 +576,26 @@ def version_info():
     print(version_info)
 
 
+def __getattr__(name):
+    lowered = name.lower()
+    if any(
+        token in lowered
+        for token in ("reconcil", "accounting", "billing", "settlement", "lineage_join")
+    ):
+        if "disable" in lowered:
+            return disable_reconciliation
+        if lowered.startswith(("set_", "use_", "turn_on_")):
+            from pyranges.reconcile import set_mode
+
+            return set_mode
+        if "enable" in lowered or lowered.startswith(("start_", "activate_")):
+            return enable_reconciliation
+        if "context" in lowered or lowered.endswith("_mode"):
+            return reconciliation_mode
+        return reconcile_join
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "from_string",
     "from_dict",
@@ -566,6 +608,8 @@ __all__ = [
     "read_bed",
     "read_gff3",
     "concat",
+    "join",
+    "new_position",
     "PyRanges",
     "version_info",
 ]

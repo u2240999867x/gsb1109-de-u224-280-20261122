@@ -168,6 +168,8 @@ class PyRanges:
         strands=None,
         int64=False,
         copy_df=True,
+        reconcile=None,
+        **reconcile_options,
     ):
         from pyranges.methods.init import _init
 
@@ -175,6 +177,13 @@ class PyRanges:
             df = pd.DataFrame(columns="Chromosome Start End".split())
 
         _init(self, df, chromosomes, starts, ends, strands, copy_df)
+
+        if reconcile is not False and (reconcile or reconcile_options):
+            from pyranges.reconcile import initialize_metadata, wants_reconciliation
+
+            if wants_reconciliation(reconcile, reconcile_options):
+                reconciled = initialize_metadata(self)
+                self.__dict__.update(reconciled.__dict__)
 
     def __array_ufunc__(self, *args, **kwargs):
         """Apply unary numpy-function.
@@ -793,6 +802,9 @@ class PyRanges:
         """
 
         if len(self) == 0:
+            empty_df = getattr(self, "_empty_df", None)
+            if empty_df is not None:
+                return empty_df.copy()
             return pd.DataFrame()
         elif len(self) == 1:
             return self.values()[0]
@@ -1283,6 +1295,9 @@ class PyRanges:
         """
 
         if not len(self.values()):
+            empty_df = getattr(self, "_empty_df", None)
+            if empty_df is not None:
+                return empty_df.columns
             return []
 
         first = next(iter(self.values()))
@@ -2256,6 +2271,8 @@ class PyRanges:
         nb_cpu=1,
         apply_strand_suffix=None,
         preserve_order=False,
+        reconcile=None,
+        **reconcile_options,
     ):
         """Join PyRanges on genomic location.
 
@@ -2398,6 +2415,30 @@ class PyRanges:
         For printing, the PyRanges was sorted on Chromosome.
         """
 
+        from pyranges.reconcile import reconcile_join, wants_reconciliation
+
+        reconciliation_mode = reconcile_options.pop("mode", None)
+        if how in {"reconcile", "reconciliation", "accounting", "billing"}:
+            reconciliation_mode = how
+            how = "outer"
+        if reconciliation_mode in {"reconcile", "reconciliation", "accounting", "billing", True}:
+            reconcile = True
+
+        if wants_reconciliation(reconcile, reconcile_options):
+            return reconcile_join(
+                self,
+                other,
+                suffix=suffix,
+                strandedness=strandedness,
+                slack=slack,
+                how=how,
+                report_overlap=report_overlap,
+                preserve_order=preserve_order,
+                nb_cpu=nb_cpu,
+                apply_strand_suffix=apply_strand_suffix,
+                **reconcile_options,
+            )
+
         from pyranges.methods.join import _write_both
 
         kwargs = {
@@ -2425,9 +2466,9 @@ class PyRanges:
         how = kwargs.get("how")
 
         if how in ["left", "outer"]:
-            kwargs["example_header_other"] = other.head(1).df
+            kwargs["example_header_other"] = other.df.head(1)
         if how in ["right", "outer"]:
-            kwargs["example_header_self"] = self.head(1).df
+            kwargs["example_header_self"] = self.df.head(1)
 
         dfs = pyrange_apply(_write_both, self, other, **kwargs)
         gr = PyRanges(dfs)
@@ -2449,6 +2490,22 @@ class PyRanges:
                 gr.columns = gr.columns.str.replace("Strand", "Strand" + kwargs["suffix"])
 
         return gr
+
+    def reconcile(self, other, **kwargs):
+        """Outer-join opposite-strand candidates and retain billing lineage."""
+        from pyranges.reconcile import reconcile_join
+
+        options = {"how": "outer", "strandedness": "opposite"}
+        options.update(kwargs)
+        return reconcile_join(self, other, **options)
+
+    def reconcile_join(self, other, **kwargs):
+        """Alias for :meth:`PyRanges.reconcile`."""
+        return self.reconcile(other, **kwargs)
+
+    def accounting_join(self, other, **kwargs):
+        """Compatibility alias for reconciliation joins."""
+        return self.reconcile(other, **kwargs)
 
     def keys(self):
         """Return the keys.
@@ -3338,7 +3395,7 @@ class PyRanges:
 
         return gr
 
-    def new_position(self, new_pos, columns=None):
+    def new_position(self, new_pos, columns=None, reconcile=None, **reconcile_options):
         """Give new position.
 
         The operation join produces a PyRanges with two pairs of start coordinates and two pairs of
@@ -3464,6 +3521,24 @@ class PyRanges:
         For printing, the PyRanges was sorted on Chromosome.
 
         """
+
+        from pyranges.reconcile import (
+            has_marker,
+            new_position_reconcile,
+            wants_reconciliation,
+        )
+
+        explicit_reconciliation = wants_reconciliation(reconcile, reconcile_options)
+
+        if reconcile is not False and (explicit_reconciliation or has_marker(self)):
+            reconciled = new_position_reconcile(
+                self,
+                new_pos,
+                columns=columns,
+                force=explicit_reconciliation and not has_marker(self),
+            )
+            if reconciled is not None:
+                return reconciled
 
         from pyranges.methods.new_position import _new_position
 

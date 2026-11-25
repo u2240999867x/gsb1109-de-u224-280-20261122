@@ -126,18 +126,27 @@ def _init(
     if df is False or df is None:
         df = create_pyranges_df(chromosomes, starts, ends, strands)
 
+    empty_df = None
     if isinstance(df, pd.DataFrame):
         df = df.reset_index(drop=True)
 
         stranded = check_strandedness(df)
 
         df = set_dtypes(df)
+        if df.empty:
+            empty_df = df.iloc[0:0].copy()
 
+        self.__dict__["_empty_df"] = empty_df
         self.__dict__["dfs"] = create_df_dict(df, stranded)
 
     # df is actually dict of dfs
     else:
         empty_removed = {k: v.copy() for k, v in df.items() if not v.empty}
+        if not empty_removed:
+            for value in df.values():
+                empty_df = value.iloc[0:0].copy()
+                break
+        self.__dict__["_empty_df"] = empty_df
 
         _single_value_key = True
         _key_same = True
