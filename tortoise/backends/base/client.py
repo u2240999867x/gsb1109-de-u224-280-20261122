@@ -4,6 +4,7 @@ import abc
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
+from itertools import count
 from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 from pypika_tortoise import Query
@@ -37,6 +38,10 @@ async def resolve_password(password: PasswordType) -> str | None:
             resolved = await resolved
         return resolved
     return password
+
+
+#: Monotonic source of transaction epochs, shared across every backend.
+_tx_epoch_counter = count(1)
 
 
 class Capabilities:
@@ -151,6 +156,15 @@ class BaseDBAsyncClient(abc.ABC):
     schema_generator: type[BaseSchemaGenerator] = BaseSchemaGenerator
     capabilities: Capabilities = Capabilities("")
 
+    #: Transaction epoch for clients that back an ``in_transaction()`` block.
+    #: ``None`` for plain (non-transactional) clients. A transaction wrapper
+    #: keeps the stamp after its block ends, so captured queries can detect it.
+    _tx_epoch: int | None = None
+    #: How many currently-open transaction blocks share this client object.
+    #: Wrappers are normally used by a single block; clients reused across
+    #: nesting levels (e.g. ODBC) stay active until every level has exited.
+    _tx_active_depth: int = 0
+
     def __init__(self, connection_name: str, fetch_inserted: bool = True, **kwargs: Any) -> None:
         self.log = db_client_logger
         self.connection_name = connection_name
@@ -211,6 +225,24 @@ class BaseDBAsyncClient(abc.ABC):
         Will return the current context connection if already in a transaction.
         """
         raise NotImplementedError()  # pragma: nocoverage
+
+    def validate_usable(self) -> None:
+        """
+        Raise if this client is bound to a transaction block that has ended.
+
+        Querysets and custom ``Prefetch`` objects pin the connection they were
+        built against. A nested transaction (e.g. a re-collection batch) may be
+        rolled back while such a query is still in flight, after which its
+        connection must not be reused: running the query would silently leak
+        work onto the still-open outer transaction. Plain (non-transactional)
+        clients and clients of transactions that remain active are unaffected.
+        """
+        if self._tx_epoch is not None and self._tx_active_depth == 0:
+            raise TransactionManagementError(
+                "The transaction this query is bound to has already ended. "
+                "Queries captured for that transaction cannot run after it was "
+                "rolled back or committed."
+            )
 
     def _in_transaction(self) -> TransactionContext:
         raise NotImplementedError()  # pragma: nocoverage
@@ -285,6 +317,11 @@ class TransactionalDBClient(BaseDBAsyncClient, abc.ABC):
 
     _finalized: bool = False
 
+    @classmethod
+    def _next_tx_epoch(cls) -> int:
+        """Mint a unique epoch for a newly entered transaction block."""
+        return next(_tx_epoch_counter)
+
     @abc.abstractmethod
     async def begin(self) -> None: ...
 
@@ -321,6 +358,7 @@ class ConnectionWrapper(Generic[T_conn]):
             self.connection = self.client._connection
 
     async def __aenter__(self) -> T_conn:
+        self.client.validate_usable()
         await self._lock.acquire()
         await self.ensure_connection()
         return self.connection
@@ -334,6 +372,31 @@ class TransactionContext:
     and _in_transaction."""
 
     client: TransactionalDBClient
+
+    def _push_active_transaction(self) -> None:
+        """Mark this transaction's client as an open transaction block.
+
+        The marker is stored on the shared client object rather than a task
+        context so that concurrent tasks holding captured queries also observe
+        the block ending when it is rolled back or committed.
+
+        A client object reused across nesting levels (e.g. ODBC) keeps the
+        epoch of its outermost block and stays active until every level exits.
+        """
+        client = self.client
+        if client._tx_epoch is None:
+            client._tx_epoch = TransactionalDBClient._next_tx_epoch()
+        client._tx_active_depth += 1
+
+    def _pop_active_transaction(self) -> None:
+        """Remove one open-block marker from this transaction's client.
+
+        The client keeps its epoch as a permanent stamp: a wrapper instance is
+        never reused after its block ends, so queries still holding it can tell
+        the transaction is over via :meth:`validate_usable`.
+        """
+        client = self.client
+        client._tx_active_depth -= 1
 
     @abc.abstractmethod
     async def __aenter__(self) -> TransactionalDBClient: ...
@@ -368,6 +431,7 @@ class TransactionContextPooled(TransactionContext):
         # TransactionWrapper connection.
         self.token = get_connections().set(self.connection_name, self.client)
         await self.client.begin()
+        self._push_active_transaction()
         return self.client
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -380,13 +444,14 @@ class TransactionContextPooled(TransactionContext):
                 else:
                     await self.client.commit()
         finally:
+            self._pop_active_transaction()
             if self.client._parent._pool:
                 await self.client._parent._pool.release(self.client._connection)
             get_connections().reset(self.token)
 
 
 class NestedTransactionContext(TransactionContext):
-    __slots__ = ("client", "connection_name")
+    __slots__ = ("client", "connection_name", "token")
 
     def __init__(self, client: TransactionalDBClient) -> None:
         self.client = client
@@ -394,16 +459,25 @@ class NestedTransactionContext(TransactionContext):
 
     async def __aenter__(self) -> TransactionalDBClient:
         await self.client.savepoint()
+        self._push_active_transaction()
+        # Point the alias at this block's client so ORM calls without an
+        # explicit connection follow the current nested transaction instead of
+        # the surrounding block. The previous connection is restored on exit.
+        self.token = get_connections().set(self.connection_name, self.client)
         return self.client
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if not self.client._finalized:
-            if exc_type:
-                # Can't rollback a transaction that already failed.
-                if exc_type is not TransactionManagementError:
-                    await self.client.savepoint_rollback()
-            else:
-                await self.client.release_savepoint()
+        try:
+            if not self.client._finalized:
+                if exc_type:
+                    # Can't rollback a transaction that already failed.
+                    if exc_type is not TransactionManagementError:
+                        await self.client.savepoint_rollback()
+                else:
+                    await self.client.release_savepoint()
+        finally:
+            self._pop_active_transaction()
+            get_connections().reset(self.token)
 
 
 class PoolConnectionWrapper(Generic[T_conn]):

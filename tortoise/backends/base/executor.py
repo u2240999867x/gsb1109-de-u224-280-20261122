@@ -50,6 +50,7 @@ class BaseExecutor:
             list[tuple[type[Model], int, str, type[Model], Iterable[str | None]]] | None
         ) = None,
     ) -> None:
+        db.validate_usable()
         self.model = model
         self.db: BaseDBAsyncClient = db
         self.prefetch_map = prefetch_map or {}
@@ -94,6 +95,21 @@ class BaseExecutor:
                 self.delete_query,
                 self.update_cache,
             ) = EXECUTOR_CACHE[key]
+
+        self._validate_prefetch_dbs()
+
+    def _validate_prefetch_dbs(self) -> None:
+        """Reject prefetches pinned to a transaction block that has ended.
+
+        Custom ``Prefetch`` querysets may pin their own connection (e.g. the
+        client of a nested transaction). Validating them when the executor is
+        built means a query whose prefetch connection is already stale fails
+        before the main SQL is ever sent, instead of returning a half result.
+        """
+        for related_queries in self._prefetch_queries.values():
+            for _to_attr, related_queryset in related_queries:
+                if related_queryset._db is not None:
+                    related_queryset._db.validate_usable()
 
     async def execute_explain(
         self, sql: str, output_fmt: str | None = None, **options: bool
@@ -725,7 +741,18 @@ class BaseExecutor:
         return await self._prefetch_direct_relation(instance_id_list, field, related_query)
 
     async def _execute_prefetch_queries(self, instance_list: Iterable[Model]) -> Iterable[Model]:
+        # The driving transaction may have ended while the main query was
+        # running (e.g. a concurrent task rolled back a nested re-collection
+        # block). Re-check the driving connection before returning anything so
+        # the query fails as a whole instead of handing back rows read inside a
+        # transaction that no longer exists, and re-check every pinned
+        # prefetch connection instead of leaking more SQL onto an outer block.
+        self.db.validate_usable()
         if instance_list and (self.prefetch_map or self._prefetch_queries):
+            for related_queries in self._prefetch_queries.values():
+                for _to_attr, related_queryset in related_queries:
+                    if related_queryset._db is not None:
+                        related_queryset._db.validate_usable()
             self._make_prefetch_queries()
             prefetch_tasks = []
             for field, related_queries in self._prefetch_queries.items():

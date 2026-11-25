@@ -1164,6 +1164,7 @@ class Model(metaclass=ModelMeta):
         """
         await self._set_async_default_field()
         db = using_db or self._choose_db(True)
+        db.validate_usable()
         executor = db.executor_class(model=self.__class__, db=db)
         if self._partial:
             if update_fields:
@@ -1215,6 +1216,7 @@ class Model(metaclass=ModelMeta):
         :raises OperationalError: If object has never been persisted.
         """
         db = using_db or self._choose_db(True)
+        db.validate_usable()
         if not self._saved_in_db:
             raise OperationalError("Can't delete unpersisted record")
         await self._pre_delete(db)
@@ -1233,6 +1235,7 @@ class Model(metaclass=ModelMeta):
         :param using_db: Specific DB connection to use instead of default bound
         """
         db = using_db or self._choose_db()
+        db.validate_usable()
         await db.executor_class(model=self.__class__, db=db).fetch_for_list([self], *args)
 
     async def refresh_from_db(
@@ -1274,7 +1277,9 @@ class Model(metaclass=ModelMeta):
         :return: BaseDBAsyncClient:
         """
         db = router.db_for_write(cls) if for_write else router.db_for_read(cls)
-        return db or cls._meta.db
+        db = db or cls._meta.db
+        db.validate_usable()
+        return db
 
     @classmethod
     async def get_or_create(

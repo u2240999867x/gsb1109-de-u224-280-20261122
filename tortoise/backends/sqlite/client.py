@@ -185,6 +185,10 @@ class SqliteTransactionContext(TransactionContext):
         self.connection_name = connection.connection_name
         self._trxlock = trxlock
 
+    @property
+    def client(self) -> TransactionalDBClient:
+        return self.connection
+
     async def ensure_connection(self) -> None:
         if not self.connection._connection:
             await self.connection._parent.create_connection(with_db=True)
@@ -195,6 +199,7 @@ class SqliteTransactionContext(TransactionContext):
         await self.ensure_connection()
         self.token = get_connections().set(self.connection_name, self.connection)
         await self.connection.begin()
+        self._push_active_transaction()
         return self.connection
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -207,6 +212,7 @@ class SqliteTransactionContext(TransactionContext):
                 else:
                     await self.connection.commit()
         finally:
+            self._pop_active_transaction()
             get_connections().reset(self.token)
             self._trxlock.release()
 

@@ -116,13 +116,18 @@ class _ChooseDBMixin(Generic[MODEL]):
         :return: BaseDBAsyncClient:
         """
         if self._db:
+            self._db.validate_usable()
             return self._db
         db = router.db_for_write(self.model) if for_write else router.db_for_read(self.model)
-        return db or self.model._meta.db
+        db = db or self.model._meta.db
+        db.validate_usable()
+        return db
 
     def _choose_db_if_not_chosen(self, for_write: bool = False) -> None:
         if self._db is None:
             self._db = self._choose_db(for_write)
+        else:
+            self._db.validate_usable()
 
 
 class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
@@ -1359,7 +1364,9 @@ class QuerySet(AwaitableQuery[MODEL]):
 
     def __await__(self) -> Generator[Any, None, list[MODEL]]:
         if self._db is None:
-            self._db = self._choose_db(self._select_for_update)  # type: ignore[unreachable]
+            self._db = self._choose_db(self._select_for_update)
+        else:
+            self._db.validate_usable()
         self._make_query()
         return self._execute().__await__()
 

@@ -1,11 +1,14 @@
+import asyncio
 from unittest.mock import Mock
 
 import pytest
 
 from tests.testmodels import CharPkModel, Event, Team, Tournament
 from tortoise import connections
+from tortoise.backends.base.executor import BaseExecutor
 from tortoise.contrib.test import requireCapability
 from tortoise.exceptions import OperationalError, TransactionManagementError
+from tortoise.query_utils import Prefetch
 from tortoise.transactions import atomic, in_transaction
 
 
@@ -13,6 +16,10 @@ class SomeException(Exception):
     """
     A very specific exception so as to not accidentally catch another exception.
     """
+
+
+class _WithdrawnNestedTransaction(Exception):
+    """Signals that a nested transaction is deliberately rolled back."""
 
 
 @atomic()
@@ -425,3 +432,141 @@ async def test_commit_raising_exception(db_isolated):
             tx_conn.commit = Mock(side_effect=ValueError("commit"))
 
     assert connections.get("models") == conn
+
+
+@requireCapability(supports_transactions=True)
+@pytest.mark.asyncio
+async def test_withdrawn_nested_transaction_invalidates_captured_queries(
+    db_isolated, monkeypatch
+):
+    """Queries bound to a rolled-back nested transaction fail instead of leaking outward."""
+    main_query_done = asyncio.Event()
+    resume_prefetch = asyncio.Event()
+    armed = False
+    original_prefetch = BaseExecutor._execute_prefetch_queries
+
+    async def suspended_prefetch(self, instance_list):
+        if armed:
+            main_query_done.set()
+            await resume_prefetch.wait()
+        return await original_prefetch(self, instance_list)
+
+    monkeypatch.setattr(BaseExecutor, "_execute_prefetch_queries", suspended_prefetch)
+
+    async with in_transaction() as outer:
+        tournament_70 = await Tournament.create(id=70, name="device-70")
+        await Event.create(event_id=170, name="attachment-70", tournament=tournament_70)
+
+        try:
+            async with in_transaction() as inner:
+                tournament_71 = await Tournament.create(id=71, name="device-71")
+                await Event.create(event_id=171, name="first-delivery", tournament=tournament_71)
+
+                # While the nested block is open, implicit ORM reads follow it
+                # and see both devices and their attachments.
+                active = await Tournament.all().prefetch_related("events")
+                assert {t.id: [e.event_id for e in t.events] for t in active} == {
+                    70: [170],
+                    71: [171],
+                }
+
+                # First check starts inside the nested block and pauses after
+                # the main query, before reading attachments.
+                armed = True
+                started_check = asyncio.ensure_future(
+                    Tournament.all().prefetch_related("events")
+                )
+                await main_query_done.wait()
+                armed = False
+
+                # Second check is only assembled; its custom prefetch pins the
+                # nested transaction's connection explicitly.
+                unstarted_check = Tournament.all().prefetch_related(
+                    Prefetch("events", queryset=Event.all().using_db(inner))
+                )
+                stale_query = Tournament.all().using_db(inner)
+
+                raise _WithdrawnNestedTransaction()
+        except _WithdrawnNestedTransaction:
+            pass
+
+        await Tournament.create(id=72, name="device-72")
+        resume_prefetch.set()
+
+        # The already-started check must fail as a whole: no half result with
+        # device 71, and no attachment read on the outer transaction.
+        with pytest.raises(TransactionManagementError):
+            await started_check
+
+        # The not-yet-started check fails before its main query because the
+        # connection its prefetch is pinned to belongs to the ended block.
+        with pytest.raises(TransactionManagementError):
+            await unstarted_check
+
+        # Any other query captured in the ended block stays unusable.
+        with pytest.raises(TransactionManagementError):
+            await stale_query
+
+        # The surrounding transaction only retains the outer writes.
+        remaining = {t.id for t in await Tournament.all()}
+        assert remaining == {70, 72}
+
+
+@requireCapability(supports_transactions=True)
+@pytest.mark.asyncio
+async def test_recollection_after_withdrawal_reuses_ids_with_new_data(db_isolated):
+    """A second nested block can reuse rolled-back ids, and stale queries stay invalid."""
+    async with in_transaction():
+        tournament_70 = await Tournament.create(id=70, name="device-70")
+        await Event.create(event_id=170, name="attachment-70", tournament=tournament_70)
+
+        stale_inner = None
+        try:
+            async with in_transaction() as inner:
+                tournament_71 = await Tournament.create(id=71, name="device-71")
+                await Event.create(event_id=171, name="first-delivery", tournament=tournament_71)
+                stale_inner = Tournament.all().using_db(inner)
+                raise _WithdrawnNestedTransaction()
+        except _WithdrawnNestedTransaction:
+            pass
+
+        await Tournament.create(id=72, name="device-72")
+
+        # Re-collect device 71 in a fresh nested block, reusing the same ids
+        # but with the second delivery's attachment content.
+        async with in_transaction():
+            tournament_71_again = await Tournament.create(id=71, name="device-71")
+            await Event.create(
+                event_id=171, name="second-delivery", tournament=tournament_71_again
+            )
+
+            fresh = await Tournament.all().prefetch_related("events")
+            assert {
+                t.id: sorted(e.name for e in t.events) for t in sorted(fresh, key=lambda t: t.id)
+            } == {
+                70: ["attachment-70"],
+                71: ["second-delivery"],
+                72: [],
+            }
+
+            with pytest.raises(TransactionManagementError):
+                await stale_inner
+
+        final = await Tournament.all().prefetch_related("events")
+        assert {
+            t.id: sorted(e.name for e in t.events) for t in sorted(final, key=lambda t: t.id)
+        } == {
+            70: ["attachment-70"],
+            71: ["second-delivery"],
+            72: [],
+        }
+
+    # After the outer commit, an unrelated ordinary query sees the same state.
+    committed = await Tournament.all().prefetch_related("events")
+    assert {
+        t.id: sorted(e.name for e in t.events) for t in sorted(committed, key=lambda t: t.id)
+    } == {
+        70: ["attachment-70"],
+        71: ["second-delivery"],
+        72: [],
+    }
