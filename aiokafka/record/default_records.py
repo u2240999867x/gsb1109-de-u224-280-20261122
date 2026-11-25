@@ -168,6 +168,10 @@ class _DefaultRecordBatchPy(DefaultRecordBase, DefaultRecordBatchProtocol):
         return self._header_data[3]
 
     @property
+    def partition_leader_epoch(self) -> int:
+        return self._header_data[2]
+
+    @property
     def crc(self) -> int:
         return self._header_data[4]
 

@@ -793,6 +793,79 @@ class AIOKafkaConsumer:
         log.debug("Seeking to offset %s for partition %s", offset, partition)
         self._fetcher.seek_to(partition, offset)
 
+    def build_recovery_credential(self, partition, record):
+        """Build a persistable, verifiable recovery credential.
+
+        Use it with the last record of a partition that was fully processed
+        (e.g. written to the archive). The credential binds the next read
+        offset to the record's partition leader epoch so a later restart can
+        detect log truncation or replacement after a leader change.
+
+        Arguments:
+            partition (TopicPartition): partition the record belongs to.
+            record (ConsumerRecord): the last successfully processed record.
+
+        Returns:
+            PartitionRecoveryCredential | None: ``None`` when the record only
+            carries an offset without a leader epoch (pre-v2 message format or
+            an unannotated batch). Such a record cannot produce a verifiable
+            credential and must be treated as an offset-only checkpoint.
+        """
+        return self._fetcher.build_recovery_credential(partition, record)
+
+    async def validate_recovery_credential(self, credential, *, allow_reread=False):
+        """Validate a persisted recovery credential after a restart.
+
+        The current read position is preserved by default; the returned
+        :class:`.PartitionRecoveryResult` reports any offset ranges in the old
+        log that need manual reconciliation. With ``allow_reread=True`` a
+        divergent partition is replayed from the end of the credential's
+        leader epoch, but only after the current leader accepts a fetch there.
+
+        This never commits consumer group offsets and never applies the
+        ``auto_offset_reset`` policy. When verification evidence cannot be
+        obtained, the result's ``error`` is set and the position is kept.
+
+        Arguments:
+            credential (PartitionRecoveryCredential): the persisted credential
+                for an assigned partition.
+            allow_reread (bool): allow moving the read position back to replay
+                a diverged range. Defaults to ``False``.
+
+        Returns:
+            PartitionRecoveryResult: verification outcome, including the read
+            position that should be kept and any divergence ranges.
+        """
+        return await self._fetcher.validate_recovery_credential(
+            credential, allow_reread=allow_reread
+        )
+
+    def update_replay_lower_bound(self, partition, offset):
+        """Raise the retained lower bound of an armed recovery replay.
+
+        Offsets below ``offset`` are skipped when the replayed fetch is
+        delivered. Must be called before the first replayed record is
+        processed. The serving leader and leader epoch are unchanged.
+        """
+        self._fetcher.update_replay_lower_bound(partition, offset)
+
+    async def confirm_replay_position(self, partition):
+        """Confirm the replay position after a successful, possibly empty fetch.
+
+        Returns:
+            bool: ``True`` when the current leader accepted a fetch at the
+            replay position, ``False`` otherwise (the position is kept).
+        """
+        return await self._fetcher.confirm_replay_position(partition)
+
+    def replay_divergences(self, partition):
+        """Return the divergence ranges recorded while replaying a partition."""
+        return self._fetcher.replay_divergences(partition)
+
+    def clear_replay_state(self, partition):
+        """Release the replay bookkeeping for a partition."""
+        self._fetcher.clear_replay_state(partition)
+
     async def seek_to_beginning(self, *partitions):
         """Seek to the oldest available offset for partitions.
 

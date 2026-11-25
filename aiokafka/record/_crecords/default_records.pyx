@@ -204,6 +204,8 @@ cdef class DefaultRecordBatch:
         buf = <char*> self._buffer.buf
         self.base_offset = hton.unpack_int64(&buf[BASE_OFFSET_OFFSET])
         self.length = hton.unpack_int32(&buf[LENGTH_OFFSET])
+        self.partition_leader_epoch = \
+            hton.unpack_int32(&buf[PARTITION_LEADER_EPOCH_OFFSET])
         self.magic = buf[MAGIC_OFFSET]
         self.crc = <uint32_t> hton.unpack_int32(&buf[CRC_OFFSET])
         self.attributes = hton.unpack_int16(&buf[ATTRIBUTES_OFFSET])

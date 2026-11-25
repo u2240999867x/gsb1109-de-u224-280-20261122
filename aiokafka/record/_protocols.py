@@ -91,6 +91,8 @@ class DefaultRecordBatchProtocol(Iterator["DefaultRecordProtocol"], Protocol):
     @property
     def magic(self) -> int: ...
     @property
+    def partition_leader_epoch(self) -> int: ...
+    @property
     def crc(self) -> int: ...
     @property
     def attributes(self) -> int: ...
@@ -209,6 +211,7 @@ class LegacyRecordBatchProtocol(Iterable["LegacyRecordProtocol"], Protocol):
     is_control_batch: bool
     is_transactional: bool
     producer_id: int | None
+    partition_leader_epoch: int
 
     def __init__(self, buffer: bytes | bytearray | memoryview, magic: int): ...
     @property

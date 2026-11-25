@@ -75,6 +75,8 @@ cdef class LegacyRecordBatch:
     is_control_batch = False
     is_transactional = False
     producer_id = None
+    # Message formats v0/v1 predate leader epochs (KIP-101).
+    partition_leader_epoch = -1
 
     def __init__(self, object buffer, char magic):
         PyObject_GetBuffer(buffer, &self._buffer, PyBUF_SIMPLE)

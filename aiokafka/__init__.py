@@ -10,6 +10,9 @@ from .structs import (
     ConsumerRecord,
     OffsetAndMetadata,
     OffsetAndTimestamp,
+    PartitionRecoveryCredential,
+    PartitionRecoveryResult,
+    RecoveryDivergence,
     TopicPartition,
 )
 
@@ -30,4 +33,7 @@ __all__ = [  # noqa: RUF022
     "TopicPartition",
     "OffsetAndTimestamp",
     "OffsetAndMetadata",
+    "PartitionRecoveryCredential",
+    "PartitionRecoveryResult",
+    "RecoveryDivergence",
 ]

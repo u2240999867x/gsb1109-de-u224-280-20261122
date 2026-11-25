@@ -8,15 +8,27 @@ from itertools import chain
 import aiokafka.errors as Errors
 from aiokafka.errors import ConsumerStoppedError, KafkaTimeoutError, RecordTooLargeError
 from aiokafka.protocol.fetch import FetchRequest
+from aiokafka.protocol.leader_epoch import OffsetsForLeaderEpochRequest
 from aiokafka.protocol.offset import OffsetRequest
 from aiokafka.record.control_record import ABORT_MARKER, ControlRecord
 from aiokafka.record.memory_records import MemoryRecords
-from aiokafka.structs import ConsumerRecord, OffsetAndTimestamp, TopicPartition
+from aiokafka.structs import (
+    ConsumerRecord,
+    OffsetAndTimestamp,
+    PartitionRecoveryCredential,
+    PartitionRecoveryResult,
+    RecoveryDivergence,
+    TopicPartition,
+)
 from aiokafka.util import cancel_and_wait, create_future, create_task
 
 log = logging.getLogger(__name__)
 
 UNKNOWN_OFFSET = -1
+
+# Message format v2 batches carry a PartitionLeaderEpoch field; -1 marks a
+# batch that the broker did not annotate with an epoch.
+NO_PARTITION_LEADER_EPOCH = -1
 
 # Isolation levels
 READ_UNCOMMITTED = 0
@@ -173,6 +185,7 @@ class PartitionRecords:
         value_deserializer,
         check_crcs,
         isolation_level,
+        replay_lower_bound=None,
     ):
         self._tp = tp
         self._records = records
@@ -184,6 +197,9 @@ class PartitionRecords:
         self._value_deserializer = value_deserializer
         self._check_crcs = check_crcs
         self._isolation_level = isolation_level
+        # During a leader-epoch replay, offsets below this bound are part of
+        # the retained range and must not be delivered again.
+        self._replay_lower_bound = replay_lower_bound
 
         # Even without consuming any records we may need to force position to
         # a next offset. In cases like aborted transactions, control batches,
@@ -256,8 +272,17 @@ class PartitionRecords:
                 if record.offset < self.next_fetch_offset:
                     # Probably just a compressed messageset, it's ok to skip.
                     continue
-                consumer_record = self._consumer_record(tp, record)
                 self.next_fetch_offset = record.offset + 1
+                if (
+                    self._replay_lower_bound is not None
+                    and record.offset < self._replay_lower_bound
+                ):
+                    # Retained range of an in-flight leader-epoch replay: the
+                    # position still advances past the record, but it is not
+                    # delivered again.
+                    continue
+                leader_epoch = next_batch.partition_leader_epoch
+                consumer_record = self._consumer_record(tp, record, leader_epoch)
                 yield consumer_record
 
             # Message format v2 preserves the last offset in a batch even if
@@ -292,7 +317,7 @@ class PartitionRecords:
             ) from None
         return ControlRecord.parse(control_record.key) == ABORT_MARKER
 
-    def _consumer_record(self, tp, record):
+    def _consumer_record(self, tp, record, leader_epoch):
         key_size = len(record.key) if record.key is not None else -1
         value_size = len(record.value) if record.value is not None else -1
 
@@ -317,6 +342,7 @@ class PartitionRecords:
             key_size,
             value_size,
             tuple(record.headers),
+            leader_epoch,
         )
 
 
@@ -426,6 +452,8 @@ class Fetcher:
         self._records = collections.OrderedDict()
         self._in_flight = set()
         self._pending_tasks = set()
+        # Partition -> _ReplayState for armed leader-epoch recovery replays.
+        self._replay_states = {}
 
         self._wait_consume_future = None
         self._fetch_waiters = set()
@@ -505,6 +533,7 @@ class Fetcher:
                         await cancel_and_wait(task)
                     self._pending_tasks.clear()
                     self._records.clear()
+                    self._replay_states.clear()
 
                     subscription = self._subscriptions.subscription
                     if subscription is None or subscription.assignment is None:
@@ -793,6 +822,20 @@ class Fetcher:
                     continue
 
                 if error_type is Errors.NoError:
+                    replay_state = self._replay_states.get(tp)
+                    if (
+                        replay_state is not None
+                        and not replay_state.confirmed
+                        and not await self._gate_replay_delivery(tp)
+                    ):
+                        # The fetch belongs to a fenced leader term; the stale
+                        # response is discarded inside the gate and must not be
+                        # buffered as the first post-recovery delivery.
+                        continue
+                    if replay_state is not None:
+                        # The current leader accepted this fetch, so the replay
+                        # position is trusted even when no record is returned.
+                        replay_state.confirmed = True
                     if response.API_VERSION >= 11:
                         # part_data layout: [last_stable_offset,
                         # log_start_offset, aborted_transactions,
@@ -837,6 +880,11 @@ class Fetcher:
                             self._value_deserializer,
                             self._check_crcs,
                             self._isolation_level,
+                            replay_lower_bound=(
+                                replay_state.lower_bound
+                                if replay_state is not None
+                                else None
+                            ),
                         )
 
                         self._records[tp] = FetchResult(
@@ -878,7 +926,20 @@ class Fetcher:
                     ):
                         self._client.force_metadata_update()
                     elif error_type is Errors.OffsetOutOfRangeError:
-                        if self._default_reset_strategy != OffsetResetStrategy.NONE:
+                        if self._note_replay_deletion(tp, fetch_offset):
+                            # Replay of a range that was deleted. The read
+                            # position must stay put even when the consumer is
+                            # configured to auto-reset to the earliest/latest
+                            # offset.
+                            log.info(
+                                "Replay fetch offset %s for partition %s is out "
+                                "of range because the range was deleted; "
+                                "keeping position %s",
+                                fetch_offset,
+                                tp,
+                                tp_state.position,
+                            )
+                        elif self._default_reset_strategy != OffsetResetStrategy.NONE:
                             tp_state.await_reset(self._default_reset_strategy)
                         else:
                             err = Errors.OffsetOutOfRangeError({tp: fetch_offset})
@@ -1310,3 +1371,487 @@ class Fetcher:
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
         self._notify(self._wait_consume_future)
+
+    # ------------------------------------------------------------------
+    # Persistable partition recovery (KIP-320 style leader epoch validation)
+    # ------------------------------------------------------------------
+
+    def build_recovery_credential(self, tp, record):
+        """Build a persistable recovery credential for a processed record.
+
+        The credential stores the *next* offset to read (one past the record
+        that was actually processed and archived) together with the partition
+        leader epoch of the batch the record came from.
+
+        Returns ``None`` when the record cannot be tied to a verifiable
+        leader epoch, i.e. it was produced with the pre-v2 message format or
+        the broker attached no epoch (``-1``). Callers must persist such
+        records as offset-only checkpoints without claiming verifiability.
+        """
+        if not isinstance(tp, TopicPartition):
+            raise TypeError("tp should be a TopicPartition instance")
+        leader_epoch = getattr(record, "leader_epoch", None)
+        if leader_epoch is None or leader_epoch == NO_PARTITION_LEADER_EPOCH:
+            return None
+        return PartitionRecoveryCredential(
+            topic=tp.topic,
+            partition=tp.partition,
+            next_offset=record.offset + 1,
+            leader_epoch=leader_epoch,
+            verified=True,
+        )
+
+    async def validate_recovery_credential(
+        self, credential, *, allow_reread=False
+    ):
+        """Validate a persisted credential against the current partition leader.
+
+        With ``allow_reread=False`` (the default) the current read position is
+        never moved when the old and new log diverge; the returned result lists
+        the offset ranges that need manual reconciliation.
+
+        With ``allow_reread=True`` a divergence arms a replay from the end
+        offset reported for the credential's leader epoch, after confirming the
+        current leader accepts a fetch there.
+
+        The method never commits consumer group offsets and never triggers the
+        configured ``auto_offset_reset`` policy.
+        """
+        tp = credential.topic_partition
+        assignment = self._subscriptions.subscription.assignment
+        if assignment is None or not assignment.active or tp not in assignment.tps:
+            return self._unverified_recovery_result(
+                tp,
+                Errors.IllegalStateError(
+                    f"Partition {tp} is not assigned to this consumer"
+                ),
+            )
+
+        tp_state = assignment.state_value(tp)
+        if not tp_state.has_valid_position:
+            return self._unverified_recovery_result(
+                tp,
+                Errors.IllegalStateError(
+                    f"Partition {tp} has no current read position to preserve"
+                ),
+            )
+        current_position = tp_state.position
+
+        if not credential.verified or credential.leader_epoch < 0:
+            return self._unverified_recovery_result(
+                tp,
+                Errors.IllegalStateError(
+                    "Credential carries no verifiable leader epoch; the read "
+                    "position is left unchanged"
+                ),
+                position=current_position,
+            )
+
+        evidence = await self._fetch_leader_epoch_evidence(tp, credential)
+        if isinstance(evidence, Exception):
+            return self._unverified_recovery_result(tp, evidence, current_position)
+        end_offset, current_leader_epoch, log_start_offset = evidence
+
+        divergences = []
+        if end_offset is not None and end_offset < credential.next_offset:
+            divergences.append(
+                RecoveryDivergence(
+                    start_offset=end_offset,
+                    end_offset=credential.next_offset,
+                    reason=(
+                        "log truncation or replacement after leader change: "
+                        f"leader epoch {credential.leader_epoch} ends at "
+                        f"offset {end_offset}, but the processed position was "
+                        f"{credential.next_offset}"
+                    ),
+                )
+            )
+
+        # Records the current leader no longer serves (retention / compaction)
+        # can never be back-filled either.
+        if (
+            end_offset is not None
+            and log_start_offset is not None
+            and log_start_offset > end_offset
+        ):
+            deleted_end = min(log_start_offset, credential.next_offset)
+            if deleted_end > end_offset:
+                divergences.append(
+                    RecoveryDivergence(
+                        start_offset=end_offset,
+                        end_offset=deleted_end,
+                        reason=(
+                            "records were deleted and are no longer readable "
+                            f"on the current leader (earliest readable offset "
+                            f"is {log_start_offset})"
+                        ),
+                    )
+                )
+
+        if divergences and not allow_reread:
+            return PartitionRecoveryResult(
+                topic_partition=tp,
+                recoverable=False,
+                position=current_position,
+                divergences=tuple(divergences),
+            )
+
+        if divergences:
+            replay_offset = end_offset
+            accepted, error = await self._prepare_replay(
+                tp,
+                replay_offset,
+                current_leader_epoch,
+                credential,
+                tuple(divergences),
+                log_start_offset,
+            )
+            if not accepted:
+                return PartitionRecoveryResult(
+                    topic_partition=tp,
+                    recoverable=False,
+                    position=current_position,
+                    divergences=tuple(divergences),
+                    error=error,
+                )
+            return PartitionRecoveryResult(
+                topic_partition=tp,
+                recoverable=True,
+                position=replay_offset,
+                divergences=tuple(divergences),
+            )
+
+        # No divergence: the saved position is still inside the same leader
+        # epoch log, so reading may resume at the credential's next offset.
+        self.seek_to(tp, credential.next_offset)
+        return PartitionRecoveryResult(
+            topic_partition=tp,
+            recoverable=True,
+            position=credential.next_offset,
+        )
+
+    def _unverified_recovery_result(self, tp, error, position=None):
+        assignment = self._subscriptions.subscription.assignment
+        if position is None:
+            tp_state = (
+                assignment.state_value(tp)
+                if assignment is not None and tp in assignment.tps
+                else None
+            )
+            if tp_state is not None and tp_state.has_valid_position:
+                position = tp_state.position
+            else:
+                position = 0
+        return PartitionRecoveryResult(
+            topic_partition=tp,
+            recoverable=False,
+            position=position,
+            error=error,
+        )
+
+    async def _fetch_leader_epoch_evidence(self, tp, credential):
+        """Return ``(end_offset, current_leader_epoch, log_start_offset)``.
+
+        ``end_offset`` is ``None`` when the requested epoch is still the
+        current leader epoch and therefore has no end yet. Returns an
+        exception instance when the leader cannot provide evidence, in which
+        case the caller must keep the previous read position.
+        """
+        await self._client._maybe_wait_metadata()
+        node_id = self._client.cluster.leader_for_partition(tp)
+        if node_id is None:
+            self._client.add_topic(tp.topic)
+            return Errors.StaleMetadata(tp)
+        if node_id == -1:
+            return Errors.LeaderNotAvailableError(tp)
+
+        request = OffsetsForLeaderEpochRequest(
+            [(tp.topic, [(tp.partition, credential.leader_epoch)])]
+        )
+        try:
+            response = await self._client.send(node_id, request)
+        except Errors.KafkaError as err:
+            return err
+
+        for topic, partitions in response.topics:
+            for partition_data in partitions:
+                if response.API_VERSION >= 1:
+                    error_code, partition, leader_epoch, end_offset = partition_data
+                else:
+                    partition, leader_epoch, end_offset = partition_data
+                    error_code = Errors.NoError.errno
+                if partition != tp.partition:
+                    continue
+                error_type = Errors.for_code(error_code)
+                if error_type not in (Errors.NoError, Errors.FencedLeaderEpochError):
+                    return error_type(tp)
+                if error_type is Errors.FencedLeaderEpochError and end_offset < 0:
+                    return error_type(tp)
+                if error_type is Errors.NoError and end_offset < 0:
+                    # The requested epoch is still current and has no end:
+                    # nothing was truncated under that epoch.
+                    end_offset = None
+                # The earliest readable offset lets us spot ranges that were
+                # deleted (retention / compaction) even for a fenced epoch.
+                log_start = await self._safe_log_start(node_id, tp)
+                return end_offset, leader_epoch, log_start
+        return Errors.UnknownError(tp)
+
+    async def _safe_log_start(self, node_id, tp):
+        try:
+            offsets = await self._proc_offset_request(
+                node_id,
+                {tp.topic: [(tp.partition, OffsetResetStrategy.EARLIEST)]},
+            )
+        except Errors.KafkaError:
+            return None
+        result = offsets.get(tp)
+        if result is None:
+            return None
+        offset, _timestamp = result
+        return None if offset == UNKNOWN_OFFSET else offset
+
+    async def _prepare_replay(
+        self,
+        tp,
+        replay_offset,
+        current_leader_epoch,
+        credential,
+        divergences,
+        log_start_offset,
+    ):
+        """Confirm the leader accepts a fetch at ``replay_offset``, then seek.
+
+        Returns ``(accepted, error)``. The position is only changed after the
+        current partition leader accepts the probe fetch. The probe is
+        deliberately sent to the leader, not a preferred read replica: only
+        the leader can authoritatively confirm that a replay position is
+        still servable after a leader change.
+        """
+        node_id = self._client.cluster.leader_for_partition(tp)
+        if node_id is None or node_id == -1:
+            return False, Errors.LeaderNotAvailableError(tp)
+
+        request = FetchRequest(
+            self._fetch_max_wait_ms,
+            self._fetch_min_bytes,
+            self._fetch_max_bytes,
+            self._isolation_level,
+            [
+                (
+                    tp.topic,
+                    [(tp.partition, replay_offset, self._max_partition_fetch_bytes)],
+                )
+            ],
+            rack_id=self._client_rack or "",
+        )
+        try:
+            response = await self._client.send(node_id, request)
+        except Errors.KafkaError as err:
+            return False, err
+
+        for topic, partitions in response.topics:
+            for partition, error_code, _highwater, *_part_data in partitions:
+                if TopicPartition(topic, partition) != tp:
+                    continue
+                error_type = Errors.for_code(error_code)
+                if error_type is not Errors.NoError:
+                    return False, error_type(tp)
+
+        state = _ReplayState(
+            tp=tp,
+            start_offset=replay_offset,
+            lower_bound=replay_offset,
+            leader_node=node_id,
+            leader_epoch=current_leader_epoch,
+            credential=credential,
+            divergences=list(divergences),
+            log_start_offset=log_start_offset,
+            previous_position=self._subscriptions.subscription.assignment
+            .state_value(tp)
+            .position,
+        )
+        self._replay_states[tp] = state
+        self.seek_to(tp, replay_offset)
+        return True, None
+
+    def update_replay_lower_bound(self, tp, offset):
+        """Raise the retained lower bound of an armed replay before the first
+        re-fetched record is processed.
+        """
+        state = self._replay_states.get(tp)
+        if state is None:
+            raise Errors.IllegalStateError(
+                f"No active replay for partition {tp}"
+            )
+        if offset < state.lower_bound:
+            raise ValueError(
+                f"New lower bound {offset} is below current bound "
+                f"{state.lower_bound}"
+            )
+        state.lower_bound = offset
+
+    async def confirm_replay_position(self, tp):
+        """Confirm a replay position even when no record is deliverable yet.
+
+        A successful (error-free) fetch at the replay position is enough to
+        trust the position; records below the retained lower bound or empty
+        batches do not block confirmation.
+        """
+        state = self._replay_states.get(tp)
+        if state is None:
+            raise Errors.IllegalStateError(
+                f"No active replay for partition {tp}"
+            )
+
+        assignment = self._subscriptions.subscription.assignment
+        tp_state = assignment.state_value(tp)
+        node_id = self._client.cluster.leader_for_partition(tp)
+        if node_id is None or node_id == -1:
+            return False
+        request = FetchRequest(
+            self._fetch_max_wait_ms,
+            self._fetch_min_bytes,
+            self._fetch_max_bytes,
+            self._isolation_level,
+            [
+                (
+                    tp.topic,
+                    [
+                        (
+                            tp.partition,
+                            tp_state.position,
+                            self._max_partition_fetch_bytes,
+                        )
+                    ],
+                )
+            ],
+            rack_id=self._client_rack or "",
+        )
+        try:
+            response = await self._client.send(node_id, request)
+        except Errors.KafkaError:
+            return False
+        for topic, partitions in response.topics:
+            for partition, error_code, *_ in partitions:
+                if TopicPartition(topic, partition) != tp:
+                    continue
+                if Errors.for_code(error_code) is not Errors.NoError:
+                    return False
+        state.confirmed = True
+        return True
+
+    async def _gate_replay_delivery(self, tp):
+        """Term fence evaluated when a replay fetch response is processed.
+
+        Returns ``True`` when the response may be buffered under the current
+        term. When the leader epoch advanced while an old-term fetch was in
+        flight, the response belongs to a fenced term and must not become the
+        first post-recovery delivery.
+        """
+        state = self._replay_states.get(tp)
+        if state is None or state.confirmed:
+            return True
+
+        evidence = await self._fetch_leader_epoch_evidence(tp, state.credential)
+        if isinstance(evidence, Exception):
+            # No evidence for the current term: refuse the response and wait
+            # for a fresh fetch under the new term.
+            return False
+
+        _end_offset, current_leader_epoch, _log_start = evidence
+        if current_leader_epoch != state.leader_epoch:
+            # The same (or another) broker was re-elected with a newer epoch.
+            # Re-judge the replay under the new term instead of trusting data
+            # fetched while the previous term was current.
+            state.leader_epoch = current_leader_epoch
+            state.term_rejudged = True
+            return False
+        return True
+
+    def _note_replay_deletion(self, tp, fetch_offset):
+        """Record an unreadable replay range without resetting the offset.
+
+        When the whole replay range turns out to be deleted, the replay cannot
+        proceed, so the position captured before arming the replay is restored
+        (e.g. the preview position the consumer kept while validating).
+        """
+        state = self._replay_states.get(tp)
+        if state is None or state.deletion_detected:
+            return False
+        assignment = self._subscriptions.subscription.assignment
+        tp_state = assignment.state_value(tp)
+        if tp_state.position != state.start_offset:
+            return False
+        end = max(state.lower_bound, fetch_offset)
+        divergence = RecoveryDivergence(
+            start_offset=state.start_offset,
+            end_offset=end,
+            reason=(
+                "replay range was deleted and cannot be back-filled from the "
+                "current leader"
+            ),
+        )
+        if divergence not in state.divergences:
+            state.divergences.append(divergence)
+        state.deletion_detected = True
+        # Restore the position the consumer kept before arming the replay.
+        # This deliberately bypasses auto_offset_reset even when configured.
+        self.seek_to(tp, state.previous_position)
+        # The replay is concluded (unsuccessfully): do not gate the resumed
+        # normal consumption, but keep the state for divergence inspection.
+        state.confirmed = True
+        return True
+
+    def replay_divergences(self, tp):
+        """Return the divergence ranges accumulated during a replay."""
+        state = self._replay_states.get(tp)
+        if state is None:
+            return ()
+        return tuple(state.divergences)
+
+    def clear_replay_state(self, tp):
+        self._replay_states.pop(tp, None)
+
+
+class _ReplayState:
+    __slots__ = (
+        "tp",
+        "start_offset",
+        "lower_bound",
+        "leader_node",
+        "leader_epoch",
+        "credential",
+        "divergences",
+        "log_start_offset",
+        "previous_position",
+        "confirmed",
+        "term_rejudged",
+        "deletion_detected",
+    )
+
+    def __init__(
+        self,
+        *,
+        tp,
+        start_offset,
+        lower_bound,
+        leader_node,
+        leader_epoch,
+        credential,
+        divergences,
+        log_start_offset,
+        previous_position,
+    ):
+        self.tp = tp
+        self.start_offset = start_offset
+        self.lower_bound = lower_bound
+        self.leader_node = leader_node
+        self.leader_epoch = leader_epoch
+        self.credential = credential
+        self.divergences = list(divergences)
+        self.log_start_offset = log_start_offset
+        self.previous_position = previous_position
+        self.confirmed = False
+        self.term_rejudged = False
+        self.deletion_detected = False

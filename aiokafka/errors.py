@@ -875,6 +875,26 @@ class FencedInstanceIdError(BrokerResponseError):
     )
 
 
+class FencedLeaderEpochError(BrokerResponseError):
+    errno = 74
+    message = "FENCED_LEADER_EPOCH"
+    description = (
+        "The leader epoch sent by the client is fenced and no longer current."
+    )
+    retriable = True
+    invalid_metadata = True
+
+
+class UnknownLeaderEpochError(BrokerResponseError):
+    errno = 80
+    message = "UNKNOWN_LEADER_EPOCH"
+    description = (
+        "The leader epoch sent by the client is not known to the broker."
+    )
+    retriable = True
+    invalid_metadata = True
+
+
 _T = TypeVar("_T", bound=type)
 
 

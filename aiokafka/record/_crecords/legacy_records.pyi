@@ -52,6 +52,7 @@ class LegacyRecordBatch(LegacyRecordBatchProtocol):
     is_control_batch: bool
     is_transactional: bool
     producer_id: int | None
+    partition_leader_epoch: int
     def __init__(self, buffer: Buffer, magic: int) -> None: ...
     @property
     def next_offset(self) -> int: ...

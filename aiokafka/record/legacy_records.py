@@ -151,6 +151,12 @@ class _LegacyRecordBatchPy(LegacyRecordBase, LegacyRecordBatchProtocol):
     def next_offset(self) -> int:
         return self._offset + 1
 
+    @property
+    def partition_leader_epoch(self) -> int:
+        # Message formats v0/v1 predate leader epochs (KIP-101), so no
+        # verifiable partition leader epoch can be recovered.
+        return -1
+
     def validate_crc(self) -> bool:
         crc = crc32(self._buffer[self.MAGIC_OFFSET :])
         return self._crc == crc
