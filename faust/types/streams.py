@@ -3,10 +3,12 @@ import asyncio
 import typing
 from typing import (
     Any,
+    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
+    Dict,
     Iterable,
     List,
     Mapping,
@@ -161,6 +163,16 @@ class StreamT(AsyncIterable[T_co], JoinableT, ServiceT):
     async def take(
         self, max_: int, within: Seconds
     ) -> AsyncIterable[Sequence[T_co]]: ...
+
+    @abc.abstractmethod
+    @no_type_check
+    async def take_confirmed(
+        self,
+        window_end: Union[float, Callable[[], float]],
+        is_seal: Callable[[EventT], bool],
+        *,
+        partitions: Optional[Callable[[], Iterable[TP]]] = None,
+    ) -> AsyncGenerator[Dict[TP, List[EventT]], None]: ...
 
     @abc.abstractmethod
     def enumerate(self, start: int = 0) -> AsyncIterable[Tuple[int, T_co]]: ...

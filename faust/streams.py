@@ -6,6 +6,7 @@ import reprlib
 import typing
 import weakref
 from asyncio import CancelledError
+from collections import defaultdict
 from contextvars import ContextVar
 from functools import wraps
 from typing import (
@@ -14,6 +15,7 @@ from typing import (
     AsyncIterable,
     AsyncIterator,
     Callable,
+    DefaultDict,
     Deque,
     Dict,
     Iterable,
@@ -663,6 +665,236 @@ class Stream(StreamT[T_co], Service):
                         buffer_consumed.set()
                 else:  # pragma: no cover
                     pass
+            else:  # pragma: no cover
+                pass
+
+        finally:
+            # Restore last behaviour of "enable_acks"
+            self.enable_acks = stream_enable_acks
+            self._processors.remove(add_to_buffer)
+
+    @_tracks_buffer_agen
+    async def take_confirmed(
+        self,
+        window_end: Union[float, Callable[[], float]],
+        is_seal: Callable[[EventT], bool],
+        *,
+        partitions: Optional[Callable[[], Iterable[TP]]] = None,
+    ) -> AsyncGenerator[Dict[TP, List[EventT]], None]:
+        """Buffer events until every assigned partition seals the window.
+
+        Unlike :meth:`take`, which flushes after a number of values or a
+        timeout and so cannot tell "not arrived yet" from "definitely
+        nothing", this generator only yields a batch once every assigned
+        partition has confirmed the window -- either by sending events or
+        by sending a *seal* event explicitly stating "no records for this
+        period".  Each yielded batch is split by the originating
+        topic-partition, mapping every confirmed partition to the list of
+        its original events (empty for partitions that only sent a seal).
+
+        Arguments:
+            window_end: Right edge of the half-open window, as an event
+                timestamp.  Events with ``timestamp < window_end`` belong
+                to the batch currently being collected; events exactly at
+                or beyond the edge are held back for the next batch.
+                Pass a callable to provide a new edge for every batch,
+                e.g. to read consecutive windows from the same input.
+            is_seal: Predicate called with each event; must return True
+                for seal (control) events.  Seals confirm their partition
+                for the current window and are never delivered in a batch.
+            partitions: Callable returning the currently assigned
+                partitions.  The assignment is snapshotted when a batch
+                starts and re-read on every incoming event.  Defaults to
+                the consumer assignment.
+
+        Notes:
+            A partition's events belong to the batch that was open while
+            that partition was unsealed: an event with an in-window
+            timestamp still joins the current batch when it arrives after
+            other partitions' events, as long as its own partition has not
+            sealed yet.
+
+            If the assignment changes while a batch is being collected,
+            seals already confirmed under the old assignment stay valid
+            for that batch, and revoked partitions stop blocking it.
+            Newly assigned partitions never join the batch already in
+            progress: their seals are queued and only confirm the
+            following window.
+
+            Events are acked only after the batch containing them has been
+            consumed, so reading consecutive batches from the same input
+            delivers every original event exactly once.
+        """
+        if partitions is None:
+            partitions = self.app.consumer.assignment
+        get_partitions = partitions
+        stream_enable_acks: bool = self.enable_acks
+
+        cutoff = 0.0
+        # partitions expected to seal the batch currently being collected.
+        expected: Set[TP] = set()
+        # partitions revoked since the current batch started.
+        revoked: Set[TP] = set()
+        # partitions whose seal for the current window was confirmed.
+        confirmed: Set[TP] = set()
+        # in-window events of the current batch, split by partition.
+        buffered: DefaultDict[TP, List[EventT]] = defaultdict(list)
+        # events at or beyond the window edge, held for the next batch.
+        deferred: DefaultDict[TP, List[EventT]] = defaultdict(list)
+        # seals that arrived outside their window, queued by partition.
+        pending_seals: DefaultDict[TP, List[EventT]] = defaultdict(list)
+        # events to ack once the current batch has been consumed.
+        batch_events: List[EventT] = []
+
+        batch_confirmed = asyncio.Event()
+        buffer_consumed = asyncio.Event()
+        buffer_consuming: Optional[asyncio.Future] = None
+
+        channel_it = aiter(self.channel)
+
+        def _rotate_batch() -> None:
+            # Prepare the next window: reclassify held events against the
+            # new edge, snapshot the assignment, and apply queued seals.
+            nonlocal cutoff, batch_events
+            cutoff = window_end() if callable(window_end) else window_end
+            batch_events = []
+            for tp in list(deferred):
+                events = deferred[tp]
+                inside = [
+                    event
+                    for event in events
+                    if event.message.timestamp < cutoff
+                ]
+                if inside:
+                    buffered[tp].extend(inside)
+                    batch_events.extend(inside)
+                    remaining = [
+                        event
+                        for event in events
+                        if event.message.timestamp >= cutoff
+                    ]
+                    if remaining:
+                        deferred[tp] = remaining
+                    else:
+                        del deferred[tp]
+            expected.clear()
+            expected.update(get_partitions())
+            revoked.clear()
+            confirmed.clear()
+            for tp in list(pending_seals):
+                if tp in expected:
+                    seal_events = pending_seals.pop(tp)
+                    confirmed.add(tp)
+                    batch_events.append(seal_events.pop(0))
+                    if seal_events:
+                        pending_seals[tp] = seal_events
+            if expected <= confirmed:
+                batch_confirmed.set()
+            else:
+                batch_confirmed.clear()
+
+        def _reconcile_assignment() -> None:
+            # A rebalance shrinks the expected set of the batch in
+            # progress: seals already confirmed under the old assignment
+            # stay valid, revoked partitions stop blocking the batch, and
+            # newly assigned partitions only join the next window.
+            missing = expected - set(get_partitions())
+            if missing:
+                expected.difference_update(missing)
+                revoked.update(missing)
+                if expected <= confirmed:
+                    batch_confirmed.set()
+
+        # We add this processor to populate the buffer, and the stream
+        # is passively consumed in the background (enable_passive below).
+        async def add_to_buffer(value: T) -> T:
+            try:
+                # buffer_consuming is set when consuming buffer after timeout.
+                nonlocal buffer_consuming
+                if buffer_consuming is not None:
+                    try:
+                        await buffer_consuming
+                    finally:
+                        buffer_consuming = None
+                event = self.current_event
+                if event is None:
+                    raise RuntimeError("Take buffer found current_event is None")
+                _reconcile_assignment()
+                while batch_confirmed.is_set():
+                    # the batch is complete: wait for it to be consumed and
+                    # rotated so this event joins the next window.
+                    buffer_consumed.clear()
+                    # mode types the waitable as ``mode.utils.locks.Event``,
+                    # but Service.wait accepts anything with an awaitable
+                    # ``.wait()`` -- asyncio.Event included.
+                    await self.wait(buffer_consumed)  # type: ignore[arg-type]
+                tp = event.message.tp
+                if is_seal(event):
+                    if tp in expected and tp not in confirmed:
+                        confirmed.add(tp)
+                        batch_events.append(event)
+                        if expected <= confirmed:
+                            # signal that the batch should be consumed.
+                            batch_confirmed.set()
+                            # strict wait for the batch to be consumed so
+                            # no further event leaks into it.
+                            buffer_consumed.clear()
+                            await self.wait(buffer_consumed)  # type: ignore[arg-type]
+                    else:
+                        # seal for a partition outside the expected set
+                        # (newly assigned, revoked, or a duplicate): it can
+                        # only confirm a following window.
+                        pending_seals[tp].append(event)
+                elif event.message.timestamp < cutoff:
+                    buffered[tp].append(event)
+                    batch_events.append(event)
+                else:
+                    # half-open window: events exactly at or beyond the
+                    # right edge are left for the next batch.
+                    deferred[tp].append(event)
+            except CancelledError:  # pragma: no cover
+                raise
+            except Exception as exc:
+                self.log.exception("Error adding to take buffer: %r", exc)
+                await self.crash(exc)
+            return value
+
+        # Disable acks to ensure this method acks manually
+        # events only after they are consumed by the user
+        self.enable_acks = False
+
+        self.add_processor(add_to_buffer)
+        self._enable_passive(cast(ChannelT, channel_it))
+        try:
+            _rotate_batch()
+            while not self.should_stop:
+                # wait until every expected partition has sealed the window.
+                # Same mode annotation gap as in take() above: the waitable
+                # is typed as ``mode.utils.locks.Event`` but anything with
+                # an awaitable ``.wait()`` -- asyncio.Event included -- works.
+                await self.wait_for_stopped(
+                    batch_confirmed  # type: ignore[arg-type]
+                )
+                if self.should_stop:  # pragma: no cover
+                    break
+                # make sure background thread does not add new items to
+                # buffer while we read.
+                buffer_consuming = self.loop.create_future()
+                try:
+                    batch: Dict[TP, List[EventT]] = {
+                        tp: [] for tp in confirmed
+                    }
+                    for tp, events in buffered.items():
+                        batch[tp] = list(events)
+                    yield batch
+                finally:
+                    buffered.clear()
+                    for event in batch_events:
+                        await self.ack(event)
+                    _rotate_batch()
+                    # allow writing to buffer again
+                    notify(buffer_consuming)
+                    buffer_consumed.set()
             else:  # pragma: no cover
                 pass
 

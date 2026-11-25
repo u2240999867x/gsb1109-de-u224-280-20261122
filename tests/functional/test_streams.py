@@ -10,6 +10,7 @@ from mode.utils.aiter import aiter, anext
 import faust
 from faust.exceptions import ImproperlyConfigured
 from faust.streams import maybe_forward
+from faust.types import TP
 from tests.helpers import AsyncMock
 
 from .helpers import channel_empty, message, put
@@ -885,6 +886,131 @@ async def test_take__no_event_crashes(app, loop):
         await asyncio.sleep(0)  # needed for some reason
         assert isinstance(s._crash_reason, RuntimeError)
     print("RETURNING")
+    assert s.enable_acks is True
+
+
+TP_A = TP("topic", 0)
+TP_B = TP("topic", 1)
+TP_C = TP("topic", 2)
+
+
+def is_seal_event(event):
+    return event.value == "SEAL"
+
+
+@pytest.mark.asyncio
+async def test_take_confirmed(app):
+    """A batch is split by partition and only yields once every assigned
+    partition sealed the window; two consecutive windows on the same input
+    deliver every original event exactly once."""
+    assignment = {TP_A, TP_B, TP_C}
+    cutoffs = iter([100.0, 200.0])
+    async with new_stream(app) as s:
+        assert s.enable_acks is True
+        batches = s.take_confirmed(
+            lambda: next(cutoffs),
+            is_seal_event,
+            partitions=lambda: assignment,
+        )
+        # window 1: partition 0 sends two in-window events, then one event
+        # exactly at the right edge -- the half-open window leaves the
+        # latter for the next batch.
+        await put(s.channel, value=1, partition=0, timestamp=90.0, offset=1)
+        await put(s.channel, value=2, partition=0, timestamp=95.0, offset=2)
+        await put(s.channel, value=3, partition=0, timestamp=100.0, offset=3)
+        # partition 1's earlier event arrives after partition 0's events,
+        # but before partition 1's own seal: still part of this batch.
+        await put(s.channel, value=4, partition=1, timestamp=80.0, offset=4)
+        await put(s.channel, value=5, partition=1, timestamp=120.0, offset=5)
+        # partition 2 sends no data, only the "no records" seal.
+        await put(s.channel, value="SEAL", partition=0, timestamp=100.0, offset=6)
+        await put(s.channel, value="SEAL", partition=1, timestamp=100.0, offset=7)
+        await put(s.channel, value="SEAL", partition=2, timestamp=100.0, offset=8)
+        # seals confirming the second window.
+        await put(s.channel, value="SEAL", partition=0, timestamp=200.0, offset=9)
+        await put(s.channel, value="SEAL", partition=1, timestamp=200.0, offset=10)
+        await put(s.channel, value="SEAL", partition=2, timestamp=200.0, offset=11)
+
+        received = []
+        async for batch in batches:
+            assert s.enable_acks is False
+            received.append(batch)
+            if len(received) >= 2:
+                break
+
+        first, second = received
+        assert [event.value for event in first[TP_A]] == [1, 2]
+        assert [event.value for event in first[TP_B]] == [4]
+        # sealed without data: definitely nothing, not "not arrived yet".
+        assert first[TP_C] == []
+        # events at or beyond the edge were held for the second window.
+        assert [event.value for event in second[TP_A]] == [3]
+        assert [event.value for event in second[TP_B]] == [5]
+        assert second[TP_C] == []
+        # no original event lost or duplicated across the two batches.
+        delivered = [
+            event.value
+            for batch in received
+            for events in batch.values()
+            for event in events
+        ]
+        assert sorted(delivered) == [1, 2, 3, 4, 5]
+    assert s.enable_acks is True
+
+
+@pytest.mark.asyncio
+async def test_take_confirmed__rebalance(app):
+    """Reassignment during a batch: seals confirmed under the old
+    assignment stay valid for that batch; seals of newly assigned
+    partitions only confirm the following window."""
+    assignment = {TP_A, TP_B}
+    cutoffs = iter([100.0, 200.0])
+    async with new_stream(app) as s:
+        batches = s.take_confirmed(
+            lambda: next(cutoffs),
+            is_seal_event,
+            partitions=lambda: assignment,
+        )
+
+        async def scenario():
+            await put(s.channel, value=1, partition=0, timestamp=50.0, offset=1)
+            await put(
+                s.channel, value="SEAL", partition=0, timestamp=100.0, offset=2
+            )
+            # let partition 0 confirm under the old assignment.
+            await asyncio.sleep(0.1)
+            # rebalance: partition 0 revoked, partition 2 newly assigned.
+            assignment.discard(TP_A)
+            assignment.add(TP_C)
+            # the new partition's seal must not complete the old batch.
+            await put(
+                s.channel, value="SEAL", partition=2, timestamp=100.0, offset=3
+            )
+            await put(s.channel, value=2, partition=1, timestamp=60.0, offset=4)
+            await put(
+                s.channel, value="SEAL", partition=1, timestamp=100.0, offset=5
+            )
+            # seal confirming the second window for partition 1.
+            await put(
+                s.channel, value="SEAL", partition=1, timestamp=200.0, offset=6
+            )
+
+        asyncio.ensure_future(scenario())
+        received = []
+        async for batch in batches:
+            received.append(batch)
+            if len(received) >= 2:
+                break
+
+        first, second = received
+        # partition 0's old confirmation and events remain in batch 1
+        # even though it was revoked before the batch completed.
+        assert [event.value for event in first[TP_A]] == [1]
+        assert [event.value for event in first[TP_B]] == [2]
+        assert TP_C not in first
+        # partition 2's seal was queued and only confirms window 2.
+        assert second[TP_B] == []
+        assert second[TP_C] == []
     assert s.enable_acks is True
 
 

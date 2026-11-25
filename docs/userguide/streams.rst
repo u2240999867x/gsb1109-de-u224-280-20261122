@@ -439,6 +439,40 @@ The above code works better: if values are constantly being streamed it will
 process hundreds and hundreds without delay, but if there are long periods of
 time with no events received it will still process what it has gathered.
 
+``take_confirmed()`` -- Buffer a window sealed by every partition
+-----------------------------------------------------------------
+
+:meth:`Stream.take() <faust.Stream.take>` flushes after a number of values
+or a timeout, so it cannot tell "this partition has not sent anything yet"
+apart from "this partition definitely had nothing to send".
+
+Use :meth:`Stream.take_confirmed() <faust.Stream.take_confirmed>` to gather
+one window of events at a time, split by originating topic-partition, where
+every assigned partition confirms the window either by sending events or by
+sending a *seal* event explicitly stating "no records for this period":
+
+.. sourcecode:: python
+
+    @app.agent()
+    async def process(stream):
+        async for batch in stream.take_confirmed(
+            window_end=lambda: next(cutoffs),
+            is_seal=lambda event: event.value == 'SEAL',
+        ):
+            for tp, events in batch.items():
+                # events is empty for partitions that only sent their seal.
+                print(f'{tp}: {len(events)} events')
+
+The window is half-open: events with a timestamp exactly at or beyond
+``window_end`` are held back for the next batch, while an in-window event
+still joins the current batch when it arrives before its own partition's
+seal.  Pass a callable as ``window_end`` to read consecutive windows from
+the same input; every original event is delivered exactly once.
+
+If the partition assignment changes while a batch is being collected, seals
+already confirmed under the old assignment stay valid for that batch, while
+seals from newly assigned partitions only confirm the following window.
+
 ``enumerate()`` -- Count values
 -------------------------------
 
