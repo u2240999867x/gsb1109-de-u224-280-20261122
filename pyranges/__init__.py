@@ -11,11 +11,49 @@ from natsort import natsorted  # type: ignore
 import pyranges as pr
 import pyranges.genomicfeatures as gf  # NOQA: F401
 from pyranges import data, statistics
+from pyranges.collection_audit import (
+    AuditReport,
+    CollectionAuditor,
+    CollectionObservation,
+    CollectionAuditError,
+    CountSpec,
+    ExtremeEvidence,
+    IncompatibleCollection,
+    RingBinningAuditor,
+    audit_bins,
+    audit_collection,
+    audit_collection_records,
+    audit_collections,
+    audit_ring_bins,
+    bin_collection_records,
+    check_collection_records,
+    reconcile_collection_bins,
+    reconcile_collection_records,
+    verify_collection_records,
+)
 from pyranges.get_fasta import get_fasta, get_sequence, get_transcript_sequence
 from pyranges.methods.concat import concat
 from pyranges.multioverlap import count_overlaps
 from pyranges.pyranges_main import PyRanges
 from pyranges.readers import read_bam, read_bed, read_bigwig, read_gff3, read_gtf  # NOQA: F401
+
+PyRanges.audit_collection_records = staticmethod(audit_collection_records)
+PyRanges.audit_collections = staticmethod(audit_collections)
+PyRanges.audit_ring_bins = staticmethod(audit_ring_bins)
+PyRanges.reconcile_collection_bins = staticmethod(reconcile_collection_bins)
+PyRanges.bin_collection_records = staticmethod(bin_collection_records)
+PyRanges.audit_collection = staticmethod(audit_collection)
+PyRanges.audit_bins = staticmethod(audit_bins)
+PyRanges.reconcile_bins = staticmethod(reconcile_collection_bins)
+PyRanges.collection_bins = staticmethod(bin_collection_records)
+
+audit = audit_collection_records
+audit_observations = audit_collection_records
+audit_ring_collection = audit_collection_records
+reconcile_collection = reconcile_collection_bins
+reconcile_bins = reconcile_collection_bins
+reconcile_ring_bins = reconcile_collection_bins
+collection_bins = bin_collection_records
 
 __version__ = importlib.metadata.version("pyranges")
 
