@@ -72,6 +72,9 @@ path = "src/cloudevents/__init__.py"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/cloudevents", "src/reconcile", "src/reconciliation"]
+
 [tool.hatch.build.targets.wheel.force-include]
 "CHANGELOG.md" = "CHANGELOG.md"
 "MAINTAINERS.md" = "MAINTAINERS.md"
@@ -79,7 +82,7 @@ allow-direct-references = true
 "MIGRATION.md" = "MIGRATION.md"
 
 [tool.hatch.build.targets.sdist]
-packages = ["src/cloudevents"]
+packages = ["src/cloudevents", "src/reconcile", "src/reconciliation"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "CHANGELOG.md" = "CHANGELOG.md"
