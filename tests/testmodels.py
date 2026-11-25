@@ -329,6 +329,14 @@ class DecimalFields(Model):
     decimal_null = fields.DecimalField(max_digits=18, decimal_places=4, null=True)
 
 
+class BillEntry(Model):
+    id = fields.IntField(primary_key=True)
+    batch = fields.IntField()
+    warehouse = fields.CharField(max_length=8)
+    status = fields.CharField(max_length=8)
+    amount = fields.DecimalField(max_digits=40, decimal_places=2)
+
+
 class DatetimeFields(Model):
     id = fields.IntField(primary_key=True)
     datetime = fields.DatetimeField()

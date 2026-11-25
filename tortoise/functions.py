@@ -1,6 +1,7 @@
 from pypika_tortoise import SqlContext, functions
 
 from tortoise.expressions import Aggregate, Function
+from tortoise.fields.data import DecimalField
 
 ##############################################################################
 # Standard functions
@@ -103,6 +104,16 @@ class Sum(Aggregate):
 
     database_func = functions.Sum
     populate_field_object = True
+
+    def resolve(self, resolve_context):
+        result = super().resolve(resolve_context)
+        if resolve_context.model._meta.db.capabilities.dialect == "sqlite" and isinstance(
+            result.output_field, DecimalField
+        ):
+            from tortoise.contrib.sqlite.decimals import exact_sum
+
+            result.term = exact_sum(result.term)
+        return result
 
 
 class Max(Aggregate):

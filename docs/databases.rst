@@ -104,7 +104,9 @@ SQLite is an embedded database, and can run on a file or in-memory. Good databas
 
     SQLite doesn't support many of the common datatypes natively, although we do emulation where we can, not everything is perfect.
 
-    For example ``DecimalField`` has precision preserved by storing values as strings, except when doing aggregates/ordering on it. In those cases we have to cast to/from floating-point numbers.
+    ``DecimalField`` values are stored as strings, and comparison, ordering and ``SUM`` are
+    performed exactly through a custom collation and aggregate, so totals keep their cent
+    precision even when they exceed the range of a signed 64 bit integer.
 
     Similarly case-insensitivity is only partially implemented.
 

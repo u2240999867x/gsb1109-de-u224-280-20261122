@@ -11,8 +11,6 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 from uuid import UUID, uuid4
 
-from pypika_tortoise import functions
-from pypika_tortoise.enums import SqlTypes
 from pypika_tortoise.terms import Term
 
 from tortoise import timezone
@@ -442,7 +440,11 @@ class DecimalField(Field[T_DECIMAL], Decimal):  # type: ignore
         SQL_TYPE = "VARCHAR(40)"
 
         def function_cast(self, term: Term) -> Term:
-            return functions.Cast(term, SqlTypes.NUMERIC)
+            from tortoise.contrib.sqlite.decimals import collate_decimal
+
+            # Stored as text: keep it that way and compare/order through an exact
+            # decimal collation instead of casting to floating point NUMERIC.
+            return collate_decimal(term)
 
 
 # In case of queryset with filter `__year`/`__month`/`__day` ..., value can be int, float or str. Example:

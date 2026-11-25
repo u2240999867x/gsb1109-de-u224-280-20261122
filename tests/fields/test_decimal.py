@@ -370,3 +370,113 @@ def test_to_python_value_keeps_context_rounding():
     with localcontext() as ctx:
         ctx.rounding = ROUND_HALF_UP
         assert str(field.to_python_value("1.005")) == "1.01"
+
+
+BIG = Decimal("92233720368547758.07")
+BIG_ALT = Decimal("92233720368547758.06")
+THRESHOLD = Decimal("92233720368547758.06")
+
+
+async def _seed_bills(old_batch: int = 1, reverse: bool = False) -> None:
+    done, pending, first, second = "done", "pending", "A", "B"
+    rows = [
+        (old_batch, first, done, BIG),
+        (old_batch, first, done, BIG),
+        (old_batch + 1, first, done, -BIG_ALT),
+        (old_batch, second, done, BIG),
+        (old_batch, second, done, BIG_ALT),
+        (old_batch + 1, second, done, -BIG_ALT),
+        (old_batch + 1, first, pending, Decimal("1.00")),
+    ]
+    if reverse:
+        rows.reverse()
+    for batch, warehouse, status, amount in rows:
+        await testmodels.BillEntry.create(
+            batch=batch, warehouse=warehouse, status=status, amount=amount
+        )
+
+
+def _report():
+    # Only settled entries, every positive and offsetting negative contributes.
+    return (
+        testmodels.BillEntry.filter(status="done").annotate(net=Sum("amount")).group_by("warehouse")
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_decimal_filter_beyond_float_precision(db):
+    await _seed_bills()
+    # Detail filtering must tell the two adjacent amounts apart.
+    rows = await (
+        testmodels.BillEntry.filter(status="done", amount__gt=THRESHOLD)
+        .order_by("warehouse")
+        .values_list("warehouse", "amount")
+    )
+    assert rows == [
+        ("A", BIG),
+        ("A", BIG),
+        ("B", BIG),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exact_decimal_net_aggregate_filter_order_values(db):
+    await _seed_bills()
+    values = await _report().order_by("-net").values("warehouse", "net")
+    assert values == [
+        {"warehouse": "A", "net": Decimal("92233720368547758.08")},
+        {"warehouse": "B", "net": Decimal("92233720368547758.07")},
+    ]
+    assert all(isinstance(row["net"], Decimal) for row in values)
+    assert all(row["net"].as_tuple().exponent == -2 for row in values)
+
+    filtered = await _report().filter(net__gt=BIG).values("warehouse", "net")
+    assert filtered == [{"warehouse": "A", "net": Decimal("92233720368547758.08")}]
+
+
+@pytest.mark.asyncio
+async def test_exact_decimal_net_after_correction(db):
+    await _seed_bills()
+    await testmodels.BillEntry.filter(batch=2, warehouse="A", status="done").update(amount=-BIG)
+    values = await _report().order_by("-net").values("warehouse", "net")
+    assert {row["warehouse"]: row["net"] for row in values} == {"A": BIG, "B": BIG}
+    assert await _report().filter(net__gt=BIG).values("warehouse", "net") == []
+
+
+@pytest.mark.asyncio
+async def test_exact_decimal_insertion_order_independent(db):
+    await _seed_bills(reverse=False)
+    forward = await _report().order_by("-net").values("warehouse", "net")
+
+    await testmodels.BillEntry.all().delete()
+    await _seed_bills(reverse=True)
+    backward = await _report().order_by("-net").values("warehouse", "net")
+
+    assert forward == backward
+
+
+@pytest.mark.asyncio
+async def test_exact_decimal_aggregate_variants(db):
+    from tortoise.expressions import Q
+
+    await _seed_bills()
+    filtered = (
+        await testmodels.BillEntry.filter(status="done")
+        .annotate(total=Sum("amount", _filter=Q(warehouse="A")))
+        .values("total")
+    )
+    assert filtered == [{"total": Decimal("92233720368547758.08")}]
+
+    distinct = (
+        await testmodels.BillEntry.filter(warehouse="A", status="done")
+        .annotate(total=Sum("amount", distinct=True))
+        .values("total")
+    )
+    # Two identical credits collapse, the negative offset is still applied exactly.
+    assert distinct == [{"total": Decimal("0.01")}]
+
+    # Integers still use the native aggregate and stay exact.
+    await testmodels.ValidatorModel.create(max_value=2)
+    await testmodels.ValidatorModel.create(max_value=3)
+    ints = await testmodels.ValidatorModel.annotate(total=Sum("max_value")).values("total")
+    assert ints == [{"total": 5}]
