@@ -25,6 +25,8 @@ from pandera.pandas import (
     check_io,
     check_output,
     check_types,
+    dataframe_check,
+    dataframe_parser,
     errors,
 )
 from pandera.typing import DataFrame, Index, Series
@@ -2029,3 +2031,204 @@ def test_check_input_positional_selector_applies_inplace(obj_getter):
     before = df["column1"].dtype
     decorated(df)
     assert df["column1"].dtype != before
+
+
+class _BatchDetailV1(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_parser
+    def mark_legacy(cls, df: pd.DataFrame) -> pd.DataFrame:
+        # Both object cells reference the same dict, so append once.
+        df["payload"].iloc[0]["marks"].append("legacy")
+        return df
+
+    @dataframe_check
+    def has_legacy(cls, df: pd.DataFrame) -> pd.Series:
+        return df["payload"].map(lambda cell: "legacy" in cell["marks"])
+
+
+class _BatchReceiptV1(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_check
+    def has_legacy_receipt(cls, df: pd.DataFrame) -> pd.Series:
+        return df["payload"].map(lambda cell: "legacy_receipt" in cell)
+
+
+class _BatchDetailV2(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_parser
+    def mark_current(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df["payload"].iloc[0]["marks"].append("current")
+        return df
+
+    @dataframe_check
+    def has_current(cls, df: pd.DataFrame) -> pd.Series:
+        return df["payload"].map(lambda cell: "current" in cell["marks"])
+
+
+class _BatchReceiptV2(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_check
+    def has_receipt_id(cls, df: pd.DataFrame) -> pd.Series:
+        return df["payload"].map(lambda cell: "receipt_id" in cell)
+
+
+class _BatchAudit(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_parser
+    def mark_audit(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df["payload"].iloc[0]["marks"].append("audit")
+        return df
+
+
+class _BatchExport(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_parser
+    def mark_export(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df["payload"].iloc[0]["marks"].append("export")
+        return df
+
+
+class _BatchArchive(DataFrameModel):
+    payload: Series[object]
+
+    @dataframe_parser
+    def mark_archive(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df["payload"].iloc[0]["marks"].append("archive")
+        return df
+
+
+_BatchV1 = tuple[DataFrame[_BatchDetailV1], DataFrame[_BatchReceiptV1]]
+_BatchV2 = tuple[DataFrame[_BatchDetailV2], DataFrame[_BatchReceiptV2]]
+_BatchItem = tuple[
+    typing.Union[_BatchV1, _BatchV2],
+    dict[str, DataFrame[_BatchAudit]],
+]
+_BatchExport = tuple[
+    dict[str, DataFrame[_BatchExport]],
+    dict[str, DataFrame[_BatchArchive]],
+]
+
+
+def _shared_batch_tables(*, with_receipt_id: bool):
+    shared = {"marks": ["raw"]}
+    if with_receipt_id:
+        shared["receipt_id"] = "receipt-1"
+    shared["self"] = shared
+    detail = pd.DataFrame({"payload": [shared, shared]}, dtype=object)
+    audit = pd.DataFrame({"payload": [shared]}, dtype=object)
+    return shared, detail, audit
+
+
+def test_check_types_union_of_table_pairs_isolates_candidates():
+    """Union candidates holding table pairs validate against converted copies.
+
+    Each candidate starts from the pre-validation value; parsers are allowed
+    to mutate nested objects, so a failed legacy candidate must not leak its
+    ``legacy`` marker into the value validated by the current candidate (or
+    into the caller's original tables).
+    """
+    received: dict[str, typing.Any] = {}
+
+    @check_types(inplace=True)
+    def ingest(
+        batch: dict[str, _BatchItem],
+    ) -> _BatchExport:
+        detail = batch["order-1"][0][0]
+        received["detail"] = detail
+        received["audit"] = batch["order-1"][1]["audit"]
+        return {"export": detail}, {"archive": detail}
+
+    shared, detail, audit = _shared_batch_tables(with_receipt_id=True)
+    batch = {"order-1": ((detail, audit), {"audit": audit})}
+
+    exports, archives = ingest(batch)
+
+    received_detail = received["detail"]
+    first_cell = received_detail["payload"].iloc[0]
+    assert first_cell["marks"] == ["raw", "current"]
+    assert received_detail["payload"].iloc[1] == first_cell
+    assert received_detail["payload"].iloc[1] is first_cell
+    assert first_cell["self"] is first_cell
+    assert received["audit"]["payload"].iloc[0]["marks"] == [
+        "raw",
+        "audit",
+    ]
+
+    # Caller's original tables and the shared dict are untouched.
+    assert shared["marks"] == ["raw"]
+    assert detail["payload"].iloc[0]["marks"] == ["raw"]
+    assert audit["payload"].iloc[0]["marks"] == ["raw"]
+
+    export_table = exports["export"]
+    archive_table = archives["archive"]
+    export_cell = export_table["payload"].iloc[0]
+    archive_cell = archive_table["payload"].iloc[0]
+    assert export_cell["marks"] == ["raw", "current", "export"]
+    assert archive_cell["marks"] == ["raw", "current", "archive"]
+    for table in (export_table, archive_table):
+        cell = table["payload"].iloc[0]
+        assert table["payload"].iloc[1] is cell
+        assert cell["self"] is cell
+
+    # The table retained by the function was not mutated by return validation.
+    assert received_detail["payload"].iloc[0]["marks"] == [
+        "raw",
+        "current",
+    ]
+
+
+def test_check_types_union_of_table_pairs_reports_each_candidate():
+    """Both failing candidates report the batch item and receipt location."""
+    calls = []
+
+    @check_types(inplace=True)
+    def ingest(
+        batch: dict[str, _BatchItem],
+    ) -> _BatchExport:
+        calls.append(batch)
+        return {}, {}
+
+    shared, detail, audit = _shared_batch_tables(with_receipt_id=False)
+    batch = {"order-9": ((detail, audit), {"audit": audit})}
+
+    with pytest.raises(errors.SchemaErrors) as exc_info:
+        ingest(batch)
+
+    assert not calls
+    summary = exc_info.value.message["union_validation"]
+    assert summary["batch_item"] == "order-9"
+    candidates = summary["candidates"]
+    assert [candidate["candidate_version"] for candidate in candidates] == [
+        1,
+        2,
+    ]
+    for candidate in candidates:
+        receipt_failures = candidate["receipt_failures"]
+        assert receipt_failures
+        assert all(
+            failure["location"].endswith("[1]")
+            and failure["role"] == "receipt"
+            for failure in receipt_failures
+        )
+    reported_schemas = {
+        failure["schema"]
+        for candidate in candidates
+        for failure in candidate["receipt_failures"]
+    }
+    assert reported_schemas == {"_BatchReceiptV1", "_BatchReceiptV2"}
+
+    # The original data is unchanged and can be retried directly.
+    assert shared["marks"] == ["raw"]
+    assert detail["payload"].iloc[0]["marks"] == ["raw"]
+    assert audit["payload"].iloc[0]["marks"] == ["raw"]
+
+    with pytest.raises(errors.SchemaErrors):
+        ingest(batch)
+    assert not calls
+    assert shared["marks"] == ["raw"]

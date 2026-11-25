@@ -1,5 +1,6 @@
 """Decorators for integrating pandera into existing data pipelines."""
 
+import copy
 import functools
 import inspect
 import sys
@@ -674,6 +675,13 @@ def check_types(
             annotation: type,
         ) -> "_AnnotationInfoWithModelTree":
             annotation_info = AnnotationInfo(annotation)
+            if (
+                annotation_info.origin is types.UnionType
+                or annotation_info.origin in [Union, "Union"]
+            ):
+                # Normalize PEP 604 unions (``X | Y``) so both spellings take
+                # the same union-validation path.
+                annotation_info.origin = Union
             if annotation_info.is_generic_model:
                 return _AnnotationInfoWithModelTree(
                     annotation_info=annotation_info,
@@ -707,10 +715,348 @@ def check_types(
             ).items()
         }
 
+    # Path segments are ``(kind, value)`` pairs where ``kind`` is one of
+    # ``"arg"``, ``"key"``, or ``"index"``. They are threaded through the
+    # recursive validation so that candidate errors can point back at the
+    # batch item and table that failed.
+    _Path = tuple[tuple[str, Any], ...]
+
+    def _format_path(path: _Path) -> str:
+        formatted = ""
+        for kind, value in path:
+            if kind == "arg":
+                formatted += str(value)
+            elif kind == "key":
+                formatted += f"[{value!r}]"
+            else:
+                formatted += f"[{value}]"
+        return formatted or "argument"
+
+    def _jsonable(value: Any, _seen: set[int] | None = None) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            return "<recursive>"
+        _seen.add(id(value))
+        try:
+            if isinstance(value, dict):
+                return {str(k): _jsonable(v, _seen) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [_jsonable(v, _seen) for v in value]
+            try:
+                return str(value)
+            except Exception:  # pragma: no cover - defensive
+                return repr(value)
+        finally:
+            _seen.discard(id(value))
+
+    def _deepcopy_value(
+        value: Any, _memo: dict[int, Any] | None = None
+    ) -> Any:
+        """Copy a value while preserving aliasing within the copied graph.
+
+        ``DataFrame.copy(deep=True)`` and ``copy.deepcopy`` both leave object
+        cells pointing at the original Python objects. Parser callbacks mutate
+        those objects, so validating a candidate copy can corrupt the original
+        data or another candidate. This helper copies object-dtype cells
+        recursively and records them in ``_memo`` so shared references (two
+        cells pointing at the same dict) and self-references stay intact.
+        """
+        if _memo is None:
+            _memo = {}
+        value_id = id(value)
+        if value_id in _memo:
+            return _memo[value_id]
+
+        try:
+            import pandas as pd
+        except ImportError:  # pragma: no cover - pandas is a test extra
+            pd = None
+
+        if pd is not None and isinstance(value, pd.DataFrame):
+            copied = value.copy(deep=True)
+            _memo[value_id] = copied
+            for position in range(copied.shape[1]):
+                if copied.dtypes.iloc[position] != object:
+                    continue
+                copied_values = [
+                    _deepcopy_value(item, _memo)
+                    for item in value.iloc[:, position]
+                ]
+                import numpy as np
+
+                array = np.empty(len(copied_values), dtype=object)
+                array[:] = copied_values
+                copied.isetitem(position, array)
+            return copied
+
+        if pd is not None and isinstance(value, pd.Series):
+            if value.dtype != object:
+                copied = value.copy(deep=True)
+                _memo[value_id] = copied
+                return copied
+            copied_values = [_deepcopy_value(item, _memo) for item in value]
+            copied = pd.Series(
+                copied_values,
+                index=_deepcopy_value(value.index, _memo),
+                name=value.name,
+                dtype=object,
+            )
+            _memo[value_id] = copied
+            return copied
+
+        if pd is not None and isinstance(value, pd.Index):
+            copied = value.copy(deep=True)
+            _memo[value_id] = copied
+            return copied
+
+        if isinstance(value, dict):
+            copied_dict: dict[Any, Any] = {}
+            _memo[value_id] = copied_dict
+            for key, item in value.items():
+                copied_dict[_deepcopy_value(key, _memo)] = _deepcopy_value(
+                    item, _memo
+                )
+            return copied_dict
+
+        if isinstance(value, list):
+            copied_list: list[Any] = []
+            _memo[value_id] = copied_list
+            copied_list.extend(_deepcopy_value(item, _memo) for item in value)
+            return copied_list
+
+        if isinstance(value, tuple):
+            copied_items = [_deepcopy_value(item, _memo) for item in value]
+            if hasattr(value, "_fields"):  # namedtuple
+                copied = type(value)(*copied_items)
+            else:
+                copied = tuple(copied_items)
+            _memo[value_id] = copied
+            return copied
+
+        if isinstance(value, set):
+            copied_items = [_deepcopy_value(item, _memo) for item in value]
+            copied_set = set(copied_items)
+            _memo[value_id] = copied_set
+            return copied_set
+
+        try:
+            copied = copy.deepcopy(value, _memo)
+        except Exception:  # pragma: no cover - defensive
+            # If a value cannot be copied, fall back to validating it in place.
+            copied = value
+        _memo[value_id] = copied
+        return copied
+
+    def _iter_schema_errors(exc: BaseException) -> list[errors.SchemaError]:
+        if isinstance(exc, errors.SchemaErrors):
+            leaves: list[errors.SchemaError] = []
+            for schema_error in exc.schema_errors:
+                leaves.extend(_iter_schema_errors(schema_error))
+            return leaves
+        if isinstance(exc, errors.SchemaError):
+            return [exc]
+        return []
+
+    def _annotate_schema_errors(
+        exc: BaseException,
+        path: _Path,
+        schema_model: BaseModel | None,
+        schema,
+        data: Any,
+    ) -> None:
+        model_name = (
+            schema_model.__name__ if schema_model is not None else None
+        )
+        for schema_error in _iter_schema_errors(exc):
+            setattr(schema_error, "_pandera_path", path)
+            setattr(schema_error, "_pandera_model", model_name)
+            setattr(schema_error, "_pandera_model_schema", schema)
+            setattr(schema_error, "_pandera_data", data)
+
+    def _annotation_model_names(
+        node: _AnnotationInfoWithModelTree,
+    ) -> list[str]:
+        if node.dataframe_model is not None:
+            return [node.dataframe_model.__name__]
+        names: list[str] = []
+        for child in node.children or []:
+            names.extend(_annotation_model_names(child))
+        return names
+
+    def _annotation_has_model(
+        node: _AnnotationInfoWithModelTree,
+    ) -> bool:
+        if node.dataframe_model is not None:
+            return True
+        return any(
+            _annotation_has_model(child) for child in node.children or []
+        )
+
+    def _failure_positions(schema_error: errors.SchemaError) -> list[Any]:
+        failure_cases = schema_error.failure_cases
+        if failure_cases is None:
+            return []
+        values: list[Any]
+        if isinstance(failure_cases, dict):
+            values = list(failure_cases.values())
+        elif hasattr(failure_cases, "columns"):
+            columns = list(failure_cases.columns)
+            try:
+                if "index" in columns:
+                    values = list(failure_cases["index"])
+                elif "failure_case" in columns:
+                    values = list(failure_cases["failure_case"])
+                else:
+                    values = [
+                        next(iter(row.values()), None)
+                        for row in failure_cases.to_dicts()
+                    ]
+            except Exception:  # pragma: no cover - backend-specific frames
+                values = list(columns)
+        elif isinstance(failure_cases, (list, tuple, set)):
+            values = list(failure_cases)
+        else:
+            values = [failure_cases]
+        return [_jsonable(value) for value in values[:50]]
+
+    def _is_receipt_path(
+        error_path: _Path,
+        base_path: _Path,
+        candidate_node: _AnnotationInfoWithModelTree,
+    ) -> bool:
+        """Whether a failure occurred on the second table of a table pair."""
+        candidate_children = candidate_node.children or []
+        if len(candidate_children) < 2:
+            return False
+        if candidate_node.annotation_info.origin not in [tuple, "Tuple"]:
+            return False
+        prefix = base_path + (("index", 1),)
+        return (
+            len(error_path) > len(base_path)
+            and error_path[: len(prefix)] == prefix
+        )
+
+    def _candidate_failure_summary(
+        candidate_index: int,
+        candidate_node: _AnnotationInfoWithModelTree,
+        exc: BaseException,
+        path: _Path,
+    ) -> dict[str, Any]:
+        leaves = _iter_schema_errors(exc)
+        failures = []
+        if leaves:
+            for schema_error in leaves:
+                error_path = getattr(schema_error, "_pandera_path", path)
+                model_name = getattr(schema_error, "_pandera_model", None)
+                model_label = model_name or getattr(
+                    schema_error.schema, "name", None
+                )
+                is_receipt = _is_receipt_path(
+                    error_path, path, candidate_node
+                ) or (
+                    model_name is not None and "receipt" in model_name.lower()
+                )
+                failures.append(
+                    {
+                        "location": _format_path(error_path),
+                        "schema": model_label,
+                        "role": "receipt" if is_receipt else "detail",
+                        "column": schema_error.column_name,
+                        "positions": _failure_positions(schema_error),
+                        "message": str(schema_error).replace("\n", " "),
+                    }
+                )
+        else:
+            failures.append(
+                {
+                    "location": _format_path(
+                        getattr(exc, "_pandera_path", path)
+                    ),
+                    "schema": None,
+                    "role": None,
+                    "column": None,
+                    "positions": [],
+                    "message": str(exc).replace("\n", " "),
+                }
+            )
+
+        receipt_failures = [
+            failure for failure in failures if failure["role"] == "receipt"
+        ]
+        schemas = _annotation_model_names(candidate_node)
+        version_labels = [name.lower() for name in schemas]
+        return {
+            "candidate": candidate_index + 1,
+            "candidate_version": candidate_index + 1,
+            "version": version_labels,
+            "version_labels": version_labels,
+            "schemas": schemas,
+            "failures": failures,
+            "receipt_failures": receipt_failures,
+        }
+
+    def _raise_union_validation_error(
+        arg_value: Any,
+        path: _Path,
+        candidate_failures: list[dict[str, Any]],
+        all_schema_errors: list[errors.SchemaError],
+    ) -> NoReturn:
+        key_segments = [value for kind, value in path if kind == "key"]
+        summary = {
+            "batch_item": key_segments[0] if key_segments else None,
+            "batch_items": _jsonable(key_segments),
+            "argument": _format_path(path),
+            "location": _format_path(path),
+            "candidates": candidate_failures,
+        }
+
+        # Prefer constructing a regular ``SchemaErrors`` so that callers can
+        # continue to inspect the usual failure metadata.
+        exc: errors.SchemaErrors | None = None
+        if all_schema_errors:
+            first_error = all_schema_errors[0]
+            schema = getattr(first_error, "_pandera_model_schema", None)
+            data = getattr(first_error, "_pandera_data", None)
+            if schema is not None and data is not None:
+                try:
+                    exc = errors.SchemaErrors(
+                        schema=schema,
+                        schema_errors=all_schema_errors,
+                        data=data,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    exc = None
+        if exc is None:
+            exc = errors.SchemaErrors.__new__(errors.SchemaErrors)
+            exc.schema = (
+                getattr(all_schema_errors[0], "_pandera_model_schema", None)
+                if all_schema_errors
+                else None
+            )
+            exc.schema_errors = all_schema_errors
+            exc.data = arg_value
+            exc.failure_cases = None
+            exc.error_counts = {}
+
+        if isinstance(exc.message, dict):
+            message = {"union_validation": summary, **exc.message}
+        else:
+            message = {
+                "union_validation": summary,
+                "message": exc.message,
+            }
+        exc.message = message
+        exc.args = (message,)
+        raise exc
+
     def _check_arg_value_against_model(
         arg_value: Any,
         schema_model: BaseModel | None,
         annotation_info: AnnotationInfo,
+        path: _Path = (),
     ) -> Any:
         if schema_model is None or (
             annotation_info.optional and arg_value is None
@@ -737,15 +1083,19 @@ def check_types(
         ):
             return arg_value
 
-        arg_value = schema.validate(
-            arg_value,
-            head,
-            tail,
-            sample,
-            random_state,
-            lazy,
-            inplace,
-        )
+        try:
+            arg_value = schema.validate(
+                arg_value,
+                head,
+                tail,
+                sample,
+                random_state,
+                lazy,
+                inplace,
+            )
+        except (errors.SchemaError, errors.SchemaErrors) as exc:
+            _annotate_schema_errors(exc, path, schema_model, schema, arg_value)
+            raise
 
         to_format = getattr(config, "to_format", None) if config else None
         if data_container_type and to_format:
@@ -756,31 +1106,47 @@ def check_types(
     def _check_arg_value_against_union(
         arg_value: Any,
         union_child_nodes: list[_AnnotationInfoWithModelTree],
+        path: _Path = (),
     ) -> Any:
-        # Check if the arg value matches any of the children
-        schema_errors = []
-        for child in union_child_nodes:
+        # Every candidate starts from the value as it was before this round of
+        # validation. Composite candidates include parsers that mutate nested
+        # objects, so each attempt needs an isolated copy: a failed candidate
+        # must not leak mutations into the original data or into later
+        # candidates.
+        candidate_failures: list[dict[str, Any]] = []
+        all_schema_errors: list[errors.SchemaError] = []
+
+        for candidate_index, child in enumerate(union_child_nodes):
+            if not _annotation_has_model(child):
+                # Plain Python alternatives (e.g. ``int | str``) keep the
+                # established pass-through behavior.
+                return arg_value
+            candidate_value = _deepcopy_value(arg_value)
             try:
-                return _check_arg_value_against_model(
-                    arg_value, child.dataframe_model, child.annotation_info
+                return _check_arg_value(
+                    candidate_value, child, path=path, isolated=True
                 )
-            except errors.SchemaError as e:
-                schema_errors.append(e)
-            except errors.SchemaErrors as e:
-                schema_errors.extend(e.schema_errors)
-        if schema_errors:
-            raise errors.SchemaErrors(
-                schema=child.dataframe_model.to_schema()
-                if child.dataframe_model
-                else None,
-                schema_errors=schema_errors,
-                data=arg_value,
+            except (errors.SchemaError, errors.SchemaErrors) as exc:
+                all_schema_errors.extend(_iter_schema_errors(exc))
+                candidate_failures.append(
+                    _candidate_failure_summary(
+                        candidate_index, child, exc, path
+                    )
+                )
+
+        if candidate_failures:
+            _raise_union_validation_error(
+                arg_value, path, candidate_failures, all_schema_errors
             )
+
+        # An empty union (or one without schema models) is a no-op.
         return arg_value
 
     def _check_arg_value_against_tuple(
         arg_value: Any,
         tuple_child_nodes: list[_AnnotationInfoWithModelTree],
+        path: _Path = (),
+        isolated: bool = False,
     ) -> Any:
         # Pass through if not a tuple. This handles:
         # 1. None values in union types like tuple[X, Y] | None
@@ -789,16 +1155,38 @@ def check_types(
         if not isinstance(arg_value, tuple):
             return arg_value
 
+        converted: list[Any] = []
+        changed = False
         # Each of the children should match their respective schema
-        for child_arg_value, child_annotation_model_tree in zip(
-            arg_value, tuple_child_nodes
+        for index, (child_arg_value, child_annotation_model_tree) in enumerate(
+            zip(arg_value, tuple_child_nodes)
         ):
-            _check_arg_value(child_arg_value, child_annotation_model_tree)
-        return arg_value
+            new_value = _check_arg_value(
+                child_arg_value,
+                child_annotation_model_tree,
+                path=path + (("index", index),),
+                copy_value=True,
+                isolated=isolated,
+            )
+            converted.append(new_value)
+            changed = changed or new_value is not child_arg_value
+
+        # Preserve trailing tuple entries that have no matching annotation.
+        if len(converted) < len(arg_value):
+            converted.extend(arg_value[len(converted) :])
+            changed = True
+
+        if not changed:
+            return arg_value
+        if hasattr(arg_value, "_fields"):  # namedtuple
+            return type(arg_value)(*converted)
+        return tuple(converted)
 
     def _check_arg_value_against_list(
         arg_value: Any,
         list_child_node: _AnnotationInfoWithModelTree | None,
+        path: _Path = (),
+        isolated: bool = False,
     ) -> Any:
         if not list_child_node:
             # List of no specific type
@@ -812,13 +1200,28 @@ def check_types(
             return arg_value
 
         # Check all children conform to the schema
-        for x in arg_value:
-            _check_arg_value(x, list_child_node)
-        return arg_value
+        converted = [
+            _check_arg_value(
+                item,
+                list_child_node,
+                path=path + (("index", index),),
+                copy_value=True,
+                isolated=isolated,
+            )
+            for index, item in enumerate(arg_value)
+        ]
+        if all(
+            new_item is old_item
+            for new_item, old_item in zip(converted, arg_value)
+        ):
+            return arg_value
+        return converted
 
     def _check_arg_value_against_dict(
         arg_value: Any,
         dict_child_node: _AnnotationInfoWithModelTree | None,
+        path: _Path = (),
+        isolated: bool = False,
     ) -> Any:
         if not dict_child_node:
             # Dict of no specific value type
@@ -832,38 +1235,76 @@ def check_types(
             return arg_value
 
         # Check all children conform to the schema
-        for _, x in arg_value.items():
-            _check_arg_value(x, dict_child_node)
-        return arg_value
+        converted: dict[Any, Any] = {}
+        changed = False
+        for key, item in arg_value.items():
+            new_value = _check_arg_value(
+                item,
+                dict_child_node,
+                path=path + (("key", key),),
+                copy_value=True,
+                isolated=isolated,
+            )
+            converted[key] = new_value
+            changed = changed or new_value is not item
+        if not changed:
+            return arg_value
+        return converted
 
     def _check_arg_value(
         arg_value: Any,
         annotation_model_tree: _AnnotationInfoWithModelTree,
+        path: _Path = (),
+        copy_value: bool = False,
+        isolated: bool = False,
     ) -> Any:
+        if (
+            copy_value
+            and not isolated
+            and _annotation_has_model(annotation_model_tree)
+        ):
+            # Containers hold independent table references: validating each
+            # child on a copy keeps the caller's original objects untouched
+            # and prevents one table's parsers from mutating a sibling. When
+            # the value is already an isolated copy (a union candidate),
+            # deeper copies would break references shared by the tables in
+            # the candidate.
+            arg_value = _deepcopy_value(arg_value)
+            isolated = True
         if annotation_model_tree.annotation_info.origin == Union:
             return _check_arg_value_against_union(
-                arg_value, annotation_model_tree.children or []
+                arg_value, annotation_model_tree.children or [], path=path
             )
         # NOTE: We use string literals for Tuple, List, and Dict here to prevent
         #       pyupgrade from (incorrectly) converting them to tuple, list, and dict.
         #       This is important because we want to match both list and List, for example.
         elif annotation_model_tree.annotation_info.origin in [tuple, "Tuple"]:
             return _check_arg_value_against_tuple(
-                arg_value, annotation_model_tree.children or []
+                arg_value,
+                annotation_model_tree.children or [],
+                path=path,
+                isolated=isolated,
             )
         elif annotation_model_tree.annotation_info.origin in [list, "List"]:
             return _check_arg_value_against_list(
-                arg_value, annotation_model_tree.child_at_index(0)
+                arg_value,
+                annotation_model_tree.child_at_index(0),
+                path=path,
+                isolated=isolated,
             )
         elif annotation_model_tree.annotation_info.origin in [dict, "Dict"]:
             return _check_arg_value_against_dict(
-                arg_value, annotation_model_tree.child_at_index(1)
+                arg_value,
+                annotation_model_tree.child_at_index(1),
+                path=path,
+                isolated=isolated,
             )
         else:
             return _check_arg_value_against_model(
                 arg_value,
                 annotation_model_tree.dataframe_model,
                 annotation_model_tree.annotation_info,
+                path=path,
             )
 
     def _check_arg(arg_name: str, arg_value: Any) -> Any:
@@ -878,7 +1319,11 @@ def check_types(
 
         annotation_model_tree = annotated_schema_models[arg_name]
 
-        return _check_arg_value(arg_value, annotation_model_tree)
+        return _check_arg_value(
+            arg_value,
+            annotation_model_tree,
+            path=(("arg", arg_name),),
+        )
 
     sig = inspect.signature(wrapped)
 
