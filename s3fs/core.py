@@ -33,6 +33,7 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
+from s3fs.resumable import ResumableDownload
 from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
@@ -1663,9 +1664,25 @@ class S3FileSystem(AsyncFileSystem):
         version_id=None,
         chunksize=None,
         max_concurrency=None,
+        transfer_id=None,
+        takeover=False,
         **kwargs,
     ):
-        """Download a complete object with non-range GetObject request options."""
+        """Download a complete object with non-range GetObject request options.
+
+        Parameters
+        ----------
+        transfer_id : hashable, optional
+            Enable resumable, publish-atomic mode. The same identifier resumes a
+            partially finished download across processes, while a different
+            identifier takes over the destination and permanently fences the
+            previous task off. When omitted, the object is downloaded directly
+            to ``lpath`` as before.
+        takeover : bool, optional
+            Must be True when ``transfer_id`` differs from the transfer that
+            currently owns ``lpath``. Once accepted, the previous owner can no
+            longer publish, even if it is still running.
+        """
         for option in ("Range", "PartNumber"):
             if option in kwargs or option in self.s3_additional_kwargs:
                 raise ValueError(
@@ -1675,6 +1692,21 @@ class S3FileSystem(AsyncFileSystem):
         if os.path.isdir(lpath):
             return
         bucket, key, vers = self.split_path(rpath)
+
+        if transfer_id is not None:
+            await ResumableDownload(
+                self,
+                rpath,
+                lpath,
+                transfer_id,
+                chunksize=chunksize,
+                max_concurrency=max_concurrency,
+                version_id=version_id or vers,
+                callback=callback,
+                extra_kwargs=kwargs,
+                takeover=takeover,
+            ).run()
+            return
 
         async def _open_file(range: int):
             kw = {**self.req_kw, **kwargs}

@@ -4,6 +4,7 @@ Changelog
 Unreleased
 ----------
 
+- Add an optional resumable, publish-atomic mode to ``get_file`` via ``transfer_id`` (with ``takeover`` for a new task to seize a destination); downloads resume across processes from a local sidecar and only replace the target once complete.
 - Preserve exclusive-create conditions and file options when committing empty files.
 - Forward per-call S3 request options through single-object and batched deletes.
 - Delete the requested object version in ``rm_file`` when the path includes one.

@@ -397,6 +397,50 @@ In order for this to function the user must have the necessary IAM permissions t
 a GetObjectVersion
 
 
+Resumable, atomic downloads
+---------------------------
+
+``get_file`` normally streams an object straight into the local path. Passing a
+``transfer_id`` instead switches it to a resumable, publish-atomic mode suitable
+for schedulers that may be killed mid-download and restarted in another process.
+
+.. code-block:: python
+
+   # First attempt, and any later restart using the same task number:
+   s3.get_file("bucket/incoming/daily.dat", "ready/daily.dat", transfer_id=42)
+
+While the transfer runs, downloaded bytes accumulate in a sidecar directory
+named ``ready/daily.dat.s3dl`` rather than in the destination. A restart with
+the same ``transfer_id`` reuses the bytes already on disk and fetches only the
+missing byte ranges, so the chunk size may change between attempts. The
+destination itself is replaced with an atomic rename only once every byte is
+available, which means a reader that reopens ``ready/daily.dat`` always sees
+either the previous complete file or the new complete file, never a partial one.
+
+Once a transfer has published, repeating the call with the same number is
+idempotent: it confirms the publication and returns without downloading again.
+
+A different task can seize a destination by also passing ``takeover=True``:
+
+.. code-block:: python
+
+   s3.get_file("bucket/incoming/daily.dat", "ready/daily.dat",
+               transfer_id=99, takeover=True)
+
+After the takeover is accepted, the previous ``transfer_id`` is fenced off: even
+if that task is still alive, its next attempt raises
+:class:`~s3fs.resumable.TransferSuperseded` and it can no longer publish. A
+caller that reuses an already-owned destination without ``takeover=True`` is
+rejected the same way.
+
+The transfer pins the object version captured at start. If that version later
+disappears (for example, a bucket without versioning overwrites the object
+before a partial download is finished), a resume raises
+:class:`~s3fs.resumable.TransferUnrecoverable` and leaves the previous local file
+untouched. Calls that omit ``transfer_id`` keep the original direct-download
+behavior and create no sidecar directory.
+
+
 Contents
 ========
 
