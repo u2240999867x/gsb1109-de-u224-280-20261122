@@ -36,6 +36,8 @@ _T = TypeVar("_T", bound=Any)
 
 _C = TypeVar("_C", bound=Callable[..., Any])
 
+_absent_token: Any = object()
+
 
 class _ModuleClsMeta(type):
     def __setattr__(cls, key: str, value: Callable[..., Any]) -> None:
@@ -60,6 +62,10 @@ class ModuleClsProxy(metaclass=_ModuleClsMeta):
         ],
     ] = collections.defaultdict(lambda: (set(), []))
 
+    _proxy_save_stack: list[
+        tuple[MutableMapping[str, Any], Any, dict[str, Any]]
+    ]
+
     @classmethod
     def _update_module_proxies(cls, name: str) -> None:
         attr_names, modules = cls._setups[cls]
@@ -68,17 +74,49 @@ class ModuleClsProxy(metaclass=_ModuleClsMeta):
 
     def _install_proxy(self) -> None:
         attr_names, modules = self._setups[self.__class__]
+        try:
+            stack = self._proxy_save_stack
+        except AttributeError:
+            stack = self._proxy_save_stack = []
         for globals_, locals_ in modules:
+            # save the current module state so that a nested proxy
+            # installation can be removed again without disturbing
+            # the proxy that was previously in place, e.g. when an
+            # outer migration environment invokes another environment
+            # within the same operation.
+            stack.append(
+                (
+                    globals_,
+                    globals_.get("_proxy"),
+                    {
+                        attr_name: globals_.get(attr_name, _absent_token)
+                        for attr_name in attr_names
+                    },
+                )
+            )
             globals_["_proxy"] = self
             for attr_name in attr_names:
                 globals_[attr_name] = getattr(self, attr_name)
 
     def _remove_proxy(self) -> None:
         attr_names, modules = self._setups[self.__class__]
-        for globals_, locals_ in modules:
-            globals_["_proxy"] = None
+        stack = getattr(self, "_proxy_save_stack", None)
+        if not stack:
+            # unpaired removal; no saved state to restore
+            for globals_, locals_ in modules:
+                globals_["_proxy"] = None
+                for attr_name in attr_names:
+                    globals_.pop(attr_name, None)
+            return
+        for _ in modules:
+            globals_, prev_proxy, prev_attrs = stack.pop()
+            globals_["_proxy"] = prev_proxy
             for attr_name in attr_names:
-                del globals_[attr_name]
+                prev_attr = prev_attrs[attr_name]
+                if prev_attr is _absent_token:
+                    globals_.pop(attr_name, None)
+                else:
+                    globals_[attr_name] = prev_attr
 
     @classmethod
     def create_module_class_proxy(

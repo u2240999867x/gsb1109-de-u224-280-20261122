@@ -233,8 +233,10 @@ class AbstractOperations(util.ModuleClsProxy):
     ) -> Iterator[Operations]:
         op = Operations(migration_context)
         op._install_proxy()
-        yield op
-        op._remove_proxy()
+        try:
+            yield op
+        finally:
+            op._remove_proxy()
 
     @contextmanager
     def batch_alter_table(

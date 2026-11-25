@@ -185,6 +185,7 @@ class MigrationContext:
         self.version_table_schema = version_table_schema = opts.get(
             "version_table_schema", None
         )
+        self.version_table_pipeline = opts.get("version_table_pipeline", None)
 
         self._start_from_rev: str | None = opts.get("starting_rev")
         self.impl = ddl.DefaultImpl.get_by_dialect(dialect)(
@@ -200,6 +201,7 @@ class MigrationContext:
             version_table=version_table,
             version_table_schema=version_table_schema,
             version_table_pk=opts.get("version_table_pk", True),
+            version_table_pipeline=self.version_table_pipeline,
         )
 
         log.info("Context impl %s.", self.impl.__class__.__name__)
@@ -524,12 +526,12 @@ class MigrationContext:
             if not self._has_version_table():
                 return ()
         assert self.connection is not None
-        return tuple(
-            row[0]
-            for row in self.connection.execute(
-                select(self._version.c.version_num)
+        stmt = select(self._version.c.version_num)
+        if self.version_table_pipeline is not None:
+            stmt = stmt.where(
+                self._version.c.pipeline == self.version_table_pipeline
             )
-        )
+        return tuple(row[0] for row in self.connection.execute(stmt))
 
     def _ensure_version_table(self, purge: bool = False) -> None:
         with sqla_compat._ensure_scope_for_ddl(self.connection):
@@ -537,7 +539,13 @@ class MigrationContext:
             self._version.create(self.connection, checkfirst=True)
             if purge:
                 assert self.connection is not None
-                self.connection.execute(self._version.delete())
+                stmt = self._version.delete()
+                if self.version_table_pipeline is not None:
+                    stmt = stmt.where(
+                        self._version.c.pipeline
+                        == self.version_table_pipeline
+                    )
+                self.connection.execute(stmt)
 
     def _has_version_table(self) -> bool:
         assert self.connection is not None
@@ -703,13 +711,29 @@ class HeadMaintainer:
         self.context = context
         self.heads = set(heads)
 
+    def _pipeline_values(self) -> dict[str, Any]:
+        pipeline = self.context.version_table_pipeline
+        if pipeline is None:
+            return {}
+        return {"pipeline": literal_column("'%s'" % pipeline)}
+
+    def _pipeline_criteria(self) -> list[Any]:
+        pipeline = self.context.version_table_pipeline
+        if pipeline is None:
+            return []
+        return [
+            self.context._version.c.pipeline
+            == literal_column("'%s'" % pipeline)
+        ]
+
     def _insert_version(self, version: str) -> None:
         assert version not in self.heads
         self.heads.add(version)
 
         self.context.impl._exec(
             self.context._version.insert().values(
-                version_num=literal_column("'%s'" % version)
+                version_num=literal_column("'%s'" % version),
+                **self._pipeline_values(),
             )
         )
 
@@ -717,10 +741,12 @@ class HeadMaintainer:
         self.heads.remove(version)
 
         ret = self.context.impl._exec(
-            self.context._version.delete().where(
+            self.context._version.delete()
+            .where(
                 self.context._version.c.version_num
                 == literal_column("'%s'" % version)
             )
+            .where(*self._pipeline_criteria())
         )
 
         if (
@@ -748,6 +774,7 @@ class HeadMaintainer:
                 self.context._version.c.version_num
                 == literal_column("'%s'" % from_)
             )
+            .where(*self._pipeline_criteria())
         )
 
         if (

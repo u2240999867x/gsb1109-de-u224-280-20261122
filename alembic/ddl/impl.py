@@ -150,6 +150,7 @@ class DefaultImpl(metaclass=ImplMeta):
         version_table: str,
         version_table_schema: str | None,
         version_table_pk: bool,
+        version_table_pipeline: str | None = None,
         **kw: Any,
     ) -> Table:
         """Generate a :class:`.Table` object which will be used as the
@@ -160,19 +161,32 @@ class DefaultImpl(metaclass=ImplMeta):
         be named based on the ``version_table`` parameter and contains
         at least a single string-holding column named ``version_num``.
 
+        :param version_table_pipeline: if given, the table also includes
+         a string-holding column named ``pipeline`` which is part of the
+         primary key, allowing several independent migration environments
+         to share a single version table, each reading and writing only
+         the rows that carry its own pipeline identifier.
+
         .. versionadded:: 1.14
 
         """
+        pipeline_cols: list[Column[Any]] = []
+        if version_table_pipeline is not None:
+            pipeline_cols.append(
+                Column("pipeline", String(32), nullable=False)
+            )
         vt = Table(
             version_table,
             MetaData(),
+            *pipeline_cols,
             Column("version_num", String(32), nullable=False),
             schema=version_table_schema,
         )
         if version_table_pk:
             vt.append_constraint(
                 PrimaryKeyConstraint(
-                    "version_num", name=f"{version_table}_pkc"
+                    *([c.name for c in pipeline_cols] + ["version_num"]),
+                    name=f"{version_table}_pkc",
                 )
             )
 

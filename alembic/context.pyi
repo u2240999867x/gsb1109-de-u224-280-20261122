@@ -305,6 +305,15 @@ def configure(
      only takes effect when the table is first created.
      Defaults to True; setting to False should not be necessary and is
      here for backwards compatibility reasons.
+    :param version_table_pipeline: optional string identifier for this
+     migration environment, recorded in an additional ``pipeline``
+     column of the Alembic version table.  When set, the version table
+     is expected to use a composite primary key of
+     ``(pipeline, version_num)``, and all reads and writes of version
+     rows are scoped to the given identifier.  This allows several
+     independent migration environments (e.g. separate pipelines) to
+     share a single, pre-existing version table without interfering
+     with each other's rows.
     :param on_version_apply: a callable or collection of callables to be
         run for each migration step.
         The callables will be run in the order they are given, once for
