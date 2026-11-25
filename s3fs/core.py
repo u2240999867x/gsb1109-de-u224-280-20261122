@@ -434,6 +434,7 @@ class S3FileSystem(AsyncFileSystem):
         )  # False when the caller injected a session
         self.fixed_upload_size = fixed_upload_size
         self.local_expiry_check = local_expiry_check
+        self._version_cleanup = None
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         self.max_concurrency = max_concurrency
@@ -448,6 +449,20 @@ class S3FileSystem(AsyncFileSystem):
 
     def _filter_kwargs(self, s3_method, kwargs):
         return self._kwargs_helper.filter_dict(s3_method.__name__, kwargs)
+
+    def _get_version_cleanup(self):
+        """Return the version-cleanup coordinator bound to this filesystem.
+
+        The coordinator holds replay reservations across work orders handled
+        by one filesystem instance, so a duplicate work order cannot bypass
+        an outstanding delete.  It is created lazily so ordinary filesystem
+        use has no additional state.
+        """
+        from s3fs.cleanup import VersionCleanup
+
+        if self._version_cleanup is None:
+            self._version_cleanup = VersionCleanup(self)
+        return self._version_cleanup
 
     async def get_s3(self, bucket=None):
         if self.cache_regions and bucket is not None:
@@ -2482,6 +2497,116 @@ class S3FileSystem(AsyncFileSystem):
             for p in paths
         ]
         return sum(out, [])
+
+    async def _cleanup(self, ledger, work_orders, merge_ledger=False):
+        """Remove exact object versions without breaking replay batches.
+
+        Parameters
+        ----------
+        ledger : dict, list, or path
+            Replay ledger.  Each batch entry names the registered copies as
+            version-qualified S3 targets, for example
+            ``test/east/raw.csv?versionId=A1``.  A batch may be a dict such as
+            ``{"name": "east", "copies": [...]}`` or a mapping of batch name
+            to copies.  JSON file paths (including NDJSON) are accepted too.
+        work_orders : iterable, dict, or path
+            Work orders to process.  Each order has a ``line`` (the original
+            source line used in receipts) and ``targets`` (the exact versions
+            to remove).  A bare list of targets is also accepted.
+        merge_ledger : bool
+            If True, merge these batches into batches registered by earlier
+            calls instead of replacing them.
+
+        Returns
+        -------
+        CleanupReport
+            A list of per-target receipts.  ``report["lines"]`` groups them by
+            work-order line, and ``report["summary"]`` counts statuses.
+
+        Notes
+        -----
+        Only exact versions explicitly present in the ledger are eligible.
+        A target referenced by any batch whose other registered copies are
+        unavailable is returned as ``blocked`` and is not deleted.  A second
+        work order for an in-flight target receives ``pending`` and does not
+        issue another delete.  Ambiguous outcomes remain pending until
+        :meth:`cleanup_status` verifies them.
+        """
+        return await self._get_version_cleanup().submit(
+            ledger, work_orders, merge_ledger=merge_ledger
+        )
+
+    def _public_cleanup(self, ledger, work_orders, merge_ledger=False):
+        if getattr(self, "asynchronous", False):
+            return self._cleanup(ledger, work_orders, merge_ledger=merge_ledger)
+        return sync(
+            self.loop,
+            self._cleanup,
+            ledger,
+            work_orders,
+            merge_ledger=merge_ledger,
+        )
+
+    cleanup = _public_cleanup
+
+    def _public_cleanup_status(
+        self, ledger=None, work_orders=None, targets=None, confirm=True
+    ):
+        if getattr(self, "asynchronous", False):
+            return self._cleanup_status(
+                ledger,
+                work_orders=work_orders,
+                targets=targets,
+                confirm=confirm,
+            )
+        return sync(
+            self.loop,
+            self._cleanup_status,
+            ledger,
+            work_orders=work_orders,
+            targets=targets,
+            confirm=confirm,
+        )
+
+    cleanup_status = _public_cleanup_status
+    submit_cleanup = _public_cleanup
+    cleanup_versions = _public_cleanup
+    cleanup_report = _public_cleanup
+
+    async def _cleanup_status(
+        self, ledger=None, work_orders=None, targets=None, confirm=True
+    ):
+        """Inspect replay coverage and pending version removals.
+
+        Parameters
+        ----------
+        ledger : dict, list, or path, optional
+            Updated replay ledger to install before checking.
+        work_orders : iterable, dict, or path, optional
+            Work orders whose lines should be included in the grouped view.
+        targets : iterable, optional
+            Restrict the answer to these targets.  By default every ledger
+            copy and every target seen by this process is reported.
+        confirm : bool
+            When True, probe unresolved versions by exact ``HeadObject`` so a
+            completed delete is reported as ``deleted``.  A readable version
+            with an unconfirmed delete remains ``pending``: it is not treated
+            as a safe replay copy while a late delete may still run.
+
+        Returns
+        -------
+        CleanupStatus
+            Per-target records with ``status``, ``protected_batches``,
+            ``waiting_for`` and replay ``coverage``.
+        """
+        return await self._get_version_cleanup().status(
+            ledger=ledger,
+            work_orders=work_orders,
+            targets=targets,
+            confirm=confirm,
+        )
+
+    cleanup_status = sync_wrapper(_cleanup_status)
 
     async def _is_bucket_versioned(self, bucket):
         return (await self._call_s3("get_bucket_versioning", Bucket=bucket)).get(

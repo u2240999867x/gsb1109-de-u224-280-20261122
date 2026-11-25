@@ -25,6 +25,7 @@ setup(
     license="BSD",
     keywords="s3, boto",
     packages=["s3fs"],
+    entry_points={"console_scripts": ["s3fs-cleanup = s3fs.cleanup_cli:main"]},
     python_requires=">= 3.11",
     install_requires=[open("requirements.txt").read().strip().split("\n")],
     long_description="README.md",

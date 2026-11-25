@@ -6,6 +6,8 @@ API
 .. autosummary::
    S3FileSystem
    S3FileSystem.cat
+   S3FileSystem.cleanup
+   S3FileSystem.cleanup_status
    S3FileSystem.du
    S3FileSystem.exists
    S3FileSystem.find
@@ -42,6 +44,18 @@ API
 .. autoclass:: S3FileSystem
    :members:
    :inherited-members:
+
+.. currentmodule:: s3fs.cleanup
+
+.. autoclass:: VersionCleanup
+
+.. autoclass:: CleanupReport
+
+.. autoclass:: CleanupStatus
+
+.. autofunction:: parse_target
+
+.. currentmodule:: s3fs.core
 
 .. autoclass:: S3File
    :members:

@@ -4,6 +4,9 @@ Changelog
 Unreleased
 ----------
 
+- Add replay-safe version cleanup with ``cleanup`` and ``cleanup_status``.
+  Exact versions are removed only while every replay batch retains another
+  registered readable copy; duplicate and ambiguous work orders stay pending.
 - Preserve exclusive-create conditions and file options when committing empty files.
 - Forward per-call S3 request options through single-object and batched deletes.
 - Delete the requested object version in ``rm_file`` when the path includes one.
