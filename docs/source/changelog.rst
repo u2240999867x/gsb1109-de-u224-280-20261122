@@ -4,6 +4,13 @@ Changelog
 Unreleased
 ----------
 
+- Add path-scoped request rules (``request_scope``/``request_rules``) for batch
+  reads: per-source requester-pays, bucket-owner verification, and
+  HEAD/LIST/GET-specific conventions, applied consistently to directory
+  discovery, object/directory detection, local downloads, and file handles.
+- Reject owner constraints whose required option the current client does not
+  support before the transfer starts, and never treat a cached listing or a
+  permission fallback as a verified owner.
 - Preserve exclusive-create conditions and file options when committing empty files.
 - Forward per-call S3 request options through single-object and batched deletes.
 - Delete the requested object version in ``rm_file`` when the path includes one.

@@ -9,6 +9,8 @@ import os
 import socket
 import weakref
 import re
+from contextvars import ContextVar
+from contextlib import contextmanager
 
 from urllib3.exceptions import IncompleteRead
 
@@ -24,6 +26,13 @@ from fsspec.asyn import (
     _run_coros_in_chunks,
 )
 from fsspec.callbacks import _DEFAULT_CALLBACK
+from fsspec.implementations.local import (
+    LocalFileSystem,
+    make_path_posix,
+    trailing_sep,
+)
+from fsspec.utils import check_contained, is_exception, other_paths
+from glob import has_magic
 
 import aiobotocore
 import botocore
@@ -33,7 +42,16 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
-from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
+from s3fs.utils import (
+    S3BucketRegionCache,
+    ParamKwargsHelper,
+    RequestScope,
+    UnsupportedRequestOption,
+    _apply_shortcuts,
+    _split_required,
+    _get_brange,
+    FileExpired,
+)
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
 # aiobotocore, we guard the import here in case this dependency is replaced in a future version
@@ -70,6 +88,10 @@ S3_RETRYABLE_ERRORS = (
 )
 
 MAX_UPLOAD_PARTS = 10_000  # maximum number of parts for S3 multipart upload
+
+# Per-call scope used to carry request rules through discovery and transfer
+# helpers.  A ContextVar keeps concurrent batches independent.
+_ACTIVE_SCOPE = ContextVar("s3fs_active_scope", default=None)
 
 if ClientPayloadError is not None:
     S3_RETRYABLE_ERRORS += (ClientPayloadError,)
@@ -340,6 +362,20 @@ class S3FileSystem(AsyncFileSystem):
         Perform expiry checks when using range reads locally instead of having the
         server perform them. VAST S3 requires local_expiry_check=True because
         it doesn't support the `If-Match` http header used for expiry check on the server.
+    request_scope : RequestScope or mapping (None)
+        Path-scoped S3 request options.  Rules are matched by bucket/key prefix
+        and are applied to directory discovery, object/directory detection,
+        downloads, and file handles opened from this instance.  A ``None``
+        option value turns an inherited option off for matching paths (for
+        example ``{"public": {"RequestPayer": None}}`` for a public replica
+        that should not use requester pays).  ``ExpectedBucketOwner`` (or the
+        ``RequiredOwner`` shortcut) is treated as a verification: cached
+        listings are bypassed and the option must be supported by the current
+        client, otherwise :class:`~s3fs.utils.UnsupportedRequestOption` is
+        raised before the transfer.  Use the ``operations`` key to give HEAD,
+        LIST, and GET their own conventions; see :class:`~s3fs.utils.RequestScope`.
+    request_rules : RequestScope or mapping (None)
+        Alias for ``request_scope``.
 
     The following parameters are passed on to fsspec:
 
@@ -390,6 +426,8 @@ class S3FileSystem(AsyncFileSystem):
         max_concurrency=10,
         fixed_upload_size: bool = False,
         local_expiry_check: bool = False,
+        request_scope=None,
+        request_rules=None,
         **kwargs,
     ):
         if key and username:
@@ -423,6 +461,13 @@ class S3FileSystem(AsyncFileSystem):
         self.config_kwargs = config_kwargs or {}
         self.requester_pays = requester_pays
         self.req_kw = {"RequestPayer": "requester"} if requester_pays else {}
+        if request_rules is not None:
+            request_scope = request_rules if request_scope is None else request_scope
+        self.request_scope = (
+            request_scope
+            if isinstance(request_scope, RequestScope)
+            else RequestScope(request_scope)
+        )
         self.s3_additional_kwargs = s3_additional_kwargs or {}
         self.use_ssl = use_ssl
         self.cache_regions = cache_regions
@@ -447,7 +492,7 @@ class S3FileSystem(AsyncFileSystem):
         return self._s3
 
     def _filter_kwargs(self, s3_method, kwargs):
-        return self._kwargs_helper.filter_dict(s3_method.__name__, kwargs)
+        return self._kwargs_helper.filter_dict(s3_method, kwargs)
 
     async def get_s3(self, bucket=None):
         if self.cache_regions and bucket is not None:
@@ -455,14 +500,145 @@ class S3FileSystem(AsyncFileSystem):
         else:
             return self._s3
 
+    @staticmethod
+    def _scope_path(bucket=None, key=None, prefix=None):
+        """Build the bucket/key form used to look up scope rules."""
+        if bucket is None:
+            return None
+        if key is None:
+            key = prefix
+        if key:
+            return f"{bucket}/{key}"
+        return bucket
+
+    def _resolve_scope_options(self, path, request_scope=None, operation=None):
+        """Merge filesystem-wide and per-call scope rules for ``path``."""
+        if path is None:
+            options, required = {}, set()
+        else:
+            options, required = self._scope_options_for(path, operation)
+        if request_scope is not None:
+            extra, extra_required = self._call_scope_options(
+                path, request_scope, operation
+            )
+            options = {**options, **extra}
+            required = required | extra_required
+        return options, required
+
+    def _request_options_for(
+        self,
+        bucket,
+        key,
+        *,
+        request_scope=None,
+        requester_pays=None,
+        kwargs=None,
+        operation=None,
+    ):
+        """Resolve the request-wide and path-scoped options for one request.
+
+        Returns ``(options, required)`` where ``required`` lists the option
+        names that must be accepted by the operation model.  Options whose
+        value is ``None`` are retained as an explicit "do not send" marker;
+        the request layer uses them to suppress a broader default such as
+        ``RequestPayer``.
+        """
+        path = self._scope_path(bucket, key)
+        options, required = self._resolve_scope_options(
+            path, request_scope, operation
+        )
+        merged = {**self.req_kw, **options, **(kwargs or {})}
+        if requester_pays is not None:
+            merged["RequestPayer"] = "requester" if requester_pays else None
+        # ``None`` is retained as an explicit "do not send" marker; it is
+        # dropped after merging in ``_get_s3_method_kwargs`` so that it can
+        # suppress a broader default.
+        required = {name for name in required if merged.get(name) is not None}
+        return merged, required
+
+    def _scope_requires_owner(self, path, operation=None):
+        """Whether ``path`` has a required bucket-owner constraint."""
+        if path is None:
+            return False
+        options, required = self._resolve_scope_options(
+            path, operation=operation
+        )
+        return "ExpectedBucketOwner" in options and "ExpectedBucketOwner" in required
+
+    def _scope_required_for_method(self, path, method):
+        """Required option names for ``path`` when using ``method``."""
+        if path is None:
+            return set()
+        options, required = self._resolve_scope_options(
+            path, operation=method
+        )
+        return {name for name in required if options.get(name) is not None}
+
+    def _scope_options_for(self, path, operation=None):
+        """Options and required names for a filesystem-level scope path."""
+        if path is None:
+            return {}, set()
+        options, required = self.request_scope.options_for(path, operation)
+        active = _ACTIVE_SCOPE.get()
+        if active is not None:
+            extra_options, extra_required = active.options_for(path, operation)
+            options = {**options, **extra_options}
+            required = required | extra_required
+        return options, required
+
+    @staticmethod
+    def _as_scope(scope):
+        if scope is None:
+            return None
+        if isinstance(scope, RequestScope):
+            return scope
+        return RequestScope(scope)
+
+    @contextmanager
+    def _scope_context(self, request_scope=None):
+        """Make a per-call scope visible to helpers spawned for one batch."""
+        scope = self._as_scope(request_scope)
+        if scope is None:
+            yield
+            return
+        token = _ACTIVE_SCOPE.set(scope)
+        try:
+            yield
+        finally:
+            _ACTIVE_SCOPE.reset(token)
+
+    def _call_scope_options(self, path, request_scope=None, operation=None):
+        """Options/required names contributed by a per-call scope."""
+        scope = self._as_scope(request_scope)
+        if scope is None:
+            return {}, set()
+        return scope.options_for(path, operation)
+
+    async def _ensure_options_supported(self, method, required, bucket=None):
+        """Fail before a transfer if a required option is unsupported.
+
+        This deliberately consults the *current* client, so replacing the
+        client (or refreshing the session) changes which request options are
+        accepted instead of reusing a stale operation model.
+        """
+        if not required:
+            return
+        await self.set_session()
+        client = await self.get_s3(bucket)
+        bound = getattr(client, method)
+        self._kwargs_helper.require(bound, required)
+
     async def _call_s3(self, method, *akwarglist, **kwargs):
+        required = kwargs.pop("_required_options", None)
         await self.set_session()
         s3 = await self.get_s3(kwargs.get("Bucket"))
         method = getattr(s3, method)
         kw2 = kwargs.copy()
         kw2.pop("Body", None)
         logger.debug("CALL: %s - %s - %s", method.__name__, akwarglist, kw2)
-        additional_kwargs = self._get_s3_method_kwargs(method, *akwarglist, **kwargs)
+        additional_kwargs = self._get_s3_method_kwargs(
+            method, *akwarglist, _required_options=required, **kwargs
+        )
         return await _error_wrapper(
             method, kwargs=additional_kwargs, retries=self.retries
         )
@@ -473,16 +649,45 @@ class S3FileSystem(AsyncFileSystem):
         additional_kwargs = self.s3_additional_kwargs.copy()
         # Apply request-wide defaults; unsupported parameters are filtered below.
         additional_kwargs.update(self.req_kw)
+        required = set(kwargs.pop("_required_options", None) or ())
+        # Path-scoped rules override request-wide defaults but are themselves
+        # overridden by options for the specific file/call passed below.
+        path = self._scope_path(
+            kwargs.get("Bucket"), kwargs.get("Key"), kwargs.get("Prefix")
+        )
+        scope_options, scope_required = self._scope_options_for(
+            path, method.__name__
+        )
+        for name, value in scope_options.items():
+            if value is None:
+                # A narrower scope explicitly turns the option off, and the
+                # default must not reappear through a later merge.  A `None`
+                # sentinel preserves an explicit per-file default because the
+                # final pass drops it only after narrower merges are done.
+                additional_kwargs[name] = None
+            else:
+                additional_kwargs[name] = value
+        required |= scope_required
         for akwargs in akwarglist:
-            additional_kwargs.update(akwargs)
+            if akwargs:
+                additional_kwargs.update(_apply_shortcuts(akwargs))
         # Add the normal kwargs in
-        additional_kwargs.update(kwargs)
-        # A narrower scope can explicitly disable the request-wide default.
-        if (
-            "RequestPayer" in additional_kwargs
-            and additional_kwargs["RequestPayer"] is None
-        ):
-            additional_kwargs.pop("RequestPayer")
+        additional_kwargs.update(_apply_shortcuts(kwargs))
+        # A ``required`` marker carried by any of the option mappings names
+        # options that must survive filtering for this particular method.
+        _, marker_required, _ = _split_required(additional_kwargs)
+        required |= marker_required
+        # ``None`` means "do not send this option" for this narrower scope.
+        additional_kwargs = {
+            name: value
+            for name, value in additional_kwargs.items()
+            if value is not None
+        }
+        required = {name for name in required if name in additional_kwargs}
+        if required:
+            # Required options are checked against the client that will carry
+            # the request; optional options are merely filtered by the model.
+            self._kwargs_helper.require(method, required)
         # filter all kwargs
         return self._filter_kwargs(method, additional_kwargs)
 
@@ -817,6 +1022,7 @@ class S3FileSystem(AsyncFileSystem):
             block_size = self.default_block_size
         if fill_cache is None:
             fill_cache = self.default_fill_cache
+        requester_pays_explicit = requester_pays is not None
         if requester_pays is None:
             requester_pays = self.requester_pays
 
@@ -848,6 +1054,7 @@ class S3FileSystem(AsyncFileSystem):
             cache_type=cache_type,
             autocommit=autocommit,
             requester_pays=requester_pays,
+            requester_pays_explicit=requester_pays_explicit,
             cache_options=cache_options,
             size=size,
         )
@@ -869,7 +1076,23 @@ class S3FileSystem(AsyncFileSystem):
             prefix = ""
         if key:
             prefix = key.lstrip("/") + "/" + prefix
-        if path not in self.dircache or refresh or not delimiter or versions or partial:
+        # A bucket-owner constraint is a verification of the live listing.
+        # A cached directory entry cannot satisfy it (it may come from an
+        # earlier, unverified request), so bypass the cache entirely.
+        list_method = (
+            "list_object_versions" if self.version_aware else "list_objects_v2"
+        )
+        verified = self._scope_requires_owner(
+            path, list_method
+        ) or self._scope_requires_owner(self._scope_path(bucket, prefix), list_method)
+        if (
+            path not in self.dircache
+            or refresh
+            or not delimiter
+            or versions
+            or partial
+            or verified
+        ):
             try:
                 logger.debug("Get directory listing page for %s" % path)
                 dirs = []
@@ -890,7 +1113,7 @@ class S3FileSystem(AsyncFileSystem):
             except ClientError as e:
                 raise translate_boto_error(e)
 
-            if delimiter and files and not versions and not partial:
+            if delimiter and files and not versions and not partial and not verified:
                 self.dircache[path] = files
             return files
         return self.dircache[path]
@@ -912,7 +1135,10 @@ class S3FileSystem(AsyncFileSystem):
         else:
             method = "list_objects_v2"
             contents_key = "Contents"
-        kwargs = dict(Bucket=bucket, Prefix=prefix, Delimiter=delimiter, **self.req_kw)
+        # Request-wide and path-scoped options are applied by
+        # ``_get_s3_method_kwargs``; passing ``req_kw`` here as well would
+        # override a narrower scope that disables requester pays.
+        kwargs = dict(Bucket=bucket, Prefix=prefix, Delimiter=delimiter)
         if max_items is not None:
             kwargs["MaxKeys"] = 2 * max_items
         remaining = max_items
@@ -1262,31 +1488,51 @@ class S3FileSystem(AsyncFileSystem):
         path = self._strip_protocol(path)
         bucket, key, version_id = self.split_path(path)
         if key:
-            exists_in_cache = self._exists_in_cache(path, bucket, key, version_id)
-            if exists_in_cache is not None:
-                return exists_in_cache
+            fullpath = "/".join((bucket, key))
+            owner_verified = self._scope_requires_owner(fullpath, "head_object")
+            if not owner_verified:
+                # A bucket-owner check must be answered by a live metadata
+                # request, never by a directory listing from an earlier call.
+                exists_in_cache = self._exists_in_cache(path, bucket, key, version_id)
+                if exists_in_cache is not None:
+                    return exists_in_cache
 
             try:
                 await self._info(path, bucket, key, version_id=version_id)
                 return True
             except FileNotFoundError:
                 return False
-        elif self.dircache.get(bucket, False):
-            return True
         else:
-            try:
-                if self._ls_from_cache(bucket):
+            # A bucket-owner constraint must be checked against a live bucket
+            # request, not a cached listing (which may predate the check).
+            bucket_verified = self._scope_requires_owner(bucket, "head_bucket")
+            if not bucket_verified:
+                if self.dircache.get(bucket, False):
                     return True
-            except FileNotFoundError:
-                # might still be a bucket we can access but don't own
-                pass
+                try:
+                    if self._ls_from_cache(bucket):
+                        return True
+                except FileNotFoundError:
+                    # might still be a bucket we can access but don't own
+                    pass
             probes = [("head_bucket", {}), ("get_bucket_location", {})]
             if self.requester_pays:
                 probes.append(("list_objects_v2", {"MaxKeys": 1}))
             for method, extra in probes:
+                # Bucket-owner verification is scoped to each method's own
+                # convention; a probe that cannot carry the required option
+                # must be reported rather than silently skipped.
+                required = self._scope_required_for_method(bucket, method)
+                if required:
+                    await self._ensure_options_supported(method, required, bucket)
                 try:
                     await self._call_s3(method, Bucket=bucket, **extra)
                     return True
+                except UnsupportedRequestOption:
+                    # The scope requires an owner check that this method
+                    # cannot carry; do not treat another probe as success.
+                    if bucket_verified:
+                        raise
                 except Exception as e:
                     logger.debug("bucket probe %s failed for %s: %s", method, bucket, e)
             return False
@@ -1311,6 +1557,130 @@ class S3FileSystem(AsyncFileSystem):
 
     touch = sync_wrapper(_touch)
 
+    async def _get(
+        self,
+        rpath,
+        lpath,
+        recursive=False,
+        callback=_DEFAULT_CALLBACK,
+        maxdepth=None,
+        request_scope=None,
+        requester_pays=None,
+        request_rules=None,
+        **kwargs,
+    ):
+        """Copy one or more objects to local, with optional scope rules.
+
+        ``request_scope`` supplies per-source request rules used for the
+        discovery that expands ``rpath`` as well as for every download.  It
+        may be a :class:`~s3fs.utils.RequestScope`, a prefix-to-options
+        mapping, or a callable.  ``requester_pays`` applies to this call only.
+        """
+        if request_rules is not None and request_scope is None:
+            request_scope = request_rules
+        scope = self._as_scope(request_scope)
+        with self._scope_context(scope):
+            if isinstance(lpath, list) and isinstance(rpath, list):
+                rpaths = [self._strip_protocol(p) for p in rpath]
+                lpaths = lpath
+            else:
+                source_is_str = isinstance(rpath, str)
+                source_not_trailing_sep = source_is_str and not trailing_sep(rpath)
+                rpath = self._strip_protocol(rpath)
+                rpaths = await self._expand_path(
+                    rpath, recursive=recursive, maxdepth=maxdepth
+                )
+                if source_is_str and (not recursive or maxdepth is not None):
+                    rpaths = [
+                        p
+                        for p in rpaths
+                        if not (trailing_sep(p) or await self._isdir(p))
+                    ]
+                    if not rpaths:
+                        return
+
+                lpath = make_path_posix(lpath)
+                source_is_file = len(rpaths) == 1
+                dest_is_dir = isinstance(lpath, str) and (
+                    trailing_sep(lpath) or LocalFileSystem().isdir(lpath)
+                )
+                exists = source_is_str and (
+                    (has_magic(rpath) and source_is_file)
+                    or (
+                        not has_magic(rpath)
+                        and dest_is_dir
+                        and source_not_trailing_sep
+                    )
+                )
+                lpaths = other_paths(
+                    rpaths, lpath, exists=exists, flatten=not source_is_str
+                )
+                if isinstance(lpath, str):
+                    check_contained(lpath, lpaths)
+
+            [os.makedirs(os.path.dirname(lp), exist_ok=True) for lp in lpaths]
+            batch_size = kwargs.pop("batch_size", self.batch_size)
+
+            coros = []
+            callback.set_size(len(lpaths))
+            for lpath, rpath in zip(lpaths, rpaths):
+                get_file = callback.branch_coro(self._get_file)
+                coros.append(
+                    get_file(
+                        rpath,
+                        lpath,
+                        request_scope=scope,
+                        requester_pays=requester_pays,
+                        **kwargs,
+                    )
+                )
+            return await _run_coros_in_chunks(
+                coros, batch_size=batch_size, callback=callback
+            )
+
+    async def _cat(
+        self,
+        path,
+        recursive=False,
+        on_error="raise",
+        batch_size=None,
+        request_scope=None,
+        requester_pays=None,
+        **kwargs,
+    ):
+        scope = self._as_scope(request_scope)
+        with self._scope_context(scope):
+            paths = await self._expand_path(path, recursive=recursive)
+            coros = [
+                self._cat_file(
+                    p,
+                    request_scope=scope,
+                    requester_pays=requester_pays,
+                    **kwargs,
+                )
+                for p in paths
+            ]
+            batch_size = batch_size or self.batch_size
+            out = await _run_coros_in_chunks(
+                coros, batch_size=batch_size, nofiles=True, return_exceptions=True
+            )
+            if on_error == "raise":
+                ex = next(filter(is_exception, out), False)
+                if ex:
+                    raise ex
+            if (
+                len(paths) > 1
+                or isinstance(path, list)
+                or paths[0] != self._strip_protocol(path)
+            ):
+                return {
+                    k: v
+                    for k, v in zip(paths, out)
+                    if on_error != "omit" or not is_exception(v)
+                }
+            else:
+                return out[0]
+
     async def _cat_file(
         self,
         path,
@@ -1319,8 +1689,21 @@ class S3FileSystem(AsyncFileSystem):
         end=None,
         chunksize=None,
         max_concurrency=None,
+        request_scope=None,
+        requester_pays=None,
+        **kwargs,
     ):
         bucket, key, vers = self.split_path(path)
+        path = self._scope_path(bucket, key)
+        options, required = self._request_options_for(
+            bucket,
+            key,
+            request_scope=request_scope,
+            requester_pays=requester_pays,
+            kwargs=kwargs,
+            operation="get_object",
+        )
+        await self._ensure_options_supported("get_object", required, bucket)
         if start is not None or end is not None:
             if end == 0 or (
                 start is not None
@@ -1349,6 +1732,7 @@ class S3FileSystem(AsyncFileSystem):
                 Bucket=bucket,
                 Key=key,
                 **version_id_kw(version_id or vers),
+                **options,
                 **head,
             )
             try:
@@ -1372,8 +1756,10 @@ class S3FileSystem(AsyncFileSystem):
                     chunksize,
                     max_concurrency=max_concurrency,
                     version_id=version_id or vers,
+                    request_scope=request_scope,
+                    requester_pays=requester_pays,
+                    **kwargs,
                 )
-
         return await _error_wrapper(_call_and_read, retries=self.retries)
 
     async def _cat_file_concurrent(
@@ -1384,11 +1770,22 @@ class S3FileSystem(AsyncFileSystem):
         chunksize,
         max_concurrency=None,
         version_id=None,
+        request_scope=None,
+        requester_pays=None,
+        **kwargs,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
+        options, _ = self._request_options_for(
+            bucket,
+            key,
+            request_scope=request_scope,
+            requester_pays=requester_pays,
+            kwargs=kwargs,
+            operation="get_object",
+        )
 
         async def _read_chunk(start, end):
-            kw = self.req_kw.copy()
+            kw = dict(options)
             kw["Range"] = f"bytes={start}-{end}"
             resp = await self._call_s3(
                 "get_object",
@@ -1617,12 +2014,22 @@ class S3FileSystem(AsyncFileSystem):
         callback=_DEFAULT_CALLBACK,
         max_concurrency=None,
         version_id=None,
+        request_scope=None,
+        requester_pays=None,
         **kwargs,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
+        options, _ = self._request_options_for(
+            bucket,
+            key,
+            request_scope=request_scope,
+            requester_pays=requester_pays,
+            kwargs=kwargs,
+            operation="get_object",
+        )
 
         async def _download_chunk(start, end):
-            kw = {**self.req_kw, **kwargs}
+            kw = dict(options)
             kw["Range"] = f"bytes={start}-{end}"
             resp = await self._call_s3(
                 "get_object",
@@ -1663,9 +2070,21 @@ class S3FileSystem(AsyncFileSystem):
         version_id=None,
         chunksize=None,
         max_concurrency=None,
+        request_scope=None,
+        requester_pays=None,
+        request_rules=None,
         **kwargs,
     ):
-        """Download a complete object with non-range GetObject request options."""
+        """Download a complete object with non-range GetObject request options.
+
+        ``request_scope`` applies per-source request rules (for example a
+        different ``RequestPayer`` or a bucket-owner constraint) to this
+        download and the discovery that precedes it.  ``requester_pays``
+        overrides requester-pays handling for this copy only.  ``request_rules``
+        is accepted as an alias for ``request_scope``.
+        """
+        if request_rules is not None and request_scope is None:
+            request_scope = request_rules
         for option in ("Range", "PartNumber"):
             if option in kwargs or option in self.s3_additional_kwargs:
                 raise ValueError(
@@ -1676,10 +2095,22 @@ class S3FileSystem(AsyncFileSystem):
             return
         bucket, key, vers = self.split_path(rpath)
 
-        async def _open_file(range: int):
-            kw = {**self.req_kw, **kwargs}
-            if range:
-                kw["Range"] = f"bytes={range}-"
+        options, required = self._request_options_for(
+            bucket,
+            key,
+            request_scope=request_scope,
+            requester_pays=requester_pays,
+            kwargs=kwargs,
+            operation="get_object",
+        )
+        # A required option must be known to be acceptable before any bytes
+        # move, so a client that cannot carry it fails at the right method.
+        await self._ensure_options_supported("get_object", required, bucket)
+
+        async def _open_file(range_: int):
+            kw = dict(options)
+            if range_:
+                kw["Range"] = f"bytes={range_}-"
             resp = await self._call_s3(
                 "get_object",
                 Bucket=bucket,
@@ -1689,7 +2120,7 @@ class S3FileSystem(AsyncFileSystem):
             )
             return resp["Body"], resp.get("ContentLength", None)
 
-        body, content_length = await _open_file(range=0)
+        body, content_length = await _open_file(0)
         callback.set_size(content_length)
 
         chunksize = chunksize or self.default_block_size
@@ -1709,6 +2140,8 @@ class S3FileSystem(AsyncFileSystem):
                 callback=callback,
                 max_concurrency=max_concurrency,
                 version_id=version_id or vers,
+                request_scope=request_scope,
+                requester_pays=requester_pays,
                 **kwargs,
             )
 
@@ -1768,7 +2201,12 @@ class S3FileSystem(AsyncFileSystem):
         if path in ["/", ""]:
             return {"name": path, "size": 0, "type": "directory"}
         version_id = _coalesce_version_id(path_version_id, version_id)
-        if not refresh:
+        # A bucket-owner constraint must be verified by an actual metadata
+        # request for this object. Cached directory data and the permission
+        # fallback below are not proof that the owner matches, so neither may
+        # satisfy this lookup.
+        owner_verified = self._scope_requires_owner(fullpath, "head_object")
+        if not refresh and not owner_verified:
             out = self._ls_from_cache(fullpath)
             if out is not None:
                 if self.version_aware and version_id is not None:
@@ -1785,6 +2223,8 @@ class S3FileSystem(AsyncFileSystem):
                     out = [o for o in out if o["name"] == fullpath]
                     if out:
                         return out[0]
+                    # A cached directory entry is fine unless a verified
+                    # (owner-constrained) answer was demanded.
                     return {"name": path, "size": 0, "type": "directory"}
         head_error = None
         if key:
@@ -1817,6 +2257,10 @@ class S3FileSystem(AsyncFileSystem):
             except PermissionError as e:
                 if version_id is not None:
                     raise
+                if owner_verified:
+                    # A denied HEAD cannot be re-interpreted as a directory:
+                    # that would report success without verifying the owner.
+                    raise
                 # Prefix-scoped access can allow listing key/ while denying
                 # HeadObject for key itself. Check for a directory before failing.
                 head_error = e
@@ -1835,6 +2279,11 @@ class S3FileSystem(AsyncFileSystem):
             except ClientError as e:
                 raise translate_boto_error(e, set_cause=False)
 
+        if owner_verified and head_error is not None:
+            # The caller asked for a verified answer and HEAD was denied.  A
+            # directory interpretation from LIST would report success without
+            # ever confirming the owner, so keep the original failure.
+            raise head_error
         try:
             # We check to see if the path is a directory by attempting to list its
             # contexts. If anything is found, it is indeed a directory
@@ -2621,6 +3070,7 @@ class S3File(AbstractBufferedFile):
         autocommit=True,
         cache_type="readahead",
         requester_pays=False,
+        requester_pays_explicit=True,
         cache_options=None,
         size=None,
     ):
@@ -2640,6 +3090,33 @@ class S3File(AbstractBufferedFile):
         self.req_kw = {"RequestPayer": "requester"} if requester_pays else {}
         self._request_payer_kw = {"RequestPayer": self.req_kw.get("RequestPayer")}
         self.read_kw = self._request_payer_kw
+        # Re-borrowing the connection for this object must obey the same
+        # path-scoped conventions (owner verification, payer, etc.) as the
+        # filesystem-level request plumbing.  An explicit per-file
+        # ``requester_pays`` wins over a path rule; otherwise the scope decides.
+        for read_method in ("head_object", "get_object"):
+            head_options, head_required = s3._request_options_for(
+                bucket,
+                key,
+                requester_pays=(
+                    requester_pays if requester_pays_explicit else None
+                ),
+                operation=read_method,
+            )
+            if head_required:
+                s3._kwargs_helper.require(
+                    getattr(s3.s3, read_method), head_required
+                )
+        scope_options, scope_required = s3._request_options_for(
+            bucket,
+            key,
+            requester_pays=requester_pays if requester_pays_explicit else None,
+            operation="get_object",
+        )
+        # Keep ``None`` values: for this object they explicitly turn an
+        # inherited option (such as requester pays) off.
+        self._scope_options = dict(scope_options)
+        self._required_options = set(scope_required) - set(self.s3_additional_kwargs)
         if "r" not in mode:
             if block_size < 5 * 2**20:
                 raise ValueError("Block size must be >=5MB")
@@ -2714,10 +3191,12 @@ class S3File(AbstractBufferedFile):
             }
 
     def _call_s3(self, method, *kwarglist, **kwargs):
+        if self._required_options:
+            kwargs["_required_options"] = self._required_options
         return self.fs.call_s3(
             method,
             self.s3_additional_kwargs,
-            self._request_payer_kw,
+            self._scope_options,
             *kwarglist,
             **kwargs,
         )

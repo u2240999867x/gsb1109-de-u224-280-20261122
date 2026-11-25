@@ -55,4 +55,8 @@ API
 
 .. autoclass:: ParamKwargsHelper
 
+.. autoclass:: RequestScope
+
+.. autoclass:: UnsupportedRequestOption
+
 .. autoclass:: SSEParams
