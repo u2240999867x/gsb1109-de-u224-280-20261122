@@ -73,6 +73,10 @@ class DirCacheUpdater:
         parent = self._parent(path)
         if parent in self.dircache:
             self.dircache.pop(parent, None)
+            version_dircache = getattr(self, "_version_dircache", None)
+            if version_dircache is not None:
+                version_dircache.pop(parent, None)
+            self._listing_cache_epoch = getattr(self, "_listing_cache_epoch", 0) + 1
         else:
             self.invalidate_cache(parent)
 

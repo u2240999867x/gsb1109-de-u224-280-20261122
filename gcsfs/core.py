@@ -28,6 +28,7 @@ import aiohttp
 import fsspec
 from fsspec import asyn
 from fsspec.callbacks import NoOpCallback
+from fsspec.dircache import DirCache
 from fsspec.implementations.http import get_client
 from fsspec.utils import other_paths, setup_logging, stringify_path
 
@@ -296,7 +297,7 @@ def _coalesce_generation(*args):
 
 
 def _is_directory_marker(entry):
-    return entry["size"] == 0 and entry["name"].endswith("/")
+    return entry.get("size", 0) == 0 and entry.get("name", "").endswith("/")
 
 
 def _get_cache_type_header_value(cache_type, cache_source=None):
@@ -469,6 +470,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     protocol = "gs", "gcs"
     async_impl = True
     MIN_CHUNK_SIZE_FOR_CONCURRENCY = 5 * 1024 * 1024
+    _listing_cache_epoch = 0
 
     def __init__(
         self,
@@ -500,6 +502,15 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             loop=loop,
             **kwargs,
         )
+        if not hasattr(self, "_version_dircache"):
+            self._version_dircache = DirCache(
+                use_listings_cache=getattr(self.dircache, "use_listings_cache", True),
+                listings_expiry_time=getattr(
+                    self.dircache, "listings_expiry_time", None
+                ),
+                max_paths=getattr(self.dircache, "max_paths", None),
+            )
+        self._listing_cache_epoch = getattr(self, "_listing_cache_epoch", 0)
         if access not in self.scopes:
             raise ValueError(f"access must be one of {self.scopes}")
         if project is None:
@@ -792,22 +803,34 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     make_bucket_requester_pays = asyn.sync_wrapper(_make_bucket_requester_pays)
 
-    async def _get_object(self, path):
+    async def _get_object(self, path, generation=None):
         """Return object information at the given path."""
-        bucket, key, generation = self.split_path(path)
+        bucket, key, path_generation = self.split_path(path)
+        generation = _coalesce_generation(generation, path_generation)
+        cache_path = "/".join(part for part in (bucket, key) if part)
 
-        # Check if parent dir is in listing cache
-        listing = self._ls_from_cache(path)
+        # Check if parent dir is in listing cache. A versioned listing is
+        # kept separately and is never authoritative for reading an object.
+        exact_listing = self.dircache.get(cache_path)
+        try:
+            listing = self._ls_from_cache(cache_path)
+        except FileNotFoundError:
+            if not generation:
+                raise
+            listing = None
         if listing:
             name = "/".join((bucket, key))
             for file_details in listing:
-                if (
-                    file_details["type"] == "file"
-                    and file_details["name"] == name
-                    and (not generation or file_details.get("generation") == generation)
+                if file_details["type"] == "file" and file_details["name"] == name and (
+                    not generation
+                    or str(file_details.get("generation")) == str(generation)
                 ):
                     return file_details
-            else:
+            # An exact cache entry is the listing of this path as a directory.
+            # Flat buckets allow a same-named object to coexist with it, so it
+            # is not negative evidence for the object. A parent-filtered miss
+            # is, however, a complete cached directory listing.
+            if not generation and exact_listing is None:
                 raise FileNotFoundError(path)
 
         if not key:
@@ -847,26 +870,35 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     async def _list_objects(self, path, prefix="", versions=False, **kwargs):
         bucket, key, generation = self.split_path(path)
         path = path.rstrip("/")
+        cache_generations = bool(versions or generation)
+        listing_cache = self._version_dircache if cache_generations else self.dircache
 
         # NOTE: the inventory report logic is experimental.
         inventory_report_info = kwargs.get("inventory_report_info", None)
 
         # Only attempt to list from the cache when the user does not use
-        # the inventory report service.
+        # the inventory report service. Versioned and unversioned listings are
+        # different responses and must not share one cache entry.
         if not inventory_report_info:
-            try:
-                clisting = self._ls_from_cache(path)
-                hassubdirs = clisting and any(
-                    c["name"].rstrip("/") == path and c["type"] == "directory"
-                    for c in clisting
-                )
-                if clisting and not hassubdirs:
+            if cache_generations:
+                clisting = listing_cache.get(path)
+                if clisting is not None:
                     return clisting
-            except FileNotFoundError:
-                # not finding a bucket in list of "my" buckets is OK
-                if key:
-                    raise
+            else:
+                try:
+                    clisting = self._ls_from_cache(path)
+                    hassubdirs = clisting and any(
+                        c["name"].rstrip("/") == path and c["type"] == "directory"
+                        for c in clisting
+                    )
+                    if clisting and not hassubdirs:
+                        return clisting
+                except FileNotFoundError:
+                    # not finding a bucket in list of "my" buckets is OK
+                    if key:
+                        raise
 
+        cache_epoch = self._listing_cache_epoch
         items, prefixes = await self._do_list_objects(
             path,
             prefix=prefix,
@@ -900,7 +932,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # Don't cache prefixed/partial listings, in addition to
         # not using the inventory report service to do listing directly.
         if not prefix and not use_snapshot_listing and not max_results:
-            self.dircache[path] = out
+            # A mutation or a newer completed listing can advance the epoch
+            # while this call was in flight. Never let that older response
+            # overwrite the fresher cache entry.
+            if self._listing_cache_epoch == cache_epoch:
+                listing_cache[path] = out
+                self._listing_cache_epoch += 1
         return out
 
     async def _do_list_objects(
@@ -1152,12 +1189,17 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if path is None:
             logger.debug("invalidate_cache clearing cache")
             self.dircache.clear()
+            self._version_dircache.clear()
+            self._listing_cache_epoch += 1
         else:
             path = self._strip_protocol(path).rstrip("/")
+            self._listing_cache_epoch += 1
             if not path:
                 self.dircache.pop("", None)
+                self._version_dircache.pop("", None)
             while path:
                 self.dircache.pop(path, None)
+                self._version_dircache.pop(path, None)
                 path = self._parent(path)
 
     async def _mkdir(
@@ -1285,7 +1327,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
-        path = self._strip_protocol(path).rstrip("/")
+        raw_path = self._strip_protocol(path)
+        had_trailing_slash = raw_path.endswith("/")
+        path = raw_path.rstrip("/")
         if "/" not in path:
             try:
                 out = await self._call("GET", f"b/{path}", json_out=True)
@@ -1298,23 +1342,91 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 else:
                     raise FileNotFoundError(path)
             return out
-        # Check directory cache for parent dir
-        parent_path = self._parent(path)
-        parent_cache = self._ls_from_cache(parent_path)
-        bucket, key, path_generation = self.split_path(path)
+
+        bucket, key, path_generation = self.split_path(raw_path)
         generation = _coalesce_generation(generation, path_generation)
+        cache_key = key.rstrip("/")
+        name = "/".join((bucket, cache_key))
+        parent_path = self._parent(name)
+
+        try:
+            parent_cache = self._ls_from_cache(parent_path)
+        except FileNotFoundError:
+            parent_cache = None
+
+        matches = []
         if parent_cache:
-            name = "/".join((bucket, key))
-            for o in parent_cache:
-                if o["name"].rstrip("/") == name and (
-                    not generation or o.get("generation") == generation
+            for entry in parent_cache:
+                if entry["name"].rstrip("/") == name and (
+                    not generation
+                    or str(entry.get("generation")) == str(generation)
                 ):
-                    return o
-        if self._ls_from_cache(path):
+                    matches.append(entry)
+
+        if generation:
+            cached_object = next(
+                (
+                    entry
+                    for entry in matches
+                    if entry["type"] == "file"
+                    and not _is_directory_marker(entry)
+                ),
+                None,
+            )
+            if cached_object is not None:
+                return cached_object
+            # Directory listings cannot make a deleted/old generation valid.
+            # Fetch the exact object generation and let a 404 propagate.
+            return await self._get_object(path, generation=generation)
+
+        cached_file = next(
+            (
+                entry
+                for entry in matches
+                if entry["type"] == "file" and not _is_directory_marker(entry)
+            ),
+            None,
+        )
+        cached_directory = next(
+            (
+                entry
+                for entry in matches
+                if entry["type"] == "directory" or _is_directory_marker(entry)
+            ),
+            None,
+        )
+        if had_trailing_slash and cached_directory is not None:
+            if cached_directory["type"] == "directory":
+                return cached_directory
+            return {
+                "bucket": bucket,
+                "name": name,
+                "size": 0,
+                "storageClass": "DIRECTORY",
+                "type": "directory",
+            }
+        if not had_trailing_slash and cached_file is not None:
+            return cached_file
+        if cached_directory is not None and cached_file is None:
+            if cached_directory["type"] == "directory":
+                return cached_directory
+            return {
+                "bucket": bucket,
+                "name": name,
+                "size": 0,
+                "storageClass": "DIRECTORY",
+                "type": "directory",
+            }
+
+        try:
+            path_listing = self._ls_from_cache(name)
+        except FileNotFoundError:
+            path_listing = None
+        if had_trailing_slash and path_listing:
             # this is a directory
             return {
                 "bucket": bucket,
-                "name": path,
+                "name": name,
                 "size": 0,
                 "storageClass": "DIRECTORY",
                 "type": "directory",
@@ -1438,7 +1550,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if start is None:
             start = 0
         if end is None:
-            end = (await self._info(path))["size"]
+            end = (await self._info(path, generation=kwargs.get("generation")))["size"]
         if start >= end:
             return b""
 
@@ -2181,6 +2293,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             self.dircache.update(
                 {k: list(v.values()) for k, v in cache_entries.items()}
             )
+            self._listing_cache_epoch += 1
         return dirs
 
     @retry_request(retries=retries)
@@ -3087,6 +3200,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
                 self.path,
                 start=start,
                 end=end,
+                generation=self.generation,
                 concurrency=self.concurrency,
                 cache_type=self.cache_type,
                 cache_source=self.cache_source,
@@ -3102,6 +3216,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             self.path,
             start=start_offset,
             end=start_offset + total_size,
+            generation=self.generation,
             concurrency=split_factor,
             cache_type=self.cache_type,
             cache_source=self.cache_source,
