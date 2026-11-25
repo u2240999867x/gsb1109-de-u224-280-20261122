@@ -48,11 +48,17 @@ def cache_key(
 
 def _question_fingerprint(question: Question) -> Any:
     """Everything about a question that could change its answer."""
-    return {
+    fingerprint = {
         "kind": question.kind,
         "instructions": question.instructions,
         "criteria": getattr(question, "criteria", None),
     }
+    if question.kind == "choice":
+        # A null answer is valid only for a contract that permits abstention.
+        # Omitting this made a cached null from a nullable column satisfy a
+        # later non-nullable contract with otherwise identical wording.
+        fingerprint["allow_none"] = getattr(question, "allow_none", False)
+    return fingerprint
 
 
 @runtime_checkable
@@ -91,6 +97,13 @@ class SQLiteCache:
                 "CREATE TABLE IF NOT EXISTS answers "
                 "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> SQLiteCache:
+        # The cache is explicitly thread-safe shared storage.  Keeping the
+        # same object through Pandera's schema deep copies also keeps any
+        # caller-visible instrumentation and lock identity intact.
+        memo[id(self)] = self
+        return self
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)

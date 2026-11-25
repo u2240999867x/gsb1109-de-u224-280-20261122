@@ -9,6 +9,7 @@ supply the criteria -- so nothing has to be repeated.
 
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -18,6 +19,12 @@ import pandas as pd
 from pandera import _enum_literal
 from pandera.api.parsers import ParseContext
 from pandera.decisions import primitives as q
+from pandera.decisions.broker import (
+    SOURCE_CACHE,
+    SOURCE_CALL,
+    ProviderBroker,
+    Reply,
+)
 from pandera.decisions.cache import build_cache, cache_key
 from pandera.decisions.execution import gather_decisions, run_sync
 from pandera.decisions.providers import base as provider_base
@@ -54,6 +61,21 @@ class _DecisionParser:
         self.provider = provider
         self.abstain_below = abstain_below
         self.cache = cache
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _DecisionParser:
+        # Provider objects own runtime call state and published throughput
+        # limits.  Schema construction deep-copies parsers, so cloning the
+        # provider would hide the shared gate/counter from callers and give
+        # every copy its own concurrency budget.
+        new = object.__new__(type(self))
+        memo[id(self)] = new
+        for name, value in self.__dict__.items():
+            setattr(
+                new,
+                name,
+                value if name == "provider" else copy.deepcopy(value, memo),
+            )
+        return new
 
     def _abstains(self, decision: Any) -> bool:
         """Whether an answer is too uncertain to record.
@@ -176,27 +198,30 @@ class _DecisionParser:
             states = _build_states(df, first_ctx.source)
             prepared = provider.compile(questions)
             stats = {"rows": len(df), "cached": 0, "called": 0}
+            broker = ProviderBroker.for_provider(provider)
 
             async def _decide(state: Any) -> Mapping[str, q.Decision]:
-                if cache is None:
-                    stats["called"] += 1
-                    return await provider.decide(state, prepared)
-
                 key = cache_key(
                     provider.id, provider.model_version, state, questions
                 )
-                hit = cache.get(key)
-                if hit is not None:
-                    stats["cached"] += 1
-                    return hit
-                stats["called"] += 1
-                answer = await provider.decide(state, prepared)
-                cache.set(key, answer)
-                return answer
+                begun = broker.begin(key, state, prepared, cache)
+                if isinstance(begun, Reply):
+                    if begun.source == SOURCE_CACHE:
+                        stats["cached"] += 1
+                    return begun.value
+
+                future, source = begun
+                if source == SOURCE_CALL:
+                    stats["called"] += 1
+                return await broker.resolve(future)
 
             answers = run_sync(
                 gather_decisions(
-                    states, _decide, provider.limits, on_error=on_error
+                    states,
+                    _decide,
+                    provider.limits,
+                    on_error=on_error,
+                    manage_limits=False,
                 )
             )
 
@@ -476,6 +501,33 @@ class Confidence(_DecisionParser):
     def __init__(self, of: str, *, provider: Any = None):
         super().__init__(provider=provider)
         self.of = of
+
+    def batch_key(self, ctx: ParseContext) -> Any:
+        """Join the referenced question's batch.
+
+        Confidence asks nothing and has no request-level error policy of its
+        own, so an omitted provider or ``on_error`` must not split it from the
+        column it reads.  A deliberately different source still produces a
+        different key and the existing helpful init error.
+        """
+        key = super().batch_key(ctx)
+        schema_columns = getattr(ctx.schema, "columns", None)
+        target = schema_columns.get(self.of) if schema_columns else None
+        target_parser = getattr(target, "parser", None)
+        if target is None or not isinstance(target_parser, _DecisionParser):
+            return key
+
+        target_provider = getattr(target_parser, "provider", None)
+        provider_id = (
+            target_provider
+            if isinstance(target_provider, str)
+            else getattr(target_provider, "id", None)
+        )
+        return (
+            provider_id,
+            ctx.source,
+            getattr(target, "on_error", ctx.on_error),
+        )
 
     def to_question(self, ctx: ParseContext) -> q.Question:  # pragma: no cover
         raise SchemaInitError(

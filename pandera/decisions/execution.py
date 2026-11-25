@@ -112,41 +112,49 @@ async def gather_decisions(
     decide: Callable[[Any], Awaitable[Mapping[str, Decision]]],
     limits: ProviderLimits,
     on_error: str = "raise",
+    *,
+    manage_limits: bool = True,
 ) -> list[Mapping[str, Decision] | None]:
     """Answer every state concurrently, preserving input order."""
-    semaphore = asyncio.Semaphore(max(1, limits.max_concurrency))
+    semaphore = asyncio.Semaphore(max(1, limits.max_concurrency or 1))
     bucket = TokenBucket(
         requests_per_minute=limits.requests_per_minute,
         tokens_per_second=limits.tokens_per_second,
     )
 
     async def one(index: int, state: Any) -> Mapping[str, Decision] | None:
-        async with semaphore:
-            tokens = estimate_tokens(state)
-            try:
-                # Named by row, before dispatch -- and before the rate limiter,
-                # which could otherwise block forever on a request the provider
-                # would reject outright -- rather than surfacing as a provider's
-                # HTTP error or, worse, as a silently truncated state.
-                # ``estimate_tokens`` undercounts if anything, so this errs
-                # toward letting a borderline row through.
-                if (
-                    limits.max_state_tokens is not None
-                    and tokens > limits.max_state_tokens
-                ):
-                    raise StateTooLongError(
-                        f"row {index}: the state is about {tokens} tokens, "
-                        f"over the {limits.max_state_tokens} this provider "
-                        "accepts. Shorten what the column reads from."
-                    )
+        if manage_limits:
+            async with semaphore:
+                return await _one(index, state)
+        return await _one(index, state)
+
+    async def _one(index: int, state: Any) -> Mapping[str, Decision] | None:
+        tokens = estimate_tokens(state)
+        try:
+            # Named by row, before dispatch -- and before the rate limiter,
+            # which could otherwise block forever on a request the provider
+            # would reject outright -- rather than surfacing as a provider's
+            # HTTP error or, worse, as a silently truncated state.
+            # ``estimate_tokens`` undercounts if anything, so this errs
+            # toward letting a borderline row through.
+            if (
+                limits.max_state_tokens is not None
+                and tokens > limits.max_state_tokens
+            ):
+                raise StateTooLongError(
+                    f"row {index}: the state is about {tokens} tokens, "
+                    f"over the {limits.max_state_tokens} this provider "
+                    "accepts. Shorten what the column reads from."
+                )
+            if manage_limits:
                 await bucket.acquire(tokens)
-                return await decide(state)
-            except Exception:
-                if on_error == "raise":
-                    raise
-                # "null" and "drop" both need the row marked as unanswered;
-                # what happens to it afterwards is the caller's business.
-                return None
+            return await decide(state)
+        except Exception:
+            if on_error == "raise":
+                raise
+            # "null" and "drop" both need the row marked as unanswered;
+            # what happens to it afterwards is the caller's business.
+            return None
 
     # ``gather`` preserves the order of its arguments regardless of completion
     # order, which is what keeps answers aligned with rows.
