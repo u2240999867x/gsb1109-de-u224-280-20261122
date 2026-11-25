@@ -271,6 +271,11 @@ class DataStore(metaclass=ABCMeta):
         """
         Release the claims on the given schedules and update them on the store.
 
+        Any jobs contained in the results must be added to the store in the same
+        transaction as the update to the schedule they were created from, so that a
+        schedule is never advanced without its jobs, nor its jobs queued without the
+        schedule being advanced.
+
         The data store is responsible for updating the following fields on stored
         schedules:
 
@@ -279,6 +284,11 @@ class DataStore(metaclass=ABCMeta):
         * ``trigger``
         * ``acquired_by`` (must beset to ``None``)
         * ``acquired_until`` (must be set to ``None``)
+
+        Schedules that are no longer acquired by the given scheduler (because they
+        were removed, replaced or their claims expired or were taken over by another
+        scheduler) must be left untouched, and the jobs associated with such results
+        must not be added either.
 
         :param scheduler_id: unique identifier of the scheduler
         :param results: list of schedule processing results

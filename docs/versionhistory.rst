@@ -6,6 +6,15 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- **BREAKING** Changed the data store API: ``DataStore.release_schedules()`` now
+  receives the jobs created from each schedule in the schedule results, and is
+  responsible for adding them in the same transaction as the schedule update. This
+  fixes duplicate jobs being created when a scheduler crashes (or is otherwise
+  interrupted) after queueing jobs but before updating the schedules
+  (`#700 <https://github.com/agronholm/apscheduler/issues/700>`_)
+- Fixed a replaced schedule (same ID) keeping the previous schedule's acquisition
+  claim on the SQLAlchemy data store, which could let a stale scheduler overwrite
+  the replacement schedule's next fire time when releasing its claim
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

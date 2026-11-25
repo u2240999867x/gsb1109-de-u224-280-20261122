@@ -27,6 +27,7 @@ from apscheduler import (
     ScheduleAdded,
     ScheduleRemoved,
     ScheduleUpdated,
+    SerializationError,
     Task,
     TaskAdded,
     TaskLookupError,
@@ -364,6 +365,212 @@ async def test_release_two_schedules_at_once(datastore: DataStore) -> None:
 
     remaining = await datastore.get_schedules({s.id for s in schedules})
     assert len(remaining) == 2
+
+
+async def test_release_schedules_adds_created_jobs(datastore: DataStore) -> None:
+    """
+    Test that the jobs contained in the schedule result are added in the same
+    operation that advances the schedule.
+
+    """
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    acquired = await datastore.acquire_schedules("foo", timedelta(seconds=30), 3)
+    assert len(acquired) == 1
+
+    # Simulate the schedule advancing through two fire times at once
+    fire_times = [
+        datetime(2020, 9, 13, tzinfo=UTC),
+        datetime(2020, 9, 14, tzinfo=UTC),
+    ]
+    created_jobs = [
+        Job(
+            task_id="task1",
+            schedule_id="s1",
+            scheduled_fire_time=fire_time,
+            executor="async",
+        )
+        for fire_time in fire_times
+    ]
+    results = [
+        ScheduleResult(
+            schedule_id="s1",
+            task_id="task1",
+            trigger=trigger,
+            created_jobs=created_jobs,
+            last_fire_time=fire_times[-1],
+            next_fire_time=datetime(2020, 9, 15, tzinfo=UTC),
+        )
+    ]
+    await datastore.release_schedules("foo", results)
+
+    schedules = await datastore.get_schedules()
+    assert len(schedules) == 1
+    assert schedules[0].last_fire_time == fire_times[-1]
+    assert schedules[0].next_fire_time == datetime(2020, 9, 15, tzinfo=UTC)
+    assert schedules[0].acquired_by is None
+    assert schedules[0].acquired_until is None
+
+    jobs = await datastore.get_jobs()
+    assert len(jobs) == 2
+    assert {job.scheduled_fire_time for job in jobs} == set(fire_times)
+    assert all(job.schedule_id == "s1" for job in jobs)
+
+
+async def test_release_schedules_ignores_replaced_schedule(
+    datastore: DataStore,
+) -> None:
+    """
+    Test that releasing a schedule that has been replaced in the meantime does not
+    update the replacement schedule or add the stale result's jobs.
+
+    """
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    acquired = await datastore.acquire_schedules("foo", timedelta(seconds=30), 3)
+    assert len(acquired) == 1
+
+    # Commit one batch of jobs before the replacement
+    confirmed_job = Job(
+        task_id="task1",
+        schedule_id="s1",
+        scheduled_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        executor="async",
+    )
+    await datastore.release_schedules(
+        "foo",
+        [
+            ScheduleResult(
+                schedule_id="s1",
+                task_id="task1",
+                trigger=trigger,
+                created_jobs=[confirmed_job],
+                last_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+                next_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+            )
+        ],
+    )
+
+    # The control plane replaces the schedule with a new extraction range (same ID)
+    new_trigger = DateTrigger(datetime(2020, 10, 13, tzinfo=UTC))
+    new_schedule = Schedule(
+        id="s1", task_id="task2", job_executor="async", trigger=new_trigger
+    )
+    new_schedule.next_fire_time = new_trigger.next()
+    await datastore.add_schedule(new_schedule, ConflictPolicy.replace)
+
+    # The stale release comes in after the replacement; it must be ignored
+    stale_job = Job(
+        task_id="task1",
+        schedule_id="s1",
+        scheduled_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+        executor="async",
+    )
+    await datastore.release_schedules(
+        "foo",
+        [
+            ScheduleResult(
+                schedule_id="s1",
+                task_id="task1",
+                trigger=trigger,
+                created_jobs=[stale_job],
+                last_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+                next_fire_time=datetime(2020, 9, 15, tzinfo=UTC),
+            )
+        ],
+    )
+
+    # The replacement schedule must be untouched
+    schedules = await datastore.get_schedules()
+    assert len(schedules) == 1
+    assert schedules[0].task_id == "task2"
+    assert schedules[0].next_fire_time == datetime(2020, 10, 13, tzinfo=UTC)
+    assert schedules[0].last_fire_time is None
+
+    # Only the job confirmed before the replacement may remain
+    jobs = await datastore.get_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].id == confirmed_job.id
+    assert jobs[0].schedule_id == "s1"
+
+
+async def test_release_schedules_job_serialization_failure(
+    datastore: DataStore,
+) -> None:
+    """
+    Test that a job failing to serialize rolls back the schedule update along with
+    the rest of the jobs, so that the schedule can be retried from its original
+    state.
+
+    """
+    if not isinstance(datastore, BaseExternalDataStore):
+        pytest.skip("only external data stores serialize jobs")
+
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    acquired = await datastore.acquire_schedules("foo", timedelta(seconds=30), 3)
+    assert len(acquired) == 1
+
+    good_job = Job(
+        task_id="task1",
+        schedule_id="s1",
+        scheduled_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        executor="async",
+    )
+    bad_job = Job(
+        task_id="task1",
+        args=(lambda: None,),
+        schedule_id="s1",
+        scheduled_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+        executor="async",
+    )
+    results = [
+        ScheduleResult(
+            schedule_id="s1",
+            task_id="task1",
+            trigger=trigger,
+            created_jobs=[good_job, bad_job],
+            last_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+            next_fire_time=datetime(2020, 9, 15, tzinfo=UTC),
+        )
+    ]
+    with pytest.raises(SerializationError):
+        await datastore.release_schedules("foo", results)
+
+    # The rollback must not leave any claimable jobs behind, and the schedule must
+    # still be at its original fire time
+    assert await datastore.get_jobs() == []
+    schedules = await datastore.get_schedules()
+    assert len(schedules) == 1
+    assert schedules[0].next_fire_time == datetime(2020, 9, 13, tzinfo=UTC)
+    assert schedules[0].last_fire_time is None
+    assert schedules[0].acquired_by == "foo"
+
+    # Retrying from the original cursor with a fixed set of jobs must succeed
+    results[0] = ScheduleResult(
+        schedule_id="s1",
+        task_id="task1",
+        trigger=trigger,
+        created_jobs=[good_job],
+        last_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        next_fire_time=datetime(2020, 9, 15, tzinfo=UTC),
+    )
+    await datastore.release_schedules("foo", results)
+
+    jobs = await datastore.get_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].id == good_job.id
+    schedules = await datastore.get_schedules()
+    assert schedules[0].next_fire_time == datetime(2020, 9, 15, tzinfo=UTC)
 
 
 @pytest.mark.skipif(

@@ -570,6 +570,10 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                 raise ConflictingIdError(schedule.id) from None
             elif conflict_policy is ConflictPolicy.replace:
                 del values["id"]
+                # The replacement schedule must not inherit any acquisition claim
+                # from the schedule it replaces
+                values["acquired_by"] = None
+                values["acquired_until"] = None
                 update = (
                     self._t_schedules.update()
                     .where(self._t_schedules.c.id == schedule.id)
@@ -702,15 +706,12 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
         task_ids = {result.schedule_id: result.task_id for result in results}
-        next_fire_times = {
-            result.schedule_id: result.next_fire_time for result in results
-        }
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
                     update_events: list[ScheduleUpdated] = []
+                    job_events: list[JobAdded] = []
                     finished_schedule_ids: list[str] = []
-                    update_args: list[dict[str, Any]] = []
                     for result in results:
                         try:
                             serialized_trigger = self.serializer.serialize(
@@ -725,72 +726,68 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             finished_schedule_ids.append(result.schedule_id)
                             continue
 
-                        if self._supports_tzaware_timestamps:
-                            update_args.append(
-                                {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
-                                    "p_last_fire_time": result.last_fire_time,
-                                    "p_next_fire_time": result.next_fire_time,
-                                }
-                            )
-                        else:
-                            update_args.append(
-                                {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
-                                    **marshal_timestamp(
-                                        result.last_fire_time, "p_last_fire_time"
-                                    ),
-                                    **marshal_timestamp(
-                                        result.next_fire_time, "p_next_fire_time"
-                                    ),
-                                }
-                            )
+                        # Marshal the jobs first so that a serialization error
+                        # aborts the transaction before any changes are made
+                        marshalled_jobs = [
+                            job.marshal(self.serializer) for job in result.created_jobs
+                        ]
 
-                    # Update schedules
-                    if update_args:
-                        extra_values: dict[str, BindParameter] = {}
-                        p_id: BindParameter = bindparam("p_id")
-                        p_trigger: BindParameter = bindparam("p_trigger")
-                        p_last_fire_time: BindParameter = bindparam("p_last_fire_time")
-                        p_next_fire_time: BindParameter = bindparam("p_next_fire_time")
+                        values: dict[str, Any] = {
+                            "trigger": serialized_trigger,
+                            "last_fire_time": result.last_fire_time,
+                            "next_fire_time": result.next_fire_time,
+                            "acquired_by": None,
+                            "acquired_until": None,
+                        }
                         if not self._supports_tzaware_timestamps:
-                            extra_values["last_fire_time_utcoffset"] = bindparam(
-                                "p_last_fire_time_utcoffset"
+                            values.update(
+                                marshal_timestamp(
+                                    result.last_fire_time, "last_fire_time"
+                                )
                             )
-                            extra_values["next_fire_time_utcoffset"] = bindparam(
-                                "p_next_fire_time_utcoffset"
+                            values.update(
+                                marshal_timestamp(
+                                    result.next_fire_time, "next_fire_time"
+                                )
                             )
 
+                        # Only update the schedule if it's still acquired by this
+                        # scheduler (it may have been removed, replaced or had its
+                        # claim expire or taken over while being processed)
                         update = (
                             self._t_schedules.update()
                             .where(
                                 and_(
-                                    self._t_schedules.c.id == p_id,
+                                    self._t_schedules.c.id == result.schedule_id,
                                     self._t_schedules.c.acquired_by == scheduler_id,
                                 )
                             )
-                            .values(
-                                trigger=p_trigger,
-                                last_fire_time=p_last_fire_time,
-                                next_fire_time=p_next_fire_time,
-                                acquired_by=None,
-                                acquired_until=None,
-                                **extra_values,
+                            .values(**values)
+                        )
+                        update_result = await self._execute(conn, update)
+                        if not update_result.rowcount:
+                            continue
+
+                        # Add the jobs created from this schedule
+                        for marshalled_job in marshalled_jobs:
+                            insert = self._t_jobs.insert().values(**marshalled_job)
+                            await self._execute(conn, insert)
+
+                        update_events.append(
+                            ScheduleUpdated(
+                                schedule_id=result.schedule_id,
+                                task_id=result.task_id,
+                                next_fire_time=result.next_fire_time,
                             )
                         )
-                        # TODO: actually check which rows were updated?
-                        await self._execute(conn, update, update_args)
-                        updated_ids = list(next_fire_times)
-
-                        for schedule_id in updated_ids:
-                            event = ScheduleUpdated(
-                                schedule_id=schedule_id,
-                                task_id=task_ids[schedule_id],
-                                next_fire_time=next_fire_times[schedule_id],
+                        job_events.extend(
+                            JobAdded(
+                                job_id=job.id,
+                                task_id=job.task_id,
+                                schedule_id=job.schedule_id,
                             )
-                            update_events.append(event)
+                            for job in result.created_jobs
+                        )
 
                     # Remove schedules that failed to serialize
                     if finished_schedule_ids:
@@ -800,6 +797,9 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         await self._execute(conn, delete)
 
         for event in update_events:
+            await self._event_broker.publish(event)
+
+        for event in job_events:
             await self._event_broker.publish(event)
 
         for schedule_id in finished_schedule_ids:

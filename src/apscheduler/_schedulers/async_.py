@@ -995,6 +995,7 @@ class AsyncScheduler:
                                 fire_times[0] = fire_time
 
                         # Add one or more jobs to the job queue
+                        created_jobs: list[Job] = []
                         max_jitter = (
                             schedule.max_jitter.total_seconds()
                             if schedule.max_jitter
@@ -1045,19 +1046,21 @@ class AsyncScheduler:
                                 result_expiration_time=schedule.job_result_expiration_time,
                                 metadata=schedule.metadata.copy(),
                             )
-                            await self.data_store.add_job(job)
+                            created_jobs.append(job)
 
                         results.append(
                             ScheduleResult(
                                 schedule_id=schedule.id,
                                 task_id=schedule.task_id,
                                 trigger=schedule.trigger,
+                                created_jobs=created_jobs,
                                 last_fire_time=fire_times[-1],
                                 next_fire_time=next_fire_time,
                             )
                         )
 
-                # Update the schedules (and release the scheduler's claim on them)
+                # Add the jobs and update the schedules in a single transaction (and
+                # release the scheduler's claim on them)
                 await self.data_store.release_schedules(self.identity, results)
 
                 # If we received fewer schedules than the maximum amount, sleep

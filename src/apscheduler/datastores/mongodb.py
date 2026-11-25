@@ -18,7 +18,7 @@ import pymongo
 from attrs.validators import instance_of
 from bson import CodecOptions, UuidRepresentation
 from bson.codec_options import TypeEncoder, TypeRegistry
-from pymongo import ASCENDING, DeleteOne, UpdateOne
+from pymongo import ASCENDING
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
@@ -423,44 +423,80 @@ class MongoDBDataStore(BaseExternalDataStore):
     ) -> None:
         updated_schedules: list[tuple[str, datetime | None]] = []
         finished_schedule_ids: list[str] = []
+        added_jobs: list[Job] = []
         task_ids = {result.schedule_id: result.task_id for result in results}
 
-        requests: list[UpdateOne | DeleteOne] = []
-        for result in results:
-            filters = {"_id": result.schedule_id, "acquired_by": scheduler_id}
-            try:
-                serialized_trigger = self.serializer.serialize(result.trigger)
-            except SerializationError:
-                self._logger.exception(
-                    "Error serializing schedule %r – removing from data store",
-                    result.schedule_id,
-                )
-                requests.append(DeleteOne(filters))
-                finished_schedule_ids.append(result.schedule_id)
-                continue
+        async for attempt in self._retry():
+            with attempt:
+                async with self._client.start_session() as session:
+                    for result in results:
+                        # Only update the schedule if it's still acquired by this
+                        # scheduler (it may have been removed, replaced or had its
+                        # claim expire or taken over while being processed)
+                        filters = {
+                            "_id": result.schedule_id,
+                            "acquired_by": scheduler_id,
+                        }
+                        try:
+                            serialized_trigger = self.serializer.serialize(
+                                result.trigger
+                            )
+                        except SerializationError:
+                            self._logger.exception(
+                                "Error serializing schedule %r – removing from data "
+                                "store",
+                                result.schedule_id,
+                            )
+                            await self._schedules.delete_one(filters, session=session)
+                            finished_schedule_ids.append(result.schedule_id)
+                            continue
 
-            update = {
-                "$unset": {
-                    "acquired_by": True,
-                    "acquired_until": True,
-                    "acquired_until_utcoffset": True,
-                },
-                "$set": {
-                    "trigger": serialized_trigger,
-                    **marshal_timestamp(result.last_fire_time, "last_fire_time"),
-                    **marshal_timestamp(result.next_fire_time, "next_fire_time"),
-                },
-            }
-            requests.append(UpdateOne(filters, update))
-            updated_schedules.append((result.schedule_id, result.next_fire_time))
+                        # Marshal the jobs first so that a serialization error
+                        # prevents any changes from being made
+                        job_documents: list[dict[str, Any]] = []
+                        for job in result.created_jobs:
+                            document = job.marshal(self.serializer)
+                            marshal_document(document)
+                            job_documents.append(document)
 
-        if requests:
-            async for attempt in self._retry():
-                with attempt:
-                    async with self._client.start_session() as session:
-                        await self._schedules.bulk_write(
-                            requests, ordered=False, session=session
+                        update = {
+                            "$unset": {
+                                "acquired_by": True,
+                                "acquired_until": True,
+                                "acquired_until_utcoffset": True,
+                            },
+                            "$set": {
+                                "trigger": serialized_trigger,
+                                **marshal_timestamp(
+                                    result.last_fire_time, "last_fire_time"
+                                ),
+                                **marshal_timestamp(
+                                    result.next_fire_time, "next_fire_time"
+                                ),
+                            },
+                        }
+                        update_result = await self._schedules.update_one(
+                            filters, update, session=session
                         )
+                        if not update_result.matched_count:
+                            continue
+
+                        # Add the jobs created from this schedule
+                        if job_documents:
+                            await self._jobs.insert_many(job_documents, session=session)
+
+                        updated_schedules.append(
+                            (result.schedule_id, result.next_fire_time)
+                        )
+                        added_jobs.extend(result.created_jobs)
+
+        for job in added_jobs:
+            event = JobAdded(
+                job_id=job.id,
+                task_id=job.task_id,
+                schedule_id=job.schedule_id,
+            )
+            await self._event_broker.publish(event)
 
         for schedule_id, next_fire_time in updated_schedules:
             event = ScheduleUpdated(

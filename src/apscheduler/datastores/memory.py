@@ -177,8 +177,14 @@ class MemoryDataStore(BaseDataStore):
     ) -> None:
         # Send update events for schedules
         for result in results:
+            schedule = self._schedules_by_id.get(result.schedule_id)
+            if schedule is None or schedule.acquired_by != scheduler_id:
+                # The schedule was removed, replaced or its claim was lost while it
+                # was being processed, so neither the schedule update nor the jobs
+                # created from it may be applied
+                continue
+
             # Remove the schedule
-            schedule = self._schedules_by_id[result.schedule_id]
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -188,6 +194,11 @@ class MemoryDataStore(BaseDataStore):
             schedule.acquired_by = None
             schedule.acquired_until = None
             insort_right(self._schedules, schedule)
+
+            # Add any jobs created from this schedule
+            for job in result.created_jobs:
+                await self.add_job(job)
+
             event = ScheduleUpdated(
                 schedule_id=result.schedule_id,
                 task_id=schedule.task_id,

@@ -247,6 +247,8 @@ class ScheduleResult:
     :ivar schedule_id: ID of the schedule
     :ivar task_id: ID of the schedule's task
     :ivar trigger: the schedule's trigger
+    :ivar created_jobs: jobs created from this schedule, to be added to the store in
+        the same transaction as the schedule update
     :ivar last_fire_time: the schedule's trigger
     :ivar next_fire_time: the next
     """
@@ -254,6 +256,7 @@ class ScheduleResult:
     schedule_id: str
     task_id: str
     trigger: Trigger
+    created_jobs: list[Job] = attrs.field(factory=list)
     last_fire_time: datetime
     next_fire_time: datetime | None
 
