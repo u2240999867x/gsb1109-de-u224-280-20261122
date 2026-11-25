@@ -470,6 +470,15 @@ class TopicPartitionState:
         self._reset_strategy = None  # type: int
         self._status = PartitionStatus.AWAITING_RESET  # type: PartitionStatus
 
+        # Monotonically increasing generation of the pending position reset.
+        # It is bumped by every `await_reset`/`seek` so a position lookup that
+        # was superseded by a newer one can detect that its result is stale.
+        self._reset_generation = 0
+        # Position to fall back to when a position reset is abandoned before
+        # its result is applied (e.g. the awaiting call was cancelled). It is
+        # captured from the buffered, not yet consumed, fetch position.
+        self._restore_position = None
+
         self._assignment = assignment
 
         self._paused = False
@@ -500,12 +509,30 @@ class TopicPartitionState:
     def reset_strategy(self) -> int:
         return self._reset_strategy
 
-    def await_reset(self, strategy):
+    @property
+    def reset_generation(self) -> int:
+        """Generation of the currently pending position reset. A value
+        returned by an offset lookup can only be applied if it still matches
+        this generation, otherwise a newer reset superseded it.
+        """
+        return self._reset_generation
+
+    @property
+    def restore_position(self):
+        return self._restore_position
+
+    def await_reset(self, strategy, restore_position=None):
         """Called by either Coonsumer in `seek_to_*` or by Coordinator after
         setting initial committed point.
+
+        ``restore_position`` is the buffered fetch position to resume from if
+        this reset is abandoned (the awaiting call is cancelled) before its
+        lookup result arrives.
         """
+        self._reset_generation += 1
         self._reset_strategy = strategy
         self._position = None
+        self._restore_position = restore_position
         if self._position_fut.done():
             self._position_fut = create_future()
         self._status = PartitionStatus.AWAITING_RESET
@@ -531,22 +558,55 @@ class TopicPartitionState:
         """Called by Fetcher when yielding results to Consumer"""
         assert self._status == PartitionStatus.CONSUMING
         self._position = position
+        # Records buffered up to ``position`` are now handed over, so there is
+        # nothing to restore to past the current position.
+        self._restore_position = None
 
-    def reset_to(self, position: int):
+    def reset_to(self, position: int, generation: int | None = None):
         """Called by Fetcher after performing a reset to force position to
         a new point.
+
+        The result is only applied if ``generation`` still matches the
+        pending reset generation, i.e. no newer reset or seek superseded it.
+        Returns ``True`` if the position was actually changed.
         """
         assert self._status == PartitionStatus.AWAITING_RESET
+        if generation is not None and generation != self._reset_generation:
+            return False
         self._position = position
         self._reset_strategy = None
+        self._restore_position = None
         self._status = PartitionStatus.CONSUMING
         if not self._position_fut.done():
             self._position_fut.set_result(None)
+        return True
+
+    def restore_pending_reset(self):
+        """Abandon the pending reset without applying its result and move
+        back to the previously buffered position. Used when the call awaiting
+        the reset is cancelled before the lookup result arrives.
+
+        Returns the restored position, or ``None`` if there was nothing to
+        restore (the partition stays without a valid position).
+        """
+        if self._status != PartitionStatus.AWAITING_RESET:
+            return self._position
+        position = self._restore_position
+        self._reset_strategy = None
+        self._restore_position = None
+        self._status = PartitionStatus.CONSUMING
+        if position is not None:
+            self._position = position
+            if not self._position_fut.done():
+                self._position_fut.set_result(None)
+        return position
 
     def seek(self, position: int):
         """Called by Consumer to force position to a specific offset"""
+        self._reset_generation += 1
         self._position = position
         self._reset_strategy = None
+        self._restore_position = None
         self._status = PartitionStatus.CONSUMING
         if not self._position_fut.done():
             self._position_fut.set_result(None)

@@ -13,6 +13,12 @@ New features:
 
 Bugfixes:
 
+* Make concurrent ``seek_to_beginning``/``seek_to_end`` calls coordinate per
+  partition: a later position reset supersedes an earlier one, each call
+  returns ``True`` only if its own lookup result was applied to all requested
+  partitions (``False`` otherwise), and cancelling a call restores the
+  previously buffered read point instead of letting a late broker reply move
+  it.
 * Fix unexpected ``CancelledError`` during consumer shutdown after connection
   failures or immediately after startup (issues #647, #974, #1210).
 * Fix decoding of ``DescribeGroups`` v3 responses when describing multiple

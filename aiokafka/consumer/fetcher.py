@@ -138,6 +138,13 @@ class FetchResult:
     def has_more(self):
         return self._partition_records is not None
 
+    @property
+    def next_fetch_offset(self):
+        """Offset of the next record still buffered for the user."""
+        if self._partition_records is None:
+            return None
+        return self._partition_records.next_fetch_offset
+
     def __repr__(self):
         return f"<FetchResult position={self._partition_records.next_fetch_offset!r}>"
 
@@ -429,6 +436,15 @@ class Fetcher:
 
         self._wait_consume_future = None
         self._fetch_waiters = set()
+        # Per-partition futures of in-flight `seek_to_*` position lookups.
+        # A future resolves to ``True`` only if its own lookup result actually
+        # changed the partition's read point; a reset superseded by a newer one
+        # resolves to ``False``. Used to coordinate concurrent seek calls.
+        self._offset_reset_waiters = collections.defaultdict(list)
+        # Records buffered for a partition whose read point is being reset.
+        # They are kept (instead of discarded) so a cancelled reset can resume
+        # serving them even if the broker no longer retains those offsets.
+        self._shelved_records = {}
 
         # SubscriptionState will pass Coordination critical errors to those
         # waiters directly
@@ -505,6 +521,8 @@ class Fetcher:
                         await cancel_and_wait(task)
                     self._pending_tasks.clear()
                     self._records.clear()
+                    self._shelved_records.clear()
+                    self._offset_reset_waiters.clear()
 
                     subscription = self._subscriptions.subscription
                     if subscription is None or subscription.assignment is None:
@@ -951,11 +969,16 @@ class Fetcher:
 
         topic_data = collections.defaultdict(list)
         needs_reset = []
+        reset_generations = {}
         for tp in tps:
             tp_state = assignment.state_value(tp)
             if not tp_state.awaiting_reset:
                 continue
             needs_reset.append(tp)
+            # Capture the reset generation this lookup answers. By the time the
+            # broker reply arrives a newer `seek_to_*`/`seek` may have superseded
+            # it, in which case the stale result must not move the read point.
+            reset_generations[tp] = tp_state.reset_generation
 
             strategy = tp_state.reset_strategy
             assert strategy is not None
@@ -984,7 +1007,20 @@ class Fetcher:
             tp_state = assignment.state_value(tp)
             # There could have been some `seek` call while fetching offset
             if tp_state.awaiting_reset:
-                tp_state.reset_to(offset)
+                generation = reset_generations[tp]
+                applied = tp_state.reset_to(offset, generation=generation)
+                self._resolve_offset_reset_waiters(tp, applied, generation)
+                if applied:
+                    # The read point moved to the broker-provided offset; any
+                    # records buffered before the reset are now obsolete.
+                    self._discard_shelved_records(tp)
+                else:
+                    log.debug(
+                        "Discarding stale offset reset result %s for "
+                        "partition %s as a newer reset superseded it",
+                        offset,
+                        tp,
+                    )
         return needs_wakeup
 
     async def _retrieve_offsets(self, timestamps, timeout_ms=None):
@@ -1280,30 +1316,166 @@ class Fetcher:
         return {tp: offset for (tp, (offset, ts)) in offsets.items()}
 
     def request_offset_reset(self, tps, strategy):
-        """Force a position reset. Called from Consumer of `seek_to_*` API's."""
+        """Force a position reset. Called from Consumer of `seek_to_*` API's.
+
+        Returns a list with one future per partition, in the same order. Each
+        future resolves to ``True`` only if this call's own lookup result
+        actually moved that partition's read point; it resolves to ``False`` if
+        the reset was superseded by a newer one.
+        """
         assignment = self._subscriptions.subscription.assignment
         assert assignment is not None
 
         waiters = []
         for tp in tps:
             tp_state = assignment.state_value(tp)
-            tp_state.await_reset(strategy)
-            waiters.append(tp_state.wait_for_position())
-            # Invalidate previous fetch result
+            # Remember where prefetched, not yet consumed records continue so
+            # the read point can be restored if this reset is cancelled before
+            # its lookup result is applied. Records already shelved by an
+            # earlier reset (and their restore point) take precedence.
+            restore_position = self._buffered_position(tp)
+            if restore_position is None and tp in self._shelved_records:
+                restore_position = tp_state.restore_position
+            tp_state.await_reset(strategy, restore_position=restore_position)
+            waiter = create_future()
+            self._offset_reset_waiters[tp].append(
+                (tp_state.reset_generation, waiter)
+            )
+            waiters.append(waiter)
+            # Move any prefetched, not yet consumed records aside instead of
+            # dropping them: a cancelled reset must still be able to serve
+            # these records even after the broker no longer retains them.
             if tp in self._records:
-                del self._records[tp]
+                record = self._records.pop(tp)
+                if type(record) is FetchResult and record.has_more():
+                    self._shelved_records[tp] = record
+                self._notify(self._wait_consume_future)
 
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
         self._notify(self._wait_consume_future)
 
-        return asyncio.gather(*waiters)
+        return waiters
+
+    def abort_offset_reset(self, tps, waiters):
+        """Called when a `seek_to_*` coroutine is cancelled before all of its
+        lookups completed. Detaches its waiters and restores the previous
+        buffered read point on partitions it still owns, so a broker reply that
+        arrives later can no longer move the position.
+        """
+        assignment = self._subscriptions.subscription.assignment
+        for tp, waiter in zip(tps, waiters):
+            own_generation = None
+            entries = self._offset_reset_waiters.get(tp, [])
+            remaining = []
+            for generation, fut in entries:
+                if fut is waiter:
+                    own_generation = generation
+                else:
+                    remaining.append((generation, fut))
+            if remaining:
+                self._offset_reset_waiters[tp] = remaining
+            else:
+                self._offset_reset_waiters.pop(tp, None)
+
+            if assignment is None:
+                continue
+            tp_state = assignment.state_value(tp)
+            if tp_state is None:
+                continue
+            if (
+                tp_state.awaiting_reset
+                and own_generation == tp_state.reset_generation
+            ):
+                # This call still owns the pending lookup: fall back to the
+                # previously buffered position and fail any waiter left behind.
+                restored = tp_state.restore_pending_reset()
+                if restored is not None:
+                    self._restore_shelved_records(tp)
+                else:
+                    self._discard_shelved_records(tp)
+                self._fail_pending_offset_reset_waiters(tp)
+            elif not tp_state.awaiting_reset:
+                # A seek or an earlier restore already settled the partition,
+                # so no registered waiter can be satisfied by a reset anymore.
+                self._fail_pending_offset_reset_waiters(tp)
+
+    def detach_offset_reset_waiters(self, tps, waiters):
+        """Unregister waiters without touching the partition state. Used when
+        the awaiting call gives up due to a timeout or assignment change while
+        the background lookup may still finish on its own.
+        """
+        for tp, waiter in zip(tps, waiters):
+            entries = self._offset_reset_waiters.get(tp)
+            if not entries:
+                self._offset_reset_waiters.pop(tp, None)
+                continue
+            remaining = [item for item in entries if item[1] is not waiter]
+            if remaining:
+                self._offset_reset_waiters[tp] = remaining
+            else:
+                self._offset_reset_waiters.pop(tp, None)
+
+    def _buffered_position(self, tp):
+        """Next offset that would be handed to the user from the records
+        prefetched for ``tp``, or ``None`` if nothing is buffered.
+        """
+        result = self._records.get(tp)
+        if type(result) is FetchResult and result.has_more():
+            return result.next_fetch_offset
+        return None
+
+    def _restore_shelved_records(self, tp):
+        """Put records shelved while resetting ``tp`` back into the active
+        buffer so consumption resumes from the restored read point.
+        """
+        record = self._shelved_records.pop(tp, None)
+        if record is not None and record.has_more() and tp not in self._records:
+            self._records[tp] = record
+            self._notify(self._wait_consume_future)
+
+    def _discard_shelved_records(self, tp):
+        """Drop records shelved for ``tp`` once the read point moved past
+        them or they can no longer be served.
+        """
+        self._shelved_records.pop(tp, None)
+
+    def _resolve_offset_reset_waiters(self, tp, applied, generation):
+        entries = self._offset_reset_waiters.get(tp)
+        if not entries:
+            self._offset_reset_waiters.pop(tp, None)
+            return
+        remaining = []
+        for waiter_generation, fut in entries:
+            if waiter_generation <= generation:
+                if not fut.done():
+                    fut.set_result(applied and waiter_generation == generation)
+            else:
+                # A newer reset superseded this lookup and still awaits its own
+                # result, so keep its waiters.
+                remaining.append((waiter_generation, fut))
+        if remaining:
+            self._offset_reset_waiters[tp] = remaining
+        else:
+            self._offset_reset_waiters.pop(tp, None)
+
+    def _fail_pending_offset_reset_waiters(self, tp):
+        entries = self._offset_reset_waiters.pop(tp, None)
+        if entries is None:
+            return
+        for _generation, fut in entries:
+            if not fut.done():
+                fut.set_result(False)
 
     def seek_to(self, tp, offset):
         """Force a position change to specific offset. Called from
         `Consumer.seek()` API.
         """
         self._subscriptions.seek(tp, offset)
+        # A manual seek supersedes any reset that was still awaiting a lookup.
+        self._fail_pending_offset_reset_waiters(tp)
+        # The explicit position overrides records buffered before the reset.
+        self._discard_shelved_records(tp)
         if tp in self._records:
             del self._records[tp]
 

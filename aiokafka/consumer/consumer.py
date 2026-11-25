@@ -793,6 +793,49 @@ class AIOKafkaConsumer:
         log.debug("Seeking to offset %s for partition %s", offset, partition)
         self._fetcher.seek_to(partition, offset)
 
+    async def _request_offset_reset(self, partitions, strategy):
+        """Drive a `seek_to_*` call and report whether it changed every
+        partition's read point itself.
+
+        Returns ``True`` only if this call's own lookup result was applied to
+        all of ``partitions``. If another concurrent reset superseded it on any
+        partition, or it gave up early (assignment change, timeout), the result
+        is ``False``. Cancelling the awaiting coroutine restores the previously
+        buffered read point instead of letting a late broker reply move it.
+        """
+        waiters = self._fetcher.request_offset_reset(partitions, strategy)
+        combined = asyncio.gather(*waiters)
+        assignment = self._subscription.subscription.assignment
+        try:
+            await asyncio.wait(
+                [combined, assignment.unassign_future],
+                timeout=self._request_timeout_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            # Detach from the background lookups and make sure a reply that
+            # arrives later cannot move a partition this call still owns.
+            combined.cancel()
+            self._fetcher.abort_offset_reset(partitions, waiters)
+            raise
+        finally:
+            # Avoid "future exception never retrieved" warnings if we left
+            # early. A cancelled gather has no exception to retrieve.
+            combined.add_done_callback(
+                lambda fut: None if fut.cancelled() else fut.exception()
+            )
+
+        if not combined.done():
+            # Timed out or the assignment was revoked: the background lookup is
+            # still running, so just stop waiting for it.
+            combined.cancel()
+            self._fetcher.detach_offset_reset_waiters(partitions, waiters)
+            self._coordinator.check_errors()
+            return False
+
+        self._coordinator.check_errors()
+        return all(combined.result())
+
     async def seek_to_beginning(self, *partitions):
         """Seek to the oldest available offset for partitions.
 
@@ -803,6 +846,14 @@ class AIOKafkaConsumer:
         Raises:
             IllegalStateError: If any partition is not currently assigned
             TypeError: If partitions are not instances of :class:`.TopicPartition`
+
+        Returns:
+            bool: ``True`` only if this call's own lookup result was applied to
+            every requested partition. ``False`` if a concurrent
+            :meth:`seek_to_beginning`/:meth:`seek_to_end` superseded it on any
+            partition, or the wait ended because of a timeout or assignment
+            change. A superseded call still waits for its own remaining
+            partitions and never waits for the call that replaced it.
 
         .. versionadded:: 0.3.0
 
@@ -821,17 +872,9 @@ class AIOKafkaConsumer:
         for tp in partitions:
             log.debug("Seeking to beginning of partition %s", tp)
 
-        fut = self._fetcher.request_offset_reset(
+        return await self._request_offset_reset(
             partitions, OffsetResetStrategy.EARLIEST
         )
-        assignment = self._subscription.subscription.assignment
-        await asyncio.wait(
-            [fut, assignment.unassign_future],
-            timeout=self._request_timeout_ms / 1000,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        self._coordinator.check_errors()
-        return fut.done()
 
     async def seek_to_end(self, *partitions):
         """Seek to the most recent available offset for partitions.
@@ -843,6 +886,14 @@ class AIOKafkaConsumer:
         Raises:
             IllegalStateError: If any partition is not currently assigned
             TypeError: If partitions are not instances of :class:`.TopicPartition`
+
+        Returns:
+            bool: ``True`` only if this call's own lookup result was applied to
+            every requested partition. ``False`` if a concurrent
+            :meth:`seek_to_beginning`/:meth:`seek_to_end` superseded it on any
+            partition, or the wait ended because of a timeout or assignment
+            change. A superseded call still waits for its own remaining
+            partitions and never waits for the call that replaced it.
 
         .. versionadded:: 0.3.0
 
@@ -860,15 +911,9 @@ class AIOKafkaConsumer:
 
         for tp in partitions:
             log.debug("Seeking to end of partition %s", tp)
-        fut = self._fetcher.request_offset_reset(partitions, OffsetResetStrategy.LATEST)
-        assignment = self._subscription.subscription.assignment
-        await asyncio.wait(
-            [fut, assignment.unassign_future],
-            timeout=self._request_timeout_ms / 1000,
-            return_when=asyncio.FIRST_COMPLETED,
+        return await self._request_offset_reset(
+            partitions, OffsetResetStrategy.LATEST
         )
-        self._coordinator.check_errors()
-        return fut.done()
 
     async def seek_to_committed(self, *partitions):
         """Seek to the committed offset for partitions.
