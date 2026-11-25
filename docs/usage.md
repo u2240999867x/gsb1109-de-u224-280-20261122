@@ -367,3 +367,92 @@ for name, details in sorted(known_implementations.items()):
 
 !!! tip "Custom Filesystems"
     Built a custom fsspec filesystem? UPath will work with it automatically!
+
+### How do I configure two `simplecache` layers separately?
+
+A chained path can contain more than one cache layer, for example a cache that
+holds downloaded archives and an outer cache that holds extracted members:
+
+```python
+from upath import UPath
+
+uri = (
+    "simplecache::zip://tables/sales.csv::"
+    "simplecache::ftp://127.0.0.1:2121/daily/report.zip"
+)
+path = UPath(
+    uri,
+    cache_options={
+        "outer": {"cache_storage": "/work/member-cache"},
+        "inner": {"cache_storage": "/shared/archive-cache"},
+    },
+)
+
+path.cache_options["outer"]  # {'cache_storage': '/work/member-cache'}
+path.cache_options["inner"]  # {'cache_storage': '/shared/archive-cache'}
+```
+
+`cache_options` may be a list ordered from outermost to innermost layer, or a
+mapping with `outer` and `inner` keys. The keys `outer_cache_options` and
+`inner_cache_options`, as well as `simplecache:outer` and `simplecache:inner`,
+are accepted too.
+
+A single unattributed `cache_storage` is still valid for a chain with exactly
+one cache layer:
+
+```python
+UPath("simplecache::s3://bucket/data.csv", simplecache={"cache_storage": "/tmp/cache"})
+```
+
+If a chain contains two cache layers and only one unattributed `cache_storage`
+is passed, UPath raises a `ValueError` before any filesystem is created. The
+message names both candidate chain positions and the supported ways to
+disambiguate.
+
+### How do I pin a release digest?
+
+Pass the publisher's whole-archive SHA-256 as `sha256` (aliases such as
+`expected_sha256` and `release_digest` are accepted). The digest namespaces both
+cache layers, so two releases of the same archive path never share cached data:
+
+```python
+path = UPath(
+    uri,
+    cache_options={
+        "outer": {"cache_storage": "/work/member-cache"},
+        "inner": {
+            "cache_storage": "/shared/archive-cache",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb924...",
+        },
+    },
+)
+path.release_sha256  # the configured digest
+```
+
+A download is written to a temporary file, hashed after the complete transfer,
+and only published atomically when the digest matches. If the upstream path now
+serves a different ZIP, reading a member raises `ReleaseDigestMismatch` (a
+subclass of `FileNotFoundError` and `ValueError`) with `expected_sha256`,
+`actual_sha256` and the failing path. Partial or mismatching transfers never
+become visible to other processes, and a later retry is not blocked by them.
+A cached archive that no longer matches its digest is never reused.
+
+### How do I hand a path to another process?
+
+`str(path)` is the full chained URI, and `dict(path.storage_options)` is plain
+JSON-compatible data. Another process can reopen the exact same chain with:
+
+```python
+import json
+
+handoff = {
+    "uri": str(path),
+    "storage_options": json.loads(json.dumps(dict(path.storage_options))),
+}
+reopened = UPath.from_uri(handoff["uri"], **handoff["storage_options"])
+```
+
+The consumer may replace the outer `cache_storage` with its own directory while
+keeping the shared inner archive directory. Cache hits are served without
+constructing or connecting the remote filesystem, so previously fetched release
+data remains readable while the origin is offline.

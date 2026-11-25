@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import sys
 import warnings
 from collections import defaultdict
 from collections import deque
 from collections.abc import Iterator
+from collections.abc import Mapping
 from collections.abc import MutableMapping
 from collections.abc import Sequence
 from collections.abc import Set
@@ -32,6 +34,346 @@ __all__ = [
     "FSSpecChainParser",
     "DEFAULT_CHAIN_PARSER",
 ]
+
+
+CACHE_PROTOCOLS = frozenset({"blockcache", "filecache", "simplecache"})
+
+_DIGEST_OPTION_NAMES = (
+    "sha256",
+    "sha256sum",
+    "sha256_digest",
+    "digest",
+    "expected_sha256",
+    "expected_digest",
+    "release_sha256",
+    "release_digest",
+    "archive_sha256",
+    "archive_digest",
+    "content_sha256",
+    "zip_sha256",
+)
+
+_LEAF_OPTION_NAMES = {
+    "ftp": frozenset(
+        {
+            "host",
+            "port",
+            "username",
+            "password",
+            "acct",
+            "tls",
+            "timeout",
+            "encoding",
+        }
+    ),
+    "sftp": frozenset(
+        {
+            "host",
+            "port",
+            "username",
+            "password",
+            "passphrase",
+            "timeout",
+        }
+    ),
+    "ssh": frozenset({"host", "port", "username", "password", "timeout"}),
+    "http": frozenset(
+        {"simple_links", "same_scheme", "client_kwargs", "encoded"}
+    ),
+    "https": frozenset(
+        {"simple_links", "same_scheme", "client_kwargs", "encoded"}
+    ),
+}
+
+_CACHE_LAYER_NAMES = {
+    "outer": 0,
+    "outermost": 0,
+    "top": 0,
+    "first": 0,
+    "member": 0,
+    "members": 0,
+    "layer0": 0,
+    "l0": 0,
+    "inner": -1,
+    "innermost": -1,
+    "bottom": -1,
+    "second": -1,
+    "last": -1,
+    "archive": -1,
+    "zip": -1,
+    "layer1": -1,
+    "l1": -1,
+}
+
+_CACHE_LAYER_KEY_NAMES = {
+    "outer_cache_options": "outer",
+    "inner_cache_options": "inner",
+    "outer_cache": "outer",
+    "inner_cache": "inner",
+    "outer_options": "outer",
+    "inner_options": "inner",
+    "outer_simplecache": "outer",
+    "inner_simplecache": "inner",
+    "simplecache_outer": "outer",
+    "simplecache_inner": "inner",
+    "cache_outer": "outer",
+    "cache_inner": "inner",
+    "cache_options_outer": "outer",
+    "cache_options_inner": "inner",
+    "outer_cache_opts": "outer",
+    "inner_cache_opts": "inner",
+}
+
+_CACHE_STORAGE_KEY_NAMES = {
+    "outer_cache_storage": "outer",
+    "inner_cache_storage": "inner",
+    "cache_storage_outer": "outer",
+    "cache_storage_inner": "inner",
+    "outer_cache_dir": "outer",
+    "inner_cache_dir": "inner",
+    "outer_workdir": "outer",
+    "inner_workdir": "inner",
+    "outer_work_dir": "outer",
+    "inner_work_dir": "inner",
+}
+
+
+def normalize_sha256(value: Any) -> str:
+    """return a lowercase hex sha256 digest from common input formats"""
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    if not isinstance(value, str):
+        raise TypeError(f"expected sha256 digest as str, not {type(value)!r}")
+    digest = value.strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest.partition(":")[2].strip()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError(f"invalid sha256 digest: {value!r}")
+    return digest
+
+
+def _normalize_cache_options_value(value: Any) -> list[dict[str, Any]]:
+    """accept a list of layer options or a mapping keyed by layer name"""
+    if value is None:
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [dict(v or {}) for v in value]
+    if not isinstance(value, MutableMapping):
+        raise TypeError(
+            "cache_options must be a list of option mappings or a mapping"
+            " with 'outer'/'inner' keys"
+        )
+    if not value:
+        return []
+    keys = list(value)
+    if all(k in _CACHE_LAYER_NAMES or isinstance(k, int) for k in keys):
+        layers: dict[int, dict[str, Any]] = {}
+        for key, opts in value.items():
+            idx = _CACHE_LAYER_NAMES.get(key, key) if isinstance(key, str) else key
+            if idx == -1:
+                idx = 1
+            if idx not in (0, 1):
+                raise ValueError(f"unsupported cache layer key: {key!r}")
+            layers[idx] = dict(opts or {})
+        if not layers:
+            return []
+        return [layers.get(i, {}) for i in range(max(layers) + 1)]
+    return [dict(value)]
+
+
+def _pop_digest_options(options: MutableMapping[str, Any]) -> str | None:
+    digest = None
+    for key in _DIGEST_OPTION_NAMES:
+        if key in options:
+            value = options.pop(key)
+            if value is not None:
+                digest = normalize_sha256(value)
+    return digest
+
+
+def _cache_layer_indices(segments: Sequence[ChainSegment]) -> list[int]:
+    """indices of cache segments, ordered outermost to innermost"""
+    return [
+        idx
+        for idx, segment in enumerate(segments)
+        if segment.protocol in CACHE_PROTOCOLS
+    ]
+
+
+def _count_nested_cache_storage(options: Any) -> int:
+    """count cache_storage entries in an already-nested target_options tree"""
+    if not isinstance(options, Mapping):
+        return 0
+    count = 1 if "cache_storage" in options else 0
+    nested = options.get("target_options")
+    if isinstance(nested, Mapping):
+        count += _count_nested_cache_storage(nested)
+    return count
+
+
+def _split_cache_options(
+    segments: Sequence[ChainSegment],
+    storage_options: MutableMapping[str, Any],
+) -> tuple[list[dict[str, Any]], MutableMapping[str, Any]]:
+    """extract and remove cache layer options from flat storage options
+
+    the returned list is ordered from the outermost cache layer to the
+    innermost cache layer. Unambiguous flat ``cache_storage`` options are
+    assigned to the outer layer for backward compatibility.
+    """
+    cache_indices = _cache_layer_indices(segments)
+    n_cache = len(cache_indices)
+    layer_options: list[dict[str, Any]] = [{} for _ in cache_indices]
+
+    raw = storage_options.pop("cache_options", None)
+    if raw is not None:
+        normalized = _normalize_cache_options_value(raw)
+        if normalized and n_cache and len(normalized) > n_cache:
+            raise ValueError(
+                f"cache_options defines {len(normalized)} layers, but the chain"
+                f" contains only {n_cache} cache layer(s)"
+            )
+        for idx, opts in enumerate(normalized):
+            layer_options[idx].update(opts)
+
+    for key, layer_name in _CACHE_LAYER_KEY_NAMES.items():
+        value = storage_options.pop(key, None)
+        if value is None:
+            continue
+        idx = 0 if layer_name == "outer" else 1
+        if not n_cache:
+            raise ValueError(f"{key} was provided but the chain has no cache layer")
+        layer_options[idx].update(dict(value))
+
+    for ref in list(storage_options):
+        if not isinstance(ref, str) or ":" not in ref:
+            continue
+        proto, _, layer_name = ref.partition(":")
+        if proto not in CACHE_PROTOCOLS:
+            continue
+        idx = _CACHE_LAYER_NAMES.get(layer_name)
+        if idx is None:
+            continue
+        if idx == -1:
+            idx = 1
+        value = storage_options.pop(ref)
+        if not n_cache:
+            raise ValueError(f"{ref!r} was provided but the chain has no cache layer")
+        if idx >= n_cache:
+            raise ValueError(
+                f"{ref!r} was provided but the chain has only {n_cache}"
+                " cache layer(s)"
+            )
+        layer_options[idx].update(dict(value or {}))
+
+    for proto in CACHE_PROTOCOLS:
+        value = storage_options.get(proto)
+        if not isinstance(value, MutableMapping):
+            continue
+        if n_cache == 1:
+            layer_options[0].update(storage_options.pop(proto))
+        elif "cache_storage" in value and n_cache > 1:
+            if _count_nested_cache_storage(storage_options.get("target_options")):
+                continue
+            # a bare protocol mapping on a multi-cache chain is ambiguous
+            raise ValueError(
+                f"storage option {proto!r} with 'cache_storage' is ambiguous:"
+                f" the chain has {n_cache} cache layers at chain positions"
+                f" {cache_indices}. Use cache_options,"
+                " outer_cache_options/inner_cache_options, or"
+                f" {proto}:outer / {proto}:inner keys instead."
+            )
+
+    flat_cache_storage = storage_options.get("cache_storage", UNSET_DEFAULT)
+    if flat_cache_storage is not UNSET_DEFAULT:
+        if not n_cache:
+            # keep fsspec behavior for non-cache chains
+            pass
+        elif n_cache == 1 and not (
+            isinstance(flat_cache_storage, Mapping)
+            or (
+                isinstance(flat_cache_storage, Sequence)
+                and not isinstance(flat_cache_storage, (str, bytes))
+            )
+        ):
+            layer_options[0]["cache_storage"] = storage_options.pop("cache_storage")
+        elif isinstance(flat_cache_storage, Mapping) and n_cache > 1:
+            for layer_name, value in flat_cache_storage.items():
+                idx = _CACHE_LAYER_NAMES.get(str(layer_name))
+                if idx is None:
+                    raise ValueError(
+                        f"cache_storage key {layer_name!r} is not a cache layer;"
+                        " use 'outer' or 'inner'"
+                    )
+                if idx == -1:
+                    idx = 1
+                layer_options[idx]["cache_storage"] = value
+            storage_options.pop("cache_storage")
+        elif (
+            isinstance(flat_cache_storage, Sequence)
+            and not isinstance(flat_cache_storage, (str, bytes))
+            and n_cache > 1
+            and len(flat_cache_storage) == n_cache
+        ):
+            for idx, value in enumerate(flat_cache_storage):
+                layer_options[idx]["cache_storage"] = value
+            storage_options.pop("cache_storage")
+        elif n_cache == 1:
+            layer_options[0]["cache_storage"] = storage_options.pop("cache_storage")
+        elif _count_nested_cache_storage(storage_options.get("target_options")):
+            # fully nested options (i.e. handed over as JSON) are unambiguous:
+            # top-level options describe the outermost cache layer
+            pass
+        else:
+            raise ValueError(
+                "storage option 'cache_storage' is ambiguous:"
+                f" the chain has {n_cache} cache layers at chain positions"
+                f" {cache_indices}. Use cache_options,"
+                " outer_cache_options/inner_cache_options, or"
+                " simplecache:outer / simplecache:inner keys instead."
+            )
+
+    for key, layer_name in _CACHE_STORAGE_KEY_NAMES.items():
+        value = storage_options.pop(key, None)
+        if value is None:
+            continue
+        if not n_cache:
+            raise ValueError(f"{key} was provided but the chain has no cache layer")
+        idx = 0 if layer_name == "outer" else 1
+        layer_options[idx]["cache_storage"] = value
+
+    # a flat release digest pins the archive-holding cache layer
+    flat_digest = _pop_digest_options(storage_options)
+    if flat_digest is not None and n_cache:
+        layer_options[-1]["sha256"] = flat_digest
+
+    for opts in layer_options:
+        digest = _pop_digest_options(opts)
+        if digest is not None:
+            opts["sha256"] = digest
+
+    # route leaf-specific flat options to the final segment; explicit flat
+    # options take precedence over values parsed from the urlpath
+    leaf = segments[-1]
+    leaf_names = _LEAF_OPTION_NAMES.get(leaf.protocol, frozenset())
+    for name in list(storage_options):
+        if name in leaf_names:
+            leaf.storage_options[name] = storage_options.pop(name)
+
+    for proto, leaf_names in _LEAF_OPTION_NAMES.items():
+        value = storage_options.get(proto)
+        if not isinstance(value, MutableMapping):
+            continue
+        if proto == segments[-1].protocol:
+            leaf.storage_options.update(storage_options.pop(proto))
+        elif set(value).issubset(leaf_names):
+            storage_options.pop(proto)
+        elif segments[-1].protocol in _LEAF_OPTION_NAMES:
+            # the caller addressed a different source implementation; keep the
+            # options but attach them to the actual leaf
+            leaf.storage_options.update(storage_options.pop(proto))
+
+    return layer_options, storage_options
 
 
 class ChainSegment(NamedTuple):
@@ -225,6 +567,11 @@ class FSSpecChainParser:
             protocol = protocol or storage_options.get("protocol")
         if storage_options is None:
             storage_options = {}
+        else:
+            try:
+                storage_options = copy.deepcopy(storage_options)
+            except Exception:
+                storage_options = copy.copy(storage_options)
 
         segments: list[ChainSegment] = []
         path_bit: str | None
@@ -266,6 +613,11 @@ class FSSpecChainParser:
                 next_path_overwrite = None
             segments.append(ChainSegment(path_bit, proto, extra_so))
 
+        # resolve explicit per-cache-layer options before any filesystem exists
+        layer_options, storage_options = _split_cache_options(
+            segments, storage_options
+        )
+
         root_so = segments[0].storage_options
         for segment, proto_fo_so in zip_longest(
             segments,
@@ -292,6 +644,16 @@ class FSSpecChainParser:
                 segment.storage_options.update(root_so.pop(proto, {}))
                 segment.storage_options.update(t_so)
 
+        for idx, opts in zip(_cache_layer_indices(segments), layer_options):
+            segment = segments[idx]
+            segment.storage_options.update(
+                {
+                    key: value
+                    for key, value in opts.items()
+                    if key not in segment.storage_options
+                }
+            )
+
         return segments
 
     def chain(self, segments: Sequence[ChainSegment]) -> tuple[str, dict[str, Any]]:
@@ -299,7 +661,11 @@ class FSSpecChainParser:
         urlpaths = []
         kwargs = {}
         for segment in segments:
-            if segment.protocol and segment.path is not None:
+            if segment.protocol in CACHE_PROTOCOLS:
+                # cache layers are passthrough links: their source is carried
+                # by the next segment's inline ``fo`` option
+                urlpath = segment.protocol
+            elif segment.protocol and segment.path is not None:
                 # FIXME: currently unstrip_protocol is only implemented by
                 #   AbstractFileSystem, LocalFileSystem, and OSSFileSystem
                 #   so to make this work we just implement it ourselves here.

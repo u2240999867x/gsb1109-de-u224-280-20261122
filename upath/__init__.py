@@ -29,3 +29,14 @@ def __getattr__(name):
         return UnsupportedOperation
     else:
         raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+def _register_cache_filesystem() -> None:
+    """ensure the digest-aware simplecache filesystem is registered"""
+    try:
+        from upath.implementations import cached  # noqa: F401
+    except Exception:  # pragma: no cover - optional fsspec features
+        pass
+
+
+_register_cache_filesystem()

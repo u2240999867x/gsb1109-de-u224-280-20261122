@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- upath.implementations.cached: per-cache-layer `cache_options` for chains with
+  multiple `simplecache` layers, with an early error for ambiguous
+  `cache_storage` options
+- upath.implementations.cached: release digest verification for cached archives,
+  with atomic publication, digest-aware cache namespacing and
+  `ReleaseDigestMismatch` diagnostics
+- upath.implementations.cached: cached reads no longer construct or connect the
+  remote target filesystem
+- `UPath.from_uri()` can reopen a chained cache path using only the URI and its
+  JSON-compatible `storage_options`
+
 ## [0.3.10] - 2026-02-22
 
 ### Fixed
