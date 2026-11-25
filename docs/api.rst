@@ -128,6 +128,11 @@ will handle those differently. Possible consumer errors include:
 * :exc:`~aiokafka.errors.InvalidMessageError` - CRC check on MessageSet failed due to connection
   failure or bug. Always raised. Changed in version ``0.5.0``, before we
   ignored this error in ``async for``.
+* :exc:`~aiokafka.errors.DecompressionLimitError` - a gzip compressed record
+  batch expanded past ``max_decompressed_batch_bytes`` while the optional guard
+  was enabled. It subclasses both :exc:`~aiokafka.errors.CorruptRecordException`
+  and :exc:`~aiokafka.errors.RecordTooLargeError`. Records decoded before the
+  affected batch are still returned; the error is raised on the next call.
 
 
 

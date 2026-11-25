@@ -281,6 +281,21 @@ class CorruptRecordException(BrokerResponseError):
 InvalidMessageError = CorruptRecordException
 
 
+class DecompressionLimitError(CorruptRecordException, RecordTooLargeError):
+    """A compressed record batch expands past the configured limit.
+
+    This is a :exc:`CorruptRecordException` so existing consumers that handle
+    corrupt records still work, but it is also a :exc:`RecordTooLargeError` to
+    make it distinguishable from a checksum or structural failure.
+    """
+
+
+# Alternative spellings for callers that want to catch the decompression guard
+# explicitly.
+DecompressedBatchTooLargeError = DecompressionLimitError
+GzipDecompressionLimitError = DecompressionLimitError
+
+
 class UnknownTopicOrPartitionError(BrokerResponseError):
     errno = 3
     message = "UNKNOWN_TOPIC_OR_PARTITION"

@@ -30,6 +30,15 @@ Security:
 * Reject negative or oversized response frame lengths before reading the frame
   body. Add a strict ``receive_message_max_bytes`` limit to consumers, producers,
   and admin clients, defaulting to 100 MiB.
+* Add optional guards against highly compressible gzip record batches. With
+  ``max_decompressed_batch_bytes`` and ``decompression_memory_limit`` the
+  consumer streams gzip batches instead of inflating them eagerly, bounding both
+  the bytes produced per batch (64 MiB default) and the shared transient
+  decompression memory. Oversized batches raise
+  ``DecompressionLimitError`` and a corrupt CRC, gzip stream, or record framing
+  raises ``CorruptRecordException`` before any record of the affected batch is
+  delivered. The guard is applied by both the pure-Python and native record
+  implementations.
 
 
 0.15.0 (2026-10-28)

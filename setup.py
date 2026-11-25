@@ -47,6 +47,14 @@ extensions = [
         optional=True,
     ),
     Extension(
+        "aiokafka.record._crecords.decompression",
+        ["aiokafka/record/_crecords/decompression.pyx"],
+        libraries=LIBRARIES,
+        extra_compile_args=CFLAGS,
+        extra_link_args=LDFLAGS,
+        optional=True,
+    ),
+    Extension(
         "aiokafka.record._crecords.cutil",
         ["aiokafka/record/_crecords/crc32c.c", "aiokafka/record/_crecords/cutil.pyx"],
         libraries=LIBRARIES,

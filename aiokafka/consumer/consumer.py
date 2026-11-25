@@ -16,6 +16,10 @@ from aiokafka.errors import (
     IllegalStateError,
     RecordTooLargeError,
 )
+from aiokafka.record.decompression import (
+    DEFAULT_DECOMPRESSION_MEMORY_LIMIT,
+    DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
+)
 from aiokafka.structs import ConsumerRecord, TopicPartition
 from aiokafka.util import commit_structure_validate, get_running_loop
 
@@ -24,6 +28,11 @@ from .group_coordinator import GroupCoordinator, NoGroupCoordinator
 from .subscription_state import SubscriptionState
 
 log = logging.getLogger(__name__)
+
+
+def _validate_positive_int(name, value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"`{name}` must be a positive Integer")
 
 
 class AIOKafkaConsumer:
@@ -104,6 +113,18 @@ class AIOKafkaConsumer:
             including a first batch larger than the requested fetch limits.
             This is a strict cap and does not limit decompressed record size.
             Default: 104857600 (100 MiB).
+        max_decompressed_batch_bytes (int): Optional safety limit for decompressed
+            message format v2 gzip record batches. When set, gzip batches are
+            decompressed incrementally and a batch that expands past this many
+            bytes raises :exc:`~aiokafka.errors.DecompressionLimitError` (a
+            subclass of both :exc:`~aiokafka.errors.CorruptRecordException` and
+            :exc:`~aiokafka.errors.RecordTooLargeError`). ``None`` keeps the
+            existing eager decompression behaviour. Default: ``None``.
+        decompression_memory_limit (int): Optional working-memory budget shared by
+            all partitions while incrementally decompressing gzip batches. It
+            bounds the input/output chunks kept per partition and, if
+            ``max_decompressed_batch_bytes`` is unset, also enables the guard with
+            a 64 MiB per-batch limit. Default: ``None`` (disabled).
         retry_backoff_ms (int): Milliseconds to backoff when retrying on
             errors. Default: 100.
         auto_offset_reset (str): A policy for resetting offsets on
@@ -276,6 +297,11 @@ class AIOKafkaConsumer:
         sasl_oauth_token_provider=None,
         client_rack=None,
         receive_message_max_bytes=DEFAULT_RECEIVE_MESSAGE_MAX_BYTES,
+        max_decompressed_batch_bytes=None,
+        decompression_memory_limit=None,
+        max_decompressed_bytes=None,
+        max_decompression_memory=None,
+        decompression_guard=None,
     ):
         if loop is None:
             loop = get_running_loop()
@@ -299,6 +325,28 @@ class AIOKafkaConsumer:
             not isinstance(max_poll_records, int) or max_poll_records < 1
         ):
             raise ValueError("`max_poll_records` should be positive Integer")
+
+        if max_decompressed_batch_bytes is None:
+            max_decompressed_batch_bytes = max_decompressed_bytes
+        if decompression_memory_limit is None:
+            decompression_memory_limit = max_decompression_memory
+        if decompression_guard is not None and decompression_guard is not False:
+            if max_decompressed_batch_bytes is None:
+                max_decompressed_batch_bytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES
+            if decompression_memory_limit is None:
+                decompression_memory_limit = DEFAULT_DECOMPRESSION_MEMORY_LIMIT
+        if max_decompressed_batch_bytes is not None:
+            _validate_positive_int(
+                "max_decompressed_batch_bytes", max_decompressed_batch_bytes
+            )
+            if decompression_memory_limit is None:
+                decompression_memory_limit = DEFAULT_DECOMPRESSION_MEMORY_LIMIT
+        if decompression_memory_limit is not None:
+            _validate_positive_int(
+                "decompression_memory_limit", decompression_memory_limit
+            )
+            if max_decompressed_batch_bytes is None:
+                max_decompressed_batch_bytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES
 
         if rebalance_timeout_ms is None:
             rebalance_timeout_ms = session_timeout_ms
@@ -345,6 +393,8 @@ class AIOKafkaConsumer:
         self._rebalance_timeout_ms = rebalance_timeout_ms
         self._max_poll_interval_ms = max_poll_interval_ms
         self._client_rack = client_rack
+        self._max_decompressed_batch_bytes = max_decompressed_batch_bytes
+        self._decompression_memory_limit = decompression_memory_limit
 
         self._check_crcs = check_crcs
         self._subscription = SubscriptionState(loop=loop)
@@ -405,6 +455,8 @@ class AIOKafkaConsumer:
             auto_offset_reset=self._auto_offset_reset,
             isolation_level=self._isolation_level,
             client_rack=self._client_rack,
+            max_decompressed_batch_bytes=self._max_decompressed_batch_bytes,
+            decompression_memory_limit=self._decompression_memory_limit,
         )
 
         if self._group_id is not None:

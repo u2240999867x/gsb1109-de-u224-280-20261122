@@ -10,6 +10,11 @@ from aiokafka.errors import ConsumerStoppedError, KafkaTimeoutError, RecordTooLa
 from aiokafka.protocol.fetch import FetchRequest
 from aiokafka.protocol.offset import OffsetRequest
 from aiokafka.record.control_record import ABORT_MARKER, ControlRecord
+from aiokafka.record.decompression import (
+    DEFAULT_DECOMPRESSION_MEMORY_LIMIT,
+    DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
+    ProtectedMemoryRecords,
+)
 from aiokafka.record.memory_records import MemoryRecords
 from aiokafka.structs import ConsumerRecord, OffsetAndTimestamp, TopicPartition
 from aiokafka.util import cancel_and_wait, create_future, create_task
@@ -62,6 +67,11 @@ class FetchResult:
         self._backoff = backoff
 
         self._assignment = assignment
+        # An error found at a batch boundary is reported only after records
+        # that were already decoded ahead of it.  Keeping it here lets a single
+        # ``getmany(max_records=...)`` return those records first and raise on
+        # the next call.
+        self._pending_error = None
 
     def calculate_backoff(self):
         lifetime = time.monotonic() - self._created
@@ -108,35 +118,79 @@ class FetchResult:
 
     def getone(self):
         tp = self._topic_partition
-        if not self.check_assignment(tp) or not self.has_more():
+        if self._pending_error is not None and not self.has_more():
+            raise self._take_pending_error()
+        if not self.has_more() or not self.check_assignment(tp):
             return None
 
-        msg = next(self._partition_records, None)
+        try:
+            msg = next(self._partition_records, None)
+        except Errors.KafkaError:
+            # The stream failed while decoding a batch.  Records delivered by
+            # earlier calls stay delivered; the failure is reported now and
+            # the rest of the response is discarded.
+            self._partition_records = None
+            raise
         # We should update position in any case
         self._update_position()
         if msg is None:
             self._partition_records = None
+            if self._pending_error is not None:
+                raise self._take_pending_error()
         return msg
 
     def getall(self, max_records=None):
         tp = self._topic_partition
-        if not self.check_assignment(tp) or not self.has_more():
+        if self._pending_error is not None and not self.has_more():
+            raise self._take_pending_error()
+        if not self.has_more() or not self.check_assignment(tp):
             return []
 
         ret_list = []
-        for msg in self._partition_records:
-            ret_list.append(msg)
-            if max_records is not None and len(ret_list) >= max_records:
+        try:
+            for msg in self._partition_records:
+                ret_list.append(msg)
+                if max_records is not None and len(ret_list) >= max_records:
+                    self._update_position()
+                    break
+            else:
                 self._update_position()
-                break
-        else:
+                self._partition_records = None
+        except Errors.KafkaError as err:
+            # Keep the position at the start of the failing batch and return
+            # everything decoded before it.  The error is raised on the next
+            # call, after the caller has seen the earlier records.
             self._update_position()
             self._partition_records = None
-
+            if not ret_list:
+                raise
+            self._pending_error = err
+            return ret_list
         return ret_list
 
     def has_more(self):
         return self._partition_records is not None
+
+    def has_pending_error(self):
+        return self._pending_error is not None
+
+    def take_pending_error(self):
+        error = self._pending_error
+        self._pending_error = None
+        return error
+
+    def _take_pending_error(self):
+        return self.take_pending_error()
+
+    def close(self):
+        """Release any decompression resources held by this result."""
+        partition_records = self._partition_records
+        self._partition_records = None
+        self._pending_error = None
+        if partition_records is not None:
+            close = getattr(partition_records, "close", None)
+            if close is not None:
+                close()
 
     def __repr__(self):
         return f"<FetchResult position={self._partition_records.next_fetch_offset!r}>"
@@ -163,7 +217,7 @@ class FetchError:
 
 
 class PartitionRecords:
-    def __init__(  # noqa: PLR0917
+    def __init__(
         self,
         tp,
         records,
@@ -203,6 +257,21 @@ class PartitionRecords:
             self._records_iterator = None
             raise
 
+    def close(self):
+        """Release resources held by an unfinished decompression pass."""
+        iterator = self._records_iterator
+        self._records_iterator = None
+        if iterator is not None:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        records = self._records
+        self._records = None
+        if records is not None:
+            close = getattr(records, "close", None)
+            if close is not None:
+                close()
+
     def _unpack_records(self):
         # NOTE: if the batch is not compressed it's equal to 1 record in
         #       v0 and v1.
@@ -210,6 +279,9 @@ class PartitionRecords:
         records = self._records
         while records.has_next():
             next_batch = records.next_batch()
+            # Guarded gzip batches validate themselves lazily (CRC included)
+            # and stream records without materialising the whole payload.  For
+            # those ``validate_crc`` is an idempotent header check.
             if self._check_crcs and not next_batch.validate_crc():
                 # This iterator will be closed after the exception, so we don't
                 # try to drain other batches here. They will be refetched.
@@ -394,6 +466,8 @@ class Fetcher:
         auto_offset_reset="latest",
         isolation_level="read_uncommitted",
         client_rack=None,
+        max_decompressed_batch_bytes=None,
+        decompression_memory_limit=None,
     ):
         self._client = client
         self._loop = client._loop
@@ -410,6 +484,13 @@ class Fetcher:
         self._subscriptions = subscriptions
         self._default_reset_strategy = OffsetResetStrategy.from_str(auto_offset_reset)
         self._client_rack = client_rack
+        self._max_decompressed_batch_bytes = max_decompressed_batch_bytes
+        self._decompression_memory_limit = decompression_memory_limit
+        if self._max_decompressed_batch_bytes is not None:
+            if self._decompression_memory_limit is None:
+                self._decompression_memory_limit = DEFAULT_DECOMPRESSION_MEMORY_LIMIT
+        elif self._decompression_memory_limit is not None:
+            self._max_decompressed_batch_bytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES
         # KIP-392: cache of preferred read replica per partition.
         # tp -> (node_id, expires_at_monotonic)
         self._preferred_read_replica: dict[TopicPartition, tuple[int, float]] = {}
@@ -449,6 +530,22 @@ class Fetcher:
 
         for x in self._pending_tasks:
             await cancel_and_wait(x)
+
+        # Release any partially consumed decompression state.
+        self._clear_records()
+
+    def _discard_result(self, tp):
+        """Drop a partition's buffered result, releasing decoder resources."""
+        result = self._records.pop(tp, None)
+        if result is None:
+            return
+        close = getattr(result, "close", None)
+        if close is not None:
+            close()
+
+    def _clear_records(self):
+        for tp in list(self._records.keys()):
+            self._discard_result(tp)
 
     def _notify(self, future):
         if future is not None and not future.done():
@@ -504,7 +601,7 @@ class Fetcher:
                     for task in self._pending_tasks:
                         await cancel_and_wait(task)
                     self._pending_tasks.clear()
-                    self._records.clear()
+                    self._clear_records()
 
                     subscription = self._subscriptions.subscription
                     if subscription is None or subscription.assignment is None:
@@ -819,7 +916,17 @@ class Fetcher:
 
                     # part_data also contains lso, aborted_transactions.
                     # message_set is last
-                    records = MemoryRecords(part_data[-1])
+                    raw_records = part_data[-1]
+                    if self._max_decompressed_batch_bytes is not None:
+                        records = ProtectedMemoryRecords(
+                            raw_records,
+                            max_decompressed_bytes=self._max_decompressed_batch_bytes,
+                            memory_limit=self._decompression_memory_limit,
+                            partition_count=len(assignment.tps),
+                            check_crcs=self._check_crcs,
+                        )
+                    else:
+                        records = MemoryRecords(raw_records)
                     if records.has_next():
                         log.debug(
                             "Adding fetched record for partition %s with"
@@ -839,6 +946,7 @@ class Fetcher:
                             self._isolation_level,
                         )
 
+                        self._discard_result(tp)
                         self._records[tp] = FetchResult(
                             tp,
                             partition_records=partition_records,
@@ -1174,20 +1282,25 @@ class Fetcher:
                 if partitions and tp not in partitions:
                     # Cleanup results for unassigned partitions
                     if not self._subscriptions.is_assigned(tp):
-                        del self._records[tp]
+                        self._discard_result(tp)
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) is FetchResult:
-                    message = res_or_error.getone()
+                    try:
+                        message = res_or_error.getone()
+                    except Errors.KafkaError:
+                        self._discard_result(tp)
+                        self._notify(self._wait_consume_future)
+                        raise
                     if message is None:
                         # We already processed all messages, request new ones
-                        del self._records[tp]
+                        self._discard_result(tp)
                         self._notify(self._wait_consume_future)
                     else:
                         return message
                 else:
                     # Remove error, so we can fetch on partition again
-                    del self._records[tp]
+                    self._discard_result(tp)
                     self._notify(self._wait_consume_future)
                     res_or_error.check_raise()
 
@@ -1210,30 +1323,55 @@ class Fetcher:
                 if partitions and tp not in partitions:
                     # Cleanup results for unassigned partitions
                     if not self._subscriptions.is_assigned(tp):
-                        del self._records[tp]
+                        self._discard_result(tp)
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) is FetchResult:
-                    records = res_or_error.getall(max_records)
+                    try:
+                        records = res_or_error.getall(max_records)
+                    except Errors.KafkaError as err:
+                        # Decoding failed before any record of this partition
+                        # could be returned.  Release the broken result; if we
+                        # already drained other partitions, deliver those first
+                        # and defer the error to the next call.
+                        self._discard_result(tp)
+                        self._notify(self._wait_consume_future)
+                        if drained:
+                            self._records[tp] = FetchError(
+                                error=err, backoff=self._prefetch_backoff
+                            )
+                            return drained
+                        raise
+                    if records:
+                        drained[tp] = records
+                        if max_records is not None:
+                            max_records -= len(records)
+                            assert max_records >= 0  # Just in case
+                    if res_or_error.has_pending_error():
+                        error = res_or_error.take_pending_error()
+                        self._discard_result(tp)
+                        self._notify(self._wait_consume_future)
+                        if drained:
+                            # Deliver what we have.  ``getmany`` will raise the
+                            # deferred error on the next call.
+                            self._records[tp] = FetchError(
+                                error=error, backoff=self._prefetch_backoff
+                            )
+                            return drained
+                        raise error
                     if not res_or_error.has_more():
                         # We processed all messages - request new ones
-                        del self._records[tp]
+                        self._discard_result(tp)
                         self._notify(self._wait_consume_future)
-                    if not records:
-                        continue
-                    drained[tp] = records
-                    if max_records is not None:
-                        max_records -= len(drained[tp])
-                        assert max_records >= 0  # Just in case
-                        if max_records == 0:
-                            break
+                    if max_records is not None and max_records == 0:
+                        break
                 elif drained:
                     # We already got some messages from another partition -
                     # return them. We will raise this error on next call
                     return drained
                 else:
                     # Remove error, so we can fetch on partition again
-                    del self._records[tp]
+                    self._discard_result(tp)
                     self._notify(self._wait_consume_future)
                     res_or_error.check_raise()
 
@@ -1291,7 +1429,7 @@ class Fetcher:
             waiters.append(tp_state.wait_for_position())
             # Invalidate previous fetch result
             if tp in self._records:
-                del self._records[tp]
+                self._discard_result(tp)
 
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
@@ -1305,7 +1443,7 @@ class Fetcher:
         """
         self._subscriptions.seek(tp, offset)
         if tp in self._records:
-            del self._records[tp]
+            self._discard_result(tp)
 
         # XXX: Maybe we should use a different future or rename? Not really
         # describing the purpose.
