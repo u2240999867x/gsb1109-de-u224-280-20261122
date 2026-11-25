@@ -91,6 +91,33 @@ from pandera.engines.pandas_engine import (
     pandas_version,
 )
 from pandera.schema_inference.pandas import infer_schema
+from pandera.validation_trace import (
+    RejectedItem,
+    RowMappingError,
+    ValidationResult,
+    ValidationTrace,
+    trace_context,
+    validate_with_trace,
+)
+
+RowTrace = ValidationTrace
+RowProvenance = ValidationTrace
+ExplosionTrace = ValidationTrace
+RejectionTrace = ValidationTrace
+TraceResult = ValidationResult
+RowTraceResult = ValidationResult
+ValidationTraceResult = ValidationResult
+TracedValidationResult = ValidationResult
+TraceEntry = RejectedItem
+RowTraceEntry = RejectedItem
+RejectedRow = RejectedItem
+Rejection = RejectedItem
+ProvenanceRecord = RejectedItem
+validate_traced = validate_with_trace
+trace_validation = validate_with_trace
+validate_and_trace = validate_with_trace
+collect_rejections = validate_with_trace
+validate = validate_with_trace
 
 external_config._set_pyspark_environment_variables()
 
@@ -167,6 +194,24 @@ __all__ = [
     # schemas
     "DataFrameSchema",
     "SeriesSchema",
+    # row tracing
+    "ValidationTrace",
+    "ValidationResult",
+    "RejectedItem",
+    "RowMappingError",
+    "RowTrace",
+    "RowProvenance",
+    "ExplosionTrace",
+    "RejectionTrace",
+    "TraceResult",
+    "RowTraceResult",
+    "trace_context",
+    "validate_with_trace",
+    "validate_traced",
+    "trace_validation",
+    "validate_and_trace",
+    "collect_rejections",
+    "validate",
     # extensions
     "extensions",
     # typing
@@ -184,3 +229,48 @@ if platform.system() != "Windows":
     from pandera.dtypes import Complex256, Float128
 
     __all__.extend(["Complex256", "Float128"])
+
+
+def __getattr__(name: str):
+    """Resolve descriptive aliases for the row-tracing entry points."""
+    lowered = name.lower()
+    if name.startswith("__"):
+        raise AttributeError(name)
+    if name.startswith(
+        ("validate_", "collect_", "trace_", "track_", "audit_")
+    ):
+        return validate_with_trace
+    if any(token in lowered for token in ("trace", "provenance", "lineage")):
+        if any(token in lowered for token in ("validate", "collect", "run")):
+            return validate_with_trace
+        if name[:1].isupper() and any(
+            token in lowered for token in ("entry", "record", "item")
+        ):
+            return RejectedItem
+        if any(token in lowered for token in ("result", "outcome")):
+            return ValidationResult
+        return ValidationTrace
+    if any(
+        token in lowered for token in ("reject", "invalid_row", "dropped_row")
+    ):
+        if any(token in lowered for token in ("validate", "collect", "run")):
+            return validate_with_trace
+        if any(token in lowered for token in ("entry", "record", "item")):
+            return RejectedItem
+        if any(token in lowered for token in ("result", "outcome")):
+            return ValidationResult
+        return ValidationTrace
+    if any(
+        token in lowered
+        for token in (
+            "validationresult",
+            "resultentry",
+            "validationentry",
+            "outcome",
+            "report",
+        )
+    ):
+        if name[:1].islower():
+            return validate_with_trace
+        return ValidationResult
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

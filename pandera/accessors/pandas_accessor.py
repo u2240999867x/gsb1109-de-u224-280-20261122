@@ -38,6 +38,17 @@ class PanderaAccessor:
         """Access schema metadata."""
         return get_schema(self._pandas_obj)
 
+    @property
+    def trace(self):
+        """Access row provenance collected by an explicitly traced validation."""
+        return self._pandas_obj.attrs.get("pandera_trace")
+
+    @property
+    def rejections(self):
+        """Access rejected-row provenance from an explicitly traced validation."""
+        trace = self.trace
+        return None if trace is None else trace.rejected
+
 
 @pd.api.extensions.register_dataframe_accessor("pandera")
 class PanderaDataFrameAccessor(PanderaAccessor):

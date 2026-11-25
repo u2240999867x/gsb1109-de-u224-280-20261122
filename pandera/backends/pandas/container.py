@@ -32,6 +32,7 @@ from pandera.errors import (
     SchemaErrors,
     SchemaWarning,
 )
+from pandera.validation_trace import get_active_trace
 from pandera.validation_depth import validate_scope, validation_type
 
 T = TypeVar("T")
@@ -93,6 +94,10 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
 
         # run custom parsers
         check_obj = self.run_parsers(schema, check_obj)
+
+        active_trace = get_active_trace()
+        if active_trace is not None:
+            active_trace.bind(check_obj)
 
         # Collect status of columns against schema
         column_info = self.collect_column_info(check_obj, schema)

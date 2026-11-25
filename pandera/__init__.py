@@ -62,3 +62,17 @@ except (ImportError, ModuleNotFoundError) as err:
         "dtypes",
         "typing",
     ]
+
+
+def __getattr__(name: str):
+    """Resolve pandas-specific descriptive aliases from the pandas entry point."""
+    if name.startswith("__"):
+        raise AttributeError(name)
+    from pandera import pandas as pandas_api
+
+    try:
+        return getattr(pandas_api, name)
+    except AttributeError as exc:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from exc

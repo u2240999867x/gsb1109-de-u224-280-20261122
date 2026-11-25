@@ -33,6 +33,7 @@ from pandera.errors import (
     SchemaErrorReason,
     SchemaWarning,
 )
+from pandera.validation_trace import get_active_trace
 
 FieldCheckObj = Union[pd.Series, pd.DataFrame]
 
@@ -196,40 +197,25 @@ class PandasSchemaBackend(BaseSchemaBackend):
 
     def drop_invalid_rows(self, check_obj, error_handler: ErrorHandler):
         """Remove invalid elements in a check obj according to failures caught by the error handler."""
-        for err in error_handler.schema_errors:
-            if isinstance(err.failure_cases, str):
-                # if the failure cases are a string, it means the error is
-                # a schema-level error.
-                continue
-            # Reporting can truncate or omit failure cases from the full mask.
-            if isinstance(
-                err.failure_cases, (pd.Series, pd.DataFrame)
-            ) and isinstance(err.check_output, (pd.Series, pd.DataFrame)):
-                check_output = err.check_output
-                if isinstance(check_output, pd.DataFrame):
-                    check_output = check_output.all(axis="columns")
-                index_values = check_output.index[~check_output.astype(bool)]
-            elif isinstance(err.failure_cases, pd.Series):
-                # Series: use .index to get failing row indices
-                index_values = err.failure_cases.index
-            elif isinstance(check_obj.index, pd.MultiIndex):
-                index_tuples = err.failure_cases["index"].apply(eval)
-                index_values = pd.MultiIndex.from_tuples(index_tuples)
-            else:
-                index_values = err.failure_cases["index"]
-                # align dtypes so isin() matches (e.g. "1" vs 1)
-                try:
-                    if hasattr(check_obj.index, "dtype") and hasattr(
-                        index_values, "astype"
-                    ):
-                        index_values = index_values.astype(
-                            check_obj.index.dtype
-                        )
-                except (TypeError, ValueError):
-                    pass
+        trace = get_active_trace()
+        if trace is not None:
+            trace.bind(check_obj)
 
-            mask = ~check_obj.index.isin(index_values)
-            check_obj = check_obj.loc[mask]
+        invalid_positions: set[int] = set()
+        for err in error_handler.schema_errors:
+            positions = self._failure_positions(check_obj, err)
+            if positions is not None:
+                invalid_positions.update(positions)
+                if trace is not None:
+                    trace.record_error(err, positions)
+
+        keep_positions = [
+            position
+            for position in range(len(check_obj))
+            if position not in invalid_positions
+        ]
+        if invalid_positions:
+            check_obj = check_obj.iloc[keep_positions]
 
         # Restore parsed column values that may have been overwritten (e.g. custom
         # parser + drop_invalid_rows returning None in parsed column, #2216).
@@ -239,10 +225,111 @@ class PandasSchemaBackend(BaseSchemaBackend):
                 if colname not in check_obj.columns:
                     continue
                 try:
-                    restored = series.reindex(check_obj.index)
-                    check_obj.loc[:, colname] = restored.values
+                    restored = series.iloc[keep_positions]
+                    check_obj.loc[:, colname] = restored.to_numpy()
                 except Exception:
                     pass
             _parsed_column_values.set(None)
 
         return check_obj
+
+    def _failure_positions(self, check_obj, err) -> set[int] | None:
+        check_output = getattr(err, "check_output", None)
+        if isinstance(check_output, pd.DataFrame):
+            check_output = check_output.all(axis="columns")
+
+        if isinstance(check_output, pd.Series):
+            if len(check_output) == len(check_obj):
+                output_mask = (
+                    check_output.fillna(False).astype(bool).to_numpy()
+                )
+                return {
+                    position
+                    for position, passed in enumerate(output_mask)
+                    if not passed
+                }
+
+            positions = self._positions_for_index_values(
+                check_obj.index, check_output.index
+            )
+            if positions is not None:
+                output_mask = (
+                    check_output.fillna(False).astype(bool).to_numpy()
+                )
+                return {
+                    position
+                    for position, passed in zip(positions, output_mask)
+                    if not passed and position >= 0
+                }
+
+        if isinstance(err.failure_cases, str):
+            # if the failure cases are a string, it means the error is
+            # a schema-level error.
+            return None
+
+        if isinstance(err.failure_cases, pd.Series):
+            return set(
+                self._positions_for_index_values(
+                    check_obj.index, err.failure_cases.index
+                )
+                or []
+            )
+
+        try:
+            if isinstance(check_obj.index, pd.MultiIndex):
+                index_tuples = err.failure_cases["index"].apply(eval)
+                index_values = pd.MultiIndex.from_tuples(index_tuples)
+            else:
+                index_values = err.failure_cases["index"]
+                # align dtypes so isin() matches (e.g. "1" vs 1)
+                if hasattr(check_obj.index, "dtype") and hasattr(
+                    index_values, "astype"
+                ):
+                    try:
+                        index_values = index_values.astype(
+                            check_obj.index.dtype
+                        )
+                    except (TypeError, ValueError):
+                        pass
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        positions = self._positions_for_index_values(
+            check_obj.index, pd.Index(index_values)
+        )
+        if positions is None:
+            return None
+        return {position for position in positions if position >= 0}
+
+    @staticmethod
+    def _positions_for_index_values(
+        index: pd.Index, index_values: pd.Index
+    ) -> list[int] | None:
+        """Map labels to integer positions without collapsing duplicates."""
+        if index.is_unique:
+            try:
+                return [
+                    int(position)
+                    for position in index.get_indexer_for(index_values)
+                ]
+            except Exception:
+                return None
+
+        try:
+            source_positions: dict[object, list[int]] = defaultdict(list)
+            for position, label in enumerate(index):
+                source_positions[label].append(position)
+
+            seen_counts: defaultdict[object, int] = defaultdict(int)
+            positions: list[int] = []
+            for label in index_values:
+                label_positions = source_positions.get(label, [])
+                occurrence = seen_counts[label]
+                seen_counts[label] += 1
+                if occurrence < len(label_positions):
+                    positions.append(label_positions[occurrence])
+                else:
+                    positions.append(-1)
+            return positions
+        except Exception:
+            return None

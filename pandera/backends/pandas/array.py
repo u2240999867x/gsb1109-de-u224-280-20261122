@@ -26,6 +26,7 @@ from pandera.errors import (
     SchemaErrors,
 )
 from pandera.validation_depth import validate_scope, validation_type
+from pandera.validation_trace import get_active_trace
 
 
 class ArraySchemaBackend(PandasSchemaBackend):
@@ -120,6 +121,10 @@ class ArraySchemaBackend(PandasSchemaBackend):
 
         # run custom parsers
         check_obj = self.run_parsers(schema, check_obj)
+
+        active_trace = get_active_trace()
+        if active_trace is not None:
+            active_trace.bind(check_obj)
 
         try:
             if is_field(check_obj) and schema.coerce:

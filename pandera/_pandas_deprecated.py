@@ -96,6 +96,13 @@ from pandera.engines.pandas_engine import (
     pandas_version,
 )
 from pandera.schema_inference.pandas import infer_schema
+from pandera.validation_trace import (
+    RejectedItem,
+    ValidationResult,
+    ValidationTrace,
+    trace_context,
+    validate_with_trace,
+)
 
 _future_warning = """Importing pandas-specific classes and functions from the
 top-level pandera module will be **removed in a future version of pandera**.
@@ -228,6 +235,12 @@ __all__ = [
     # schemas
     "DataFrameSchema",
     "SeriesSchema",
+    # row tracing
+    "ValidationTrace",
+    "ValidationResult",
+    "RejectedItem",
+    "trace_context",
+    "validate_with_trace",
     # extensions
     "extensions",
     # typing

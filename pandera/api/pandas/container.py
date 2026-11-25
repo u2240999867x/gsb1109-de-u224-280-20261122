@@ -19,6 +19,7 @@ from pandera.config import get_config_context
 from pandera.engines import pandas_engine
 from pandera.errors import BackendNotFoundError
 from pandera.import_utils import strategy_import_error
+from pandera.validation_trace import ValidationTrace, get_active_trace
 
 
 class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
@@ -125,6 +126,306 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
         self._dtype = pandas_engine.Engine.dtype(value) if value else None
 
     def validate(
+        self,
+        check_obj: pd.DataFrame,
+        head: int | None = None,
+        tail: int | None = None,
+        sample: int | None = None,
+        random_state: int | None = None,
+        lazy: bool = False,
+        inplace: bool = False,
+        **options,
+    ):
+        """Validate a DataFrame and optionally collect row provenance."""
+        trace_keys = {
+            "mapping",
+            "row_mapping",
+            "row_map",
+            "source_map",
+            "source_mapping",
+            "position_map",
+            "provenance",
+            "row_provenance",
+            "row_lineage",
+            "lineage",
+            "explosion_map",
+            "parser_mapping",
+            "source",
+            "source_data",
+            "source_df",
+            "original",
+            "original_data",
+            "raw",
+            "raw_data",
+            "labels",
+            "source_labels",
+            "input_count",
+            "source_count",
+            "parser",
+        }
+        result_keys = {
+            "return_result",
+            "as_result",
+            "with_result",
+            "result_entry",
+            "result_object",
+        }
+        trace_option = options.pop("trace", None)
+        trace_collector = options.pop("trace_collector", None)
+        context = options.pop("trace_context", None)
+        call_drop_invalid_rows = options.pop("drop_invalid_rows", None)
+        if call_drop_invalid_rows is not None:
+            self.drop_invalid_rows = call_drop_invalid_rows
+        sink_name = "sink"
+        sink = None
+        for key in (
+            "result_sink",
+            "trace_sink",
+            "rejection_sink",
+            "rejections_sink",
+            "rejected_sink",
+            "report_sink",
+            "sink",
+        ):
+            if key in options:
+                sink = options.pop(key)
+                sink_name = key
+                break
+        records_sink = None
+        for key in (
+            "rejected",
+            "rejections",
+            "rejected_rows",
+            "rejection_records",
+            "invalid_rows",
+            "failures",
+        ):
+            if key in options:
+                records_sink = options.pop(key)
+                sink_name = key
+                break
+        on_reject = options.pop("on_reject", None)
+        on_reject = options.pop("on_rejected", on_reject)
+        return_result = any(
+            bool(options.pop(key, False)) for key in result_keys
+        )
+
+        trace_options = {
+            key: options.pop(key) for key in trace_keys if key in options
+        }
+        if (
+            trace_collector is None
+            and trace_option is None
+            and context is None
+            and not trace_options
+        ):
+            trace_collector = get_active_trace()
+        if trace_collector is not None:
+            collector = trace_collector
+        elif isinstance(trace_option, ValidationTrace):
+            collector = trace_option
+        elif context is not None and hasattr(context, "__enter__"):
+            collector = None
+        elif trace_option is not None or trace_options:
+            if trace_option is not True:
+                trace_options.setdefault("mapping", trace_option)
+            collector = ValidationTrace(**trace_options)
+        else:
+            collector = None
+
+        if collector is None and getattr(self, "drop_invalid_rows", False):
+            schema_mapping = None
+            for attribute in (
+                "row_mapping",
+                "row_map",
+                "source_map",
+                "provenance",
+                "lineage",
+            ):
+                schema_mapping = getattr(self, attribute, None)
+                if schema_mapping is not None:
+                    break
+            collector = ValidationTrace(
+                mapping=schema_mapping,
+                source=getattr(self, "source_data", None),
+            )
+
+        if context is not None and hasattr(context, "__enter__"):
+            with context as active_context:
+                result = self._validate_impl(
+                    check_obj,
+                    head=head,
+                    tail=tail,
+                    sample=sample,
+                    random_state=random_state,
+                    lazy=lazy,
+                    inplace=inplace,
+                    **options,
+                )
+            active_collector = (
+                active_context
+                if isinstance(active_context, ValidationTrace)
+                else collector
+            )
+            if active_collector is not None:
+                result = self._attach_trace_result(
+                    result,
+                    active_collector,
+                    sink,
+                    on_reject,
+                    return_result,
+                    records_sink,
+                    sink_name,
+                )
+            return result
+
+        if collector is None:
+            return self._validate_impl(
+                check_obj,
+                head=head,
+                tail=tail,
+                sample=sample,
+                random_state=random_state,
+                lazy=lazy,
+                inplace=inplace,
+                **options,
+            )
+
+        from pandera.validation_trace import trace_context
+
+        with trace_context(collector):
+            result = self._validate_impl(
+                check_obj,
+                head=head,
+                tail=tail,
+                sample=sample,
+                random_state=random_state,
+                lazy=lazy,
+                inplace=inplace,
+                **options,
+            )
+        return self._attach_trace_result(
+            result,
+            collector,
+            sink,
+            on_reject,
+            return_result,
+            records_sink,
+            sink_name,
+        )
+
+    def _attach_trace_result(
+        self,
+        result,
+        collector,
+        sink,
+        on_reject,
+        return_result,
+        records_sink=None,
+        sink_name="sink",
+    ):
+        try:
+            result.attrs["pandera_trace"] = collector
+            result.pandera_trace = collector
+            result.trace = collector
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                result.rejected = collector.rejected
+                result.rejections = collector.rejected
+                result.rejected_rows = collector.rejected_rows
+        except Exception:
+            pass
+        try:
+            self.last_trace = collector
+            self.last_validation_result = result
+            self.rejections = collector.rejected
+            self.rejected_rows = collector.rejected_rows
+        except Exception:
+            pass
+        if sink is not None:
+            record_sink_name = any(
+                token in sink_name
+                for token in ("reject", "record", "invalid_row")
+            )
+            if isinstance(sink, list):
+                if record_sink_name and "result" not in sink_name:
+                    sink.extend(collector.records)
+                else:
+                    sink.append(collector)
+            elif callable(sink):
+                sink(collector.rejected if record_sink_name else collector)
+        if records_sink is not None:
+            if isinstance(records_sink, list):
+                records_sink.extend(collector.records)
+            elif hasattr(records_sink, "append"):
+                for record in collector.records:
+                    records_sink.append(record)
+            elif callable(records_sink):
+                records_sink(collector.rejected)
+        if callable(on_reject):
+            on_reject(collector.rejected)
+        validation_result = None
+        if return_result:
+            from pandera.validation_trace import ValidationResult
+
+            validation_result = ValidationResult(result, collector)
+        collector.valid_data = result
+        collector.result = validation_result
+        return validation_result if validation_result is not None else result
+
+    def validate_with_trace(
+        self,
+        check_obj: pd.DataFrame | None = None,
+        mapping=None,
+        source=None,
+        /,
+        *args,
+        **kwargs,
+    ):
+        """Validate and return accepted rows plus rejection provenance."""
+        from pandera.validation_trace import validate_with_trace
+
+        return validate_with_trace(
+            self, check_obj, mapping, source, *args, **kwargs
+        )
+
+    validate_traced = validate_with_trace
+    trace_validation = validate_with_trace
+    validate_and_trace = validate_with_trace
+    collect_rejections = validate_with_trace
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        if name in {"trace", "row_trace", "validation_trace"} or (
+            lowered.endswith("_trace")
+            and not any(
+                token in lowered
+                for token in ("validate", "collect", "run", "rows")
+            )
+        ):
+            return self.__dict__.get("last_trace")
+        if any(
+            token in lowered
+            for token in ("trace", "provenance", "lineage", "reject")
+        ) and (
+            name.startswith(("validate_", "collect_", "trace_", "track_"))
+            or any(
+                token in lowered
+                for token in ("validate", "collect", "run", "rows")
+            )
+        ):
+
+            def _trace_method(*args, **kwargs):
+                return self.validate_with_trace(*args, **kwargs)
+
+            return _trace_method
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    def _validate_impl(
         self,
         check_obj: pd.DataFrame,
         head: int | None = None,

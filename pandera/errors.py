@@ -62,7 +62,7 @@ class ParserError(ReducedPickleExceptionBase):
 
     TO_STRING_KEYS = ["failure_cases", "parser_output"]
 
-    def __init__(self, message, failure_cases, parser_output=None):
+    def __init__(self, message, failure_cases=None, parser_output=None):
         super().__init__(message)
         self.failure_cases = failure_cases
         self.parser_output = parser_output

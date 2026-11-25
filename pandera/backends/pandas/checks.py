@@ -235,7 +235,11 @@ class PandasCheckBackend(BaseCheckBackend):
                     .head(self.check.n_failure_cases)["failure_cases"]
                 )
             else:
-                failure_cases = failure_cases.groupby(check_output).head(
+                # All selected rows correspond to False values in
+                # check_output. Slice by position instead of grouping by the
+                # boolean Series: grouping aligns on index labels and fails
+                # when an external, duplicate-valued index is present.
+                failure_cases = failure_cases.head(
                     self.check.n_failure_cases
                 )
         return failure_cases
