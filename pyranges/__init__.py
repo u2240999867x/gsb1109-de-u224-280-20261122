@@ -16,6 +16,13 @@ from pyranges.methods.concat import concat
 from pyranges.multioverlap import count_overlaps
 from pyranges.pyranges_main import PyRanges
 from pyranges.readers import read_bam, read_bed, read_bigwig, read_gff3, read_gtf  # NOQA: F401
+from pyranges.clearance import (  # NOQA: F401
+    ClearancePlanner,
+    ClearanceResult,
+    InfeasibleRegion,
+    PlanSegment,
+    plan_clearance,
+)
 
 __version__ = importlib.metadata.version("pyranges")
 
