@@ -44,9 +44,11 @@ from .retry import (
     retry_request,
     validate_response,
 )
+from .resumable import ResumableDownloader
 from .telemetry import manager as telemetry_manager
 from .telemetry.context import HTTP_HEADER_KEY, Dimension
 from .telemetry.wrapper import (
+    _gcs_sync_wrapper,
     _run_sync,
     bind_gcs_sync_methods,
     mirror_gcs_methods,
@@ -2434,6 +2436,38 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 os.remove(lpath)
             raise
 
+    async def _get_file_resumable(
+        self,
+        rpath,
+        lpath,
+        credential_path=None,
+        part_path=None,
+        chunk_size=8 * 1024 * 1024,
+        concurrency=4,
+        generation=None,
+        **kwargs,
+    ):
+        """Resumable, generation-pinned download to a fixed publish path.
+
+        Bytes land in a private ``<lpath>.part`` file with progress recorded in
+        a ``<lpath>.resume.json`` credential. An interrupted download can be
+        resumed as long as the pinned object generation remains readable; the
+        publish path is replaced atomically only after the whole object matches
+        its service-reported CRC32C. If the generation has disappeared, the
+        existing publish file is left untouched.
+        """
+        downloader = ResumableDownloader(
+            self,
+            rpath,
+            lpath,
+            credential_path=credential_path,
+            part_path=part_path,
+            chunk_size=chunk_size,
+            concurrency=concurrency,
+            generation=generation,
+        )
+        return await downloader.run()
+
     def _open(
         self,
         path,
@@ -2593,6 +2627,11 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
 # Wrap sync and native async methods so they propagate caller framework telemetry.
 mirror_gcs_methods(GCSFileSystem)
+
+# Not covered by mirror_gcs_methods: "get_file_resumable" is not an fsspec method.
+GCSFileSystem.get_file_resumable = _gcs_sync_wrapper(
+    GCSFileSystem._get_file_resumable
+)
 
 GoogleCredentials.load_tokens()
 
