@@ -135,3 +135,112 @@ this within the ``run_migrations_offline()`` function::
     else:
         run_migrations_online()
 
+
+
+.. _staged_artifacts:
+
+Staged Offline Artifacts
+------------------------
+
+The plain ``--sql`` output is a single script.  When that script is handed to
+another team, a process stop in the middle of a revision can leave the
+database in a state that is hard to reason about: some DDL may have landed
+while the version table was not updated, or an object may exist with a
+different definition than the deployment intended.
+
+Alembic can instead compile a **staged offline artifact** with the
+``--staged`` option::
+
+    $ alembic upgrade head --sql --staged --output deploy.json
+
+Compilation uses no target database connection.  Alembic runs the migration
+scripts against an offline context, captures the SQL that would have been
+emitted, and splits each revision into phases:
+
+``transaction``
+    Ordinary DDL and, for revisions with no autocommit phase, the version
+    bookkeeping, all in one database transaction.  If anything fails, both
+    the DDL and the progress update roll back, so a transactional phase is
+    never considered complete on failure.
+
+``autocommit``
+    DDL that must execute outside of a transaction, such as PostgreSQL
+    ``CREATE INDEX CONCURRENTLY``.  The preceding transaction is committed
+    first; the following transaction begins only after the phase finishes.
+
+``commit``
+    Version bookkeeping in a new transaction, immediately after an
+    autocommit phase.
+
+Each phase carries read-only check conditions derived from the compiled
+definition.  Checks are plain ``SELECT`` statements returning a single
+value:
+
+``exists``
+    Applied when the value is truthy.
+
+``absent``
+    Applied when the value is falsey (the object is gone).
+
+``definition``
+    Applied only when the value exactly equals the definition compiled into
+    the artifact.  Any other non-empty value is a *conflict*.
+
+``version``
+    Applied when the version table exactly matches a declared boundary.
+
+A migration that uses hand-written SQL can declare its check with
+:meth:`.MigrationContext.declare_staged_check`::
+
+    def upgrade():
+        op.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY)")
+        op.get_context().declare_staged_check(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'audit_log'",
+            kind="exists",
+        )
+
+Replaying the Artifact
+~~~~~~~~~~~~~~~~~~~~~~
+
+The artifact is deliberately self-contained and does not depend on a Python
+project checkout.  It is a JSON document; a generic external runner reads it
+and reconciles it against the database::
+
+    $ alembic staged-check deploy.json --url "$DATABASE_URL"
+    $ alembic staged-apply deploy.json --url "$DATABASE_URL"
+
+``staged-check`` reports, for every phase, whether it is ``not_applied``,
+``applied``, or in ``conflict``, and writes nothing.  ``staged-apply``
+evaluates **all** checks for a revision before writing anything for that
+revision, then:
+
+* skips phases that report ``applied``;
+* executes ``not_applied`` phases in order;
+* for a non-transactional backend, completes a phase whose DDL is already
+  present but whose version update was not written, after confirming the
+  effect check;
+* aborts with a :exc:`.StagedConflictError` naming the offending revision and
+  phase if any check reports a conflict.
+
+Version advancement is always guarded: the effect checks for a phase run
+before the version table is updated, and the update is verified afterwards.
+
+To stop at a phase boundary, for example to demonstrate recovery, use
+``--stop-after``::
+
+    $ alembic staged-apply deploy.json --url "$DATABASE_URL" --stop-after 2
+
+Operator serialization
+~~~~~~~~~~~~~~~~~~~~~~
+
+Staged artifacts do not add cross-process locking.  Operators are expected to
+run migrations serially against a given database.  The runner's version
+boundary check prevents an artifact from being applied to a database whose
+version is outside the artifact's declared ranges, but concurrent runs from
+separate artifacts are not coordinated.
+
+The artifact can also be rendered to plain SQL for review with
+``alembic staged-sql deploy.json``.  The rendering preserves the phase
+boundaries, placing autocommit phases between ``COMMIT`` and the following
+``BEGIN``.

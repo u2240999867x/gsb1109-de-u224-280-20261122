@@ -4,6 +4,7 @@ from collections.abc import Collection
 from collections.abc import Mapping
 from collections.abc import MutableMapping
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -967,7 +968,21 @@ class EnvironmentContext(util.ModuleClsProxy):
         """
         assert self._migration_context is not None
         with Operations.context(self._migration_context):
-            self.get_context().run_migrations(**kw)
+            if self.context_opts.get("staged"):
+                self._run_staged_migrations(**kw)
+            else:
+                self.get_context().run_migrations(**kw)
+
+    def _run_staged_migrations(self, **kw: Any) -> None:
+        from . import staged
+
+        assert self._migration_context is not None
+        artifact = staged.compile_staged_artifact(self._migration_context)
+        output_path = self.context_opts.get("staged_output")
+        if output_path:
+            artifact.write(output_path)
+        else:
+            self.config.print_stdout(artifact.dumps())
 
     def execute(
         self,
@@ -1043,6 +1058,11 @@ class EnvironmentContext(util.ModuleClsProxy):
         mode.
 
         """
+
+        if self.context_opts.get("staged"):
+            # staged compilation owns transaction boundaries; the outer
+            # env.py begin_transaction() must not emit or open anything
+            return nullcontext()
 
         return self.get_context().begin_transaction()
 

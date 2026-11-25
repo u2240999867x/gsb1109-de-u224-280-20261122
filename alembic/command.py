@@ -13,6 +13,8 @@ from .script import ScriptDirectory
 from .util import compat
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from alembic.config import Config
     from alembic.script.base import Script
     from alembic.script.revision import _RevIdType
@@ -448,6 +450,8 @@ def upgrade(
     revision: str,
     sql: bool = False,
     tag: str | None = None,
+    staged: bool = False,
+    output: str | None = None,
 ) -> None:
     """Upgrade to a later version.
 
@@ -462,7 +466,16 @@ def upgrade(
      ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
      method.
 
+    :param staged: when True (requires ``sql=True``), compile a staged
+     offline artifact instead of plain SQL.  See :ref:`staged_artifacts`.
+
+    :param output: destination for a staged artifact; defaults to the
+     configured output buffer.
+
     """
+
+    if staged and not sql:
+        raise util.CommandError("--staged requires --sql")
 
     script = ScriptDirectory.from_config(config)
 
@@ -483,6 +496,8 @@ def upgrade(
         starting_rev=starting_rev,
         destination_rev=revision,
         tag=tag,
+        staged=staged,
+        staged_output=output,
     ):
         script.run_env()
 
@@ -492,6 +507,8 @@ def downgrade(
     revision: str,
     sql: bool = False,
     tag: str | None = None,
+    staged: bool = False,
+    output: str | None = None,
 ) -> None:
     """Revert to a previous version.
 
@@ -506,7 +523,16 @@ def downgrade(
      ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
      method.
 
+    :param staged: when True (requires ``sql=True``), compile a staged
+     offline artifact instead of plain SQL.  See :ref:`staged_artifacts`.
+
+    :param output: destination for a staged artifact; defaults to the
+     configured output buffer.
+
     """
+
+    if staged and not sql:
+        raise util.CommandError("--staged requires --sql")
 
     script = ScriptDirectory.from_config(config)
     starting_rev = None
@@ -530,6 +556,8 @@ def downgrade(
         starting_rev=starting_rev,
         destination_rev=revision,
         tag=tag,
+        staged=staged,
+        staged_output=output,
     ):
         script.run_env()
 
@@ -850,3 +878,136 @@ def ensure_version(config: Config, sql: bool = False) -> None:
         as_sql=sql,
     ):
         script.run_env()
+
+
+def staged_check(
+    config: Config,
+    artifact: str,
+    url: str | None = None,
+    output: str | None = None,
+) -> None:
+    """Report the state of each phase of a staged artifact without writing.
+
+    :param config: a :class:`.Config` instance.
+
+    :param artifact: path to a staged artifact produced by
+     ``upgrade --sql --staged``.
+
+    :param url: database URL to check; defaults to ``sqlalchemy.url`` from
+     the Alembic configuration.
+
+    :param output: optional path to write the JSON report; defaults to
+     standard output.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    from .runtime import staged as staged_mod
+
+    art = staged_mod.StagedArtifact.load(artifact)
+    engine = _staged_engine(config, art, url)
+    try:
+        report = staged_mod.describe_staged_artifact(art, engine)
+    finally:
+        engine.dispose()
+    _write_report(config, report.dumps(), output)
+
+
+def staged_apply(
+    config: Config,
+    artifact: str,
+    url: str | None = None,
+    stop_after: int | None = None,
+    output: str | None = None,
+) -> None:
+    """Execute a staged artifact against a database, safely replaying it.
+
+    Every effect check is evaluated before a revision's first write.  Phases
+    that are already applied are skipped; conflicting state aborts the run
+    with the offending phase identified.
+
+    :param config: a :class:`.Config` instance.
+
+    :param artifact: path to a staged artifact.
+
+    :param url: database URL to run against; defaults to
+     ``sqlalchemy.url`` from the Alembic configuration.
+
+    :param stop_after: execute at most this many phases, then stop.  This
+     simulates a process stop at a phase boundary for testing.
+
+    :param output: optional path for the JSON run report.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    from .runtime import staged as staged_mod
+
+    art = staged_mod.StagedArtifact.load(artifact)
+    engine = _staged_engine(config, art, url)
+    try:
+        report = staged_mod.run_staged_artifact(
+            art, engine, stop_after=stop_after
+        )
+    finally:
+        engine.dispose()
+    _write_report(config, report.dumps(), output)
+
+
+def staged_sql(
+    config: Config,
+    artifact: str,
+    output: str | None = None,
+) -> None:
+    """Render a staged artifact as a plain SQL script.
+
+    Transaction and commit phases are bracketed by ``BEGIN``/``COMMIT``;
+    autocommit phases appear between the commit of the preceding
+    transaction and the begin of the next one.
+
+    :param config: a :class:`.Config` instance.
+
+    :param artifact: path to a staged artifact.
+
+    :param output: optional path for the SQL script; defaults to standard
+     output.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    from .runtime import staged as staged_mod
+
+    art = staged_mod.StagedArtifact.load(artifact)
+    _write_report(config, art.render_sql(), output)
+
+
+def _staged_engine(
+    config: Config, artifact: Any, url: str | None
+) -> Any:
+    from sqlalchemy import create_engine
+
+    if url is None:
+        url = config.get_main_option("sqlalchemy.url")
+    if not url:
+        raise util.CommandError(
+            "No database URL: pass --url or configure sqlalchemy.url"
+        )
+    engine = create_engine(url)
+    if engine.dialect.name != artifact.dialect:
+        engine.dispose()
+        raise util.CommandError(
+            "Artifact was compiled for dialect %r but the target is %r"
+            % (artifact.dialect, engine.dialect.name)
+        )
+    return engine
+
+
+def _write_report(config: Config, text: str, output: str | None) -> None:
+    if output:
+        with open(output, "w") as f:
+            f.write(text)
+    else:
+        config.print_stdout(text)

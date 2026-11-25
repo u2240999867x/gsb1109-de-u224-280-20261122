@@ -38,3 +38,16 @@ not exposed to the end-user, except when the
 
 .. automodule:: alembic.runtime.migration
     :members: MigrationContext
+
+.. _alembic.runtime.staged.toplevel:
+
+Staged Offline Artifacts
+========================
+
+The :mod:`alembic.runtime.staged` module exposes the data model and runner
+for staged offline artifacts described in :ref:`staged_artifacts`.
+
+.. automodule:: alembic.runtime.staged
+    :members: StagedArtifact, StagedRevision, StagedPhase, PhaseCheck,
+        StagedConflictError, run_staged_artifact, describe_staged_artifact
+    :member-order: bysource

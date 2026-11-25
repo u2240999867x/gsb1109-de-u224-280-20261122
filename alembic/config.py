@@ -825,6 +825,46 @@ class CommandLine:
                 ),
             ),
         ),
+        "staged": (
+            "--staged",
+            dict(
+                action="store_true",
+                help="With --sql, compile a staged, restart-safe artifact "
+                "instead of plain SQL.",
+            ),
+        ),
+        "output": (
+            "-o",
+            "--output",
+            dict(
+                type=str,
+                help="Write staged artifact or report to this path instead "
+                "of standard output.",
+            ),
+        ),
+        "artifact": (
+            "--artifact",
+            dict(
+                type=str,
+                help="Path to a staged artifact.",
+            ),
+        ),
+        "url": (
+            "--url",
+            dict(
+                type=str,
+                help="Database URL for staged replay/check; defaults to "
+                "sqlalchemy.url.",
+            ),
+        ),
+        "stop_after": (
+            "--stop-after",
+            dict(
+                type=int,
+                help="Execute at most this many phases, then stop. Used to "
+                "simulate a process stop at a phase boundary.",
+            ),
+        ),
     }
     _POSITIONAL_OPTS = {
         "directory": dict(help="location of scripts directory"),
@@ -834,6 +874,9 @@ class CommandLine:
         "revisions": dict(
             nargs="+",
             help="one or more revisions, or 'heads' for all heads",
+        ),
+        "artifact": dict(
+            help="path to a staged artifact",
         ),
     }
     _POSITIONAL_TRANSLATIONS: dict[Any, dict[str, str]] = {

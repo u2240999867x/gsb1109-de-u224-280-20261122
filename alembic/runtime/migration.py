@@ -13,6 +13,7 @@ import sys
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import Literal
 from typing import Optional
 from typing import TYPE_CHECKING
 
@@ -600,8 +601,12 @@ class MigrationContext:
 
         head_maintainer = HeadMaintainer(self, heads)
 
+        _observer = self.opts.get("_step_observer")
+
         assert self._migrations_fn is not None
         for step in self._migrations_fn(heads, self):
+            if _observer is not None:
+                _observer("start", step, set(head_maintainer.heads))
             with self.begin_transaction(_per_migration=True):
                 if self.as_sql and not head_maintainer.heads:
                     # for offline mode, include a CREATE TABLE from
@@ -628,6 +633,8 @@ class MigrationContext:
                         heads=set(head_maintainer.heads),
                         run_args=kw,
                     )
+            if _observer is not None:
+                _observer("end", step, set(head_maintainer.heads))
 
         # NOTE: offline ("--sql") mode intentionally does not emit a DROP
         # of the version table when ending at base.  Online mode never drops
@@ -642,6 +649,55 @@ class MigrationContext:
             return False
         else:
             return meth()
+
+    def build_staged_artifact(self) -> Any:
+        """Compile the pending migration steps into a staged artifact.
+
+        This method is only usable in offline (``as_sql=True``) mode.  It
+        runs the configured migration function, capturing the SQL that
+        would have been emitted, and returns a
+        :class:`.StagedArtifact` describing phase boundaries and
+        read-only checks.  It does not write to any database.
+
+        """
+        from . import staged
+
+        return staged.compile_staged_artifact(self)
+
+    def declare_staged_check(
+        self,
+        sql: str,
+        *,
+        kind: Literal["exists", "absent", "definition"] = "exists",
+        expected: str | None = None,
+    ) -> None:
+        """Declare a read-only check for the next emitted DDL statement.
+
+        This directive is only meaningful while compiling a staged offline
+        artifact (``alembic upgrade --sql --staged``).  It lets a migration
+        that executes hand-written SQL declare how the operator's runner
+        should verify the database effect before writing progress.
+
+        :param sql: a single ``SELECT`` returning one scalar value.
+        :param kind: ``"exists"`` (truthy means applied), ``"absent"``
+         (falsey means applied), or ``"definition"`` (must equal
+         ``expected``).
+        :param expected: expected scalar value for a ``"definition"`` check.
+
+        .. versionadded:: 1.21.0
+
+        """
+        capture = getattr(self, "_staged_capture", None)
+        if capture is None:
+            raise util.CommandError(
+                "declare_staged_check() is only available while compiling "
+                "a staged offline artifact"
+            )
+        from . import staged
+
+        capture.declare_check(
+            staged.PhaseCheck(sql=sql, kind=kind, expected=expected)
+        )
 
     def execute(
         self,

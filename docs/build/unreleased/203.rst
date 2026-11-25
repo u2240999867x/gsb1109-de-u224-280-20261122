@@ -1,0 +1,13 @@
+.. change::
+    :tags: feature, environment
+
+    Added optional staged offline artifacts.  ``alembic upgrade --sql
+    --staged`` (or ``downgrade``) compiles a migration into a JSON artifact
+    that splits each revision into transaction, autocommit, and version
+    registration phases, with read-only checks derived from the compiled
+    definitions.  The new ``alembic staged-check``, ``alembic staged-apply``,
+    and ``alembic staged-sql`` commands let an external runner reconcile and
+    replay an artifact without a project checkout.  Already-applied phases
+    are skipped, a phase whose DDL landed but whose version was not written
+    is completed when the backend is non-transactional, and conflicting
+    definitions abort before any write and name the offending phase.
