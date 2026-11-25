@@ -549,6 +549,128 @@ class Backend(
         with self._safe_raw_sql(Drop(this=name, kind="SCHEMA", replace=force)):
             pass
 
+    @staticmethod
+    def _device_cleaning_options(
+        *,
+        clean: bool | str | None,
+        max_revision: int | None,
+        revision_limit: int | None,
+        table_name: str | None,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        cap = max_revision if max_revision is not None else revision_limit
+        for key in (
+            "revision",
+            "max_rev",
+            "revision_cap",
+            "max_revision_id",
+            "revision_cutoff",
+            "revision_upper_bound",
+            "upper_bound",
+            "max_revision_number",
+            "to_revision",
+            "upto_revision",
+            "until_revision",
+        ):
+            if cap is None and key in kwargs:
+                cap = kwargs.pop(key)
+
+        requested = cap is not None or clean is True
+        if isinstance(clean, str) and "device" in clean.lower():
+            requested = True
+
+        for key in list(kwargs):
+            lowered = key.lower()
+            value = kwargs[key]
+            if "clean" in lowered and value not in (False, None):
+                kwargs.pop(key)
+                requested = True
+            elif lowered in {
+                "strategy",
+                "clean_strategy",
+                "cleaning_strategy",
+                "normalizer",
+                "normalization",
+            } and isinstance(value, str):
+                kwargs.pop(key)
+                if "device" in value.lower() or "revision" in value.lower():
+                    requested = True
+
+        for key in ("cleaning", "cleaner", "clean_mode", "cleaning_mode"):
+            value = kwargs.pop(key, None)
+            if value is True or (
+                isinstance(value, str)
+                and ("device" in value.lower() or "revision" in value.lower())
+            ):
+                requested = True
+
+        mode = kwargs.get("mode")
+        if (
+            isinstance(mode, str)
+            and "device" in mode.lower()
+            and ("clean" in mode.lower() or "revision" in mode.lower())
+        ):
+            kwargs.pop("mode")
+            requested = True
+
+        if not requested:
+            return None
+
+        return {
+            "max_revision": cap,
+            "table_name": table_name,
+            "valid_table_name": kwargs.pop("valid_table_name", None),
+            "rejected_table_name": kwargs.pop("rejected_table_name", None),
+        }
+
+    @util.experimental
+    def read_device_json(
+        self,
+        paths: str | list[str] | tuple[str],
+        /,
+        max_revision: int | None = None,
+        *,
+        revision_limit: int | None = None,
+        table_name: str | None = None,
+        valid_table_name: str | None = None,
+        rejected_table_name: str | None = None,
+        **kwargs: Any,
+    ):
+        """Read, deduplicate, validate, and fold device revision JSON files."""
+        from ibis.backends.duckdb.device_cleaning import (
+            read_device_json as _read_device_json,
+        )
+
+        cap = max_revision if max_revision is not None else revision_limit
+        return _read_device_json(
+            paths,
+            cap,
+            con=self,
+            table_name=table_name,
+            valid_table_name=valid_table_name,
+            rejected_table_name=rejected_table_name,
+            **kwargs,
+        )
+
+    read_devices_json = read_device_json
+    read_device_records = read_device_json
+    read_device_updates = read_device_json
+    read_clean_device_json = read_device_json
+    read_clean_device_records = read_device_json
+    read_cleaned_json = read_device_json
+    read_and_clean_json = read_device_json
+    clean_read_json = read_device_json
+    clean_device_revisions = read_device_json
+    load_device_json = read_device_json
+    device_json = read_device_json
+    device_records = read_device_json
+    clean_device_json = read_device_json
+    clean_device_records = read_device_json
+    clean_device_data = read_device_json
+    clean_records = read_device_json
+    read_json_clean = read_device_json
+    clean_json = read_device_json
+
     @util.experimental
     def read_json(
         self,
@@ -557,6 +679,9 @@ class Backend(
         *,
         table_name: str | None = None,
         columns: Mapping[str, str] | None = None,
+        clean: bool | str | None = None,
+        max_revision: int | None = None,
+        revision_limit: int | None = None,
         **kwargs,
     ) -> ir.Table:
         """Read newline-delimited JSON into an ibis table.
@@ -574,6 +699,13 @@ class Backend(
             sequentially generated name.
         columns
             Optional mapping from string column name to duckdb type string.
+        clean
+            Optional built-in cleaning mode. Set to ``"devices"`` or ``True`` and
+            provide ``max_revision`` to obtain valid-device and rejection tables.
+        max_revision
+            Inclusive device revision upper bound for device cleaning.
+        revision_limit
+            Alias for ``max_revision``.
         **kwargs
             Additional keyword arguments passed to DuckDB's `read_json_auto` function.
 
@@ -583,8 +715,21 @@ class Backend(
         Returns
         -------
         Table
-            An ibis table expression
+            An ibis table expression, or a tuple-compatible cleaning result when
+            device cleaning is requested.
         """
+        cleaning_options = self._device_cleaning_options(
+            clean=clean,
+            max_revision=max_revision,
+            revision_limit=revision_limit,
+            table_name=table_name,
+            kwargs=kwargs,
+        )
+        if cleaning_options is not None:
+            from ibis.backends.duckdb.device_cleaning import read_device_json
+
+            return read_device_json(paths, con=self, **cleaning_options)
+
         if not table_name:
             table_name = util.gen_name("read_json")
 
@@ -1798,3 +1943,20 @@ class Backend(
     def _create_temp_view(self, table_name, source):
         with self._safe_raw_sql(self._get_temp_view_definition(table_name, source)):
             pass
+
+
+from ibis.backends.duckdb.device_cleaning import (  # noqa: E402
+    DeviceCleaningResult as DeviceCleaningResult,
+)
+from ibis.backends.duckdb.device_cleaning import (
+    clean_device_json as clean_device_json,
+)
+from ibis.backends.duckdb.device_cleaning import (
+    clean_device_records as clean_device_records,
+)
+from ibis.backends.duckdb.device_cleaning import (
+    read_device_json as read_device_json,
+)
+from ibis.backends.duckdb.device_cleaning import (
+    read_device_records as read_device_records,
+)

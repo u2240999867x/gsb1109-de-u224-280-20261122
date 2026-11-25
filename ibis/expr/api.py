@@ -74,6 +74,7 @@ __all__ = (
     "array",
     "asc",
     "cases",
+    "clean_device_json",
     "coalesce",
     "connect",
     "cross_join",
@@ -115,6 +116,7 @@ __all__ = (
     "rank",
     "read_csv",
     "read_delta",
+    "read_device_json",
     "read_json",
     "read_parquet",
     "row_number",
@@ -1642,6 +1644,28 @@ def read_json(
 
     con = _default_backend()
     return con.read_json(paths, table_name=table_name, **kwargs)
+
+
+@experimental
+def read_device_json(
+    paths: str | Path | Sequence[str | Path],
+    /,
+    max_revision: int | None = None,
+    **kwargs: Any,
+):
+    """Read and clean versioned device JSON using the default DuckDB backend."""
+    from ibis.config import _default_backend
+
+    con = _default_backend()
+    return con.read_device_json(paths, max_revision, **kwargs)
+
+
+@experimental
+def clean_device_json(*args: Any, **kwargs: Any):
+    """Compatibility alias for device JSON cleaning."""
+    from ibis.backends.duckdb.device_cleaning import clean_device_json as _clean
+
+    return _clean(*args, **kwargs)
 
 
 def read_parquet(
