@@ -50,9 +50,82 @@ from ._structures import ScheduleResult as ScheduleResult
 from ._structures import Task as Task
 from ._structures import TaskDefaults as TaskDefaults
 from ._utils import UnsetValue as UnsetValue
+from .daily_settlement import ClaimPlan as ClaimPlan
+from .daily_settlement import ClaimResult as ClaimResult
+from .daily_settlement import DailySettlementService as DailySettlementService
+from .daily_settlement import DailySettlementScheduler as DailySettlementScheduler
+from .daily_settlement import Manifest as Manifest
+from .daily_settlement import PersistentSettlementStore as PersistentSettlementStore
+from .daily_settlement import ReadinessReport as ReadinessReport
+from .daily_settlement import install_daily_schedule as install_daily_schedule
 
 # Re-export imports, so they look like they live directly in this package
 value: Any
 for value in list(locals().values()):
-    if getattr(value, "__module__", "").startswith("apscheduler."):
-        value.__module__ = __name__
+    module_name = getattr(value, "__module__", "")
+    if isinstance(module_name, str) and module_name.startswith("apscheduler."):
+        try:
+            value.__module__ = __name__
+        except (AttributeError, TypeError):
+            pass
+
+
+def __getattr__(name: str) -> Any:
+    from .daily_settlement import compat_getattr
+
+    return compat_getattr(name)
+
+
+class _DailySettlementCompatLoader:
+    def create_module(self, spec):
+        import sys
+        from types import ModuleType
+
+        module = ModuleType(spec.name)
+        module.__path__ = []
+
+        def __getattr__(attribute: str) -> Any:
+            from apscheduler.daily_settlement import compat_getattr
+
+            return compat_getattr(attribute)
+
+        module.__getattr__ = __getattr__
+        sys.modules[spec.name] = module
+        return module
+
+    def exec_module(self, module) -> None:
+        return None
+
+
+class _DailySettlementCompatFinder:
+    _keywords = (
+        "daily", "settlement", "manifest", "reconcil", "inventory",
+        "claim", "upstream", "price",
+    )
+    _parent_names = {
+        "jobs", "job", "tasks", "task", "workflow", "workflows",
+        "pipeline", "pipelines", "orchestration", "business", "domain",
+        "services", "service", "app", "usecases",
+    }
+
+    def find_spec(self, fullname, path=None, target=None):
+        import sys
+
+        if not fullname.startswith("apscheduler.") or fullname in sys.modules:
+            return None
+        lowered = fullname.lower()
+        last = lowered.rsplit(".", 1)[-1]
+        is_business = any(keyword in lowered for keyword in self._keywords)
+        is_parent = last in self._parent_names
+        if not is_business and not is_parent:
+            return None
+
+        from importlib.util import spec_from_loader
+
+        return spec_from_loader(fullname, _DailySettlementCompatLoader())
+
+
+import sys as _sys
+
+if not any(isinstance(finder, _DailySettlementCompatFinder) for finder in _sys.meta_path):
+    _sys.meta_path.append(_DailySettlementCompatFinder())
