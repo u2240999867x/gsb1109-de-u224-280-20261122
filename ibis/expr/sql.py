@@ -428,6 +428,65 @@ def parse_sql(sqlstring, catalog, dialect=None):
     return convert(plan.root, catalog=catalog)
 
 
+def rename_bound_table(
+    query: str, old_name: str, new_name: str, dialect: str | None = None
+) -> str:
+    """Rename unqualified references to a table bound through ``Table.sql``.
+
+    References resolved to a CTE or derived table defined inside ``query`` are
+    left untouched, as are catalog/schema-qualified table references.
+    """
+    from sqlglot.optimizer.scope import traverse_scope
+
+    parsed = sg.parse_one(query, read=dialect)
+    scopes = traverse_scope(parsed)
+    scope_by_expression = {id(scope.expression): scope for scope in scopes}
+    bound_sources = set()
+
+    for scope in scopes:
+        for table in scope.tables:
+            if (
+                table.name != old_name
+                or table.args.get("catalog") is not None
+                or table.args.get("db") is not None
+            ):
+                continue
+
+            source = scope.sources.get(table.alias_or_name)
+            if source is table:
+                bound_sources.add(id(table))
+                table.set("this", sg.to_identifier(new_name, quoted=True))
+
+    if not bound_sources:
+        return query
+
+    for column in parsed.find_all(sge.Column):
+        if (
+            column.table != old_name
+            or column.args.get("catalog") is not None
+            or column.args.get("db") is not None
+        ):
+            continue
+
+        query_expression = column.find_ancestor(sge.Query)
+        scope = scope_by_expression.get(id(query_expression))
+
+        while scope is not None:
+            source = scope.sources.get(old_name)
+            if source is not None:
+                if (
+                    id(source) in bound_sources
+                    and source.args.get("alias") is None
+                ):
+                    column.args["table"].replace(
+                        sg.to_identifier(new_name, quoted=True)
+                    )
+                break
+            scope = scope.parent
+
+    return parsed.sql(dialect)
+
+
 class SQLString(str):
     """Object to hold a formatted SQL string.
 

@@ -212,6 +212,7 @@ class BigQueryCompiler(SQLGlotCompiler):
         params: Mapping[ir.Expr, Any] | None = None,
         session_dataset_id: str | None = None,
         session_project: str | None = None,
+        **kwargs: Any,
     ) -> Any:
         """Compile an Ibis expression.
 
@@ -236,7 +237,9 @@ class BigQueryCompiler(SQLGlotCompiler):
             backend.
 
         """
-        sql = super().to_sqlglot(expr, limit=limit, params=params)
+        sql = super().to_sqlglot(
+            expr, limit=limit, params=params, **kwargs
+        )
 
         table_expr = expr.as_table()
 

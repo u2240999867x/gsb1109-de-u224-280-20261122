@@ -58,6 +58,7 @@ class RisingWaveCompiler(PostgresCompiler):
         *,
         limit: str | None = None,
         params: Mapping[ir.Expr, Any] | None = None,
+        **kwargs: Any,
     ):
         table_expr = expr.as_table()
         schema = table_expr.schema()
@@ -78,7 +79,9 @@ class RisingWaveCompiler(PostgresCompiler):
 
         if conversions:
             table_expr = table_expr.mutate(**conversions)
-        return SQLGlotCompiler.to_sqlglot(self, table_expr, limit=limit, params=params)
+        return SQLGlotCompiler.to_sqlglot(
+            self, table_expr, limit=limit, params=params, **kwargs
+        )
 
     def visit_DateNow(self, op):
         return self.cast(sge.CurrentTimestamp(), dt.date)

@@ -4098,12 +4098,23 @@ class Table(Expr, FixedTextJupyterMixin):
         if isinstance(op, ops.AliasedRelation):
             name = op.name
             expr = op.parent.to_expr()
+            bound_name = util.gen_name("sql_query")
+            from ibis.expr.sql import rename_bound_table
+
+            query = rename_bound_table(
+                query, name, bound_name, dialect=backend.dialect
+            )
+            parent = ops.AliasedRelation(parent=op.parent, name=bound_name)
         else:
             name = util.gen_name("sql_query")
+            bound_name = name
             expr = self
+            parent = op
 
-        schema = backend._get_sql_string_view_schema(name=name, table=expr, query=query)
-        node = ops.SQLStringView(parent=self.op(), query=query, schema=schema)
+        schema = backend._get_sql_string_view_schema(
+            name=bound_name, table=expr, query=query
+        )
+        node = ops.SQLStringView(parent=parent, query=query, schema=schema)
         return node.to_expr()
 
     def to_pandas(

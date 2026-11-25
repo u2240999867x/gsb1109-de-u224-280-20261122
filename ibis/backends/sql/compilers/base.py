@@ -52,7 +52,7 @@ except ImportError:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
     import ibis.expr.schema as sch
     import ibis.expr.types as ir
@@ -583,6 +583,7 @@ class SQLGlotCompiler(abc.ABC):
         *,
         limit: Literal["default"] | int | None = None,
         params: Mapping[ir.Expr, Any] | None = None,
+        reserved_aliases: Collection[str] | None = None,
     ):
         import ibis
 
@@ -596,7 +597,9 @@ class SQLGlotCompiler(abc.ABC):
         if params is None:
             params = {}
 
-        sql = self.translate(table_expr.op(), params=params)
+        sql = self.translate(
+            table_expr.op(), params=params, reserved_aliases=reserved_aliases
+        )
         assert not isinstance(sql, sge.Subquery)
 
         if isinstance(sql, sge.Table):
@@ -605,7 +608,13 @@ class SQLGlotCompiler(abc.ABC):
         assert not isinstance(sql, sge.Subquery)
         return sql
 
-    def translate(self, op, *, params: Mapping[ir.Value, Any]) -> sge.Expression:
+    def translate(
+        self,
+        op,
+        *,
+        params: Mapping[ir.Value, Any],
+        reserved_aliases: Collection[str] | None = None,
+    ) -> sge.Expression:
         """Translate an ibis operation to a sqlglot expression.
 
         Parameters
@@ -636,6 +645,16 @@ class SQLGlotCompiler(abc.ABC):
 
         aliases = {}
         counter = itertools.count()
+        used_aliases = set(reserved_aliases or ())
+
+        for sql_view in op.find(ops.SQLStringView):
+            try:
+                raw_query = sg.parse_one(sql_view.query, read=self.dialect)
+            except sg.errors.SqlglotError:
+                continue
+            used_aliases.update(
+                cte.alias_or_name for cte in raw_query.find_all(sge.CTE)
+            )
 
         def fn(node, __unused__, **kwargs):
             result = self.visit_node(node, **kwargs)
@@ -645,11 +664,16 @@ class SQLGlotCompiler(abc.ABC):
                 return result
 
             # alias ops.AliasedRelations to their explicitly assigned name otherwise generate
-            alias = (
-                node.name
-                if isinstance(node, ops.AliasedRelation)
-                else f"t{next(counter)}"
-            )
+            if isinstance(node, ops.AliasedRelation):
+                alias = node.name
+                while alias in used_aliases:
+                    alias = f"{node.name}_{next(counter)}"
+            else:
+                alias = f"t{next(counter)}"
+                while alias in used_aliases:
+                    alias = f"t{next(counter)}"
+
+            used_aliases.add(alias)
             aliases[node] = alias
 
             alias = sg.to_identifier(alias, quoted=self.quoted)
@@ -1611,8 +1635,13 @@ class SQLGlotCompiler(abc.ABC):
     def add_query_to_expr(self, *, name: str, table: ir.Table, query: str) -> str:
         dialect = self.dialect
 
-        compiled_ibis_expr = self.to_sqlglot(table)
         compiled_query = sg.parse_one(query, read=dialect)
+        reserved_aliases = {
+            cte.alias_or_name for cte in compiled_query.find_all(sge.CTE)
+        }
+        compiled_ibis_expr = self.to_sqlglot(
+            table, reserved_aliases=reserved_aliases
+        )
 
         ctes = [
             *compiled_ibis_expr.ctes,
