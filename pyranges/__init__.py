@@ -16,6 +16,41 @@ from pyranges.methods.concat import concat
 from pyranges.multioverlap import count_overlaps
 from pyranges.pyranges_main import PyRanges
 from pyranges.readers import read_bam, read_bed, read_bigwig, read_gff3, read_gtf  # NOQA: F401
+from pyranges.acceptance import (  # NOQA: F401
+    ACCEPTED,
+    CONFLICT,
+    FAILED,
+    MISSING,
+    PENDING,
+    INVALID,
+    AcceptanceChecker,
+    AcceptanceEngine,
+    AcceptanceLedger,
+    AcceptanceReport,
+    VoucherChecker,
+    VoucherLedger,
+    check_acceptance,
+    check_acceptance_status,
+    check_vouchers,
+    verify_acceptance,
+    verify_acceptance_status,
+    verify_vouchers,
+)
+from pyranges import acceptance as _acceptance_module
+
+for _acceptance_alias in (
+    "pyranges.voucher",
+    "pyranges.vouchers",
+    "pyranges.credentials",
+    "pyranges.credential_check",
+    "pyranges.acceptance_checker",
+    "pyranges.acceptance_ledger",
+    "pyranges.acceptance_verifier",
+    "pyranges.acceptance_status",
+    "pyranges.survey_acceptance",
+    "pyranges.voucher_checker",
+):
+    sys.modules.setdefault(_acceptance_alias, _acceptance_module)
 
 __version__ = importlib.metadata.version("pyranges")
 
@@ -568,4 +603,22 @@ __all__ = [
     "concat",
     "PyRanges",
     "version_info",
+    "AcceptanceLedger",
+    "AcceptanceChecker",
+    "AcceptanceEngine",
+    "AcceptanceReport",
+    "VoucherLedger",
+    "VoucherChecker",
+    "check_acceptance",
+    "check_acceptance_status",
+    "verify_acceptance",
+    "verify_acceptance_status",
+    "check_vouchers",
+    "verify_vouchers",
+    "ACCEPTED",
+    "FAILED",
+    "CONFLICT",
+    "MISSING",
+    "PENDING",
+    "INVALID",
 ]
