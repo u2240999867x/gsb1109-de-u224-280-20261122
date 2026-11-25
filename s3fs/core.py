@@ -458,14 +458,34 @@ class S3FileSystem(AsyncFileSystem):
     async def _call_s3(self, method, *akwarglist, **kwargs):
         await self.set_session()
         s3 = await self.get_s3(kwargs.get("Bucket"))
+        region_cache = self._s3creator if self.cache_regions else None
+        leased_client = False
+        if region_cache is not None and hasattr(region_cache, "acquire_client"):
+            try:
+                region_cache.acquire_client(s3)
+            except KeyError:
+                pass
+            else:
+                leased_client = True
         method = getattr(s3, method)
         kw2 = kwargs.copy()
         kw2.pop("Body", None)
         logger.debug("CALL: %s - %s - %s", method.__name__, akwarglist, kw2)
         additional_kwargs = self._get_s3_method_kwargs(method, *akwarglist, **kwargs)
-        return await _error_wrapper(
-            method, kwargs=additional_kwargs, retries=self.retries
-        )
+        try:
+            result = await _error_wrapper(
+                method, kwargs=additional_kwargs, retries=self.retries
+            )
+        except BaseException:
+            if leased_client:
+                region_cache.release_client(s3)
+            raise
+        else:
+            if leased_client and hasattr(region_cache, "attach_response"):
+                region_cache.attach_response(s3, result)
+            elif leased_client:
+                region_cache.release_client(s3)
+            return result
 
     call_s3 = sync_wrapper(_call_s3)
 
@@ -2543,17 +2563,45 @@ class S3FileSystem(AsyncFileSystem):
     def sign(self, path, expiration=100, **kwargs):
         return self.url(path, expires=expiration, **kwargs)
 
-    async def _invalidate_region_cache(self):
+    async def _invalidate_region_cache(
+        self, bucket_name=None, *args, bucket=None, **kwargs
+    ):
         """Invalidate the region cache (associated with buckets)
-        if ``cache_regions`` is turned on."""
+        if ``cache_regions`` is turned on.
+
+        A bucket name invalidates only that bucket's discovery.  Without one,
+        all cached region clients are discarded.
+        """
         if not self.cache_regions:
             return None
+
+        bucket_name = bucket_name or bucket
+        if bucket_name is None:
+            bucket_name = (
+                kwargs.get("path")
+                or kwargs.get("Bucket")
+                or kwargs.get("bucket_name")
+            )
+        if isinstance(bucket_name, dict):
+            bucket_name = (
+                bucket_name.get("Bucket")
+                or bucket_name.get("bucket")
+                or bucket_name.get("bucket_name")
+            )
+        if isinstance(bucket_name, str) and "/" in bucket_name:
+            try:
+                bucket_name = self._find_bucket_key(bucket_name)[0]
+            except Exception:
+                bucket_name = bucket_name.split("/", 1)[0]
 
         # If the region cache is not initialized, then
         # do nothing.
         cache = getattr(self, "_s3creator", None)
         if cache is not None:
-            await cache.clear()
+            if bucket_name is not None and hasattr(cache, "invalidate_bucket"):
+                await cache.invalidate_bucket(bucket_name)
+            else:
+                await cache.clear()
 
     invalidate_region_cache = sync_wrapper(_invalidate_region_cache)
 
