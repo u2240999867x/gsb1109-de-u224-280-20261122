@@ -286,9 +286,14 @@ declared type instead of being told what it is producing, and raising
 `SchemaInitError` from `bind` surfaces the problem before any data is touched.
 
 `batch_key` groups parsers that can share work. Columns whose parsers return
-equal non-`None` keys are handed to the class's `batch` classmethod and filled
-by a single call; returning `None` opts out. This is what lets a schema declare
-one derivation per column without paying for one pass per column.
+equal non-`None` keys are handed to the class's `batch` classmethod and, when
+their source columns are all available at the same point, filled by a single
+call; returning `None` opts out. When a column's sources are themselves
+derived, the same key may compile into several calls that run in dependency
+order, and the scheduler packs as many same-key columns as each call can
+serve, using the fewest calls the contract's dependencies allow. This is what
+lets a schema declare one derivation per column without paying for one pass
+per column.
 
 ## Parsing columns
 

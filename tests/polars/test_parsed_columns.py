@@ -153,3 +153,79 @@ def test_parsed_columns_are_ordered_by_dependency():
     )
     out = schema.validate(pl.DataFrame({"body": ["a b c"]}))
     assert out["n_words_times_two"].to_list() == [6]
+
+
+class _Service:
+    """One billed call per ``batch`` invocation, adding a fixed value.
+
+    The log is class-level because pandera deep-copies columns (and their
+    parsers) into the schema.
+    """
+
+    add = {"A": 1, "B": 10, "C": 100}
+    call_log: list = []
+
+    def __init__(self, service):
+        self.service = service
+
+    def bind(self, ctx):  # pragma: no cover - batched instead
+        raise AssertionError("should have been batched")
+
+    def batch_key(self, ctx):
+        return self.service
+
+    @classmethod
+    def batch(cls, items):
+        service = {parser.service for parser, _ in items}.pop()
+        plan = [(ctx.target, ctx.source[0]) for _, ctx in items]
+
+        def _fn(df):
+            cls.call_log.append(service)
+            return df.with_columns(
+                [
+                    (pl.col(source) + cls.add[service]).alias(target)
+                    for target, source in plan
+                ]
+            )
+
+        return _fn
+
+
+def test_dependent_batched_columns_use_the_fewest_service_calls():
+    _Service.call_log = []
+    schema = pa.DataFrameSchema(
+        {
+            "dom_raw": pa.Column(pl.Int64),
+            "intl_raw": pa.Column(pl.Int64),
+            "dom_code": pa.ParsedColumn(
+                pl.Int64, source="dom_raw", parser=_Service("A")
+            ),
+            "dom_fee": pa.ParsedColumn(
+                pl.Int64, source="dom_code", parser=_Service("B")
+            ),
+            "dom_tier": pa.ParsedColumn(
+                pl.Int64, source="dom_fee", parser=_Service("C")
+            ),
+            "intl_fee": pa.ParsedColumn(
+                pl.Int64, source="intl_raw", parser=_Service("B")
+            ),
+            "intl_tier": pa.ParsedColumn(
+                pl.Int64, source="intl_fee", parser=_Service("C")
+            ),
+            "intl_code": pa.ParsedColumn(
+                pl.Int64, source="intl_tier", parser=_Service("A")
+            ),
+            "fee_note": pa.ParsedColumn(
+                pl.Int64, source="intl_raw", parser=_Service("B")
+            ),
+        }
+    )
+    out = schema.validate(
+        pl.DataFrame({"dom_raw": [1], "intl_raw": [2]})
+    )
+
+    assert _Service.call_log == ["A", "B", "C", "A"]
+    row = out.row(0, named=True)
+    assert row["dom_tier"] == 112
+    assert row["intl_code"] == 113
+    assert row["fee_note"] == 12

@@ -421,6 +421,266 @@ def test_batch_key_without_batch_method_is_an_error():
         schema.validate(pd.DataFrame({"a": [1]}))
 
 
+class _Service:
+    """A paid parsing service.
+
+    One ``batch`` invocation is one billed call: it adds a service-specific
+    constant to each source column and can fill any number of targets whose
+    sources are present when the call starts. The log is class-level because
+    pandera deep-copies columns (and parsers) into the schema.
+    """
+
+    add = {"A": 1, "B": 10, "C": 100}
+    call_log: list = []
+
+    def __init__(self, service):
+        self.service = service
+
+    def bind(self, ctx: ParseContext):  # pragma: no cover - batched instead
+        raise AssertionError("should have been batched")
+
+    def batch_key(self, ctx: ParseContext):
+        return self.service
+
+    @classmethod
+    def batch(cls, items):
+        service = {parser.service for parser, _ in items}.pop()
+        plan = [(ctx.target, ctx.source[0]) for _, ctx in items]
+
+        def _fn(df):
+            cls.call_log.append(
+                (service, tuple(target for target, _ in plan))
+            )
+            out = df
+            for target, source in plan:
+                out = out.assign(**{target: df[source] + cls.add[service]})
+            return out
+
+        return _fn
+
+
+class _Total:
+    """A table-level derivation that opts out of batching."""
+
+    def bind(self, ctx: ParseContext):
+        def _fn(df):
+            return df.assign(
+                total=df["dom_tier"] + df["intl_code"]
+            )
+
+        return _fn
+
+    def batch_key(self, ctx: ParseContext):
+        return None
+
+
+def _settlement_columns():
+    return [
+        ("dom_raw", pa.Column(int)),
+        ("intl_raw", pa.Column(int)),
+        (
+            "dom_code",
+            pa.ParsedColumn(
+                int, source="dom_raw", parser=_Service("A")
+            ),
+        ),
+        (
+            "dom_fee",
+            pa.ParsedColumn(
+                int, source="dom_code", parser=_Service("B")
+            ),
+        ),
+        (
+            "dom_tier",
+            pa.ParsedColumn(
+                int, source="dom_fee", parser=_Service("C")
+            ),
+        ),
+        (
+            "intl_fee",
+            pa.ParsedColumn(
+                int, source="intl_raw", parser=_Service("B")
+            ),
+        ),
+        (
+            "intl_tier",
+            pa.ParsedColumn(
+                int, source="intl_fee", parser=_Service("C")
+            ),
+        ),
+        (
+            "intl_code",
+            pa.ParsedColumn(
+                int, source="intl_tier", parser=_Service("A")
+            ),
+        ),
+        (
+            "fee_note",
+            pa.ParsedColumn(
+                int, source="intl_raw", parser=_Service("B")
+            ),
+        ),
+        (
+            "total",
+            pa.ParsedColumn(
+                int,
+                source=["dom_tier", "intl_code"],
+                parser=_Total(),
+            ),
+        ),
+    ]
+
+
+def test_dependent_batched_columns_use_the_fewest_service_calls():
+    _Service.call_log = []
+    schema = pa.DataFrameSchema(dict(_settlement_columns()))
+    out = schema.validate(
+        pd.DataFrame({"dom_raw": [1], "intl_raw": [2]})
+    )
+
+    # two chains weave through the same three services, but each service is
+    # only revisited when a dependency forces it: A, B, C, then A again.
+    assert [call[0] for call in _Service.call_log] == [
+        "A",
+        "B",
+        "C",
+        "A",
+    ]
+
+    # columns ready at different times still share the one B call: the
+    # intl-only fields are ready immediately, dom_fee only after the first A.
+    b_calls = [
+        targets
+        for service, targets in _Service.call_log
+        if service == "B"
+    ]
+    assert len(b_calls) == 1
+    assert set(b_calls[0]) == {"dom_fee", "intl_fee", "fee_note"}
+
+    row = out.iloc[0]
+    assert row["dom_tier"] == 112
+    assert row["intl_code"] == 113
+    assert row["fee_note"] == 12
+    assert row["total"] == 225
+
+
+def test_batching_plan_is_independent_of_declaration_order():
+    expected = ["A", "B", "C", "A"]
+    for column_order in (
+        _settlement_columns(),
+        list(reversed(_settlement_columns())),
+    ):
+        _Service.call_log = []
+        schema = pa.DataFrameSchema(dict(column_order))
+        out = schema.validate(
+            pd.DataFrame({"dom_raw": [1], "intl_raw": [2]})
+        )
+        assert [call[0] for call in _Service.call_log] == expected
+        assert out.iloc[0]["total"] == 225
+
+
+def test_a_cycle_between_batched_parsers_is_still_an_error():
+    schema = pa.DataFrameSchema(
+        {
+            "x": pa.ParsedColumn(
+                int, source="y", parser=_Service("A")
+            ),
+            "y": pa.ParsedColumn(
+                int, source="x", parser=_Service("B")
+            ),
+        }
+    )
+    with pytest.raises(SchemaInitError, match="cycle"):
+        schema.validate(pd.DataFrame({"x": [1], "y": [2]}))
+
+
+class _SoloStep:
+    """A None batch_key parser whose output feeds a later batched parser."""
+
+    def bind(self, ctx: ParseContext):
+        return lambda series: series + 1
+
+    def batch_key(self, ctx: ParseContext):
+        return None
+
+
+def test_none_batch_key_output_can_feed_a_later_batch():
+    _Service.call_log = []
+    schema = pa.DataFrameSchema(
+        {
+            "raw": pa.Column(int),
+            "seeded": pa.ParsedColumn(
+                int, source="raw", parser=_SoloStep()
+            ),
+            "derived": pa.ParsedColumn(
+                int, source="seeded", parser=_Service("A")
+            ),
+        }
+    )
+    out = schema.validate(pd.DataFrame({"raw": [1]}))
+    # the solo parser runs on its own; its column is still a valid source for
+    # the single service call that follows.
+    assert out["seeded"].tolist() == [2]
+    assert out["derived"].tolist() == [3]
+    assert [call[0] for call in _Service.call_log] == ["A"]
+
+
+def test_scheduler_defers_ready_columns_to_reach_the_minimum():
+    # c_early is ready immediately, but firing service C at once would force a
+    # second C call later for c_late. The minimum plan waits and serves both in
+    # one C call, so the whole contract takes four calls rather than five.
+    _Service.call_log = []
+    schema = pa.DataFrameSchema(
+        {
+            "r0": pa.Column(int),
+            "r1": pa.Column(int),
+            "b0": pa.ParsedColumn(
+                int, source="r0", parser=_Service("B")
+            ),
+            "c_early": pa.ParsedColumn(
+                int, source="r1", parser=_Service("C")
+            ),
+            "a_mid": pa.ParsedColumn(
+                int, source="b0", parser=_Service("A")
+            ),
+            "c_late": pa.ParsedColumn(
+                int, source="b0", parser=_Service("C")
+            ),
+            "b_from_c": pa.ParsedColumn(
+                int, source="c_early", parser=_Service("B")
+            ),
+            "b_from_a": pa.ParsedColumn(
+                int, source="a_mid", parser=_Service("B")
+            ),
+        }
+    )
+    out = schema.validate(pd.DataFrame({"r0": [10], "r1": [20]}))
+
+    assert len(_Service.call_log) == 4
+    c_calls = [
+        targets
+        for service, targets in _Service.call_log
+        if service == "C"
+    ]
+    assert len(c_calls) == 1
+    assert set(c_calls[0]) == {"c_early", "c_late"}
+    b_calls = [
+        targets
+        for service, targets in _Service.call_log
+        if service == "B"
+    ]
+    assert set(b_calls[-1]) == {"b_from_c", "b_from_a"}
+
+    row = out.iloc[0]
+    assert row["b0"] == 20
+    assert row["c_early"] == 120
+    assert row["a_mid"] == 21
+    assert row["c_late"] == 120
+    assert row["b_from_c"] == 130
+    assert row["b_from_a"] == 31
+
+
+
 def test_parsed_column_missing_source_at_runtime():
     """The source is declared in the schema but absent from the data."""
     schema = pa.DataFrameSchema(
