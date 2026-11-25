@@ -4143,7 +4143,8 @@ class Table(Expr, FixedTextJupyterMixin):
         statement or call the `.release()` method for more control.
 
         This method is idempotent: calling it multiple times in succession will
-        return the same value as the first call.
+        reuse the same underlying cached table as long as a previous call's
+        result is still alive.
 
         ::: {.callout-note}
         ## This method eagerly evaluates the expression prior to caching
@@ -5557,9 +5558,15 @@ class CachedTable(Table):
         return self
 
     def release(self) -> None:
-        """Release the underlying expression from the cache."""
+        """Release the underlying expression from the cache.
+
+        Calling `release()` more than once on the same handle is a no-op.  The
+        cached data itself is only dropped once every handle referring to it
+        has been released and every reader opened from those handles has been
+        exhausted or closed.
+        """
         current_backend = self._find_backend(use_default=True)
-        return current_backend._finalize_cached_table(self.op().name)
+        return current_backend._release_cached_table(self)
 
 
 public(Table=Table, CachedTable=CachedTable)

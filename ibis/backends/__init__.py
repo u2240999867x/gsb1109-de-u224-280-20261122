@@ -13,7 +13,7 @@ import urllib.parse
 import weakref
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, ClassVar, overload
 
 import ibis
 import ibis.common.exceptions as exc
@@ -888,18 +888,56 @@ class CanCreateDatabase(CanListDatabase):
         """
 
 
-class CacheEntry(NamedTuple):
-    orig_op: ops.Relation
-    cached_op_ref: weakref.ref[ops.Relation]
-    finalizer: weakref.finalize
+class CacheEntry:
+    """Bookkeeping for a single cached table.
+
+    A cached table is kept alive while at least one cache handle or one
+    reader obtained from a cache handle still refers to it.  The entry
+    remains available for reuse through ``_cache_op_to_entry`` only while it
+    has live handles; once the last handle goes away (via ``release()`` or
+    garbage collection) the entry is retired so that a later ``.cache()``
+    call materializes a fresh snapshot, while any outstanding readers keep
+    the physical table alive until they are done with it.
+    """
+
+    __slots__ = (
+        "__weakref__",
+        "dropped",
+        "handles",
+        "name",
+        "op",
+        "orig_op",
+        "pins",
+        "retired",
+        "tokens",
+    )
+
+    def __init__(self, orig_op: ops.Relation, op: ops.Relation, name: str) -> None:
+        self.orig_op = orig_op
+        self.op = op
+        self.name = name
+        self.handles = 0
+        self.pins = 0
+        self.tokens = set()
+        self.retired = False
+        self.dropped = False
 
 
 class CacheHandler:
     """A mixin for handling `.cache()`/`CachedTable` operations."""
 
     def __init__(self):
-        self._cache_name_to_entry = {}
+        # Maps the original expression operation to the *active* cache entry,
+        # used to make repeated `.cache()` calls reuse the same table.
         self._cache_op_to_entry = {}
+        # Maps a cached table name to its entry for as long as the physical
+        # table exists (including entries retired by their handles but still
+        # pinned by one or more readers).
+        self._cache_name_to_entry = {}
+        # Maps each cache handle to ``(entry, token)`` so that ``release()``
+        # can be idempotent per handle and drop the table only when no other
+        # handle or reader needs it.
+        self._cache_handles = weakref.WeakKeyDictionary()
 
     def _cached_table(self, table: ir.Table) -> ir.CachedTable:
         """Convert a Table to a CachedTable.
@@ -915,18 +953,101 @@ class CacheHandler:
             Cached table
         """
         entry = self._cache_op_to_entry.get(table.op())
-        if entry is None or (cached_op := entry.cached_op_ref()) is None:
+        if entry is None:
             cached_op = self._create_cached_table(util.gen_name("cached"), table).op()
-            entry = CacheEntry(
-                table.op(),
-                weakref.ref(cached_op),
-                weakref.finalize(
-                    cached_op, self._finalize_cached_table, cached_op.name
-                ),
-            )
+            entry = CacheEntry(table.op(), cached_op, cached_op.name)
             self._cache_op_to_entry[table.op()] = entry
             self._cache_name_to_entry[cached_op.name] = entry
-        return ir.CachedTable(cached_op)
+
+        handle = ir.CachedTable(entry.op)
+
+        token = object()
+        entry.handles += 1
+        entry.tokens.add(token)
+        finalizer = weakref.finalize(
+            handle, self._finalize_cached_handle, weakref.ref(entry), token
+        )
+        self._cache_handles[handle] = (entry, token, finalizer)
+        return handle
+
+    def _release_cached_table(self, handle: ir.CachedTable) -> None:
+        """Release ``handle``'s claim on its cached table.
+
+        Releasing the same handle more than once is a no-op.  The physical
+        table is dropped once the last handle is released *and* any readers
+        opened from it have finished or been closed.
+        """
+        params = self._cache_handles.pop(handle, None)
+        if params is not None:
+            entry, token, finalizer = params
+            finalizer.detach()
+            self._release_cached_token(entry, token)
+
+    def _finalize_cached_handle(
+        self, entry_ref: weakref.ref[CacheEntry], token: object
+    ) -> None:
+        entry = entry_ref()
+        if entry is not None:
+            self._release_cached_token(entry, token)
+
+    def _release_cached_token(self, entry: CacheEntry, token: object) -> None:
+        if token not in entry.tokens:
+            # The handle was already released explicitly.
+            return
+        entry.tokens.discard(token)
+        entry.handles -= 1
+        if entry.handles <= 0:
+            entry.handles = 0
+            self._retire_cached_entry(entry)
+        self._maybe_drop_cached_entry(entry)
+
+    def _retire_cached_entry(self, entry: CacheEntry) -> None:
+        if entry.retired:
+            return
+        entry.retired = True
+        if self._cache_op_to_entry.get(entry.orig_op) is entry:
+            self._cache_op_to_entry.pop(entry.orig_op, None)
+
+    def _cached_entries_in(self, expr: ir.Expr) -> list[CacheEntry]:
+        """Return the live cache entries referenced by ``expr``."""
+        names = {node.name for node in expr.op().find(ops.DatabaseTable)}
+        if not names:
+            return []
+        return [
+            entry
+            for name, entry in self._cache_name_to_entry.items()
+            if name in names and not entry.dropped
+        ]
+
+    def _pin_cached_entries(self, expr: ir.Expr) -> list[CacheEntry]:
+        """Pin every cached table referenced by ``expr``.
+
+        The returned entries must be passed to `_unpin_cached_entries` once
+        the corresponding reader is exhausted or closed.
+        """
+        entries = self._cached_entries_in(expr)
+        for entry in entries:
+            entry.pins += 1
+        return entries
+
+    def _unpin_cached_entries(self, entries: Iterable[CacheEntry]) -> None:
+        for entry in entries:
+            entry.pins -= 1
+            if entry.pins <= 0:
+                entry.pins = 0
+                self._maybe_drop_cached_entry(entry)
+
+    def _maybe_drop_cached_entry(self, entry: CacheEntry) -> None:
+        if entry.dropped or entry.handles > 0 or entry.pins > 0:
+            return
+        entry.dropped = True
+        self._cache_name_to_entry.pop(entry.name, None)
+        try:
+            self._drop_cached_table(entry.name)
+        except Exception:
+            # suppress exceptions during interpreter shutdown
+            if not sys.is_finalizing():
+                raise
 
     def _finalize_cached_table(self, name: str) -> None:
         """Release a cached table given its name.
@@ -938,15 +1059,10 @@ class CacheHandler:
         name
             The name of the cached table.
         """
-        if (entry := self._cache_name_to_entry.pop(name, None)) is not None:
-            self._cache_op_to_entry.pop(entry.orig_op)
-            entry.finalizer.detach()
-            try:
-                self._drop_cached_table(name)
-            except Exception:
-                # suppress exceptions during interpreter shutdown
-                if not sys.is_finalizing():
-                    raise
+        entry = self._cache_name_to_entry.get(name)
+        if entry is not None:
+            for token in tuple(entry.tokens):
+                self._release_cached_token(entry, token)
 
     def _create_cached_table(self, name: str, expr: ir.Table) -> ir.Table:
         return self.create_table(name, expr, schema=expr.schema(), temp=True)

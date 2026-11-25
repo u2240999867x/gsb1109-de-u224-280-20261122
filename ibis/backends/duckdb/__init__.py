@@ -79,6 +79,145 @@ class _Settings:
         return repr(self.con.sql("from duckdb_settings()"))
 
 
+def _make_pinned_reader(inner: pa.ipc.RecordBatchReader, on_release):
+    """Wrap ``inner`` so that ``on_release`` runs exactly once.
+
+    The wrapper is a `pyarrow.RecordBatchReader` subclass so that downstream
+    code (and `isinstance` checks) continue to see a reader.  ``on_release``
+    runs when the reader is closed, garbage collected, or has just handed out
+    its final batch (detected with one batch of lookahead).
+    """
+    import pyarrow as pa
+
+    _missing = object()
+
+    class _PinnedReader(pa.ipc.RecordBatchReader):
+        @classmethod
+        def create(cls, inner, on_release):
+            self = cls.__new__(cls)
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "_on_release", on_release)
+            object.__setattr__(self, "_released", False)
+            object.__setattr__(self, "_lookahead", _missing)
+            object.__setattr__(self, "_pending_exc", None)
+            return self
+
+        @property
+        def schema(self):
+            return self._inner.schema
+
+        def _release(self):
+            if not self._released:
+                object.__setattr__(self, "_released", True)
+                self._on_release()
+
+        def _refill(self):
+            if self._released:
+                object.__setattr__(self, "_lookahead", _missing)
+                return
+            try:
+                nxt = self._inner.read_next_batch()
+            except StopIteration:
+                object.__setattr__(self, "_lookahead", _missing)
+                self._release()
+            except BaseException as exc:
+                # surface the failure on the next read rather than losing the
+                # batch that was just handed back to the caller
+                object.__setattr__(self, "_lookahead", _missing)
+                object.__setattr__(self, "_pending_exc", exc)
+                self._release()
+            else:
+                object.__setattr__(self, "_lookahead", nxt)
+
+        def _check_pending(self):
+            exc = self._pending_exc
+            if exc is not None:
+                object.__setattr__(self, "_pending_exc", None)
+                raise exc
+
+        def read_next_batch(self):
+            self._check_pending()
+            if self._lookahead is not _missing:
+                batch = self._lookahead
+            elif self._released:
+                raise StopIteration
+            else:
+                try:
+                    batch = self._inner.read_next_batch()
+                except StopIteration:
+                    self._release()
+                    raise
+            # Reading one batch ahead lets us release the pin as soon as the
+            # final batch has been handed out, without the caller having to
+            # read once more to observe the end of the stream.
+            self._refill()
+            return batch
+
+        def read_all(self):
+            self._check_pending()
+            if self._released:
+                batches = []
+            else:
+                batches = self._inner.read_all().to_batches()
+            if self._lookahead is not _missing:
+                batches = [self._lookahead, *batches]
+                object.__setattr__(self, "_lookahead", _missing)
+            try:
+                return pa.Table.from_batches(batches, schema=self.schema)
+            finally:
+                self._release()
+
+        def read_pandas(self, **kwargs):
+            return self.read_all().to_pandas(**kwargs)
+
+        def read_next_batch_with_custom_metadata(self):
+            batch = self.read_next_batch()
+            return batch, None
+
+        def iter_batches_with_custom_metadata(self, **kwargs):
+            try:
+                yield from self._inner.iter_batches_with_custom_metadata(**kwargs)
+            finally:
+                self._release()
+
+        def close(self):
+            if self._released:
+                return
+            object.__setattr__(self, "_lookahead", _missing)
+            try:
+                self._inner.close()
+            finally:
+                self._release()
+
+        def cast(self, target_schema):
+            return _PinnedReader.create(
+                self._inner.cast(target_schema), self._on_release
+            )
+
+        def __arrow_c_stream__(self, requested_schema=None):
+            return self._inner.__arrow_c_stream__(requested_schema)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return self.read_next_batch()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+        def __del__(self):
+            try:
+                self._release()
+            except Exception:
+                pass
+
+    return _PinnedReader.create(inner, on_release)
+
+
 class Backend(
     SupportsTempTables,
     SQLBackend,
@@ -357,8 +496,10 @@ class Backend(
 
     def list_catalogs(self, *, like: str | None = None) -> list[str]:
         col = "catalog_name"
-        query = sg.select(sge.Distinct(expressions=[sg.column(col)])).from_(
-            sg.table("schemata", db="information_schema")
+        query = (
+            sg.select(sge.Distinct(expressions=[sg.column(col)]))
+            .from_(sg.table("schemata", db="information_schema"))
+            .where(sg.column(col).neq(sge.convert(self._cache_catalog)))
         )
         pa_table = self.con.sql(query.sql(self.dialect)).to_arrow_table()
         return self._filter_with_like(pa_table[col].to_pylist(), like)
@@ -386,6 +527,11 @@ class Backend(
             raise ValueError(
                 f"invalid value passed to ast.literal_eval: {read_only!r}"
             ) from e
+
+    #: Name of the in-memory catalog used for cached tables.  Tables live here
+    #: rather than in DuckDB's per-connection `temp` catalog so that readers
+    #: opened on other connections (cursors) can all see them.
+    _cache_catalog = "__ibis_cache__"
 
     @property
     def version(self) -> str:
@@ -476,6 +622,86 @@ class Backend(
             self.settings["python_enable_replacements"] = False
 
         self._record_batch_readers_consumed = {}
+
+        # Cached tables live in a dedicated in-memory catalog instead of the
+        # per-connection `temp` catalog so that reader connections can see
+        # them.  The catalog is attached lazily.
+        self._cache_catalog_attached = False
+
+    def _ensure_cache_catalog(self) -> str:
+        """Attach (if necessary) and return the catalog used for cached tables."""
+        if not self._cache_catalog_attached:
+            try:
+                self.con.execute(f"ATTACH ':memory:' AS {self._cache_catalog}")
+            except duckdb.Error:
+                # pulling in a writable in-memory database next to a read-only
+                # one requires the READ_WRITE option
+                self.con.execute(
+                    f"ATTACH ':memory:' AS {self._cache_catalog} (READ_WRITE)"
+                )
+            self._cache_catalog_attached = True
+        return self._cache_catalog
+
+    def _create_cached_table(self, name: str, expr: ir.Table) -> ir.Table:
+        catalog = self._ensure_cache_catalog()
+        self.create_table(name, expr, schema=expr.schema(), database=(catalog, "main"))
+        return self.table(name, database=(catalog, "main"))
+
+    def _drop_cached_table(self, name: str) -> None:
+        self.drop_table(name, database=(self._cache_catalog, "main"), force=True)
+
+    def _reader_connection(
+        self, table: ir.Table
+    ) -> tuple[duckdb.DuckDBPyConnection, bool]:
+        """Return a connection for reading ``table`` and whether we own it.
+
+        Each reader normally uses its own cursor connected to the same
+        underlying database.  Cursors are independent of the main connection,
+        so readers do not block the backend from materializing another cache
+        round and multiple readers can be open at the same time.
+
+        In-memory tables and UDFs are registered per connection in DuckDB, so
+        they are registered on the reader's cursor as well.  Temporary tables
+        are scoped to the main connection, so expressions that depend on them
+        are read through the main connection instead.
+        """
+        names = {node.name for node in table.op().find(ops.DatabaseTable)}
+        # cached tables (and their derivatives) always live in the shared
+        # catalog, so no temporary-table detection is required for them
+        uncached = names.difference(self._cache_name_to_entry)
+        if uncached and self._has_temporary_tables(uncached):
+            return self.con, False
+
+        con = self.con.cursor()
+        for memtable in table.op().find(ops.InMemoryTable):
+            data = memtable.data
+            try:
+                obj = data.to_pyarrow_dataset(memtable.schema)
+            except AttributeError:
+                obj = data.to_pyarrow(memtable.schema)
+            con.register(memtable.name, obj)
+        self._register_udfs(table, con=con)
+        return con, True
+
+    def _has_temporary_tables(self, names: set[str]) -> bool:
+        if not names:
+            return False
+        try:
+            result = self.con.execute(
+                "SELECT count(*) FROM ("
+                "  SELECT table_name FROM duckdb_tables() WHERE temporary"
+                "  UNION ALL"
+                "  SELECT view_name FROM duckdb_views() WHERE temporary"
+                ") WHERE table_name IN (SELECT unnest(?))",
+                [list(names)],
+            )
+        except duckdb.Error:
+            return True
+        try:
+            row = result.fetchone()
+        finally:
+            result.fetchall()
+        return bool(row and row[0])
 
     def _load_extensions(
         self, extensions: list[str], force_install: bool = False
@@ -896,12 +1122,20 @@ class Backend(
         database = table_loc.db or self.current_database
 
         col = "table_name"
+        catalogs = [sge.convert(catalog), sge.convert("temp")]
+        if self._cache_catalog_attached and (
+            catalog == self.current_catalog and database == self.current_database
+        ):
+            # Cached tables live in their own catalog; expose them alongside
+            # the tables of the current catalog unless a different database
+            # was explicitly requested.
+            catalogs.append(sge.convert(self._cache_catalog))
         sql = (
             sg.select(col)
             .from_(sg.table("tables", db="information_schema"))
             .distinct()
             .where(
-                C.table_catalog.isin(sge.convert(catalog), sge.convert("temp")),
+                C.table_catalog.isin(*catalogs),
                 C.table_schema.eq(sge.convert(database)),
             )
             .sql(self.dialect)
@@ -1367,10 +1601,9 @@ class Backend(
     ) -> pa.ipc.RecordBatchReader:
         """Return a stream of record batches.
 
-        The returned `RecordBatchReader` contains a cursor with an unbounded lifetime.
-
-        For analytics use cases this is usually nothing to fret about. In some cases you
-        may need to explicit release the cursor.
+        The returned `RecordBatchReader` owns an independent cursor.  The
+        cursor is closed automatically once the reader is exhausted, closed or
+        garbage collected.
 
         Parameters
         ----------
@@ -1390,13 +1623,49 @@ class Backend(
         table = expr.as_table()
         sql = self.compile(table, limit=limit, params=params)
 
-        def batch_producer(cur):
-            yield from cur.fetch_record_batch(rows_per_batch=chunk_size)
+        # Pin any cached tables this expression reads so that releasing the
+        # cache handle (explicitly or through garbage collection) cannot
+        # invalidate a reader that has not yet been fully consumed.  The pin
+        # is dropped when the reader is exhausted, closed or collected.
+        entries = self._pin_cached_entries(table)
 
-        result = self.raw_sql(sql)
-        return pa.ipc.RecordBatchReader.from_batches(
-            expr.as_table().schema().to_pyarrow(), batch_producer(result)
+        # Every reader gets its own cursor.  Cursors are independent of the
+        # main connection, so multiple readers can be open at once and the
+        # backend remains free to materialize a new cache round while older
+        # readers are still being consumed.
+        try:
+            con, owned = self._reader_connection(table)
+        except BaseException:
+            self._unpin_cached_entries(entries)
+            raise
+        released = False
+
+        def release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            try:
+                inner.close()
+            finally:
+                if owned:
+                    con.close()
+                self._unpin_cached_entries(entries)
+
+        def stream():
+            try:
+                reader = con.sql(sql).to_arrow_reader(chunk_size)
+            except BaseException:
+                # ensure the pins are dropped if the query cannot be started
+                release()
+                raise
+            yield from reader
+
+        inner = pa.ipc.RecordBatchReader.from_batches(
+            table.schema().to_pyarrow(), stream()
         )
+
+        return _make_pinned_reader(inner, release)
 
     def to_pyarrow(
         self,
@@ -1750,8 +2019,8 @@ class Backend(
 
         self.con.register(op.name, obj)
 
-    def _register_udfs(self, expr: ir.Expr) -> None:
-        con = self.con
+    def _register_udfs(self, expr: ir.Expr, con=None) -> None:
+        con = self.con if con is None else con
 
         for udf_node in expr.op().find(ops.ScalarUDF):
             register_func = getattr(
