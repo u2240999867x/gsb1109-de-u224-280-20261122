@@ -2,7 +2,7 @@ from collections import defaultdict, deque
 from enum import Enum, IntEnum
 from typing import NamedTuple
 
-from aiokafka.structs import TopicPartition
+from aiokafka.structs import ConsumerGroupMetadata, TopicPartition
 from aiokafka.util import create_future
 
 
@@ -149,21 +149,24 @@ class TransactionManager:
         self._txn_partitions.clear()
         self._txn_consumer_group = None
         self._pending_txn_partitions.clear()
-        for _, _, fut in self._pending_txn_offsets:
-            fut.set_exception(exc)
+        for _, _, fut, _ in self._pending_txn_offsets:
+            if not fut.done():
+                fut.set_exception(exc)
         self._pending_txn_offsets.clear()
-        self._transaction_waiter.set_exception(exc)
+        if self._transaction_waiter is not None and not self._transaction_waiter.done():
+            self._transaction_waiter.set_exception(exc)
 
     def fatal_error(self, exc):
         self._transition_to(TransactionState.FATAL_ERROR)
         self._txn_partitions.clear()
         self._txn_consumer_group = None
         self._pending_txn_partitions.clear()
-        for _, _, fut in self._pending_txn_offsets:
-            fut.set_exception(exc)
+        for _, _, fut, _ in self._pending_txn_offsets:
+            if not fut.done():
+                fut.set_exception(exc)
         self._pending_txn_offsets.clear()
         # There may be an abortable error. We just override it
-        if self._transaction_waiter.done():
+        if self._transaction_waiter is None or self._transaction_waiter.done():
             self._transaction_waiter = create_future()
         self._transaction_waiter.set_exception(exc)
 
@@ -175,11 +178,27 @@ class TransactionManager:
             self._pending_txn_partitions.add(tp)
             self.notify_task_waiter()
 
-    def add_offsets_to_txn(self, offsets, group_id):
+    def add_offsets_to_txn(
+        self,
+        offsets,
+        group_id=None,
+        group_metadata: ConsumerGroupMetadata | None = None,
+        **metadata_kwargs,
+    ):
         assert self.is_in_transaction()
         assert self.transactional_id
+        if isinstance(group_id, ConsumerGroupMetadata):
+            group_metadata = group_id
+            group_id = group_metadata.group_id
+        elif group_metadata is None:
+            group_metadata = ConsumerGroupMetadata.coerce(group_id, **metadata_kwargs)
+        if group_metadata is None:
+            group_metadata = ConsumerGroupMetadata(group_id)
+        if group_id is None:
+            group_id = group_metadata.group_id
+
         fut = create_future()
-        self._pending_txn_offsets.append((group_id, offsets, fut))
+        self._pending_txn_offsets.append((group_id, offsets, fut, group_metadata))
         self.notify_task_waiter()
         return fut
 
@@ -192,15 +211,29 @@ class TransactionManager:
     def consumer_group_to_add(self):
         if self._txn_consumer_group is not None:
             return None
-        for group_id, _, _ in self._pending_txn_offsets:
+        for group_id, _, _, _ in self._pending_txn_offsets:
             return group_id
+        return None
+
+    def consumer_group_metadata_to_add(self):
+        if self._txn_consumer_group is not None:
+            return None
+        for _, _, _, group_metadata in self._pending_txn_offsets:
+            return group_metadata
         return None
 
     def offsets_to_commit(self):
         if self._txn_consumer_group is None:
             return None
-        for group_id, offsets, _ in self._pending_txn_offsets:
+        for group_id, offsets, _, _ in self._pending_txn_offsets:
             return offsets, group_id
+        return None
+
+    def group_metadata_to_commit(self):
+        if self._txn_consumer_group is None:
+            return None
+        for _, _, _, group_metadata in self._pending_txn_offsets:
+            return group_metadata
         return None
 
     def partition_added(self, tp: TopicPartition):
@@ -211,7 +244,7 @@ class TransactionManager:
         self._txn_consumer_group = group_id
 
     def offset_committed(self, tp, offset, group_id):
-        pending_group_id, pending_offsets, fut = self._pending_txn_offsets[0]
+        pending_group_id, pending_offsets, fut, _ = self._pending_txn_offsets[0]
         assert pending_group_id == group_id
         assert tp in pending_offsets and pending_offsets[tp].offset == offset
         del pending_offsets[tp]

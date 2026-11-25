@@ -16,10 +16,16 @@ from aiokafka.protocol.group import (
     LeaveGroupRequest,
     SyncGroupRequest,
 )
-from aiokafka.structs import OffsetAndMetadata, TopicPartition
+from aiokafka.structs import (
+    ConsumerGroupMetadata,
+    OffsetAndMetadata,
+    TopicPartition,
+)
 from aiokafka.util import cancel_and_wait, create_future, create_task
 
 log = logging.getLogger(__name__)
+
+GroupMetadata = ConsumerGroupMetadata
 
 UNKNOWN_OFFSET = -1
 

@@ -16,7 +16,11 @@ from aiokafka.errors import (
     IllegalStateError,
     RecordTooLargeError,
 )
-from aiokafka.structs import ConsumerRecord, TopicPartition
+from aiokafka.structs import (
+    ConsumerGroupMetadata,
+    ConsumerRecord,
+    TopicPartition,
+)
 from aiokafka.util import commit_structure_validate, get_running_loop
 
 from .fetcher import Fetcher, OffsetResetStrategy
@@ -511,6 +515,24 @@ class AIOKafkaConsumer:
             this consumer
         """
         return self._subscription.assigned_partitions()
+
+    def group_metadata(self):
+        """Return an immutable snapshot of this consumer's group membership."""
+        if self._group_id is None:
+            raise IllegalOperation("Requires group_id")
+
+        coordinator = self._coordinator
+        generation_id = getattr(coordinator, "generation", -1)
+        member_id = getattr(coordinator, "member_id", "")
+        group_instance_id = getattr(coordinator, "_group_instance_id", None)
+        return ConsumerGroupMetadata(
+            group_id=self._group_id,
+            generation_id=generation_id,
+            member_id=member_id,
+            group_instance_id=group_instance_id,
+        )
+
+    get_group_metadata = group_metadata
 
     async def stop(self):
         """Close the consumer, while waiting for finalizers:

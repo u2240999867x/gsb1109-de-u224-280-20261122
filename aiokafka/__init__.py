@@ -7,6 +7,7 @@ from .errors import ConsumerStoppedError, IllegalOperation
 from .listeners import ProducerListener
 from .producer import AIOKafkaProducer
 from .structs import (
+    ConsumerGroupMetadata,
     ConsumerRecord,
     OffsetAndMetadata,
     OffsetAndTimestamp,
@@ -26,6 +27,7 @@ __all__ = [  # noqa: RUF022
     "ConsumerStoppedError",
     "IllegalOperation",
     # Structs
+    "ConsumerGroupMetadata",
     "ConsumerRecord",
     "TopicPartition",
     "OffsetAndTimestamp",

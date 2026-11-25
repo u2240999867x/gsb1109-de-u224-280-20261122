@@ -8,6 +8,7 @@ from aiokafka.errors import KafkaError
 
 __all__ = [
     "BrokerMetadata",
+    "ConsumerGroupMetadata",
     "ConsumerRecord",
     "OffsetAndMetadata",
     "PartitionMetadata",
@@ -24,6 +25,98 @@ class TopicPartition(NamedTuple):
 
     partition: int
     "A partition id"
+
+
+class ConsumerGroupMetadata(NamedTuple):
+    """Immutable consumer group membership used by transactional commits."""
+
+    group_id: str
+    generation_id: int = -1
+    member_id: str = ""
+    group_instance_id: str | None = None
+
+    @classmethod
+    def coerce(cls, value=None, **kwargs):
+        if value is None:
+            metadata = None
+        elif isinstance(value, ConsumerGroupMetadata):
+            metadata = value
+        elif isinstance(value, str):
+            metadata = cls(group_id=value)
+        elif isinstance(value, dict):
+            values = dict(value)
+            values.update({k: v for k, v in kwargs.items() if v is not None})
+            return cls(
+                group_id=values.get("group_id") or values.get("group"),
+                generation_id=values.get("generation_id", values.get("generation", -1)),
+                member_id=values.get("member_id", values.get("member", "")),
+                group_instance_id=values.get(
+                    "group_instance_id", values.get("instance_id")
+                ),
+            )
+        elif isinstance(value, (tuple, list)):
+            metadata = cls(*value)
+        else:
+            metadata = cls(
+                group_id=getattr(value, "group_id", None)
+                or getattr(value, "group", None),
+                generation_id=getattr(
+                    value,
+                    "generation_id",
+                    getattr(value, "generation", -1),
+                ),
+                member_id=getattr(value, "member_id", getattr(value, "member", "")),
+                group_instance_id=getattr(
+                    value,
+                    "group_instance_id",
+                    getattr(value, "instance_id", None),
+                ),
+            )
+
+        if not kwargs:
+            return metadata
+
+        fields = metadata._asdict() if metadata is not None else {}
+        if kwargs.get("group_id") is not None:
+            fields["group_id"] = kwargs["group_id"]
+        for name in (
+            "generation_id",
+            "generation",
+            "member_id",
+            "group_instance_id",
+            "instance_id",
+        ):
+            if name in kwargs and kwargs[name] is not None:
+                target = (
+                    "generation_id"
+                    if name in {"generation_id", "generation"}
+                    else "group_instance_id"
+                    if name == "instance_id"
+                    else name
+                )
+                fields[target] = kwargs[name]
+        if metadata is None and fields.get("group_id") is None:
+            return None
+        return cls(**fields)
+
+    @property
+    def generation(self) -> int:
+        return self.generation_id
+
+    @property
+    def has_member_identity(self) -> bool:
+        return (
+            self.generation_id >= 0
+            or bool(self.member_id)
+            or self.group_instance_id is not None
+        )
+
+
+GroupMetadata = ConsumerGroupMetadata
+ConsumerGroupMembership = ConsumerGroupMetadata
+GroupMembership = ConsumerGroupMetadata
+GroupIdentity = ConsumerGroupMetadata
+ConsumerGroupMemberMetadata = ConsumerGroupMetadata
 
 
 class BrokerMetadata(NamedTuple):

@@ -18,7 +18,7 @@ from aiokafka.record.default_records import (
     DefaultRecordBatch,
     DefaultRecordBatchBuilder,
 )
-from aiokafka.structs import TopicPartition
+from aiokafka.structs import ConsumerGroupMetadata, TopicPartition
 from aiokafka.util import (
     INTEGER_MAX_VALUE,
     commit_structure_validate,
@@ -618,25 +618,86 @@ class AIOKafkaProducer:
 
         return TransactionContext(self)
 
-    async def send_offsets_to_transaction(self, offsets, group_id):
+    async def send_offsets_to_transaction(
+        self,
+        offsets,
+        group_id=None,
+        generation_id=None,
+        member_id=None,
+        group_instance_id=None,
+        *,
+        group_metadata=None,
+        metadata=None,
+        **kwargs,
+    ):
         self._ensure_transactional()
 
         if not self._txn_manager.is_in_transaction():
             raise IllegalOperation("Not in the middle of a transaction")
 
-        if not group_id or not isinstance(group_id, str):
+        if group_metadata is None:
+            group_metadata = metadata
+        if group_metadata is None and isinstance(generation_id, ConsumerGroupMetadata):
+            group_metadata = generation_id
+            generation_id = None
+        if group_metadata is None and not isinstance(group_id, str):
+            group_metadata = group_id
+            group_id = None
+
+        if generation_id is None:
+            generation_id = kwargs.pop("generation", None)
+        if generation_id is None:
+            generation_id = kwargs.pop("consumer_group_generation_id", None)
+        if member_id is None:
+            member_id = kwargs.pop("consumer_id", None)
+        if group_instance_id is None:
+            group_instance_id = kwargs.pop("instance_id", None)
+
+        group_metadata = ConsumerGroupMetadata.coerce(
+            group_metadata if group_metadata is not None else group_id,
+            group_id=group_id,
+            generation_id=generation_id,
+            member_id=member_id,
+            group_instance_id=group_instance_id,
+        )
+
+        if (
+            group_metadata is None
+            or not group_metadata.group_id
+            or not isinstance(group_metadata.group_id, str)
+        ):
             raise ValueError(group_id)
 
         # validate `offsets` structure
         formatted_offsets = commit_structure_validate(offsets)
 
         log.debug(
-            "Begin adding offsets %s for consumer group %s to transaction",
+            "Begin adding offsets %s for consumer group %s (generation %s, "
+            "member %s) to transaction",
             formatted_offsets,
-            group_id,
+            group_metadata.group_id,
+            group_metadata.generation_id,
+            group_metadata.member_id,
         )
-        fut = self._txn_manager.add_offsets_to_txn(formatted_offsets, group_id)
+        fut = self._txn_manager.add_offsets_to_txn(
+            formatted_offsets,
+            group_metadata.group_id,
+            group_metadata=group_metadata,
+        )
         await asyncio.shield(fut)
+
+    async def send_offsets_to_transaction_with_group_metadata(
+        self, offsets, group_metadata
+    ):
+        await self.send_offsets_to_transaction(offsets, group_metadata=group_metadata)
+
+    async def send_offsets_to_transaction_with_metadata(self, offsets, metadata):
+        await self.send_offsets_to_transaction(offsets, metadata=metadata)
+
+    commit_offsets_to_transaction = send_offsets_to_transaction
+    send_offsets_to_transaction_with_consumer_group_metadata = (
+        send_offsets_to_transaction_with_group_metadata
+    )
 
     async def __aenter__(self):
         await self.start()

@@ -32,7 +32,7 @@ from aiokafka.protocol.transaction import (
     InitProducerIdRequest,
     TxnOffsetCommitRequest,
 )
-from aiokafka.structs import TopicPartition
+from aiokafka.structs import ConsumerGroupMetadata, TopicPartition
 from aiokafka.util import cancel_and_wait, create_task
 
 log = logging.getLogger(__name__)
@@ -312,7 +312,12 @@ class Sender:
         commit_data = txn_manager.offsets_to_commit()
         if commit_data is not None:
             offsets, group_id = commit_data
-            return create_task(self._do_txn_offset_commit(offsets, group_id))
+            group_metadata = txn_manager.group_metadata_to_commit()
+            return create_task(
+                self._do_txn_offset_commit(
+                    offsets, group_id, group_metadata=group_metadata
+                )
+            )
 
         commit_result = txn_manager.needs_transaction_commit()
         if commit_result is not None:
@@ -336,7 +341,7 @@ class Sender:
         handler = AddOffsetsToTxnHandler(self, group_id)
         return await handler.do(node_id)
 
-    async def _do_txn_offset_commit(self, offsets, group_id):
+    async def _do_txn_offset_commit(self, offsets, group_id, group_metadata=None):
         # Fast return if nothing to commit
         if not offsets:
             return
@@ -352,8 +357,13 @@ class Sender:
             group_id,
             node_id,
         )
-        handler = TxnOffsetCommitHandler(self, offsets, group_id)
-        await handler.do(node_id)
+        handler = TxnOffsetCommitHandler(
+            self, offsets, group_id, group_metadata=group_metadata
+        )
+        try:
+            await handler.do(node_id)
+        except IncompatibleBrokerVersion as exc:
+            self._txn_manager.error_transaction(exc)
 
     async def _do_txn_commit(self, commit_result):
         """Committing transaction should be done with care.
@@ -616,10 +626,61 @@ class AddOffsetsToTxnHandler(BaseHandler):
 class TxnOffsetCommitHandler(BaseHandler):
     group = ConnectionGroup.COORDINATION
 
-    def __init__(self, sender, offsets, group_id):
+    def __init__(
+        self,
+        sender,
+        offsets,
+        group_id=None,
+        generation_id=None,
+        member_id=None,
+        group_instance_id=None,
+        *,
+        group_metadata=None,
+        metadata=None,
+        **kwargs,
+    ):
         super().__init__(sender)
         self._offsets = offsets
-        self._group_id = group_id
+
+        if group_metadata is None:
+            group_metadata = metadata
+        if isinstance(group_id, ConsumerGroupMetadata):
+            group_metadata = group_id
+            group_id = group_metadata.group_id
+        elif group_metadata is None and isinstance(
+            generation_id, ConsumerGroupMetadata
+        ):
+            group_metadata = generation_id
+            generation_id = None
+
+        if generation_id is None:
+            generation_id = kwargs.pop("generation", None)
+        if member_id is None:
+            member_id = kwargs.pop("consumer_id", None)
+        if generation_id is None:
+            generation_id = kwargs.pop("consumer_group_generation_id", None)
+
+        if group_metadata is None:
+            group_metadata = ConsumerGroupMetadata.coerce(
+                group_id,
+                group_id=group_id,
+                generation_id=generation_id,
+                member_id=member_id,
+                group_instance_id=group_instance_id,
+            )
+        elif not isinstance(group_metadata, ConsumerGroupMetadata):
+            group_metadata = ConsumerGroupMetadata.coerce(
+                group_metadata,
+                group_id=group_id,
+                generation_id=generation_id,
+                member_id=member_id,
+                group_instance_id=group_instance_id,
+            )
+
+        self._group_metadata = group_metadata
+        self._group_id = (
+            group_metadata.group_id if group_metadata is not None else group_id
+        )
 
     def create_request(self):
         txn_manager = self._sender._txn_manager
@@ -636,6 +697,7 @@ class TxnOffsetCommitHandler(BaseHandler):
             producer_id=txn_manager.producer_id,
             producer_epoch=txn_manager.producer_epoch,
             topics=list(offset_data.items()),
+            group_metadata=self._group_metadata,
         )
         return req
 
@@ -673,6 +735,19 @@ class TxnOffsetCommitHandler(BaseHandler):
                     return self._default_backoff
                 elif error_type is InvalidProducerEpoch:
                     raise ProducerFenced()
+                elif error_type in (
+                    Errors.IllegalGenerationError,
+                    Errors.UnknownMemberIdError,
+                    Errors.FencedInstanceIdError,
+                ):
+                    exc = error_type()
+                    if txn_manager.is_in_transaction():
+                        txn_manager.error_transaction(exc)
+                    else:
+                        for _, _, fut, _ in txn_manager._pending_txn_offsets:
+                            if not fut.done():
+                                fut.set_exception(exc)
+                    return None
                 elif error_type is TransactionalIdAuthorizationFailed:
                     raise error_type(txn_manager.transactional_id)
                 elif error_type is GroupAuthorizationFailedError:
