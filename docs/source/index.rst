@@ -396,6 +396,73 @@ to the same object.
 In order for this to function the user must have the necessary IAM permissions to perform
 a GetObjectVersion
 
+Publish Directories
+-------------------
+
+A publish directory pins the paths of a directory to S3 object versions, so that
+downstream readers can keep listing and reading one publication generation while
+live objects continue to change.
+
+.. code-block:: python
+
+   >>> s3 = s3fs.S3FileSystem(version_aware=True)
+   >>> release = s3.publish_directory('publish/daily')
+   >>> release.ls()
+   ['publish/daily/sales.csv', ...]
+   >>> release.cat_file('sales.csv')          # pinned to the generation's version
+   b'...'
+   >>> current = s3.publication('publish/daily')
+   >>> same = s3.publication('publish/daily', release.generation)
+
+A generation lives under ``<root>/.s3fs-publication/``: ``current.json`` points at
+the active generation, and each ``versions/<id>.json`` is an immutable manifest of
+relative path to bucket, key and object version.  Because entries are keyed by
+relative path and carry explicit version ids, a generation remains readable after
+the live objects are overwritten, deleted or moved.
+
+Merging publish directories
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``begin_merge`` merges one publish directory into another.  A merge is a draft:
+the warehouse operator resolves each path conflict, and ``commit`` re-scans the
+source and publishes a new generation.
+
+.. code-block:: python
+
+   >>> draft = s3.begin_merge(
+   ...     'publish/old',
+   ...     'publish/daily',
+   ...     versions={'sales.csv': 'WORK-ORDER-VERSION-ID'},
+   ... )
+   >>> for issue in draft.conflicts():
+   ...     print(issue.source_path, issue.target_path)
+
+   >>> draft.keep('sales.csv', 'sales-review.csv')  # keep target, move incoming
+   >>> draft.replace('stock.csv')                    # incoming replaces target
+   >>> draft.replace('tax.csv')
+   >>> new_release = draft.commit()
+
+Rules at commit time:
+
+- First-time entries are copied in-bucket from the object version named by the
+  work order (or the live version when none was named).
+- Already-catalogued entries keep their original object version.  Moving such a
+  file only points the new relative path at that same version; nothing is copied
+  again.
+- Files that arrived in the source after confirmation are included at their
+  relative paths.  If one occupies a destination chosen earlier, the draft
+  reports a conflict between the incoming file and the late arrival.
+- Every ``keep``/``replace`` decision is bound to the target object version it
+  was made against.  A target replaced after confirmation, even if later restored,
+  must be confirmed again.  Decisions that are still valid (for example an
+  untouched tax table) remain valid.
+- The new tree must never contain both a file and a directory at one path.
+- All validation and copying is planned before the manifest pointer moves.  On a
+  conflict or failure, the previously published generation keeps serving readers.
+
+Use ``check_merge(draft)`` to re-validate without committing, and
+``merge_directories`` for a one-call begin/resolve/commit.
+
 
 Contents
 ========

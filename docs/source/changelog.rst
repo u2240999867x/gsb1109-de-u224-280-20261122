@@ -4,6 +4,11 @@ Changelog
 Unreleased
 ----------
 
+- Add publish directories: immutable publication manifests pin relative paths to
+  S3 object versions for stable downstream listing and reading.
+- Add publish-directory merges with per-path keep/replace confirmations, late
+  source arrivals, stale-confirmation detection and atomic generation commits.
+
 - Preserve exclusive-create conditions and file options when committing empty files.
 - Forward per-call S3 request options through single-object and batched deletes.
 - Delete the requested object version in ``rm_file`` when the path includes one.

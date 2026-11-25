@@ -2227,6 +2227,37 @@ class S3FileSystem(AsyncFileSystem):
 
     merge = sync_wrapper(_merge)
 
+    def publish_directory(self, path):
+        """Adopt the current live tree of ``path`` as a publication generation.
+
+        The returned :class:`s3fs.publication.Publication` pins every relative
+        path to the S3 object version visible now, so later overwrites or
+        deletions do not change what a reader of this generation sees.
+
+        Requires ``version_aware=True``.
+        """
+        from s3fs.publication import publish_directory as _publish_directory
+
+        return _publish_directory(self, path)
+
+    def publication(self, path, generation=None):
+        """Load a published generation of ``path`` (default: current)."""
+        from s3fs.publication import publication_for
+
+        return publication_for(self, path, generation)
+
+    def begin_merge(self, source, target, versions=None):
+        """Start merging the publish directory ``source`` into ``target``.
+
+        ``versions`` maps source-relative paths to the S3 object version named by
+        the work order for files that have not been catalogued before.  Resolve
+        conflicts on the returned draft with ``keep``/``replace``, then call
+        ``draft.commit()``.
+        """
+        from s3fs.publication import begin_merge as _begin_merge
+
+        return _begin_merge(self, source, target, versions=versions)
+
     async def _copy_basic(self, path1, path2, **kwargs):
         """Copy file between locations on S3
 

@@ -21,6 +21,9 @@ API
    S3FileSystem.rm
    S3FileSystem.tail
    S3FileSystem.touch
+   S3FileSystem.publish_directory
+   S3FileSystem.publication
+   S3FileSystem.begin_merge
 
 .. autosummary::
    S3File
@@ -56,3 +59,42 @@ API
 .. autoclass:: ParamKwargsHelper
 
 .. autoclass:: SSEParams
+
+.. currentmodule:: s3fs.publication
+
+.. autosummary::
+   Publication
+   PublicationStore
+   PublicationMerger
+   MergeDraft
+   Decision
+   MergeIssue
+   MergeConflictError
+   PublicationNotFound
+   PublicationLayoutError
+   publish_directory
+   publication_for
+   begin_merge
+   check_merge
+   commit_merge
+   merge_directories
+
+.. autoclass:: Publication
+   :members:
+
+.. autoclass:: PublicationStore
+   :members:
+
+.. autoclass:: PublicationMerger
+   :members:
+
+.. autoclass:: MergeDraft
+   :members:
+
+.. autofunction:: publish_directory
+
+.. autofunction:: publication_for
+
+.. autofunction:: begin_merge
+
+.. autofunction:: merge_directories
