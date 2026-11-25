@@ -16,6 +16,11 @@ class AbstractPartitionAssignor(abc.ABC):
     collecting partition counts which are always needed in assignors).
     """
 
+    # "eager" assignors revoke every currently owned partition before joining
+    # the group. "cooperative" assignors (KIP-429) only revoke the partitions
+    # the member has to give up and keep the rest assigned.
+    protocol_type: str = "eager"
+
     @property
     @abc.abstractmethod
     def name(self) -> str:

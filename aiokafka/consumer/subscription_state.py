@@ -49,6 +49,11 @@ class SubscriptionState:
         self._subscription_waiters = []  # type: List[Future]
         self._assignment_waiters = []  # type: List[Future]
 
+        # Partitions retained across a cooperative rebalance. Their fetch
+        # state (position, pause) and prefetched fetcher buffers survive the
+        # reassignment. Empty for classic eager rebalances.
+        self._retained_partitions: set[TopicPartition] = set()
+
         # Fetch contexts
         self._fetch_count = 0
         self._last_fetch_ended = time.monotonic()
@@ -204,19 +209,35 @@ class SubscriptionState:
         assert self._subscription_type == SubscriptionType.AUTO_PATTERN
         self._change_subscription(Subscription(topics))
 
-    def assign_from_subscribed(self, assignment: set[TopicPartition]):
+    def assign_from_subscribed(self, assignment: set[TopicPartition], reused_states=None):
         """Set assignment if automatic assignment is used.
 
         Caller: Coordinator
         Affects: SubscriptionState.subscription.assignment
+
+        ``reused_states`` maps partitions to :class:`TopicPartitionState`
+        instances of the previous assignment that must be preserved (fetch
+        position, pause state and pending reset). This is used by the
+        cooperative rebalance protocol to keep state for partitions the
+        member retains across generations.
         """
         assert self._subscription_type in [
             SubscriptionType.AUTO_PATTERN,
             SubscriptionType.AUTO_TOPICS,
         ]
 
-        self._subscription._assign(assignment)
+        if reused_states is None:
+            self._retained_partitions = set()
+        else:
+            self._retained_partitions = set(reused_states)
+
+        self._subscription._assign(assignment, reused_states=reused_states)
         self._notify_assignment_waiters()
+
+    @property
+    def retained_partitions(self) -> set[TopicPartition]:
+        """Partitions kept by this member across the current rebalance."""
+        return self._retained_partitions
 
     def begin_reassignment(self):
         """Signal from Coordinator that a group re-join is needed. For example
@@ -225,6 +246,7 @@ class SubscriptionState:
 
         Caller: Coordinator
         """
+        self._retained_partitions = set()
         if self._subscription is not None:
             self._subscription._begin_reassignment()
 
@@ -336,7 +358,7 @@ class Subscription:
     def assignment(self):
         return self._assignment
 
-    def _assign(self, topic_partitions: Iterable[TopicPartition]):
+    def _assign(self, topic_partitions: Iterable[TopicPartition], reused_states=None):
         for tp in topic_partitions:
             assert tp.topic in self._topics, (
                 f"Received an assignment for unsubscribed topic: {tp}"
@@ -345,7 +367,7 @@ class Subscription:
         if self._assignment is not None:
             self._assignment._unassign()
 
-        self._assignment = Assignment(topic_partitions)
+        self._assignment = Assignment(topic_partitions, reused_states=reused_states)
         self._reassignment_in_progress = False
 
     def _unsubscribe(self):
@@ -389,14 +411,26 @@ class Assignment:
         * Unassigned
     """
 
-    def __init__(self, topic_partitions: Iterable[TopicPartition]):
+    def __init__(
+        self,
+        topic_partitions: Iterable[TopicPartition],
+        reused_states: dict[TopicPartition, TopicPartitionState] | None = None,
+    ):
         assert isinstance(topic_partitions, list | set | tuple)
 
         self._topic_partitions = frozenset(topic_partitions)
 
         self._tp_state = {}  # type: Dict[TopicPartition, TopicPartitionState]
         for tp in self._topic_partitions:
-            self._tp_state[tp] = TopicPartitionState(self)
+            if reused_states is not None and tp in reused_states:
+                # Cooperative rebalance: the member keeps this partition, so
+                # preserve position, pause state and pending reset instead of
+                # starting from scratch.
+                tp_state = reused_states[tp]
+                tp_state._rebind(self)
+            else:
+                tp_state = TopicPartitionState(self)
+            self._tp_state[tp] = tp_state
 
         self.unassign_future = create_future()
         self.commit_refresh_needed = Event()
@@ -474,6 +508,15 @@ class TopicPartitionState:
 
         self._paused = False
         self._resume_fut = None
+
+    def _rebind(self, assignment: "Assignment"):
+        """Attach this state to a freshly built assignment.
+
+        Used by cooperative rebalances, where a retained partition keeps the
+        same state object (and thus its position and pause flag) but the
+        enclosing :class:`Assignment` is recreated.
+        """
+        self._assignment = assignment
 
     @property
     def paused(self):

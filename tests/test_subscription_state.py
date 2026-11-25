@@ -164,6 +164,62 @@ async def test_is_assigned(subscription_state):
     assert not subscription_state.is_assigned(tp2)
 
 
+async def test_cooperative_reassignment_reuses_retained_state(subscription_state):
+    tp0 = TopicPartition("topic", 0)
+    tp1 = TopicPartition("topic", 1)
+    tp2 = TopicPartition("topic", 2)
+
+    subscription_state.subscribe({"topic"})
+    subscription_state.assign_from_subscribed({tp0, tp1, tp2})
+    previous = subscription_state.subscription.assignment
+
+    # tp0 is paused for business reasons; tp1 has a consumed position.
+    subscription_state.pause(tp0)
+    subscription_state.seek(tp1, 5)
+    retained_states = {
+        tp0: previous.state_value(tp0),
+        tp1: previous.state_value(tp1),
+    }
+
+    # Cooperative round: tp2 moves away, tp0/tp1 are retained.
+    subscription_state.assign_from_subscribed(
+        {tp0, tp1}, reused_states=retained_states
+    )
+    current = subscription_state.subscription.assignment
+
+    assert subscription_state.assigned_partitions() == {tp0, tp1}
+    assert subscription_state.retained_partitions == {tp0, tp1}
+    # Same state objects, so pause flag and fetch position survive.
+    assert current.state_value(tp0) is retained_states[tp0]
+    assert current.state_value(tp1) is retained_states[tp1]
+    assert current.state_value(tp0).paused is True
+    assert current.state_value(tp1).position == 5
+    # The moved partition is gone together with its state.
+    assert current.state_value(tp2) is None
+    assert not previous.active
+
+
+async def test_eager_reassignment_does_not_retain_state(subscription_state):
+    tp0 = TopicPartition("topic", 0)
+    tp1 = TopicPartition("topic", 1)
+
+    subscription_state.subscribe({"topic"})
+    subscription_state.assign_from_subscribed({tp0, tp1})
+    subscription_state.pause(tp0)
+    previous = subscription_state.subscription.assignment
+    old_tp0_state = previous.state_value(tp0)
+
+    # Eager reassignments pass no reused states, so state starts fresh and
+    # the retained-partitions marker stays empty.
+    subscription_state.assign_from_subscribed({tp0, tp1})
+    current = subscription_state.subscription.assignment
+
+    assert subscription_state.retained_partitions == set()
+    assert current.state_value(tp0) is not old_tp0_state
+    assert current.state_value(tp0).paused is False
+    assert not current.state_value(tp0).has_valid_position
+
+
 async def test_assigned_state(subscription_state):
     tp1 = TopicPartition("topic", 0)
     tp2 = TopicPartition("topic", 1)

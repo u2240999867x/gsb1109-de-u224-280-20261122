@@ -10,6 +10,14 @@ New features:
 * Introduce ``ProducerListener`` in ``aiokafka.listeners`` and allow multiple
   producer event listeners through ``listeners=[...]``. Preserve batch callback
   arguments and synchronous delivery (pr #1213 by @Gleb-Shipilov).
+* Add optional cooperative (incremental cooperative rebalancing, KIP-429)
+  support through ``cooperative_rebalance=True`` and the
+  ``RoundRobinCooperativeAssignor``, ``RangeCooperativeAssignor`` and
+  ``StickyCooperativeAssignor`` assignors. On a rebalance a member only revokes
+  the partitions it has to give up, while retained partitions keep their fetch
+  position, pause state and prefetched records. A partition is only assigned to
+  a new member after the previous owner has actually revoked it. Eager
+  assignors keep the classic revoke-all behaviour.
 
 Bugfixes:
 

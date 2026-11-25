@@ -454,6 +454,29 @@ class Fetcher:
         if future is not None and not future.done():
             future.set_result(None)
 
+    def discard_buffers(self, partitions):
+        """Drop prefetched records for the given partitions.
+
+        Called by the coordinator when the partitions are revoked during a
+        cooperative rebalance, so their buffered data can never be delivered
+        to another owner through this consumer.
+        """
+        for tp in partitions:
+            self._records.pop(tp, None)
+            self._notify(self._wait_consume_future)
+
+    def rebind_retained_buffers(self, assignment):
+        """Reattach retained partitions' buffers to a new assignment.
+
+        A cooperative rebalance recreates the :class:`Assignment` while
+        keeping the same partitions. ``FetchResult`` instances capture the
+        assignment they were fetched under, so without rebinding they would
+        look stale and discard otherwise valid buffered records.
+        """
+        for tp, result in list(self._records.items()):
+            if isinstance(result, FetchResult) and tp in assignment.tps:
+                result._assignment = assignment
+
     def _create_fetch_waiter(self):
         # Creating a fetch waiter is usually not that frequent of an operation,
         # (get methods will return all data first, before a waiter is created)
@@ -501,10 +524,16 @@ class Fetcher:
                 # If we lose assignment we just cancel all current tasks,
                 # wait for new assignment and restart the loop
                 if assignment is None or not assignment.active:
+                    retained = self._subscriptions.retained_partitions
                     for task in self._pending_tasks:
                         await cancel_and_wait(task)
                     self._pending_tasks.clear()
-                    self._records.clear()
+                    for tp in list(self._records):
+                        # During a cooperative rebalance retained partitions
+                        # keep their prefetched buffers, position and pause
+                        # state. Only revoked partitions are dropped.
+                        if tp not in retained:
+                            del self._records[tp]
 
                     subscription = self._subscriptions.subscription
                     if subscription is None or subscription.assignment is None:
@@ -515,7 +544,13 @@ class Fetcher:
                             # Critical coordination waiters will be passed
                             # to user, but fetcher can just ignore those
                             continue
-                    assignment = self._subscriptions.subscription.assignment
+                        subscription = self._subscriptions.subscription
+                    assignment = subscription.assignment
+                    # Retained partitions kept their FetchResult, which still
+                    # points at the previous assignment. Reattach it to the new
+                    # one so buffered records validate against live state and
+                    # continue from the undelivered position.
+                    self.rebind_retained_buffers(assignment)
                 assert assignment is not None and assignment.active
 
                 # Reset consuming signal future.

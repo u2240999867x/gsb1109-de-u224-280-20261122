@@ -132,6 +132,14 @@ class AIOKafkaConsumer:
             one. The coordinator will choose the old assignment strategy until
             all members have been updated. Then it will choose the new
             strategy. Default: [:class:`.RoundRobinPartitionAssignor`]
+        cooperative_rebalance (bool): If True, prefer the cooperative
+            (incremental cooperative rebalancing, KIP-429) variant of the
+            configured assignors. On a rebalance the member only revokes the
+            partitions it has to give up and keeps fetching from, and keeps
+            the position, pause state and prefetched records of, the
+            partitions it retains. Requires every member of the group (and
+            every configured assignor) to support the cooperative protocol;
+            otherwise the classic eager rebalance is used. Default: False
 
         max_poll_interval_ms (int): Maximum allowed time between calls to
             consume messages (e.g., :meth:`.getmany`). If this interval
@@ -256,6 +264,7 @@ class AIOKafkaConsumer:
         check_crcs=True,
         metadata_max_age_ms=5 * 60 * 1000,
         partition_assignment_strategy=(RoundRobinPartitionAssignor,),
+        cooperative_rebalance=False,
         max_poll_interval_ms=300000,
         rebalance_timeout_ms=None,
         session_timeout_ms=10000,
@@ -332,6 +341,7 @@ class AIOKafkaConsumer:
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
         self._partition_assignment_strategy = partition_assignment_strategy
+        self._cooperative_rebalance = cooperative_rebalance
         self._key_deserializer = key_deserializer
         self._value_deserializer = value_deserializer
         self._fetch_min_bytes = fetch_min_bytes
@@ -423,6 +433,8 @@ class AIOKafkaConsumer:
                 exclude_internal_topics=self._exclude_internal_topics,
                 rebalance_timeout_ms=self._rebalance_timeout_ms,
                 max_poll_interval_ms=self._max_poll_interval_ms,
+                cooperative_rebalance=self._cooperative_rebalance,
+                fetcher=self._fetcher,
             )
             if self._subscription.subscription is not None:
                 if self._subscription.partitions_auto_assigned():

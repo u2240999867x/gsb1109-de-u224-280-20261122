@@ -137,6 +137,9 @@ Other references
 .. autoclass:: aiokafka.producer.message_accumulator.BatchBuilder
 .. autoclass:: aiokafka.consumer.group_coordinator.GroupCoordinator
 .. autoclass:: aiokafka.coordinator.assignors.roundrobin.RoundRobinPartitionAssignor
+.. autoclass:: aiokafka.coordinator.assignors.cooperative.RoundRobinCooperativeAssignor
+.. autoclass:: aiokafka.coordinator.assignors.cooperative.RangeCooperativeAssignor
+.. autoclass:: aiokafka.coordinator.assignors.cooperative.StickyCooperativeAssignor
 
 
 Errors

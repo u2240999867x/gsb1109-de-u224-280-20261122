@@ -234,6 +234,8 @@ class GroupCoordinator(BaseCoordinator):
         exclude_internal_topics=True,
         max_poll_interval_ms=300000,
         rebalance_timeout_ms=30000,
+        cooperative_rebalance=False,
+        fetcher=None,
     ):
         """Initialize the coordination manager.
 
@@ -256,6 +258,10 @@ class GroupCoordinator(BaseCoordinator):
         self._assignors = assignors
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
+        # When True the coordinator prefers the cooperative (incremental)
+        # variant of the negotiated assignor. Eager assignors keep working and
+        # retain the classic "revoke everything before rejoin" behaviour.
+        self._cooperative_rebalance = cooperative_rebalance
 
         self.generation = OffsetCommitRequest.DEFAULT_GENERATION_ID
         self.member_id = JoinGroupRequest.UNKNOWN_MEMBER_ID
@@ -291,6 +297,11 @@ class GroupCoordinator(BaseCoordinator):
 
         # Will be set on close
         self._closing = create_future()
+
+        # Optional fetcher handle, used to drop prefetched buffers on
+        # cooperative revocations. Injected by AIOKafkaConsumer after the
+        # fetcher is constructed.
+        self._fetcher = fetcher
 
     def _on_metadata_change(self):
         self.request_rejoin()
@@ -391,7 +402,42 @@ class GroupCoordinator(BaseCoordinator):
                 return assignor
         return None
 
+    def _is_cooperative_assignor(self, assignor):
+        return self._cooperative_rebalance and getattr(
+            assignor, "protocol_type", "eager"
+        ) == "cooperative"
+
+    def _will_join_cooperatively(self):
+        """Whether the upcoming join can use the cooperative protocol.
+
+        The broker selects one protocol supported by every member. If any
+        configured assignor is eager we conservatively prepare for an eager
+        rebalance (revoke everything), which is always correct. When every
+        assignor is cooperative the member keeps its partitions during the
+        join and only revokes what the new assignment takes away.
+        """
+        return self._cooperative_rebalance and all(
+            self._is_cooperative_assignor(assignor) for assignor in self._assignors
+        )
+
     async def _on_join_prepare(self, previous_assignment):
+        if self._will_join_cooperatively():
+            # Cooperative rebalance: partitions stay owned and fetchable
+            # until the new assignment tells us which ones must move. We do
+            # not flip the reassignment flag, so retained partitions keep
+            # being consumed while the join is in flight. We still commit
+            # consumed offsets.
+            self._group_subscription = None
+            if previous_assignment is not None:
+                try:
+                    await self._maybe_do_last_autocommit(previous_assignment)
+                except Errors.KafkaError as err:
+                    log.error("OffsetCommit failed before join, ignoring: %s", err)
+            return set()
+
+        return await self._on_join_prepare_eager(previous_assignment)
+
+    async def _on_join_prepare_eager(self, previous_assignment):
         self._subscription.begin_reassignment()
         self._group_subscription = None
 
@@ -402,11 +448,12 @@ class GroupCoordinator(BaseCoordinator):
             except Errors.KafkaError as err:
                 # We would retry any retriable commit already
                 log.error("OffsetCommit failed before join, ignoring: %s", err)
-            revoked = previous_assignment.tps
+            revoked = set(previous_assignment.tps)
         else:
             revoked = set()
 
-        # execute the user's callback before rebalance
+        # execute the user's callback before rebalance. This is invoked even
+        # for an empty set on the initial join, matching the eager contract.
         log.info(
             "Revoking previously assigned partitions %s for group %s",
             revoked,
@@ -424,6 +471,8 @@ class GroupCoordinator(BaseCoordinator):
                     self._subscription.listener,
                     self.group_id,
                 )
+
+        return revoked
 
     async def _perform_assignment(self, response: Response):
         assignment_strategy = response.group_protocol
@@ -476,9 +525,104 @@ class GroupCoordinator(BaseCoordinator):
         assert assignor, f"invalid assignment protocol: {protocol}"
 
         assignment = ConsumerProtocol.ASSIGNMENT.decode(member_assignment_bytes)
+        new_partitions = set(assignment.partitions())
+        previous_assignment = self._subscription.subscription.assignment
+        previous_partitions = set(self._subscription.assigned_partitions())
 
-        # update partition assignment
-        self._subscription.assign_from_subscribed(assignment.partitions())
+        cooperative = self._is_cooperative_assignor(assignor)
+        if cooperative:
+            revoked = previous_partitions - new_partitions
+            retained = previous_partitions & new_partitions
+            added = new_partitions - previous_partitions
+
+            # Drop prefetched buffers for revoked partitions first, so they
+            # can never be delivered after ownership is handed over. Retained
+            # partitions keep their buffers, position and pause state.
+            if self._fetcher is not None and revoked:
+                self._fetcher.discard_buffers(revoked)
+
+            if revoked:
+                log.info(
+                    "Cooperatively revoking partitions %s for group %s",
+                    revoked,
+                    self.group_id,
+                )
+                if self._subscription.listener:
+                    try:
+                        res = self._subscription.listener.on_partitions_revoked(
+                            revoked
+                        )
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        log.exception(
+                            "User provided subscription listener %s"
+                            " for group %s failed on_partitions_revoked",
+                            self._subscription.listener,
+                            self.group_id,
+                        )
+                # The broker starts another generation once members have
+                # revoked what the target assignment took away.
+                self.request_rejoin()
+
+            reused_states = {}
+            if previous_assignment is not None:
+                for tp in retained:
+                    reused_states[tp] = previous_assignment.state_value(tp)
+
+            # update partition assignment, preserving retained partition state
+            self._subscription.assign_from_subscribed(
+                new_partitions, reused_states=reused_states
+            )
+            # The await below can change subscription, remember the ongoing one.
+            subscription = self._subscription.subscription
+
+            # Reattach retained buffers synchronously, before any await, so a
+            # concurrent ``next_record`` can't mistake the still-buffered
+            # FetchResult for stale data tied to the inactive assignment. The
+            # fetcher repeats this idempotently in its own routine.
+            if self._fetcher is not None:
+                self._fetcher.rebind_retained_buffers(subscription.assignment)
+
+            # give the assignor a chance to update internal state
+            # based on the received assignment
+            assignor.on_assignment(assignment)
+
+            # We need to start this task before callback to avoid deadlocks.
+            # Callback can rely on something like ``Consumer.position()`` that
+            # requires committed point to be refreshed.
+            await self._stop_commit_offsets_refresh_task()
+            self.start_commit_offsets_refresh_task(subscription.assignment)
+
+            log.info(
+                "Setting newly assigned partitions %s for group %s"
+                " (retained %s, revoked %s)",
+                added,
+                self.group_id,
+                retained,
+                revoked,
+            )
+
+            # Only genuinely new partitions trigger the assigned callback.
+            # Retained partitions never re-notify the user.
+            if self._subscription.listener and added:
+                try:
+                    res = self._subscription.listener.on_partitions_assigned(added)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    log.exception(
+                        "User provided listener %s for group %s"
+                        " failed on partition assignment: %s",
+                        self._subscription.listener,
+                        self.group_id,
+                        added,
+                    )
+            return
+
+        # Classic eager path: revoke already happened in _on_join_prepare and
+        # every partition in the assignment is treated as newly assigned.
+        self._subscription.assign_from_subscribed(new_partitions)
         # The await below can change subscription, remember the ongoing one.
         subscription = self._subscription.subscription
 
@@ -1273,9 +1417,17 @@ class CoordinatorGroupRebalance:
         log.info("(Re-)joining group %s", self.group_id)
 
         topics = self._subscription.topics
+        owned_partitions = set(
+            self._coordinator._subscription.assigned_partitions()
+        )
         metadata_list = []
         for assignor in self._assignors:
-            metadata = assignor.metadata(topics)
+            if self._coordinator._is_cooperative_assignor(assignor):
+                metadata = assignor.metadata_with_ownership(
+                    topics, owned_partitions
+                )
+            else:
+                metadata = assignor.metadata(topics)
             if not isinstance(metadata, bytes):
                 metadata = metadata.encode()
             group_protocol = (assignor.name, metadata)
