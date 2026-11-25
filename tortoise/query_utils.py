@@ -274,6 +274,73 @@ class Prefetch:
             )
 
 
+class GroupedPrefetch:
+    """
+    Prefetches a limited, deterministically ordered window of related objects *per parent*.
+
+    Unlike :class:`Prefetch`, whose queryset runs once against all parents, this container
+    answers "give each parent its own top ``limit`` related rows". The related rows are
+    ranked with a window function inside a single SQL query, so the work stays constant as
+    the number of parents (e.g. collection stations) grows -- there are no per-parent or
+    per-row follow-up queries.
+
+    The ranking, filtering and ordering come from the supplied *queryset*, so the ordinary
+    ``filter``/``order_by`` semantics are reused unchanged. Only reverse foreign-key
+    relations are supported. The queryset may itself carry nested prefetches; those are then
+    run once over only the related rows that actually made the window.
+
+    :param relation: Related reverse foreign-key field name on the parent model.
+    :param queryset: QuerySet over the related model providing filters and the ranking order.
+    :param to_attr: Attribute on each parent instance that receives the selected objects.
+    :param limit: Maximum number of related objects attached to every parent.
+    :param cursor:
+        Optional tuple aligned with the queryset ordering (the trailing primary-key tiebreak
+        included). When set, only rows that sort strictly after the cursor are returned,
+        enabling keyset pagination without an ``OFFSET`` scan.
+    :param cursor_parent:
+        Optional primary key of the single parent whose groups the *cursor* applies to.
+        Every other parent keeps its un-paginated first window, which lets one prefetch
+        paginate one parent while still filling the homepages of all the other parents.
+    """
+
+    __slots__ = ("relation", "queryset", "to_attr", "limit", "cursor", "cursor_parent")
+
+    def __init__(
+        self,
+        relation: str,
+        queryset: QuerySet,
+        to_attr: str,
+        limit: int,
+        cursor: tuple[Any, ...] | None = None,
+        cursor_parent: Any | None = None,
+    ) -> None:
+        if limit < 0:
+            raise ValueError("GroupedPrefetch limit must be a non-negative number")
+        self.relation = relation
+        self.queryset = queryset
+        self.queryset.query = copy(self.queryset.model._meta.basequery)
+        self.to_attr = to_attr
+        self.limit = limit
+        self.cursor = cursor
+        self.cursor_parent = cursor_parent
+
+    def resolve_for_queryset(self, queryset: QuerySet) -> None:
+        """
+        Register the grouped prefetch on the owning queryset.
+
+        Nested relations are intentionally rejected: grouping always applies to the first
+        level relation named by ``relation``.
+        """
+        first_level_field, __, forwarded_prefetch = self.relation.partition("__")
+        if forwarded_prefetch:
+            raise OperationalError("GroupedPrefetch does not support nested relations")
+        if first_level_field not in queryset.model._meta.fetch_fields:
+            raise OperationalError(
+                f"relation {first_level_field} for {queryset.model._meta.db_table} not found"
+            )
+        queryset._grouped_prefetches.append(self)
+
+
 def get_json_filter_operator(
     value: dict[str, Any], operator_keywords: dict[str, Callable[..., Criterion]]
 ) -> tuple[list[str | int], Any, Callable[..., Criterion]]:

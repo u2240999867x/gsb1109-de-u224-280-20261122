@@ -30,6 +30,7 @@ from tortoise.fields.relational import (
     RelationalField,
 )
 from tortoise.query_utils import (
+    GroupedPrefetch,
     Prefetch,
     QueryModifier,
     TableCriterionTuple,
@@ -381,6 +382,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         "_orderings",
         "_prefetch_map",
         "_prefetch_queries",
+        "_grouped_prefetches",
         "_raise_does_not_exist",
         "_select_for_update",
         "_select_for_update_no_key",
@@ -399,6 +401,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         self.fields: set[str] = model._meta.db_fields
         self._prefetch_map: dict[str, set[str | Prefetch]] = {}
         self._prefetch_queries: dict[str, list[tuple[str | None, QuerySet]]] = {}
+        self._grouped_prefetches: list[GroupedPrefetch] = []
         self._single: bool = False
         self._raise_does_not_exist: bool = False
         self._limit: int | None = None
@@ -429,6 +432,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset.capabilities = self.capabilities
         queryset._prefetch_map = copy(self._prefetch_map)
         queryset._prefetch_queries = copy(self._prefetch_queries)
+        queryset._grouped_prefetches = copy(self._grouped_prefetches)
         queryset._single = self._single
         queryset._raise_does_not_exist = self._raise_does_not_exist
         queryset._db = self._db
@@ -1122,7 +1126,7 @@ class QuerySet(AwaitableQuery[MODEL]):
             return queryset
         return self
 
-    def prefetch_related(self, *args: str | Prefetch) -> QuerySet[MODEL]:
+    def prefetch_related(self, *args: str | Prefetch | GroupedPrefetch) -> QuerySet[MODEL]:
         """
         Like ``.fetch_related()`` on instance, but works on all objects in QuerySet.
 
@@ -1132,7 +1136,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset._prefetch_map = {}
 
         for relation in args:
-            if isinstance(relation, Prefetch):
+            if isinstance(relation, (Prefetch, GroupedPrefetch)):
                 relation.resolve_for_queryset(queryset)
                 continue
 
@@ -1373,6 +1377,7 @@ class QuerySet(AwaitableQuery[MODEL]):
             db=self._db,
             prefetch_map=self._prefetch_map,
             prefetch_queries=self._prefetch_queries,
+            grouped_prefetches=self._grouped_prefetches,
             select_related_idx=self._select_related_idx,  # type: ignore
         ).execute_select(
             *self.query.get_parameterized_sql(),

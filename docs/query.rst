@@ -372,6 +372,34 @@ You can view full example here:  :ref:`example_prefetching`
 .. autoclass:: tortoise.query_utils.Prefetch
     :members:
 
+Grouped prefetch
+================
+
+``Prefetch`` runs one query over every parent at once, so it cannot keep a different
+per-parent slice (e.g. the two newest alarms of each station). ``GroupedPrefetch`` fills that
+gap: the related rows are ranked inside each parent group by a window function in a single
+query and only the first ``limit`` rows are attached to each parent, regardless of how many
+parents are loaded.
+
+.. code-block:: python3
+
+    stations = await Station.all().prefetch_related(
+        GroupedPrefetch(
+            relation="alarms",
+            queryset=Alarm.filter(status="pending_review").order_by("-created_at"),
+            to_attr="alarm_page",
+            limit=2,
+        )
+    )
+    station.alarm_page  # at most the two most recent alarms of this station
+
+Passing ``cursor`` (a tuple aligned with the queryset ordering) returns only rows that sort
+strictly after it for keyset pagination. ``cursor_parent`` limits that cursor to a single
+parent while every other parent still receives its first window in the same query.
+
+.. autoclass:: tortoise.query_utils.GroupedPrefetch
+    :members:
+
 .. _union:
 
 Union

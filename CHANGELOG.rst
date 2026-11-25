@@ -14,6 +14,7 @@ Unreleased
 Added
 ^^^^^
 - Support forward relation ``in`` and ``not_in`` filters with model instances. (#2323)
+- Add ``GroupedPrefetch`` for ``prefetch_related``: a single window-function query attaches a limited, deterministically ordered slice of a reverse foreign-key relation to each parent, with optional keyset pagination (``cursor``/``cursor_parent``), while ordinary ``Prefetch`` keeps working unchanged.
 - SQLite now persists ``TimeField`` values as ISO-8601 times. (#2297)
 - Accept libpq style multi-host PostgreSQL URLs such as ``postgres://user:pass@host1:5432,host2:5433/db`` for ``asyncpg`` and ``psycopg``; ``asyncpg`` used to fail resolving ``host1,host2`` as one name, and ``psycopg`` now also reads ``target_session_attrs``. (#2387)
 - Typed ``**kwargs`` on field constructors via PEP 692 (``Unpack[TypedDict]``), so IDEs and type checkers can autocomplete and validate common field arguments (This only affects type-hint checking results without affecting runtime behavior). (#2256)

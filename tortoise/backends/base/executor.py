@@ -14,6 +14,7 @@ from tortoise.exceptions import OperationalError, UnSupportedError
 from tortoise.expressions import Expression, ResolveContext
 from tortoise.fields.base import DatabaseDefault
 from tortoise.fields.relational import RelationalField
+from tortoise.backends.base.grouped_prefetch import run_grouped_prefetch
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.backends.base.client import BaseDBAsyncClient
@@ -24,7 +25,7 @@ if TYPE_CHECKING:  # pragma: nocoverage
     )
     from tortoise.filters import FilterInfoDict
     from tortoise.models import MODEL, Model
-    from tortoise.query_utils import Prefetch
+    from tortoise.query_utils import GroupedPrefetch, Prefetch
     from tortoise.queryset import QuerySet
 
 EXECUTOR_CACHE: dict[
@@ -46,6 +47,7 @@ class BaseExecutor:
         db: BaseDBAsyncClient,
         prefetch_map: dict[str, set[str | Prefetch]] | None = None,
         prefetch_queries: dict[str, list[tuple[str | None, QuerySet]]] | None = None,
+        grouped_prefetches: list[GroupedPrefetch] | None = None,
         select_related_idx: (
             list[tuple[type[Model], int, str, type[Model], Iterable[str | None]]] | None
         ) = None,
@@ -54,6 +56,7 @@ class BaseExecutor:
         self.db: BaseDBAsyncClient = db
         self.prefetch_map = prefetch_map or {}
         self._prefetch_queries = prefetch_queries or {}
+        self.grouped_prefetches = grouped_prefetches or []
         self.select_related_idx = select_related_idx
         key = (self.db.connection_name, self.model._meta.schema, self.model._meta.db_table)
         if key not in EXECUTOR_CACHE:
@@ -725,12 +728,23 @@ class BaseExecutor:
         return await self._prefetch_direct_relation(instance_id_list, field, related_query)
 
     async def _execute_prefetch_queries(self, instance_list: Iterable[Model]) -> Iterable[Model]:
-        if instance_list and (self.prefetch_map or self._prefetch_queries):
+        if instance_list and (
+            self.prefetch_map or self._prefetch_queries or self.grouped_prefetches
+        ):
             self._make_prefetch_queries()
             prefetch_tasks = []
             for field, related_queries in self._prefetch_queries.items():
                 for related_query in related_queries:
                     prefetch_tasks.append(self._do_prefetch(instance_list, field, related_query))
+            for grouped_prefetch in self.grouped_prefetches:
+                prefetch_tasks.append(
+                    run_grouped_prefetch(
+                        self.db,
+                        self.model,
+                        list(instance_list),
+                        grouped_prefetch,
+                    )
+                )
             await asyncio.gather(*prefetch_tasks)
 
         return instance_list
