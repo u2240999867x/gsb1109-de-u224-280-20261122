@@ -40,3 +40,37 @@ def test_txn_manager(txn_manager):
     # sequence number should wrap around 32 bit signed integers
     txn_manager.increment_sequence_number(tp1, 2**32 - 5)
     assert txn_manager.sequence_number(tp1) == -4
+
+
+async def test_txn_manager_transaction_generation(txn_manager):
+    # The generation token allows detecting that a transaction, open when an
+    # operation started, was closed in the meantime.
+    assert txn_manager.transaction_generation == 0
+
+    txn_manager.set_pid_and_epoch(123, 321)
+    txn_manager.begin_transaction()
+    generation = txn_manager.transaction_generation
+
+    # Committing a transaction changes the token
+    txn_manager.committing_transaction()
+    txn_manager.complete_transaction()
+    assert txn_manager.transaction_generation != generation
+
+    # Aborting after an abortable error changes the token on both steps
+    txn_manager.begin_transaction()
+    generation = txn_manager.transaction_generation
+    txn_manager.error_transaction(ValueError())
+    assert txn_manager.transaction_generation != generation
+    # Silence "exception was never retrieved" warnings
+    txn_manager.wait_for_transaction_end().exception()
+    generation = txn_manager.transaction_generation
+    txn_manager.aborting_transaction()
+    txn_manager.complete_transaction()
+    assert txn_manager.transaction_generation != generation
+
+    # Fatal errors also close the transaction for waiting operations
+    txn_manager.begin_transaction()
+    generation = txn_manager.transaction_generation
+    txn_manager.fatal_error(ValueError())
+    assert txn_manager.transaction_generation != generation
+    txn_manager.wait_for_transaction_end().exception()

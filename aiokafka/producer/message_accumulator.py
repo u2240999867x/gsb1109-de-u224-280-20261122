@@ -6,6 +6,7 @@ import time
 from collections.abc import Sequence
 
 from aiokafka.errors import (
+    IllegalOperation,
     KafkaTimeoutError,
     LeaderNotAvailableError,
     NotLeaderForPartitionError,
@@ -465,6 +466,39 @@ class MessageAccumulator:
             batch.failure(exception)
         self._exception = exception
 
+    def fail_unsent_batches(self, exception):
+        """Fail and drop queued batches that were never sent to the broker.
+
+        Used when a transaction hits an abortable error: those batches were
+        never assigned a sequence number, so they must not reach the broker
+        and their waiters are resolved with the transaction error. Batches
+        that were already sent (including ones being retried) are left to
+        complete, preserving producer sequence number continuity for the
+        next transaction.
+        """
+        for tp in list(self._batches):
+            batches = self._batches[tp]
+            for batch in list(batches):
+                if batch.retry_count == 0:
+                    batches.remove(batch)
+                    batch.failure(exception)
+            if not batches:
+                del self._batches[tp]
+
+    def _transaction_generation(self):
+        txn_manager = self._txn_manager
+        if txn_manager is None or txn_manager.transactional_id is None:
+            return None
+        return txn_manager.transaction_generation
+
+    @staticmethod
+    def _check_transaction_generation(txn_manager, txn_generation):
+        if (
+            txn_generation is not None
+            and txn_manager.transaction_generation != txn_generation
+        ):
+            raise IllegalOperation("Transaction is closed, can't add messages to it")
+
     async def close(self):
         self._closed = True
         await self.flush()
@@ -482,6 +516,8 @@ class MessageAccumulator:
         If batch is already full this method waits (`timeout` seconds maximum)
         until batch is drained by send task
         """
+        txn_manager = self._txn_manager
+        txn_generation = self._transaction_generation()
         total_wait_time = 0.0
         try:
             while True:
@@ -491,6 +527,10 @@ class MessageAccumulator:
                     raise ProducerClosed()
                 if self._exception is not None:
                     raise copy.copy(self._exception)
+                # The transaction this message was meant for may be closed
+                # while we wait for a free batch slot. It must not leak into
+                # the next transaction.
+                self._check_transaction_generation(txn_manager, txn_generation)
 
                 pending_batches = self._batches.get(tp)
                 if not pending_batches:
@@ -695,9 +735,15 @@ class MessageAccumulator:
         if self._exception is not None:
             raise copy.copy(self._exception)
 
+        txn_manager = self._txn_manager
+        txn_generation = self._transaction_generation()
         total_wait_time = 0.0
         try:
             while timeout > 0:
+                # The transaction this batch was meant for may be closed
+                # while we wait for a free batch slot. It must not leak into
+                # the next transaction.
+                self._check_transaction_generation(txn_manager, txn_generation)
                 pending = self._batches.get(tp)
                 if pending:
                     start = time.monotonic()

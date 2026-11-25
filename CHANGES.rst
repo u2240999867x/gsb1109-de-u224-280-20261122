@@ -13,6 +13,14 @@ New features:
 
 Bugfixes:
 
+* Fix transactional producer recovery after an abortable error (for example
+  a ``TopicAuthorizationFailedError`` when adding a partition to the
+  transaction): queued, never sent batches are now failed with the
+  transaction error instead of being delivered, keeping producer sequence
+  numbers continuous so the next transaction can be sent on the same
+  producer. Sends that can no longer join the current transaction (while
+  waiting for topic metadata or for a free batch slot) now fail fast instead
+  of leaking into the next transaction.
 * Fix unexpected ``CancelledError`` during consumer shutdown after connection
   failures or immediately after startup (issues #647, #974, #1210).
 * Fix decoding of ``DescribeGroups`` v3 responses when describing multiple

@@ -6,6 +6,7 @@ import pytest
 
 from aiokafka.cluster import ClusterMetadata
 from aiokafka.errors import (
+    IllegalOperation,
     KafkaTimeoutError,
     LeaderNotAvailableError,
     NotLeaderForPartitionError,
@@ -15,6 +16,7 @@ from aiokafka.producer.message_accumulator import (
     MessageAccumulator,
     MessageBatch,
 )
+from aiokafka.producer.transaction_manager import TransactionManager
 from aiokafka.structs import TopicPartition
 from aiokafka.util import create_task
 
@@ -364,3 +366,114 @@ class TestMessageAccumulator(unittest.TestCase):
         self.assertEqual(batch.retry_count, 3)
         self.assertFalse(ma._pending_batches)
         self.assertFalse(ma._batches)
+
+    def _transactional_accumulator(self, cluster, batch_size=1000):
+        txn_manager = TransactionManager("test_tid", 30000)
+        txn_manager.set_pid_and_epoch(120, 22)
+        txn_manager.begin_transaction()
+        ma = MessageAccumulator(cluster, batch_size, 0, 30, txn_manager=txn_manager)
+        return ma, txn_manager
+
+    @run_until_complete
+    async def test_fail_unsent_batches(self):
+        # On an abortable transaction error, queued batches that were never
+        # sent must be failed with the transaction error and dropped, while
+        # batches already sent (and being retried) are left to complete.
+        tp0 = TopicPartition("test-topic", 0)
+        tp1 = TopicPartition("test-topic", 1)
+
+        cluster = ClusterMetadata(metadata_max_age_ms=10000)
+        cluster.leader_for_partition = mock.MagicMock(return_value=0)
+
+        ma, _ = self._transactional_accumulator(cluster)
+        fut_retried = await ma.add_message(tp0, None, b"retried", timeout=1)
+
+        # Imitate a batch that was already sent to the broker and is waiting
+        # for a retry: it keeps its producer state and must not be failed.
+        batches, _ = ma.drain_by_nodes(ignore_nodes=[])
+        retried_batch = batches[0][tp0]
+        retried_batch.get_data_buffer()  # builds and closes the builder
+
+        # Fresh batches queued behind it were never sent to the broker
+        fut_fresh = await ma.add_message(tp0, None, b"never sent", timeout=1)
+        fut_tp1 = await ma.add_message(tp1, None, b"fresh", timeout=1)
+        ma.reenqueue(retried_batch)
+        self.assertEqual(retried_batch.retry_count, 1)
+
+        class AbortError(Exception):
+            pass
+
+        ma.fail_unsent_batches(AbortError())
+
+        # Never sent batches are failed with the transaction error...
+        with self.assertRaises(AbortError):
+            await fut_fresh
+        with self.assertRaises(AbortError):
+            await fut_tp1
+        # ... and dropped from the accumulator, so they can not be drained
+        self.assertNotIn(tp1, ma._batches)
+        # The retried batch is still queued for delivery
+        self.assertEqual(list(ma._batches[tp0]), [retried_batch])
+        self.assertFalse(fut_retried.done())
+
+        batches, _ = ma.drain_by_nodes(ignore_nodes=[])
+        self.assertEqual(batches[0][tp0], retried_batch)
+        batches[0][tp0].done_noack()
+        self.assertIsNone(await fut_retried)
+
+    @run_until_complete
+    async def test_fail_unsent_batches_wakes_buffer_waiters(self):
+        # A send waiting for a free batch slot is woken up with the
+        # transaction error once the transaction stops accepting messages.
+        tp0 = TopicPartition("test-topic", 0)
+
+        cluster = ClusterMetadata(metadata_max_age_ms=10000)
+        cluster.leader_for_partition = mock.MagicMock(return_value=0)
+
+        ma, _ = self._transactional_accumulator(cluster)
+        # Fill the batch, so the next message waits for a free slot
+        await ma.add_message(tp0, None, b"0123456789" * 70, timeout=1)
+        add_task = create_task(ma.add_message(tp0, None, b"0" * 500, timeout=5))
+        done, _ = await asyncio.wait([add_task], timeout=0.2)
+        self.assertFalse(bool(done))
+
+        class AbortError(Exception):
+            pass
+
+        ma.fail_unsent_batches(AbortError())
+        with self.assertRaises(AbortError):
+            await add_task
+
+    @run_until_complete
+    async def test_add_message_fails_if_transaction_closed(self):
+        # If the transaction is closed while a send waits for a free batch
+        # slot, the send must fail instead of leaking into the next
+        # transaction. If the wait times out first, the timeout error is
+        # preserved.
+        tp0 = TopicPartition("test-topic", 0)
+
+        cluster = ClusterMetadata(metadata_max_age_ms=10000)
+        cluster.leader_for_partition = mock.MagicMock(return_value=0)
+
+        ma, txn_manager = self._transactional_accumulator(cluster)
+        await ma.add_message(tp0, None, b"0123456789" * 70, timeout=1)
+
+        # The slot wait times out first: the timeout error is preserved
+        with self.assertRaises(KafkaTimeoutError):
+            await ma.add_message(tp0, None, b"0" * 500, timeout=0.2)
+
+        add_task = create_task(ma.add_message(tp0, None, b"0" * 500, timeout=5))
+        done, _ = await asyncio.wait([add_task], timeout=0.2)
+        self.assertFalse(bool(done))
+
+        # The transaction is closed and the full batch is drained: the
+        # waiting send must report the closed transaction, even if it is
+        # only scheduled after a new transaction was begun.
+        txn_manager.error_transaction(ValueError("abort"))
+        txn_manager.wait_for_transaction_end().exception()
+        txn_manager.aborting_transaction()
+        txn_manager.complete_transaction()
+        txn_manager.begin_transaction()
+        ma.drain_by_nodes(ignore_nodes=[])
+        with self.assertRaises(IllegalOperation):
+            await add_task

@@ -491,17 +491,24 @@ class AIOKafkaProducer:
         """
         assert not (value is None and key is None), "Need at least one: key or value"
 
+        # Ensure transaction is started and not committing. We also bind the
+        # send to the current transaction: if it is closed while we wait for
+        # metadata, the message must not leak into the next transaction.
+        txn_manager = self._txn_manager
+        txn_generation = None
+        if txn_manager is not None and txn_manager.transactional_id is not None:
+            if not txn_manager.is_in_transaction():
+                raise IllegalOperation("Can't send messages while not in transaction")
+            txn_generation = txn_manager.transaction_generation
+
         # first make sure the metadata for the topic is available
         await self.client._wait_on_metadata(topic)
 
-        # Ensure transaction is started and not committing
-        if self._txn_manager is not None:
-            txn_manager = self._txn_manager
-            if (
-                txn_manager.transactional_id is not None
-                and not self._txn_manager.is_in_transaction()
-            ):
-                raise IllegalOperation("Can't send messages while not in transaction")
+        if (
+            txn_generation is not None
+            and txn_manager.transaction_generation != txn_generation
+        ):
+            raise IllegalOperation("Transaction is closed, can't send messages to it")
 
         headers = headers or []
 
@@ -560,19 +567,26 @@ class AIOKafkaProducer:
             asyncio.Future: object that will be set when the batch is
                 delivered.
         """
+        # Ensure transaction is started and not committing. We also bind the
+        # send to the current transaction: if it is closed while we wait for
+        # metadata, the batch must not leak into the next transaction.
+        txn_manager = self._txn_manager
+        txn_generation = None
+        if txn_manager is not None and txn_manager.transactional_id is not None:
+            if not txn_manager.is_in_transaction():
+                raise IllegalOperation("Can't send messages while not in transaction")
+            txn_generation = txn_manager.transaction_generation
+
         # first make sure the metadata for the topic is available
         await self.client._wait_on_metadata(topic)
         # We only validate we have the partition in the metadata here
         partition = self._partition(topic, partition, None, None, None, None)
 
-        # Ensure transaction is started and not committing
-        if self._txn_manager is not None:
-            txn_manager = self._txn_manager
-            if (
-                txn_manager.transactional_id is not None
-                and not self._txn_manager.is_in_transaction()
-            ):
-                raise IllegalOperation("Can't send messages while not in transaction")
+        if (
+            txn_generation is not None
+            and txn_manager.transaction_generation != txn_generation
+        ):
+            raise IllegalOperation("Transaction is closed, can't send messages to it")
 
         tp = TopicPartition(topic, partition)
         log.debug("Sending batch to %s", tp)

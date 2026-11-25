@@ -211,6 +211,16 @@ class Sender:
     def _coordinator_dead(self, coordinator_type):
         self._coordinators.pop(coordinator_type, None)
 
+    def _error_transaction(self, exc):
+        """Transition the transaction to abortable error state and fail all
+        queued, never sent batches: those must never be delivered as part of
+        this transaction, while batches already sent to the broker are left
+        to complete, keeping producer sequence numbers continuous for the
+        next transaction.
+        """
+        self._txn_manager.error_transaction(exc)
+        self._message_accumulator.fail_unsent_batches(exc)
+
     async def _find_coordinator(self, coordinator_type, coordinator_key):
         assert self._txn_manager is not None
         if coordinator_type in self._coordinators:
@@ -344,7 +354,7 @@ class Sender:
         try:
             node_id = await self._find_coordinator(CoordinationType.GROUP, group_id)
         except GroupAuthorizationFailedError as exc:
-            self._txn_manager.error_transaction(exc)
+            self._error_transaction(exc)
             return
         log.debug(
             "Sending offset-commit request with %s for group %s to %s",
@@ -543,7 +553,7 @@ class AddPartitionsToTxnHandler(BaseHandler):
                     )
                     raise error_type()
         if unauthorized_topics:
-            txn_manager.error_transaction(
+            self._sender._error_transaction(
                 TopicAuthorizationFailedError(unauthorized_topics)
             )
         return None
@@ -598,7 +608,7 @@ class AddOffsetsToTxnHandler(BaseHandler):
         elif error_type is TransactionalIdAuthorizationFailed:
             raise error_type(txn_manager.transactional_id)
         elif error_type is GroupAuthorizationFailedError:
-            txn_manager.error_transaction(error_type(self._group_id))
+            self._sender._error_transaction(error_type(self._group_id))
             return None
         else:
             log.error(
@@ -677,7 +687,7 @@ class TxnOffsetCommitHandler(BaseHandler):
                     raise error_type(txn_manager.transactional_id)
                 elif error_type is GroupAuthorizationFailedError:
                     exc = error_type(self._group_id)
-                    txn_manager.error_transaction(exc)
+                    self._sender._error_transaction(exc)
                     return None
                 else:
                     log.error(

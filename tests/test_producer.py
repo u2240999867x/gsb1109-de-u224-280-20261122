@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import time
+import unittest
 import weakref
 from unittest import mock
 
@@ -11,6 +12,7 @@ from aiokafka.client import AIOKafkaClient
 from aiokafka.cluster import ClusterMetadata
 from aiokafka.consumer import AIOKafkaConsumer
 from aiokafka.errors import (
+    IllegalOperation,
     KafkaError,
     KafkaTimeoutError,
     LeaderNotAvailableError,
@@ -767,3 +769,60 @@ class TestKafkaProducerIntegration(KafkaIntegrationTestCase):
             self.topic, b"msg", partition=0, headers=[("type", b"Normal")]
         )
         self.assertEqual(resp.partition, 0)
+
+
+@pytest.mark.usefixtures("setup_test_class_serverless")
+class TestProducerTransactionBinding(unittest.TestCase):
+    @run_until_complete
+    async def test_send_fails_if_transaction_closed_while_waiting_metadata(self):
+        # A send that waits for topic metadata is bound to the transaction
+        # that was open when it started: if that transaction is closed
+        # before metadata arrives, the send must fail instead of leaking
+        # into the next transaction.
+        producer = AIOKafkaProducer(
+            bootstrap_servers="localhost", transactional_id="test_tid"
+        )
+        producer._closed = True  # Never started, nothing to clean up
+        txn_manager = producer._txn_manager
+        txn_manager.set_pid_and_epoch(120, 22)
+        txn_manager.begin_transaction()
+
+        metadata_waiter = asyncio.Event()
+
+        async def mocked_wait_on_metadata(topic):
+            await metadata_waiter.wait()
+            return {0}
+
+        producer.client._wait_on_metadata = mocked_wait_on_metadata
+
+        send_task = asyncio.ensure_future(producer.send("topic", b"value", partition=0))
+        await asyncio.sleep(0.01)
+        self.assertFalse(send_task.done())
+
+        # The transaction is closed and a new one is begun before the
+        # metadata query returns
+        txn_manager.committing_transaction()
+        txn_manager.complete_transaction()
+        txn_manager.begin_transaction()
+        metadata_waiter.set()
+
+        with self.assertRaises(IllegalOperation):
+            await send_task
+
+    @run_until_complete
+    async def test_send_outside_transaction_fails_before_metadata_wait(self):
+        producer = AIOKafkaProducer(
+            bootstrap_servers="localhost", transactional_id="test_tid"
+        )
+        producer._closed = True  # Never started, nothing to clean up
+        txn_manager = producer._txn_manager
+        txn_manager.set_pid_and_epoch(120, 22)
+
+        async def mocked_wait_on_metadata(topic):
+            raise AssertionError("Should not wait for metadata")
+
+        producer.client._wait_on_metadata = mocked_wait_on_metadata
+
+        # Not in transaction at all
+        with self.assertRaises(IllegalOperation):
+            await producer.send("topic", b"value", partition=0)

@@ -70,6 +70,10 @@ class TransactionManager:
         self._pending_txn_partitions = set()
         self._txn_consumer_group = None
         self._pending_txn_offsets = deque()
+        # A token that changes every time the current transaction is closed
+        # (committed, aborted or failed). Allows detecting that an operation,
+        # started while a transaction was open, can no longer be part of it.
+        self._txn_generation = 0
 
     # INDEMPOTANCE PART
 
@@ -139,6 +143,7 @@ class TransactionManager:
         assert not self._pending_txn_partitions
         assert not self._pending_txn_offsets
         self._transition_to(TransactionState.READY)
+        self._txn_generation += 1
         self._txn_partitions.clear()
         self._txn_consumer_group = None
         if not self._transaction_waiter.done():
@@ -146,8 +151,12 @@ class TransactionManager:
 
     def error_transaction(self, exc):
         self._transition_to(TransactionState.ABORTABLE_ERROR)
-        self._txn_partitions.clear()
-        self._txn_consumer_group = None
+        self._txn_generation += 1
+        # NOTE: we keep `_txn_partitions` and `_txn_consumer_group`: those
+        # were already sent to the broker and the transaction can only be
+        # ended by an EndTxn request, so they are needed to decide if the
+        # abort requires a broker round trip. Only not yet sent parts of the
+        # transaction are dropped here.
         self._pending_txn_partitions.clear()
         for _, _, fut in self._pending_txn_offsets:
             fut.set_exception(exc)
@@ -156,6 +165,7 @@ class TransactionManager:
 
     def fatal_error(self, exc):
         self._transition_to(TransactionState.FATAL_ERROR)
+        self._txn_generation += 1
         self._txn_partitions.clear()
         self._txn_consumer_group = None
         self._pending_txn_partitions.clear()
@@ -185,6 +195,15 @@ class TransactionManager:
 
     def is_in_transaction(self):
         return self.state == TransactionState.IN_TRANSACTION
+
+    @property
+    def transaction_generation(self):
+        """A token that changes every time the current transaction is
+        closed (committed, aborted or failed). Allows detecting that an
+        operation, started while a transaction was open, can no longer be
+        part of it.
+        """
+        return self._txn_generation
 
     def partitions_to_add(self):
         return self._pending_txn_partitions
