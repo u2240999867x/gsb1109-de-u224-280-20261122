@@ -30,7 +30,17 @@ from .column_types import (
     Varchar,
 )
 from .combination import And, Or, Where
-from .m2m import M2M
+from .m2m import (
+    M2M,
+    M2MAllocation,
+    M2MAllocator,
+    Allocation,
+    AllocationConfig,
+    AllocationPolicy,
+    AllocationStrategy,
+    ReviewAllocation,
+    UniqueFileAllocation,
+)
 from .reference import LazyTableReference
 
 __all__ = [
@@ -71,5 +81,13 @@ __all__ = [
     "Or",
     "Where",
     "M2M",
+    "M2MAllocation",
+    "M2MAllocator",
+    "Allocation",
+    "AllocationConfig",
+    "AllocationPolicy",
+    "AllocationStrategy",
+    "ReviewAllocation",
+    "UniqueFileAllocation",
     "LazyTableReference",
 ]

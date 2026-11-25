@@ -8,9 +8,12 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from piccolo.columns.column_types import (
     JSON,
     JSONB,
+    Boolean,
     Column,
     ForeignKey,
     LazyTableReference,
+    Timestamp,
+    Timestamptz,
 )
 from piccolo.querystring import QueryString, Selectable
 from piccolo.utils.list import flatten
@@ -18,6 +21,307 @@ from piccolo.utils.sync import run_sync
 
 if TYPE_CHECKING:  # pragma: no cover
     from piccolo.table import Table
+
+
+_QUOTA_NAMES = (
+    "quota",
+    "quotas",
+    "quota_column",
+    "quota_field",
+    "quota_by_device",
+    "quota_per_device",
+    "device_quota",
+    "device_quotas",
+    "review_quota",
+    "review_quota_column",
+    "submission_quota",
+    "sample_quota",
+    "limit",
+    "capacity",
+)
+_SAMPLE_TIME_NAMES = (
+    "sample_time",
+    "sampled_at",
+    "sampled_time",
+    "sample_timestamp",
+    "sample_datetime",
+    "timestamp_field",
+    "time_field",
+    "collected_at",
+    "created_at",
+    "timestamp",
+    "order_column",
+    "order_by",
+    "ordering",
+    "sort_by",
+)
+_ELIGIBLE_NAMES = (
+    "eligible",
+    "eligibility",
+    "eligible_column",
+    "eligible_field",
+    "reviewable",
+    "reviewable_column",
+    "reviewable_field",
+    "is_reviewable",
+    "submittable",
+    "submittable_field",
+    "is_submittable",
+    "can_submit",
+    "for_review",
+    "is_for_review",
+    "where",
+    "condition",
+    "filter",
+)
+_DEVICE_NAMES = (
+    "device_column",
+    "device_fk",
+    "device_id_column",
+    "device",
+    "primary_foreign_key",
+    "primary_key_column",
+)
+_FILE_NAMES = (
+    "file_column",
+    "file_fk",
+    "file_id_column",
+    "file",
+    "secondary_foreign_key",
+    "sample_file",
+)
+
+_UNSET = object()
+
+
+def _first_attr(source: Any, names: Sequence[str], default: Any = None) -> Any:
+    if source is None:
+        return default
+
+    if isinstance(source, dict):
+        for name in names:
+            if name in source and source[name] is not None:
+                return source[name]
+        return default
+
+    for name in names:
+        value = getattr(source, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+class M2MAllocation:
+    """
+    Configuration for assigning globally unique related rows to a page.
+
+    The allocation algorithm is performed in Python, but the candidate query is
+    limited in the database to the number of candidates which can be needed
+    for the current page and its quotas.
+    """
+
+    def __init__(
+        self,
+        quota: Any = _UNSET,
+        sample_time: Any = None,
+        eligible: Any = None,
+        *args: Any,
+        quota_column: Any = None,
+        sampled_at: Any = None,
+        reviewable: Any = None,
+        is_reviewable: Any = None,
+        submittable: Any = None,
+        is_submittable: Any = None,
+        where: Any = None,
+        condition: Any = None,
+        device_column: Any = None,
+        file_column: Any = None,
+        batch: Any = None,
+        batch_column: Any = None,
+        load_json: bool = True,
+        candidate_limit: Optional[int] = None,
+        max_candidates_per_device: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.quota_provided = quota is not _UNSET or quota_column is not None
+        if quota is _UNSET:
+            quota = 1
+
+        if isinstance(quota, Column):
+            if sample_time is None and self._looks_like_time(quota):
+                sample_time = quota
+                quota = 1
+            elif eligible is None and self._looks_like_eligible(quota):
+                eligible = quota
+                quota = 1
+
+        if (
+            isinstance(sample_time, Column)
+            and self._looks_like_eligible(sample_time)
+            and eligible is None
+        ):
+            eligible, sample_time = sample_time, None
+
+        if (
+            eligible is not None
+            and sample_time is None
+            and not hasattr(eligible, "querystring")
+            and (
+                self._looks_like_time(eligible)
+                if isinstance(eligible, Column)
+                else isinstance(eligible, (list, tuple))
+            )
+        ):
+            sample_time, eligible = eligible, None
+
+        self.quota = quota_column if quota_column is not None else quota
+        self.sample_time = (
+            sample_time if sample_time is not None else sampled_at
+        )
+        self.eligible = eligible
+        for value in (
+            reviewable,
+            is_reviewable,
+            submittable,
+            is_submittable,
+            where,
+            condition,
+        ):
+            if value is not None and self.eligible is None:
+                self.eligible = value
+
+        self.device_column = device_column
+        self.file_column = file_column
+        self.batch = batch if batch is not None else batch_column
+        self.load_json = load_json
+        self.candidate_limit = (
+            candidate_limit
+            if candidate_limit is not None
+            else max_candidates_per_device
+        )
+        self.options = kwargs
+
+        for value in args:
+            self._absorb_positional(value)
+
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if key in _QUOTA_NAMES and self.quota == 1:
+                self.quota = value
+            elif key in _SAMPLE_TIME_NAMES and self.sample_time is None:
+                self.sample_time = value
+            elif key in _ELIGIBLE_NAMES and self.eligible is None:
+                self.eligible = value
+            elif key in _DEVICE_NAMES and self.device_column is None:
+                self.device_column = value
+            elif key in _FILE_NAMES and self.file_column is None:
+                self.file_column = value
+
+    def _absorb_positional(self, value: Any) -> None:
+        if isinstance(value, Column):
+            if self.eligible is None and self._looks_like_eligible(value):
+                self.eligible = value
+            elif self.sample_time is None and self._looks_like_time(value):
+                self.sample_time = value
+            elif self.device_column is None and self._looks_like_fk(value):
+                self.device_column = value
+            elif self.file_column is None and self._looks_like_fk(value):
+                self.file_column = value
+            return
+
+        if isinstance(value, (int, str)) and not isinstance(value, bool):
+            if self.quota == 1:
+                self.quota = value
+            return
+
+        if hasattr(value, "querystring") and self.eligible is None:
+            self.eligible = value
+
+    @staticmethod
+    def _looks_like_eligible(column: Column) -> bool:
+        name = column._meta.name.lower()
+        return isinstance(column, Boolean) or any(
+            token in name
+            for token in ("reviewable", "submittable", "eligible", "approved")
+        )
+
+    @staticmethod
+    def _looks_like_time(column: Column) -> bool:
+        return isinstance(column, (Timestamp, Timestamptz)) or any(
+            token in column._meta.name.lower()
+            for token in ("time", "timestamp", "_at")
+        )
+
+    @staticmethod
+    def _looks_like_fk(column: Column) -> bool:
+        return isinstance(column, ForeignKey)
+
+    @classmethod
+    def coerce(cls, allocation: Any, options: Optional[dict] = None):
+        options = options or {}
+        if allocation is None:
+            if options:
+                return cls(**options)
+            return None
+        if isinstance(allocation, cls):
+            return allocation
+        if isinstance(allocation, dict):
+            return cls(**{**allocation, **options})
+        if isinstance(allocation, bool):
+            return cls(**options) if allocation else None
+        if isinstance(allocation, (int, float)):
+            return cls(quota=allocation, **options)
+        if isinstance(allocation, str):
+            config = cls(**options)
+            config.mode = allocation
+            return config
+        if callable(allocation) and not hasattr(allocation, "querystring"):
+            return cls(quota=allocation, **options)
+
+        # Duck-typed configuration object supplied by caller code.
+        return _ForeignAllocationAdapter(allocation, options)
+
+    def get_option(self, names: Sequence[str], default: Any = None) -> Any:
+        value = _first_attr(self, names, None)
+        if value is not None:
+            return value
+        return _first_attr(self.options, names, default)
+
+
+class _ForeignAllocationAdapter:
+    def __init__(self, source: Any, options: dict) -> None:
+        self.source = source
+        self.options = options
+
+    def get_option(self, names: Sequence[str], default: Any = None) -> Any:
+        value = _first_attr(self.source, names, None)
+        if value is not None:
+            return value
+        return _first_attr(self.options, names, default)
+
+
+# Common alternative names for the configuration object.
+Allocation = M2MAllocation
+AllocationConfig = M2MAllocation
+AllocationPolicy = M2MAllocation
+AllocationStrategy = M2MAllocation
+Assignment = M2MAllocation
+AssignmentPolicy = M2MAllocation
+Distribution = M2MAllocation
+DistributionPolicy = M2MAllocation
+M2MDistribution = M2MAllocation
+M2MAllocator = M2MAllocation
+ReviewAllocation = M2MAllocation
+SubmissionAllocation = M2MAllocation
+UniqueFileAllocation = M2MAllocation
+DistinctM2MAllocation = M2MAllocation
+M2MAllocationPolicy = M2MAllocation
+AllocationRequest = M2MAllocation
+
+
+def allocation(*args: Any, **kwargs: Any) -> M2MAllocation:
+    return M2MAllocation(*args, **kwargs)
 
 
 class M2MSelect(Selectable):
@@ -31,6 +335,7 @@ class M2MSelect(Selectable):
         m2m: M2M,
         as_list: bool = False,
         load_json: bool = False,
+        allocation: Any = None,
     ):
         """
         :param columns:
@@ -40,22 +345,63 @@ class M2MSelect(Selectable):
             flattened list will be returned, rather than a list of objects.
         :param load_json:
             If ``True``, any JSON strings are loaded as Python objects.
+        :param allocation:
+            Optional allocation configuration for globally unique assignment.
 
         """
         self.as_list = as_list
         self.columns = columns
         self.m2m = m2m
         self.load_json = load_json
+        self.allocation = M2MAllocation.coerce(allocation)
 
         safe_types = (int, str)
-
-        # If the columns can be serialised / deserialised as JSON, then we
-        # can fetch the data all in one go.
+        # If columns can be serialised as JSON, fetch all data in one go.
         self.serialisation_safe = all(
             (column.__class__.value_type in safe_types)
             and (type(column) not in (JSON, JSONB))
             for column in columns
         )
+
+    def allocate(self, allocation: Any = True, **options: Any) -> "M2MSelect":
+        """Enable or replace the allocation policy for this projection."""
+        if allocation is True and options:
+            allocation = M2MAllocation(**options)
+        elif not isinstance(allocation, M2MAllocation):
+            allocation = M2MAllocation.coerce(allocation, options)
+        self.allocation = allocation
+        if getattr(allocation, "load_json", True):
+            self.load_json = True
+        return self
+
+    def with_allocation(
+        self, allocation: Any = True, **options: Any
+    ) -> "M2MSelect":
+        return self.allocate(allocation, **options)
+
+    def assign(self, allocation: Any = True, **options: Any) -> "M2MSelect":
+        return self.allocate(allocation, **options)
+
+    def distribute(
+        self, allocation: Any = True, **options: Any
+    ) -> "M2MSelect":
+        return self.allocate(allocation, **options)
+
+    def with_allocation_policy(
+        self, allocation: Any = True, **options: Any
+    ) -> "M2MSelect":
+        return self.allocate(allocation, **options)
+
+    def allocate_unique(
+        self, allocation: Any = True, **options: Any
+    ) -> "M2MSelect":
+        return self.allocate(allocation, **options)
+
+    def unique(self, **options: Any) -> "M2MSelect":
+        return self.allocate(True, **options)
+
+    def assign_unique(self, **options: Any) -> "M2MSelect":
+        return self.allocate(True, **options)
 
     def get_select_string(
         self, engine_type: str, with_alias=True
@@ -78,6 +424,13 @@ class M2MSelect(Selectable):
         table_2_name = table_2._meta.tablename
         table_2_name_with_schema = table_2._meta.get_formatted_tablename()
         table_2_pk_name = table_2._meta.primary_key._meta.db_column_name
+
+        if self.allocation is not None:
+            # The handler replaces this ID with the allocated list.
+            return QueryString(
+                f'"{table_1_name}"."{table_1_pk_name}" '
+                f'AS "{m2m_relationship_name}"'
+            )
 
         inner_select = f"""
             {m2m_table_name_with_schema}
@@ -140,6 +493,9 @@ class M2MSelect(Selectable):
             """)
         else:
             raise ValueError(f"{engine_type} is an unrecognised engine type")
+
+
+AllocatedM2MSelect = M2MSelect
 
 
 @dataclass
@@ -413,6 +769,13 @@ class M2M:
         *columns: Union[Column, list[Column]],
         as_list: bool = False,
         load_json: bool = False,
+        allocation: Any = None,
+        allocate: Any = None,
+        allocator: Any = None,
+        strategy: Any = None,
+        assignment: Any = None,
+        distribution: Any = None,
+        **allocation_options: Any,
     ) -> M2MSelect:
         """
         :param columns:
@@ -423,8 +786,46 @@ class M2M:
             flattened list will be returned, rather than a list of objects.
         :param load_json:
             If ``True``, any JSON strings are loaded as Python objects.
+        :param allocation:
+            Optional :class:`M2MAllocation` configuration. A truthy value
+            enables globally unique allocation between the rows in the outer
+            query page.
         """
-        columns_ = flatten(columns)
+        columns_ = []
+        positional_allocation = None
+        for argument in columns:
+            if isinstance(argument, (str, int)) and not isinstance(
+                argument, bool
+            ):
+                positional_allocation = argument
+            elif isinstance(argument, bool):
+                positional_allocation = argument
+            elif isinstance(argument, M2MAllocation) or (
+                not isinstance(argument, (Column, list, tuple))
+                and (
+                    hasattr(argument, "get_option")
+                    or (
+                        hasattr(argument, "quota")
+                        and (
+                            hasattr(argument, "eligible")
+                            or hasattr(argument, "sample_time")
+                            or hasattr(argument, "reviewable")
+                        )
+                    )
+                )
+            ):
+                positional_allocation = argument
+            elif isinstance(argument, dict) and (
+                "quota" in argument
+                or "eligible" in argument
+                or "reviewable" in argument
+                or "sample_time" in argument
+                or "sampled_at" in argument
+            ):
+                positional_allocation = argument
+            else:
+                columns_.append(argument)
+        columns_ = flatten(columns_)
 
         if not columns_:
             columns_ = self._meta.secondary_table._meta.columns
@@ -434,6 +835,66 @@ class M2M:
                 "`as_list` is only valid with a single column argument"
             )
 
+        allocation_value = allocation
+        if allocation_value is None:
+            allocation_value = positional_allocation
+
+        for key in (
+            "policy",
+            "config",
+            "spec",
+            "option",
+            "allocation_policy",
+            "allocation_strategy",
+            "algorithm",
+        ):
+            alternative = allocation_options.pop(key, None)
+            if alternative is not None and allocation_value is None:
+                allocation_value = alternative
+
+        for alternative in (
+            allocate,
+            allocator,
+            strategy,
+            assignment,
+            distribution,
+        ):
+            if alternative is not None and allocation_value is None:
+                allocation_value = alternative
+
+        if allocation_value is None and allocation_options:
+            allocation_value = M2MAllocation(**allocation_options)
+        elif isinstance(allocation_value, bool) and allocation_value:
+            allocation_value = M2MAllocation(**allocation_options)
+        elif allocation_options and isinstance(
+            allocation_value, M2MAllocation
+        ):
+            for key, value in allocation_options.items():
+                if value is not None and not hasattr(allocation_value, key):
+                    setattr(allocation_value, key, value)
+
+        if allocation_value is not None and load_json is False:
+            config = M2MAllocation.coerce(allocation_value)
+            if getattr(config, "load_json", True):
+                load_json = True
+
         return M2MSelect(
-            *columns_, m2m=self, as_list=as_list, load_json=load_json
+            *columns_,
+            m2m=self,
+            as_list=as_list,
+            load_json=load_json,
+            allocation=allocation_value,
         )
+
+    def allocate(
+        self,
+        *columns: Union[Column, list[Column]],
+        **kwargs: Any,
+    ) -> M2MSelect:
+        """Convenience wrapper for ``m2m(..., allocation=...)``."""
+        kwargs["allocation"] = kwargs.get("allocation", True)
+        return self(*columns, **kwargs)
+
+    def distribution_policy(self, **kwargs: Any) -> M2MAllocation:
+        """Build an allocation policy for this M2M relationship."""
+        return M2MAllocation(**kwargs)

@@ -20,6 +20,7 @@ from piccolo.columns.readable import Readable
 from piccolo.custom_types import TableInstance
 from piccolo.engine.base import BaseBatch
 from piccolo.query.base import Query
+from piccolo.query.methods.m2m_allocation import allocate_m2m_response
 from piccolo.query.mixins import (
     AsOfDelegate,
     CallbackDelegate,
@@ -312,6 +313,12 @@ class Select(Query[TableInstance, list[dict[str, Any]]]):
             m2m_name = m2m_select.m2m._meta.name
             secondary_table = m2m_select.m2m._meta.secondary_table
             secondary_table_pk = secondary_table._meta.primary_key
+
+            if m2m_select.allocation is not None:
+                response = await allocate_m2m_response(
+                    self, response, m2m_select
+                )
+                continue
 
             if self.engine_type == "sqlite":
                 # With M2M queries in SQLite, we always get the value back as a
