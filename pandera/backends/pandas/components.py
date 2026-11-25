@@ -397,7 +397,7 @@ class MultiIndexBackend(PandasSchemaBackend):
                 ]
             for index_level in index_levels:
                 index_array = check_obj.get_level_values(index_level)
-                if index.coerce or schema._coerce:
+                if (index.coerce or schema._coerce) and not index.parsers:
                     try:
                         _index = deepcopy(index)
                         _index.coerce = True
@@ -550,11 +550,20 @@ class MultiIndexBackend(PandasSchemaBackend):
             check_obj.index, schema, level_mapping, error_handler
         )
 
+        parsed_level_values: dict[int, pd.Series] = {}
+
         # Iterate over the expected index levels and validate each level with its
         # corresponding ``Index`` schema component.
         for level_pos, index_schema in level_mapping:
-            # We've already taken care of coercion, so we can disable it now.
+            # Coercion has already been handled for levels without parsers.
+            # Levels with parsers need coercion after their parser runs.
             index_schema = deepcopy(index_schema)
+            should_coerce_parsed_level = bool(
+                index_schema.parsers and (index_schema.coerce or schema.coerce)
+            )
+            # Coercion is performed after parsing below. The series backend's
+            # accessor integration expects a SeriesSchema, while this helper
+            # intentionally validates through a Column-compatible schema.
             index_schema.coerce = False
 
             # Check if we can optimize validation for this level. We skip optimization
@@ -562,8 +571,10 @@ class MultiIndexBackend(PandasSchemaBackend):
             # doesn't commute with taking unique values, which can lead to inconsistent
             # results. For instance, the check may fail on the first n unique values but
             # pass on the first n values.
-            can_optimize = validate_full_df and self._can_optimize_level(
-                index_schema
+            can_optimize = (
+                validate_full_df
+                and not index_schema.parsers
+                and self._can_optimize_level(index_schema)
             )
 
             try:
@@ -577,20 +588,43 @@ class MultiIndexBackend(PandasSchemaBackend):
                     )
                 else:
                     # Fall back to validating all of the values.
-                    self._validate_level_with_full_materialization(
-                        check_obj.index,
-                        level_pos,
-                        index_schema,
-                        head=head,
-                        tail=tail,
-                        sample=sample,
-                        random_state=random_state,
-                        lazy=lazy,
+                    parsed_level = (
+                        self._validate_level_with_full_materialization(
+                            check_obj.index,
+                            level_pos,
+                            index_schema,
+                            head=head,
+                            tail=tail,
+                            sample=sample,
+                            random_state=random_state,
+                            lazy=lazy,
+                        )
                     )
+                    if parsed_level is not None and index_schema.parsers:
+                        if should_coerce_parsed_level:
+                            coercion_schema = deepcopy(index_schema)
+                            coercion_schema.coerce = True
+                            parsed_level = ArraySchemaBackend().coerce_dtype(
+                                parsed_level,
+                                schema=coercion_schema,
+                            )
+                        parsed_level_values[level_pos] = parsed_level
             except (SchemaError, SchemaErrors) as exc:
                 self._collect_or_raise(
                     error_handler, exc, schema, index_schema=index_schema
                 )
+
+        if parsed_level_values:
+            level_arrays = [
+                check_obj.index.get_level_values(level_pos)
+                for level_pos in range(check_obj.index.nlevels)
+            ]
+            for level_pos, parsed_level in parsed_level_values.items():
+                level_arrays[level_pos] = parsed_level
+            check_obj.index = pd.MultiIndex.from_arrays(
+                level_arrays,
+                names=check_obj.index.names,
+            )
 
         # Validate multiindex_unique: ensure no duplicate index combinations
         if schema.unique:
@@ -848,7 +882,7 @@ class MultiIndexBackend(PandasSchemaBackend):
         # Use the SeriesSchemaBackend directly instead of column_schema.validate()
         # because Column.validate() expects a DataFrame.
         backend = SeriesSchemaBackend()
-        backend.validate(
+        return backend.validate(
             check_obj=level_series,
             schema=column_schema,
             head=head,

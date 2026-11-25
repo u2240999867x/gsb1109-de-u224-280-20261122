@@ -55,7 +55,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         strict: StrictType = False,
         name: str | None = None,
         ordered: bool = False,
-        unique: Union[str, list[str]] | None = None,
+        unique: Union[str, list[Any], None] = None,
         report_duplicates: UniqueSettings = "all",
         unique_column_names: bool = False,
         add_missing_columns: bool = False,
@@ -182,6 +182,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         self._coerce = coerce
         self.ordered = ordered
         self._unique = [unique] if isinstance(unique, str) else unique
+        self._unique_bindings = self._build_unique_bindings()
         self.report_duplicates = report_duplicates
         self.unique_column_names = unique_column_names
         self.add_missing_columns = add_missing_columns
@@ -256,9 +257,94 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         return self._unique
 
     @unique.setter
-    def unique(self, value: Union[str, list[str]] | None) -> None:
+    def unique(self, value: Union[str, list[Any], None]) -> None:
         """Set unique attribute."""
         self._unique = [value] if isinstance(value, str) else value
+        self._unique_bindings = None
+
+    def _normalized_unique_specs(self) -> list[list[Any]]:
+        """Normalize the supported string and nested-list unique forms."""
+        unique = self._unique
+        if not unique:
+            return []
+        if unique is True:
+            # MultiIndex(unique=True) means the whole index is the key and is
+            # handled by the index backend. Keep an empty binding here so
+            # schema construction does not need to understand that bool form.
+            return [[]]
+        if isinstance(unique, str):
+            return [[unique]]
+        if any(isinstance(item, (list, tuple)) for item in unique):
+            return [list(item) for item in unique]
+        return [list(unique)]
+
+    def _build_unique_bindings(self) -> list[list[tuple[Any, str]]]:
+        """Bind unique field names to their current column/index location."""
+        index_names_value = getattr(self.index, "names", None)
+        if index_names_value is None and self.index is not None:
+            index_name = getattr(self.index, "name", None)
+            index_names = {index_name} if index_name is not None else set()
+        else:
+            index_names = set(index_names_value or ())
+        bindings: list[list[tuple[Any, str]]] = []
+        for subset in self._normalized_unique_specs():
+            binding: list[tuple[Any, str]] = []
+            for name in subset:
+                if name in self.columns:
+                    location = "column"
+                elif name in index_names:
+                    location = "index"
+                else:
+                    # Preserve the historical column-only resolution for names
+                    # that are not currently present in the schema.
+                    location = "column"
+                binding.append((name, location))
+            bindings.append(binding)
+        return bindings
+
+    def get_unique_bindings(self) -> list[list[tuple[Any, str]]]:
+        """Return location-aware unique bindings, building them if needed."""
+        bindings = getattr(self, "_unique_bindings", None)
+        if bindings is None:
+            bindings = self._build_unique_bindings()
+            self._unique_bindings = bindings
+        return bindings
+
+    def _rename_unique_bindings(
+        self, rename_dict: dict[Any, Any], location: str
+    ) -> None:
+        for constraint in self.get_unique_bindings():
+            for position, (name, field_location) in enumerate(constraint):
+                if field_location == location and name in rename_dict:
+                    constraint[position] = (rename_dict[name], location)
+        self._sync_unique_from_bindings()
+
+    def _sync_unique_from_bindings(self) -> None:
+        """Reflect renames in the public ``unique`` attribute."""
+        if not self._unique or isinstance(self._unique, bool):
+            return
+
+        bindings = self.get_unique_bindings()
+        nested_form = any(
+            isinstance(item, (list, tuple)) for item in self._unique
+        )
+        if nested_form:
+            self._unique = [
+                [name for name, _ in constraint]
+                for constraint in bindings
+                if constraint
+            ]
+        elif bindings:
+            self._unique = [name for name, _ in bindings[0]]
+
+    def _move_unique_bindings(
+        self, names: list[Any], source_location: str, target_location: str
+    ) -> None:
+        moved_names = set(names)
+        for constraint in self.get_unique_bindings():
+            for position, (name, location) in enumerate(constraint):
+                if location == source_location and name in moved_names:
+                    constraint[position] = (name, target_location)
 
     @property
     def dtypes(self) -> dict[str, DataType]:
@@ -838,6 +924,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         }
 
         new_schema.columns = new_columns
+        new_schema._rename_unique_bindings(rename_dict, "column")
         return cast(Self, new_schema)
 
     def update_index(self, index_name: str, **kwargs) -> Self:
@@ -1111,9 +1198,12 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
 
         new_schema = copy.deepcopy(self)
 
-        keys_temp: list = (
-            list(set(keys)) if not isinstance(keys, list) else keys
-        )
+        if isinstance(keys, str):
+            keys_temp: list = [keys]
+        elif isinstance(keys, (tuple, set)):
+            keys_temp = list(keys)
+        else:
+            keys_temp = keys
 
         # ensure all specified keys are present in the columns
         not_in_cols: list[str] = [
@@ -1142,8 +1232,12 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
                     dtype=new_schema.columns[col].dtype,
                     name=col,
                     checks=new_schema.columns[col].checks,
+                    parsers=new_schema.columns[col].parsers,
                     nullable=new_schema.columns[col].nullable,
                     unique=new_schema.columns[col].unique,
+                    report_duplicates=new_schema.columns[
+                        col
+                    ].report_duplicates,
                     coerce=new_schema.columns[col].coerce,
                     title=new_schema.columns[col].title,
                     description=new_schema.columns[col].description,
@@ -1154,6 +1248,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         new_schema.index = (
             ind_list[0] if len(ind_list) == 1 else MultiIndex(ind_list)
         )
+        new_schema._move_unique_bindings(keys_temp, "column", "index")
 
         # if drop is True as defaulted, drop the columns moved into the index
         if drop:
@@ -1254,6 +1349,9 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         if level == []:
             return self
 
+        if isinstance(level, str):
+            level = [level]
+
         new_schema = copy.deepcopy(self)
 
         if new_schema.index is None:
@@ -1263,7 +1361,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
 
         # ensure no duplicates
         level_temp: Union[list[Any], list[str]] = (
-            new_schema.index.names if level is None else list(set(level))
+            new_schema.index.names if level is None else list(level)
         )
 
         # ensure all specified keys are present in the index
@@ -1282,48 +1380,52 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
                 f"Keys {level_not_in_index} not found in schema columns!"
             )
 
-        new_index = (
-            None
-            if not level_temp or isinstance(new_schema.index, Index)
-            else new_schema.index.remove_columns(level_temp)
-        )
-        new_index = (
-            new_index
-            if new_index is None
-            else (
-                Index(
-                    dtype=new_index.columns[list(new_index.columns)[0]].dtype,
-                    checks=new_index.columns[
-                        list(new_index.columns)[0]
-                    ].checks,
-                    nullable=new_index.columns[
-                        list(new_index.columns)[0]
-                    ].nullable,
-                    unique=new_index.columns[
-                        list(new_index.columns)[0]
-                    ].unique,
-                    coerce=new_index.columns[
-                        list(new_index.columns)[0]
-                    ].coerce,
-                    name=new_index.columns[list(new_index.columns)[0]].name,
+        if not drop:
+            colliding_columns = [
+                level_name
+                for level_name in level_temp
+                if level_name in new_schema.columns
+            ]
+            if colliding_columns:
+                raise errors.SchemaInitError(
+                    "Cannot reset index level(s) "
+                    f"{colliding_columns}: an existing column already "
+                    "exists with the same name."
                 )
-                if (len(list(new_index.columns)) == 1)
-                and (new_index is not None)
-                else (
-                    None
-                    if (len(list(new_index.columns)) == 0)
-                    and (new_index is not None)
-                    else new_index
+
+        if not level_temp or not isinstance(new_schema.index, MultiIndex):
+            new_index = None
+        else:
+            removed_levels = set(level_temp)
+            remaining_indexes = [
+                index_schema
+                for index_schema in new_schema.index.indexes
+                if index_schema.name not in removed_levels
+            ]
+            if not remaining_indexes:
+                new_index = None
+            elif len(remaining_indexes) == 1:
+                new_index = remaining_indexes[0]
+            else:
+                new_index = MultiIndex(
+                    remaining_indexes,
+                    coerce=new_schema.index._coerce,
+                    strict=new_schema.index.strict,
+                    ordered=new_schema.index.ordered,
+                    unique=new_schema.index.unique,
                 )
-            )
-        )
 
         if not drop:
-            additional_columns: dict[str, Any] = (
-                {col: new_schema.index.columns.get(col) for col in level_temp}
-                if isinstance(new_schema.index, MultiIndex)
-                else {new_schema.index.name: new_schema.index}
-            )
+            if isinstance(new_schema.index, MultiIndex):
+                named_indexes = new_schema.index.named_indexes
+                additional_columns: dict[str, Any] = {
+                    col: named_indexes.get(
+                        col, new_schema.index.columns.get(col)
+                    )
+                    for col in level_temp
+                }
+            else:
+                additional_columns = {new_schema.index.name: new_schema.index}
             new_schema = new_schema.add_columns(
                 {
                     k: Column(
@@ -1332,6 +1434,9 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
                         checks=v.checks,
                         nullable=v.nullable,
                         unique=v.unique,
+                        report_duplicates=getattr(
+                            v, "report_duplicates", "all"
+                        ),
                         coerce=v.coerce,
                         name=v.name,
                     )
@@ -1340,6 +1445,10 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
             )
 
         new_schema.index = new_index
+        if not drop:
+            new_schema._move_unique_bindings(
+                list(level_temp), "index", "column"
+            )
 
         return new_schema
 

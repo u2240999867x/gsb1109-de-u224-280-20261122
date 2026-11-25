@@ -196,11 +196,11 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         core_checks = [
             (self.check_column_names_are_unique, (check_obj, schema)),
             (self.check_column_presence, (check_obj, schema, column_info)),
-            (self.check_column_values_are_unique, (sample, schema)),
             (
                 self.run_schema_component_checks,
                 (sample, schema, components, lazy),
             ),
+            (self.check_column_values_are_unique, (sample, schema)),
             (self.run_checks, (sample, schema)),
         ]
         for check, args in core_checks:
@@ -256,7 +256,16 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     # override column dtype with dataframe dtype
                     schema_component.dtype = schema.dtype  # type: ignore
 
-                if getattr(schema_component, "parsers", None):
+                component_parsers = getattr(schema_component, "parsers", None)
+                if not component_parsers and hasattr(
+                    schema_component, "indexes"
+                ):
+                    component_parsers = any(
+                        getattr(index_schema, "parsers", None)
+                        for index_schema in schema_component.indexes
+                    )
+
+                if component_parsers:
                     # coercion of components with parsers is deferred to
                     # component-level validation so that parsers run before
                     # coercion: propagate dataframe-level coercion.
@@ -492,6 +501,9 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 columns[col] = Column(schema.dtype, name=str(col))
 
         schema_components = []
+        if schema.index is not None:
+            schema_components.append(schema.index)
+
         for col_name, col in columns.items():
             if (
                 col.required  # type: ignore
@@ -505,8 +517,6 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     col.name = col_name
                 schema_components.append(col)
 
-        if schema.index is not None:
-            schema_components.append(schema.index)
         return schema_components
 
     ###########
@@ -891,12 +901,18 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
 
         if schema.dtype is not None:
             obj = _try_coercion(_coerce_df_dtype, obj)
+        index_schema_has_parsers = bool(
+            getattr(schema.index, "parsers", None)
+        ) or any(
+            getattr(level_schema, "parsers", None)
+            for level_schema in getattr(schema.index, "indexes", []) or []
+        )
         if (
             schema.index is not None
             and (schema.index.coerce or schema.coerce)
             # coercion of an index with parsers is deferred to index-level
             # validation so that parsers run before coercion
-            and not getattr(schema.index, "parsers", None)
+            and not index_schema_has_parsers
         ):
             index_schema = copy.deepcopy(schema.index)
             if schema.coerce:
@@ -993,56 +1009,191 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
     @validate_scope(scope=ValidationScope.DATA)
     def check_column_values_are_unique(
         self, check_obj: pd.DataFrame, schema
-    ) -> CoreCheckResult:
-        """Check that column values are unique."""
+    ) -> list[CoreCheckResult]:
+        """Check that column/index values are unique for each unique key."""
 
-        passed = True
-        message = None
-        failure_cases = None
+        results: list[CoreCheckResult] = []
 
         if not schema.unique:
-            return CoreCheckResult(
-                passed=passed,
-                check="multiple_fields_uniqueness",
-            )
+            return [
+                CoreCheckResult(
+                    passed=True,
+                    check="multiple_fields_uniqueness",
+                )
+            ]
 
         keep_setting = convert_uniquesettings(schema.report_duplicates)
+        bindings = (
+            schema.get_unique_bindings()
+            if hasattr(schema, "get_unique_bindings")
+            else self._fallback_unique_bindings(schema)
+        )
+
+        for binding in bindings:
+            column_subset = [
+                name
+                for name, location in binding
+                if location == "column" and name in check_obj
+            ]
+            uses_index = any(location == "index" for _, location in binding)
+
+            if not uses_index:
+                if not column_subset:
+                    continue
+                result = self._check_column_unique_subset(
+                    check_obj, column_subset, keep_setting
+                )
+                if result is not None:
+                    results.append(result)
+                continue
+
+            result = self._check_field_unique_binding(
+                check_obj, binding, keep_setting
+            )
+            if result is not None:
+                results.append(result)
+
+        if not results:
+            return [
+                CoreCheckResult(
+                    passed=True,
+                    check="multiple_fields_uniqueness",
+                )
+            ]
+        return results
+
+    def _fallback_unique_bindings(self, schema):
         temp_unique: list[list] = (
             [schema.unique]
             if not any(isinstance(x, list) for x in schema.unique)
             else schema.unique
         )
-        for lst in temp_unique:
-            subset = [x for x in lst if x in check_obj]
-            if not subset:
-                continue
-            duplicates = check_obj.duplicated(  # type: ignore
-                subset=subset,
-                keep=keep_setting,  # type: ignore
-            )
-            if duplicates.any():
-                # NOTE: this is a hack to support pyspark.pandas, need to
-                # figure out a workaround to error: "Cannot combine the
-                # series or dataframe because it comes from a different
-                # dataframe."
-                if type(duplicates).__module__.startswith("pyspark.pandas"):
-                    import pyspark.pandas as ps
+        return [
+            [(name, "column") for name in subset] for subset in temp_unique
+        ]
 
-                    with ps.option_context("compute.ops_on_diff_frames", True):
-                        failure_cases = check_obj.loc[duplicates, subset]
-                else:
-                    failure_cases = check_obj.loc[duplicates, subset]
+    def _check_column_unique_subset(
+        self,
+        check_obj: pd.DataFrame,
+        subset: list[Any],
+        keep_setting,
+    ) -> CoreCheckResult | None:
+        duplicates = check_obj.duplicated(  # type: ignore
+            subset=subset,
+            keep=keep_setting,  # type: ignore
+        )
+        if not duplicates.any():
+            return None
 
-                passed = False
-                message = (
-                    f"columns '{(*subset,)}' not unique:\n{failure_cases}"
-                )
-                failure_cases = reshape_failure_cases(failure_cases)
-                break
+        if type(duplicates).__module__.startswith("pyspark.pandas"):
+            import pyspark.pandas as ps
+
+            with ps.option_context("compute.ops_on_diff_frames", True):
+                failure_cases = check_obj.loc[duplicates, subset]
+        else:
+            failure_cases = check_obj.loc[duplicates, subset]
+
+        projected = check_obj[subset]
+        key_messages = self._unique_key_messages(projected, check_obj)
+        message = (
+            f"columns '{(*subset,)}' not unique: "
+            + "; ".join(key_messages)
+            + f"\n{failure_cases}"
+        )
         return CoreCheckResult(
-            passed=passed,
+            passed=False,
             check="multiple_fields_uniqueness",
             reason_code=SchemaErrorReason.DUPLICATES,
             message=message,
-            failure_cases=failure_cases,
+            failure_cases=reshape_failure_cases(failure_cases),
         )
+
+    def _check_field_unique_binding(
+        self,
+        check_obj: pd.DataFrame,
+        binding: list[tuple[Any, str]],
+        keep_setting,
+    ) -> CoreCheckResult | None:
+        field_names: list[Any] = []
+        projection: dict[str, pd.Series] = {}
+
+        for position, (name, location) in enumerate(binding):
+            values = self._get_unique_field_values(check_obj, name, location)
+            if values is None:
+                continue
+            internal_name = f"__pandera_unique_field_{position}"
+            projection[internal_name] = pd.Series(
+                values, index=check_obj.index
+            )
+            field_names.append(name)
+
+        if not projection:
+            return None
+
+        projected = pd.DataFrame(projection, index=check_obj.index)
+        duplicates = projected.duplicated(keep=keep_setting)
+        if not duplicates.any():
+            return None
+
+        duplicate_projection = projected.loc[duplicates]
+        failure_cases = duplicate_projection.copy()
+        failure_cases.columns = field_names[: len(failure_cases.columns)]
+
+        key_messages = self._unique_key_messages(projected, check_obj)
+
+        message = f"fields '{(*field_names,)}' not unique: " + "; ".join(
+            key_messages
+        )
+        return CoreCheckResult(
+            passed=False,
+            check="multiple_fields_uniqueness",
+            reason_code=SchemaErrorReason.DUPLICATES,
+            message=message,
+            failure_cases=reshape_failure_cases(failure_cases),
+        )
+
+    @staticmethod
+    def _unique_key_messages(
+        projected: pd.DataFrame, check_obj: pd.DataFrame
+    ) -> list[str]:
+        messages: list[str] = []
+        seen_keys: set[tuple[Any, ...]] = set()
+        duplicate_rows = projected.duplicated(keep=False)
+
+        for key_values in projected.loc[duplicate_rows].itertuples(
+            index=False, name=None
+        ):
+            key = tuple(key_values)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            key_mask = pd.Series(True, index=projected.index)
+            for column, value in zip(projected.columns, key):
+                if pd.isna(value):
+                    key_mask &= projected[column].isna()
+                else:
+                    key_mask &= projected[column] == value
+
+            rows = check_obj.index[key_mask].tolist()
+            messages.append(f"key {key!r} at rows {rows!r}")
+
+        return messages
+
+    @staticmethod
+    def _get_unique_field_values(
+        check_obj: pd.DataFrame, name: Any, location: str
+    ):
+        if location == "column":
+            if name not in check_obj.columns:
+                return None
+            return check_obj[name]
+
+        index = check_obj.index
+        if isinstance(index, pd.MultiIndex):
+            if name not in index.names:
+                return None
+            return index.get_level_values(name)
+        if index.name != name:
+            return None
+        return index

@@ -346,7 +346,7 @@ class MultiIndex(DataFrameSchema):
         strict: bool = False,
         name: str | None = None,
         ordered: bool = True,
-        unique: Union[str, list[str]] | None = None,
+        unique: Union[bool, str, list[str], None] = None,
     ) -> None:
         """Create MultiIndex validator.
 
@@ -413,8 +413,10 @@ class MultiIndex(DataFrameSchema):
             columns[i if index.name is None else index.name] = Column(
                 dtype=index._dtype,
                 checks=index.checks,
+                parsers=index.parsers,
                 nullable=index.nullable,
                 unique=index.unique,
+                report_duplicates=index.report_duplicates,
             )
         super().__init__(
             columns=columns,
