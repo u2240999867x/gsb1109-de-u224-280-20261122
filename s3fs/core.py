@@ -32,6 +32,7 @@ from aiobotocore.config import AioConfig
 from botocore.exceptions import ClientError, HTTPClientError, ParamValidationError
 from botocore.parsers import ResponseParserError
 
+from s3fs.dircache import ListingCoverage
 from s3fs.errors import translate_boto_error
 from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
 
@@ -414,6 +415,10 @@ class S3FileSystem(AsyncFileSystem):
             if k in kwargs
         }  # passed to fsspec superclass
         super().__init__(loop=loop, asynchronous=asynchronous, **super_kwargs)
+        # Provenance of the listings in ``dircache``: which prefixes of each
+        # directory have actually been queried to completion. A partial sample
+        # contributes entries but never an absence proof.
+        self.listing_coverage = ListingCoverage()
 
         self.default_block_size = default_block_size or self.default_block_size
         self.default_fill_cache = default_fill_cache
@@ -860,47 +865,126 @@ class S3FileSystem(AsyncFileSystem):
         delimiter="/",
         prefix="",
         versions=False,
+        state=None,
     ):
         bucket, key, _ = self.split_path(path)
-        # A caller-supplied prefix is a stem filter, so the listing is partial
-        # and must not be cached. Capture it before prefix is overwritten below.
-        partial = bool(prefix)
-        if not prefix:
-            prefix = ""
+        # A caller-supplied prefix is a stem filter: the query only covers the
+        # names sharing that stem, so its coverage must be scoped accordingly.
+        stem_prefix = prefix
+        query_prefix = prefix
         if key:
-            prefix = key.lstrip("/") + "/" + prefix
-        if path not in self.dircache or refresh or not delimiter or versions or partial:
-            try:
-                logger.debug("Get directory listing page for %s" % path)
-                dirs = []
-                files = []
-                async for c in self._iterdir(
-                    bucket,
-                    max_items=max_items,
-                    delimiter=delimiter,
-                    prefix=prefix,
-                    versions=versions,
-                ):
-                    if c["type"] == "directory":
-                        dirs.append(c)
-                    else:
-                        files.append(c)
-                files += dirs
-                files.sort(key=lambda f: f["name"])
-            except ClientError as e:
-                raise translate_boto_error(e)
+            query_prefix = key.lstrip("/") + "/" + query_prefix
+        if delimiter and not versions and not refresh:
+            # Reuse an earlier listing when it already proved the queried
+            # scope complete. A limited sample never satisfies an unscoped (or
+            # differently stemmed) request, so such requests go back to S3
+            # instead of treating unseen names as absent.
+            if self.listing_coverage.is_complete(path, stem_prefix):
+                entries = self.dircache.get(path, [])
+                if stem_prefix:
+                    entries = [
+                        f
+                        for f in entries
+                        if self._relative_name(path, f["name"]).startswith(
+                            stem_prefix
+                        )
+                    ]
+                if state is not None:
+                    state["complete"] = max_items is None or len(entries) <= max_items
+                if max_items is not None:
+                    entries = entries[:max_items]
+                return list(entries)
+        try:
+            logger.debug("Get directory listing page for %s" % path)
+            dirs = []
+            files = []
+            query_state = state if state is not None else {}
+            async for c in self._iterdir(
+                bucket,
+                max_items=max_items,
+                delimiter=delimiter,
+                prefix=query_prefix,
+                versions=versions,
+                state=query_state,
+            ):
+                if c["type"] == "directory":
+                    dirs.append(c)
+                else:
+                    files.append(c)
+            files += dirs
+            files.sort(key=lambda f: f["name"])
+        except ClientError as e:
+            raise translate_boto_error(e)
 
-            if delimiter and files and not versions and not partial:
+        if delimiter and not versions:
+            # Delimiter listings carry directory boundaries and can be merged
+            # into the directory cache. Recursive and version listings keep
+            # their historical handling via _find's own cache population.
+            complete = query_state.get("complete", True)
+            self._store_dir_listing(
+                path, files, complete, stem_prefix, refresh=refresh
+            )
+        elif state is not None:
+            state.update(query_state)
+        return files
+
+    @staticmethod
+    def _relative_name(path, name):
+        """Return ``name`` relative to directory ``path``."""
+        prefix = path.rstrip("/") + "/"
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+        return name
+
+    def _store_dir_listing(self, path, files, complete, stem_prefix, refresh=False):
+        """Merge a listing into ``dircache`` and record its proven coverage.
+
+        Positive facts (names that were seen) are normally reusable, so
+        partial samples merge into any existing entries. A forced refresh
+        replaces the whole listing instead, since names it no longer returns
+        may have been deleted. Only a query that exhausted its own scope
+        proves absences, and the proof is limited to the queried stem (an
+        empty stem stands for the whole directory).
+        """
+        if refresh:
+            self.listing_coverage.invalidate_scope(path, stem_prefix)
+            if files:
+                # Replace rather than merge: names the refreshed query no
+                # longer returns may genuinely have been deleted.
                 self.dircache[path] = files
-            return files
-        return self.dircache[path]
+        else:
+            if path in self.dircache:
+                merged = {f["name"]: f for f in self.dircache[path]}
+                for f in files:
+                    merged[f["name"]] = f
+                files = sorted(merged.values(), key=lambda f: f["name"])
+            if files:
+                self.dircache[path] = files
+        if complete and (files or stem_prefix):
+            # An empty whole-directory query is not cached as a listing: in
+            # S3 an absent key and an empty "folder" are indistinguishable, so
+            # historical behaviour leaves those to a head/list probe. An empty
+            # stem query still yields a negative proof limited to that stem.
+            # A delimiter listing only proves the directory's immediate
+            # children, so the absence proof is deliberately non-recursive.
+            self.listing_coverage.mark_complete(path, stem_prefix)
 
     async def _iterdir(
-        self, bucket, max_items=None, delimiter="/", prefix="", versions=False
+        self,
+        bucket,
+        max_items=None,
+        delimiter="/",
+        prefix="",
+        versions=False,
+        state=None,
     ):
         """Iterate asynchronously over files and directories under `prefix`.
 
-        The contents are yielded in arbitrary order as info dicts.
+        The contents are yielded in arbitrary order as info dicts. If
+        ``state`` is a dict, ``state["complete"]`` is set to False when the
+        iteration stops before exhausting the server-side listing (a limited
+        sample or truncated pagination), and True when every matching key was
+        seen.
         """
         if versions and not self.version_aware:
             raise ValueError(
@@ -916,7 +1000,11 @@ class S3FileSystem(AsyncFileSystem):
         if max_items is not None:
             kwargs["MaxKeys"] = 2 * max_items
         remaining = max_items
+        stopped_early = False
+        page_truncated = False
+        sliced = False
         async for i in self._list_pages(method, **kwargs):
+            page_truncated = bool(i.get("IsTruncated"))
             for l in i.get("CommonPrefixes", []):
                 c = {
                     "Key": l["Prefix"][:-1],
@@ -928,7 +1016,11 @@ class S3FileSystem(AsyncFileSystem):
                 yield c
             contents = i.get(contents_key, [])
             if remaining is not None:
-                contents = contents[:remaining]
+                if len(contents) > remaining:
+                    # Drop part of the page: names beyond the sample exist but
+                    # are not seen, so the listing cannot prove absences.
+                    sliced = True
+                    contents = contents[:remaining]
                 remaining -= len(contents)
             for c in contents:
                 if not self.version_aware or c.get("IsLatest") or versions:
@@ -937,7 +1029,12 @@ class S3FileSystem(AsyncFileSystem):
                     self._fill_info(c, bucket, versions=versions)
                     yield c
             if remaining is not None and remaining <= 0:
-                return
+                stopped_early = True
+                break
+        if state is not None:
+            state["complete"] = (not stopped_early) or (
+                not page_truncated and not sliced
+            )
 
     async def _list_pages(self, method, **kwargs):
         # Each page goes through _call_s3, so a transient error on one page is
@@ -1040,7 +1137,10 @@ class S3FileSystem(AsyncFileSystem):
         #     elif len(out) == 0:
         #         return super().find(path)
         #     # else: we refresh anyway, having at least two missing trees
-        out = await self._lsdir(path, delimiter="", prefix=prefix, **kwargs)
+        out_state = {}
+        out = await self._lsdir(
+            path, delimiter="", prefix=prefix, state=out_state, **kwargs
+        )
         if (not out and key) and not prefix:
             try:
                 out = [await self._info(path)]
@@ -1092,10 +1192,32 @@ class S3FileSystem(AsyncFileSystem):
                     # name is not already present
                     thisdircache[par].insert(ind, d)
 
-        if not prefix:
-            for k, v in thisdircache.items():
-                if k not in self.dircache and len(k) >= len(path):
-                    self.dircache[k] = sorted(v, key=lambda x: x["name"])
+        complete = out_state.get("complete", True)
+        for k, v in thisdircache.items():
+            if len(k) < len(path):
+                continue
+            # Seen names are reusable positive facts even for stem-filtered
+            # queries; merge instead of replacing a possibly fuller cache.
+            if k in self.dircache:
+                merged = {f["name"]: f for f in self.dircache[k]}
+                for f in v:
+                    merged[f["name"]] = f
+                self.dircache[k] = sorted(merged.values(), key=lambda x: x["name"])
+            else:
+                self.dircache[k] = sorted(v, key=lambda x: x["name"])
+            if complete and not prefix:
+                # A full recursive listing proves every descendant of each
+                # directory it touched, including empty ones.
+                self.listing_coverage.mark_complete(k, "", recursive=True)
+        if complete:
+            if prefix:
+                # The proof only covers the queried stem, never the whole
+                # directory, so a later full traversal must still query S3.
+                # An empty result negates names within that stem but never any
+                # sibling name outside it.
+                self.listing_coverage.mark_complete(path, prefix, recursive=True)
+            else:
+                self.listing_coverage.mark_complete(path, "", recursive=True)
         if withdirs:
             out = sorted(out + dirs, key=lambda x: x["name"])
         if detail:
@@ -1194,6 +1316,57 @@ class S3FileSystem(AsyncFileSystem):
             self.dircache[""] = files
             return files
         return self.dircache[""]
+
+    def _proven_absent(self, path):
+        """Walk ancestor listings for a query that proves ``path`` absent.
+
+        A stem-scoped query records its proof on an ancestor directory, so
+        the immediate parent may not hold any entry list. Each ancestor is
+        checked with the target's name relative to that ancestor.
+        """
+        path = path.rstrip("/")
+        ancestor = self._parent(path)
+        while ancestor:
+            relative = path[len(ancestor) + 1 :]
+            if self.listing_coverage.proves_absence(ancestor, relative):
+                return True
+            if "/" not in ancestor:
+                break
+            ancestor = self._parent(ancestor)
+        return False
+
+    def _ls_from_cache(self, path):
+        """Check the cache for a listing of ``path``.
+
+        Returns the cached entries (possibly an empty list for a proven-empty
+        directory), None when the cache has no usable fact, and raises
+        ``FileNotFoundError`` only when an actual query proved the name
+        absent. A partial sample that merely did not contain the name returns
+        None instead of guessing an absence.
+        """
+        path = path.rstrip("/")
+        try:
+            return self.dircache[path]
+        except KeyError:
+            pass
+        parent = self._parent(path)
+        try:
+            parent_entries = self.dircache[parent]
+        except KeyError:
+            if self._proven_absent(path):
+                raise FileNotFoundError(path)
+            return None
+        entries = [
+            f
+            for f in parent_entries
+            if f["name"] == path
+            or (f["name"] == path.rstrip("/") and f["type"] == "directory")
+        ]
+        if entries:
+            return entries
+        if self._proven_absent(path):
+            raise FileNotFoundError(path)
+        return None
 
     async def _ls(self, path, detail=False, refresh=False, versions=False):
         """List files in given bucket, or list of buckets.
@@ -1914,7 +2087,10 @@ class S3FileSystem(AsyncFileSystem):
                 # If it contains anything other than itself it is a directory.
                 if fp["name"] != path:
                     return True
-            return False
+            if self.listing_coverage.is_complete(path):
+                # A complete listing with only the placeholder means there
+                # really are no children; an incomplete sample proves nothing.
+                return False
 
         parent = self._parent(path)
         if parent in self.dircache:
@@ -1922,6 +2098,11 @@ class S3FileSystem(AsyncFileSystem):
                 if f["name"] == path:
                     # If we find ourselves return whether we are a directory
                     return f["type"] == "directory"
+            if self._proven_absent(path):
+                return False
+        elif self._proven_absent(path):
+            # A stem-scoped query proved the name absent even though the
+            # immediate parent was never cached as a full listing.
             return False
 
         # This only returns things within the path and NOT the path object itself
@@ -2519,11 +2700,17 @@ class S3FileSystem(AsyncFileSystem):
     def invalidate_cache(self, path=None):
         if path is None:
             self.dircache.clear()
+            self.listing_coverage.clear()
         else:
             path = self._strip_protocol(path)
             self.dircache.pop(path, None)
+            # A write or delete can add a name an ancestor had implicitly
+            # proven absent, so every ancestor's coverage proof is dropped
+            # alongside its cached listing.
+            self.listing_coverage.pop(path)
             while path:
                 self.dircache.pop(path, None)
+                self.listing_coverage.pop(path)
                 path = self._parent(path)
 
     async def _walk(self, path, maxdepth=None, **kwargs):
