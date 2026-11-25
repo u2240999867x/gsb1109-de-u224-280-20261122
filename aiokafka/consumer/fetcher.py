@@ -320,6 +320,122 @@ class PartitionRecords:
         )
 
 
+class FetchSessionHandler:
+    """Tracks the KIP-227 incremental fetch session with a single broker.
+
+    The handler remembers which partitions (and at which offsets/max_bytes)
+    the broker currently keeps in the fetch session, so that subsequent
+    Fetch requests only need to send the diff: partitions that were added,
+    whose fetch position changed, or that must be forgotten (paused,
+    unassigned or moved to another leader).
+
+    The session is only ever established if the broker speaks FetchRequest
+    v7+ and returns a valid session id in the response. On brokers without
+    session support the handler stays in the sessionless state and every
+    request remains a full fetch.
+    """
+
+    INITIAL_EPOCH = 0
+    FINAL_EPOCH = -1
+    INVALID_SESSION_ID = 0
+
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.session_id = self.INVALID_SESSION_ID
+        self.next_epoch = self.INITIAL_EPOCH
+        # tp -> (fetch_offset, max_bytes) confirmed to be in the broker's
+        # session (or optimistically sent in a full fetch request).
+        self.session_partitions = {}
+        # View of the session as of the in-flight request. Only moved to
+        # ``session_partitions`` once the broker's response confirms it, so
+        # a failed request never corrupts the diff computation.
+        self._pending_partitions = None
+
+    def build_request(self, fetchable):
+        """Compute the request data for the next fetch.
+
+        Arguments:
+            fetchable: dict of ``tp -> (fetch_offset, max_bytes)`` for all
+                partitions that should be fetched from this node right now.
+
+        Returns:
+            ``(session_id, session_epoch, to_send, forgotten)`` where
+            ``to_send`` is a ``tp -> (fetch_offset, max_bytes)`` dict of
+            partitions to include explicitly (all of them for a full fetch,
+            only added/changed ones for an incremental fetch) and
+            ``forgotten`` is a list of partitions to drop from the session.
+        """
+        if self.session_id == self.INVALID_SESSION_ID:
+            # Full fetch request. INITIAL_EPOCH asks the broker to start a
+            # new session; if the broker does not support sessions the
+            # fields are not even put on the wire (see FetchRequest.build).
+            self._pending_partitions = dict(fetchable)
+            return (
+                self.INVALID_SESSION_ID,
+                self.next_epoch,
+                dict(fetchable),
+                [],
+            )
+
+        to_send = {
+            tp: fetch_info
+            for tp, fetch_info in fetchable.items()
+            if self.session_partitions.get(tp) != fetch_info
+        }
+        forgotten = [tp for tp in self.session_partitions if tp not in fetchable]
+
+        pending = dict(self.session_partitions)
+        for tp in forgotten:
+            del pending[tp]
+        pending.update(fetchable)
+        self._pending_partitions = pending
+        return (self.session_id, self.next_epoch, to_send, forgotten)
+
+    def handle_response(self, session_id, error_type):
+        """Update session state from a Fetch response (v7+).
+
+        Returns False if the broker dropped the session (the partitions
+        must be re-sent as a full fetch), True otherwise.
+        """
+        if error_type in (
+            Errors.FetchSessionIdNotFound,
+            Errors.InvalidFetchSessionEpoch,
+        ):
+            # The broker lost the session (restart, eviction, epoch
+            # desync). Rebuild it from scratch on the next request. This
+            # only affects this node's session - consumer positions are
+            # left untouched.
+            self.reset()
+            return False
+        if self._pending_partitions is not None:
+            self.session_partitions = self._pending_partitions
+            self._pending_partitions = None
+        if session_id != self.INVALID_SESSION_ID:
+            self.session_id = session_id
+            self.next_epoch += 1
+        return True
+
+    def handle_error(self):
+        # The request may never have reached the broker. Discard the
+        # optimistic view; the next build_request() recomputes the diff
+        # against the last confirmed state and reuses the same epoch.
+        self._pending_partitions = None
+
+    def reset(self):
+        self.session_id = self.INVALID_SESSION_ID
+        self.next_epoch = self.INITIAL_EPOCH
+        self.session_partitions = {}
+        self._pending_partitions = None
+
+    def session_offsets(self):
+        """Fetch offsets of all partitions in the session as of the last
+        (possibly in-flight) request."""
+        partitions = self._pending_partitions
+        if partitions is None:
+            partitions = self.session_partitions
+        return {tp: offset for tp, (offset, _) in partitions.items()}
+
+
 class Fetcher:
     """Initialize a Kafka Message Fetcher.
 
@@ -426,6 +542,8 @@ class Fetcher:
         self._records = collections.OrderedDict()
         self._in_flight = set()
         self._pending_tasks = set()
+        # KIP-227 incremental fetch session state per broker node id
+        self._fetch_sessions = {}
 
         self._wait_consume_future = None
         self._fetch_waiters = set()
@@ -642,12 +760,29 @@ class Fetcher:
             # Shuffle partition data to help get more equal consumption
             random.shuffle(partition_data)
 
+            # Compute the incremental fetch session diff for this node
+            # (KIP-227). For brokers without fetch session support this
+            # always yields a full partition list and the session fields
+            # are not put on the wire (see FetchRequest.build).
+            session_handler = self._fetch_sessions.get(node_id)
+            if session_handler is None:
+                session_handler = FetchSessionHandler(node_id)
+                self._fetch_sessions[node_id] = session_handler
+            fetchable_by_tp = {
+                tp: (position, self._max_partition_fetch_bytes)
+                for tp, position in partition_data
+            }
+            session_id, session_epoch, to_send, forgotten = (
+                session_handler.build_request(fetchable_by_tp)
+            )
+
             # Create fetch request
             by_topics = collections.defaultdict(list)
-            for tp, position in partition_data:
-                by_topics[tp.topic].append(
-                    (tp.partition, position, self._max_partition_fetch_bytes)
-                )
+            for tp, (position, max_bytes) in to_send.items():
+                by_topics[tp.topic].append((tp.partition, position, max_bytes))
+            forgotten_by_topic = collections.defaultdict(list)
+            for tp in forgotten:
+                forgotten_by_topic[tp.topic].append(tp.partition)
             req = FetchRequest(
                 self._fetch_max_wait_ms,
                 self._fetch_min_bytes,
@@ -655,6 +790,9 @@ class Fetcher:
                 self._isolation_level,
                 list(by_topics.items()),
                 rack_id=self._client_rack or "",
+                session_id=session_id,
+                session_epoch=session_epoch,
+                forgotten_topics_data=list(forgotten_by_topic.items()),
             )
             fetch_requests.append((node_id, req))
 
@@ -731,11 +869,14 @@ class Fetcher:
                     self._preferred_read_replica.pop(tp, None)
 
     async def _proc_fetch_request(self, assignment, node_id, request):
+        session_handler = self._fetch_sessions.get(node_id)
         needs_wakeup = False
         try:
             response = await self._client.send(node_id, request)
         except Errors.KafkaError as err:
             log.error("Failed fetch messages from %s: %s", node_id, err)
+            if session_handler is not None:
+                session_handler.handle_error()
             # If this fetch was routed to a preferred read replica (follower)
             # and failed at the transport/protocol level, evict the cached
             # entries so the next attempt falls back to the leader instead of
@@ -746,7 +887,22 @@ class Fetcher:
         except asyncio.CancelledError:
             # Either `close()` or partition unassigned. Either way the result
             # is no longer of interest.
+            if session_handler is not None:
+                session_handler.handle_error()
             return False
+
+        if session_handler is not None and response.API_VERSION >= 7:
+            # KIP-227: confirm or roll back the incremental session diff
+            # that was optimistically computed when the request was built.
+            error_type = Errors.for_code(response.error_code)
+            if not session_handler.handle_response(response.session_id, error_type):
+                log.info(
+                    "Fetch session with node %s was invalidated by the broker"
+                    " (%s). Rebuilding it with a full fetch request",
+                    node_id,
+                    error_type.__name__,
+                )
+                return False
 
         if not assignment.active:
             log.debug(
@@ -754,10 +910,19 @@ class Fetcher:
             )
             return False
 
-        fetch_offsets = {}
-        for topic, partitions in request.topics:
-            for partition, offset, _ in partitions:
-                fetch_offsets[TopicPartition(topic, partition)] = offset
+        if session_handler is not None and response.API_VERSION >= 7:
+            # With incremental fetches the broker may return partitions that
+            # were not explicitly listed in this request but are part of the
+            # session. Their fetch offsets are the ones recorded in the
+            # session when the request was built. Partitions that are no
+            # longer in the session (paused, moved to another leader) are
+            # stale leftovers and must be ignored.
+            fetch_offsets = session_handler.session_offsets()
+        else:
+            fetch_offsets = {}
+            for topic, partitions in request.topics:
+                for partition, offset, *_ in partitions:
+                    fetch_offsets[TopicPartition(topic, partition)] = offset
 
         now_ms = int(1000 * time.time())
         # KIP-392 is only meaningful when the client advertises a rack and the
@@ -780,7 +945,17 @@ class Fetcher:
             for partition, error_code, highwater, *part_data in partitions:
                 tp = TopicPartition(topic, partition)
                 error_type = Errors.for_code(error_code)
-                fetch_offset = fetch_offsets[tp]
+                fetch_offset = fetch_offsets.get(tp)
+                if fetch_offset is None:
+                    # Stale response for a partition that is no longer part
+                    # of this node's fetch session (paused, unassigned or
+                    # moved to another leader). Do not revive it.
+                    log.debug(
+                        "Discarding fetch response for partition %s "
+                        "since it is not part of the current fetch session",
+                        tp,
+                    )
+                    continue
                 tp_state = assignment.state_value(tp)
                 if not tp_state.has_valid_position or tp_state.position != fetch_offset:
                     log.debug(

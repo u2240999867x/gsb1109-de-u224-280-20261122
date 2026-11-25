@@ -520,6 +520,9 @@ class FetchRequest(Request[FetchRequestStruct]):
         isolation_level: int,
         topics: list[tuple[str, list[tuple[int, int, int]]]],
         rack_id: str = "",
+        session_id: int = 0,
+        session_epoch: int = -1,
+        forgotten_topics_data: list[tuple[str, list[int]]] | None = None,
     ):
         self._max_wait_ms = max_wait_time
         self._min_bytes = min_bytes
@@ -527,6 +530,14 @@ class FetchRequest(Request[FetchRequestStruct]):
         self._isolation_level = isolation_level
         self._topics = topics
         self._rack_id = rack_id
+        # KIP-227 incremental fetch session fields. Only transmitted on
+        # FetchRequest v7+; silently dropped on older versions so brokers
+        # that do not support sessions never see unknown parameters.
+        self._session_id = session_id
+        self._session_epoch = session_epoch
+        self._forgotten_topics_data = (
+            forgotten_topics_data if forgotten_topics_data is not None else []
+        )
 
     @property
     def topics(self) -> list[tuple[str, list[tuple[int, int, int]]]]:
@@ -596,13 +607,13 @@ class FetchRequest(Request[FetchRequestStruct]):
             if api_version >= 7:
                 args.extend(
                     [
-                        0,  # session_id (no incremental fetch session)
-                        -1,  # session_epoch (FINAL_EPOCH)
+                        self._session_id,
+                        self._session_epoch,
                     ]
                 )
             args.append(partitions_by_topic)
             if api_version >= 7:
-                args.append([])  # forgotten_topics_data
+                args.append(list(self._forgotten_topics_data))
             if api_version >= 11:
                 args.append(self._rack_id)
             return request_struct_class(*args)

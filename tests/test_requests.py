@@ -72,6 +72,7 @@ from aiokafka.protocol.fetch import (
     FetchRequest_v1,
     FetchRequest_v3,
     FetchRequest_v4,
+    FetchRequest_v7,
 )
 from aiokafka.protocol.group import (
     HeartbeatRequest,
@@ -677,6 +678,40 @@ cases = [
             Versions(
                 max_version=4,
                 expected=FetchRequest_v4(-1, 10, 1, 1000, 1, [("t", [(0, 5, 100)])]),
+            ),
+        ],
+    ),
+    (
+        FetchRequest(
+            max_wait_time=10,
+            min_bytes=1,
+            max_bytes=1000,
+            isolation_level=0,
+            topics=[("t", [(0, 5, 100)])],
+            session_id=10,
+            session_epoch=2,
+            forgotten_topics_data=[("t2", [1, 2])],
+        ),
+        [
+            # Session fields are only put on the wire for FetchRequest v7+;
+            # older versions keep the plain full-fetch layout.
+            Versions(
+                max_version=4,
+                expected=FetchRequest_v4(-1, 10, 1, 1000, 0, [("t", [(0, 5, 100)])]),
+            ),
+            Versions(
+                max_version=7,
+                expected=FetchRequest_v7(
+                    -1,
+                    10,
+                    1,
+                    1000,
+                    0,
+                    10,
+                    2,
+                    [("t", [(0, 5, -1, 100)])],
+                    [("t2", [1, 2])],
+                ),
             ),
         ],
     ),
