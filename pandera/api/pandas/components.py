@@ -33,6 +33,7 @@ class Column(ArraySchema[pd.DataFrame]):
         required: bool = True,
         name: Union[str, tuple[str, ...], None] = None,
         regex: bool = False,
+        occurrence: int | None = None,
         title: str | None = None,
         description: str | None = None,
         default: Any | None = None,
@@ -61,6 +62,15 @@ class Column(ArraySchema[pd.DataFrame]):
         :param name: column name in dataframe to validate.
         :param regex: whether the ``name`` attribute should be treated as a
             regex pattern to apply to multiple columns in a dataframe.
+        :param occurrence: 1-based occurrence of a duplicated column label
+            that this column rule applies to. When a dataframe contains
+            several physical columns with the same label, ``occurrence=n``
+            pins this rule to the n-th physical column carrying ``name``,
+            leaving the other occurrences to regular (non-occurrence) rules.
+            Pinned columns keep their original label and position in the
+            validated output and are identified by their original physical
+            position in error diagnostics. Cannot be combined with
+            ``regex=True``.
         :param title: A human-readable label for the column.
         :param description: An arbitrary textual description of the column.
         :param default: The default value for missing values in the column.
@@ -122,9 +132,27 @@ class Column(ArraySchema[pd.DataFrame]):
                 "on_missing must be one of "
                 f"{(None, *ON_MISSING_ACTIONS)}, got {on_missing!r}."
             )
+        if occurrence is not None:
+            if (
+                isinstance(occurrence, bool)
+                or not isinstance(occurrence, int)
+                or occurrence < 1
+            ):
+                raise errors.SchemaInitError(
+                    "occurrence must be a positive integer (1-based), got "
+                    f"{occurrence!r}."
+                )
+            if regex:
+                raise errors.SchemaInitError(
+                    "occurrence cannot be combined with regex=True: "
+                    "occurrence pinpoints a single physical column among "
+                    "duplicated labels while regex matches columns by "
+                    "pattern."
+                )
         self.required = required
         self.name = name
         self.regex = regex
+        self.occurrence = occurrence
         self.on_missing = on_missing
 
     @property
@@ -163,6 +191,7 @@ class Column(ArraySchema[pd.DataFrame]):
             "required": self.required,
             "name": self.name,
             "regex": self.regex,
+            "occurrence": self.occurrence,
             "title": self.title,
             "description": self.description,
             "default": self.default,

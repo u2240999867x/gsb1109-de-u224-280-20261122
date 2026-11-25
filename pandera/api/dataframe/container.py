@@ -69,7 +69,11 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
 
         :param columns: a dict where keys are column names and values are
             Column objects specifying the datatypes and properties of a
-            particular column.
+            particular column. A list of Column objects is also accepted,
+            which is required to declare several rules for the same column
+            label: rules with ``occurrence`` set apply to the n-th physical
+            column carrying their name, while regular rules apply to the
+            remaining columns.
         :type columns: mapping of column names and column schema component.
         :param checks: dataframe-wide checks.
         :param parsers: dataframe-wide parsers.
@@ -146,6 +150,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         if columns is None:
             columns = {}
 
+        columns, occurrence_columns = _normalize_columns(columns)
         _validate_columns(columns)
         columns = _columns_renamed(columns)
 
@@ -176,6 +181,8 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         self.columns: dict[Any, Any] = (  # type: ignore[name-defined]
             {} if columns is None else columns
         )
+
+        self.occurrence_columns = occurrence_columns
 
         self.index = index
         self.strict: Union[bool, str] = strict
@@ -1342,6 +1349,64 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         new_schema.index = new_index
 
         return new_schema
+
+
+def _normalize_columns(
+    columns: Any,
+) -> tuple[dict[Any, Any], list[Any]]:
+    """Split occurrence-pinned column rules out of the ``columns`` argument.
+
+    Accepts the usual ``{name: Column}`` mapping or a list of ``Column``
+    objects. The list form exists so several rules can be declared for the
+    same column label: rules whose ``occurrence`` is set are hoisted out of
+    the regular columns dict and returned separately, keyed to the n-th
+    physical column carrying their label at validation time.
+
+    :returns: a ``(regular_columns, occurrence_columns)`` tuple.
+    """
+    occurrence_columns: list[Any] = []
+    regular_columns: dict[Any, Any] = {}
+
+    if isinstance(columns, dict):
+        for column_name, column in columns.items():
+            if getattr(column, "occurrence", None) is None:
+                regular_columns[column_name] = column
+                continue
+            column = copy.deepcopy(column)
+            column.set_name(column_name)
+            occurrence_columns.append(column)
+    else:
+        for column in columns:
+            if getattr(column, "occurrence", None) is not None:
+                occurrence_columns.append(column)
+                continue
+            name = getattr(column, "name", None)
+            if name in regular_columns:
+                raise errors.SchemaInitError(
+                    "duplicate columns in schema definition: "
+                    f"{name!r}. To declare several rules for the same "
+                    "column label, set `occurrence` on all but one of them."
+                )
+            regular_columns[name] = column
+
+    seen_slots = set()
+    for column in occurrence_columns:
+        if not isinstance(column.name, str):
+            raise errors.SchemaInitError(
+                "occurrence-pinned columns require a string `name`, got "
+                f"{column.name!r}."
+            )
+        slot = (column.name, column.occurrence)
+        if slot in seen_slots:
+            raise errors.SchemaInitError(
+                f"multiple explicit column rules target column "
+                f"'{column.name}' occurrence {column.occurrence}; each "
+                "(name, occurrence) slot can only be claimed by one "
+                "column rule."
+            )
+        seen_slots.add(slot)
+
+    return regular_columns, occurrence_columns
 
 
 def _validate_columns(

@@ -88,91 +88,293 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         _parsed_column_values.set(None)
 
         check_obj = self.preprocess(check_obj, inplace=inplace)
-        if hasattr(check_obj, "pandera"):
-            check_obj = check_obj.pandera.add_schema(schema)
 
-        # run custom parsers
-        check_obj = self.run_parsers(schema, check_obj)
+        # Pin occurrence-targeted column rules to physical column positions
+        # by renaming them to unique internal labels for the duration of the
+        # validation; the original labels are restored before returning.
+        original_schema = schema
+        occurrence_pins: list[tuple[str, Any, int, int]] = []
+        if getattr(schema, "occurrence_columns", None):
+            check_obj, schema, occurrence_pins = self._pin_occurrence_columns(
+                check_obj, schema, error_handler
+            )
 
-        # Collect status of columns against schema
-        column_info = self.collect_column_info(check_obj, schema)
+        try:
+            if hasattr(check_obj, "pandera"):
+                check_obj = check_obj.pandera.add_schema(schema)
 
-        # Warn about optional columns that are absent from the input, based on
-        # the data as provided (i.e. before add_missing_columns runs).
-        self.warn_missing_optional_columns(check_obj, schema)
+            # run custom parsers
+            check_obj = self.run_parsers(schema, check_obj)
 
-        core_parsers: list[tuple[Callable[..., Any], tuple[Any, ...]]] = [
-            (self.add_missing_columns, (schema, column_info, lazy)),
-            (self.strict_filter_columns, (schema, column_info)),
-            (self.set_defaults, (schema,)),
-            (self.coerce_dtype, (schema,)),
-        ]
+            # Collect status of columns against schema
+            column_info = self.collect_column_info(check_obj, schema)
 
-        for parser, args in core_parsers:
-            try:
-                check_obj = parser(check_obj, *args)
-            except SchemaError as exc:
-                error_handler.collect_error(
-                    get_error_category(exc.reason_code), exc.reason_code, exc
+            # Warn about optional columns that are absent from the input, based on
+            # the data as provided (i.e. before add_missing_columns runs).
+            self.warn_missing_optional_columns(check_obj, schema)
+
+            core_parsers: list[tuple[Callable[..., Any], tuple[Any, ...]]] = [
+                (self.add_missing_columns, (schema, column_info, lazy)),
+                (self.strict_filter_columns, (schema, column_info)),
+                (self.set_defaults, (schema,)),
+                (self.coerce_dtype, (schema,)),
+            ]
+
+            for parser, args in core_parsers:
+                try:
+                    check_obj = parser(check_obj, *args)
+                except SchemaError as exc:
+                    error_handler.collect_error(
+                        get_error_category(exc.reason_code), exc.reason_code, exc
+                    )
+                except SchemaErrors as exc:
+                    if lazy:
+                        error_handler.collect_errors(exc.schema_errors)
+                    else:
+                        raise
+
+            # We may have modified columns, for example by
+            # add_missing_columns, so regenerate column info
+            column_info = self.collect_column_info(check_obj, schema)
+
+            # collect schema components
+            components = self.collect_schema_components(
+                check_obj, schema, column_info
+            )
+
+            # run the checks
+            error_handler = self.run_checks_and_handle_errors(
+                error_handler,
+                schema,
+                check_obj,
+                column_info,
+                sample,
+                components,
+                lazy,
+                head,
+                tail,
+                random_state,
+            )
+
+            if error_handler.collected_errors:
+                # annotate before SchemaErrors consolidates the report
+                self._annotate_occurrence_errors(
+                    error_handler.schema_errors, occurrence_pins
                 )
-            except SchemaErrors as exc:
-                if lazy:
-                    error_handler.collect_errors(exc.schema_errors)
+                if getattr(schema, "drop_invalid_rows", False):
+                    # if the failure cases are a string, it means the error is
+                    # a schema-level error.
+                    if any(
+                        isinstance(err.failure_cases, str)
+                        for err in error_handler.schema_errors
+                    ):
+                        raise SchemaErrors(
+                            schema=schema,
+                            schema_errors=error_handler.schema_errors,
+                            data=check_obj,
+                        )
+                    check_obj = self.drop_invalid_rows(check_obj, error_handler)
                 else:
-                    raise
-
-        # We may have modified columns, for example by
-        # add_missing_columns, so regenerate column info
-        column_info = self.collect_column_info(check_obj, schema)
-
-        # collect schema components
-        components = self.collect_schema_components(
-            check_obj, schema, column_info
-        )
-
-        # run the checks
-        error_handler = self.run_checks_and_handle_errors(
-            error_handler,
-            schema,
-            check_obj,
-            column_info,
-            sample,
-            components,
-            lazy,
-            head,
-            tail,
-            random_state,
-        )
-
-        if error_handler.collected_errors:
-            if getattr(schema, "drop_invalid_rows", False):
-                # if the failure cases are a string, it means the error is
-                # a schema-level error.
-                if any(
-                    isinstance(err.failure_cases, str)
-                    for err in error_handler.schema_errors
-                ):
                     raise SchemaErrors(
                         schema=schema,
                         schema_errors=error_handler.schema_errors,
                         data=check_obj,
                     )
-                check_obj = self.drop_invalid_rows(check_obj, error_handler)
-            else:
-                raise SchemaErrors(
-                    schema=schema,
-                    schema_errors=error_handler.schema_errors,
-                    data=check_obj,
-                )
 
-        # Propagate nested Column drop_invalid_rows to the container output
-        # (non-mutating, see _apply_nested_drop_invalid_rows).
-        if any(getattr(c, "drop_invalid_rows", False) for c in components):
-            check_obj = self._apply_nested_drop_invalid_rows(
-                check_obj, components, lazy
+            # Propagate nested Column drop_invalid_rows to the container output
+            # (non-mutating, see _apply_nested_drop_invalid_rows).
+            if any(getattr(c, "drop_invalid_rows", False) for c in components):
+                check_obj = self._apply_nested_drop_invalid_rows(
+                    check_obj, components, lazy
+                )
+        except SchemaErrors as exc:
+            if occurrence_pins:
+                self._annotate_occurrence_errors(
+                    exc.schema_errors, occurrence_pins
+                )
+                data = exc.data
+                if is_table(data):
+                    data = self._restore_occurrence_column_names(
+                        data, occurrence_pins
+                    )
+                raise SchemaErrors(
+                    schema=original_schema,
+                    schema_errors=exc.schema_errors,
+                    data=data,
+                ) from exc
+            raise
+        except SchemaError as exc:
+            if occurrence_pins:
+                self._annotate_occurrence_errors([exc], occurrence_pins)
+                if is_table(getattr(exc, "data", None)):
+                    exc.data = self._restore_occurrence_column_names(
+                        exc.data, occurrence_pins
+                    )
+            raise
+
+        check_obj = self._restore_occurrence_column_names(
+            check_obj, occurrence_pins
+        )
+        return check_obj
+
+    def _pin_occurrence_columns(
+        self,
+        check_obj: pd.DataFrame,
+        schema,
+        error_handler: ErrorHandler,
+    ) -> tuple[pd.DataFrame, Any, list[tuple[str, Any, int, int]]]:
+        """Bind occurrence-pinned column rules to physical column positions.
+
+        Each pinned rule claims the n-th physical column carrying its label;
+        that column is renamed to a unique internal label so that strict
+        filtering keeps it by identity and regular (regex or plain) rules
+        only see the columns that were not explicitly pinned.
+
+        :returns: a ``(check_obj, schema, pins)`` tuple where ``pins`` is a
+            list of ``(internal_label, name, occurrence, position)`` tuples
+            and ``position`` is the 1-based physical position of the column
+            in the input dataframe.
+        """
+        occurrence_positions: dict[Any, int] = {}
+        name_counts: dict[Any, int] = {}
+        for position, column in enumerate(check_obj.columns):
+            name_counts[column] = name_counts.get(column, 0) + 1
+            occurrence_positions.setdefault(
+                (column, name_counts[column]), position
             )
 
-        return check_obj
+        new_labels = list(check_obj.columns)
+        derived_schema = copy.copy(schema)
+        derived_schema.columns = dict(schema.columns)
+        derived_schema.occurrence_columns = []
+        reserved_labels = set(new_labels) | set(derived_schema.columns)
+
+        pins: list[tuple[str, Any, int, int]] = []
+        for column_schema in schema.occurrence_columns:
+            name = column_schema.name
+            occurrence = column_schema.occurrence
+            position = occurrence_positions.get((name, occurrence))
+            if position is None:
+                if not column_schema.required:
+                    continue
+                error = SchemaError(
+                    schema=schema,
+                    data=check_obj,
+                    message=(
+                        f"column '{name}' (occurrence {occurrence}) not in "
+                        f"dataframe: dataframe contains "
+                        f"{name_counts.get(name, 0)} occurrence(s) of "
+                        f"column '{name}'. Columns in dataframe: "
+                        f"{check_obj.columns.tolist()}"
+                    ),
+                    failure_cases=name,
+                    check="column_in_dataframe",
+                    reason_code=SchemaErrorReason.COLUMN_NOT_IN_DATAFRAME,
+                )
+                error_handler.collect_error(
+                    get_error_category(error.reason_code),
+                    error.reason_code,
+                    error,
+                )
+                continue
+
+            suffix = 0
+            while True:
+                internal_label = f"__pandera_occurrence_{name}_{occurrence}__"
+                if suffix:
+                    internal_label = f"{internal_label[:-2]}_{suffix}__"
+                if internal_label not in reserved_labels:
+                    break
+                suffix += 1
+            reserved_labels.add(internal_label)
+
+            new_labels[position] = internal_label
+            pinned_column = copy.deepcopy(column_schema)
+            pinned_column.occurrence = None
+            pinned_column.set_name(internal_label)
+            derived_schema.columns[internal_label] = pinned_column
+            pins.append((internal_label, name, occurrence, position + 1))
+
+        check_obj = check_obj.copy()
+        check_obj.columns = new_labels
+        return check_obj, derived_schema, pins
+
+    @staticmethod
+    def _occurrence_label(name: Any, occurrence: int, position: int) -> str:
+        """Human-readable locator for an occurrence-pinned column."""
+        return f"{name} (occurrence {occurrence}, column position {position})"
+
+    def _annotate_occurrence_errors(
+        self,
+        schema_errors: list,
+        occurrence_pins: list[tuple[str, Any, int, int]],
+    ) -> None:
+        """Rewrite internal labels in errors to physical column locators.
+
+        Errors raised against an occurrence-pinned column reference its
+        internal label; replace it with the original display name together
+        with the occurrence ordinal and the 1-based physical position so the
+        source of the data can locate the offending column. Idempotent.
+        """
+        if not occurrence_pins:
+            return
+        for err in schema_errors:
+            if not isinstance(err, SchemaError):
+                continue
+            for internal_label, name, occurrence, position in occurrence_pins:
+                label = self._occurrence_label(name, occurrence, position)
+                matched = False
+                if getattr(err, "column_name", None) == internal_label:
+                    err.column_name = label
+                    matched = True
+                message = err.args[0] if err.args else None
+                if isinstance(message, str):
+                    if internal_label in message:
+                        err.args = (
+                            message.replace(internal_label, label),
+                            *err.args[1:],
+                        )
+                    elif matched:
+                        err.args = (
+                            f"column '{label}': {message}",
+                            *err.args[1:],
+                        )
+                failure_cases = getattr(err, "failure_cases", None)
+                if (
+                    is_table(failure_cases)
+                    and "column" in failure_cases.columns
+                    and failure_cases["column"]
+                    .astype(str)
+                    .eq(internal_label)
+                    .any()
+                ):
+                    err.failure_cases = failure_cases.assign(
+                        column=failure_cases["column"].replace(
+                            {internal_label: label}
+                        )
+                    )
+
+    @staticmethod
+    def _restore_occurrence_column_names(
+        check_obj: pd.DataFrame,
+        occurrence_pins: list[tuple[str, Any, int, int]],
+    ) -> pd.DataFrame:
+        """Restore the original labels of occurrence-pinned columns.
+
+        Renaming by label keeps each pinned column at its physical position,
+        so the output preserves the original display names and their
+        positional relationship.
+        """
+        if not occurrence_pins or not is_table(check_obj):
+            return check_obj
+        mapping = {
+            internal_label: name
+            for internal_label, name, _, _ in occurrence_pins
+            if internal_label in check_obj.columns
+        }
+        if not mapping:
+            return check_obj
+        return check_obj.rename(columns=mapping)
 
     def run_checks_and_handle_errors(
         self,
