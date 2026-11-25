@@ -18,6 +18,17 @@ log = logging.getLogger(__name__)
 
 UNKNOWN_OFFSET = -1
 
+
+class _LeaderState:
+    __slots__ = ("leader_id", "generation", "verified_generation", "probe_offset")
+
+    def __init__(self, leader_id, generation, verified_generation, probe_offset):
+        self.leader_id = leader_id
+        self.generation = generation
+        self.verified_generation = verified_generation
+        self.probe_offset = probe_offset
+
+
 # Isolation levels
 READ_UNCOMMITTED = 0
 READ_COMMITTED = 1
@@ -415,6 +426,11 @@ class Fetcher:
         self._preferred_read_replica: dict[TopicPartition, tuple[int, float]] = {}
         self._preferred_replica_ttl = client._metadata_max_age_ms / 1000
         self._rack_warning_logged = False
+        # Rack-aware followers can serve stale or generation-mismatched responses
+        # around leader changes. Track a monotonic generation per partition so
+        # an old in-flight Fetch/ListOffsets cannot confirm a newer leader.
+        self._leader_states: dict[TopicPartition, _LeaderState] = {}
+        self._leader_assignment = None
 
         if isolation_level == "read_uncommitted":
             self._isolation_level = READ_UNCOMMITTED
@@ -577,15 +593,34 @@ class Fetcher:
         # create the fetch info as a dict of lists of partition info tuples
         # which can be passed to FetchRequest() via .items()
         fetchable = collections.defaultdict(list)
+        fetch_contexts = collections.defaultdict(dict)
         awaiting_reset = collections.defaultdict(list)
         backoff_by_nodes = collections.defaultdict(list)
         resume_futures = []
         invalid_metadata = False
 
+        self._sync_leader_generations(assignment)
+
         for tp in assignment.tps:
             tp_state = assignment.state_value(tp)
+            leader_state = self._leader_states.get(tp)
+            leader_verification_pending = (
+                self._client_rack
+                and leader_state is not None
+                and leader_state.verified_generation != leader_state.generation
+            )
 
-            node_id = self._select_read_replica(tp)
+            if leader_verification_pending:
+                # A metadata leader change must be acknowledged by the current
+                # leader from the last unconfirmed position before a cached
+                # preferred replica may serve this partition again.
+                leader_id = leader_state.leader_id
+                node_id = leader_id
+                fetch_offset = leader_state.probe_offset
+            else:
+                leader_id = None
+                node_id = self._select_read_replica(tp)
+                fetch_offset = None
             backoff = 0
             if tp in self._records:
                 # We have data still not consumed by user. In this case we
@@ -603,6 +638,17 @@ class Fetcher:
                     "No leader found for partition %s. Waiting metadata update", tp
                 )
                 invalid_metadata = True
+            elif leader_verification_pending and fetch_offset is not None:
+                generation = (
+                    leader_state.generation if leader_state is not None else 0
+                )
+                fetchable[node_id].append((tp, fetch_offset))
+                fetch_contexts[node_id][tp] = (generation, True)
+                log.debug(
+                    "Confirming leader for partition %s at offset %d",
+                    tp,
+                    fetch_offset,
+                )
             elif not tp_state.has_valid_position:
                 # Per KIP-392, only Fetch requests may be served by a follower.
                 # ListOffsets must always go to the partition leader, otherwise
@@ -624,7 +670,11 @@ class Fetcher:
                 resume_futures.append(tp_state.resume_fut)
             else:
                 position = tp_state.position
+                generation = (
+                    leader_state.generation if leader_state is not None else 0
+                )
                 fetchable[node_id].append((tp, position))
+                fetch_contexts[node_id][tp] = (generation, False)
                 log.debug(
                     "Adding fetch request for partition %s at offset %d", tp, position
                 )
@@ -656,6 +706,7 @@ class Fetcher:
                 list(by_topics.items()),
                 rack_id=self._client_rack or "",
             )
+            req._leader_context = fetch_contexts.get(node_id, {})
             fetch_requests.append((node_id, req))
 
         if backoff_by_nodes:
@@ -730,6 +781,80 @@ class Fetcher:
                 if cached is not None and cached[0] == node_id:
                     self._preferred_read_replica.pop(tp, None)
 
+    def _sync_leader_generations(self, assignment):
+        """Observe metadata leader changes and fence stale prefetched data.
+
+        A leader change starts a new generation. Rack-aware fetches must be
+        confirmed by the current leader before preferred replicas are used
+        again. Old in-flight requests carry the generation they were sent in
+        and are discarded when their generation is no longer current.
+        """
+        if not self._client_rack or assignment is None:
+            return frozenset()
+
+        if self._leader_assignment is not assignment:
+            self._leader_assignment = assignment
+            self._leader_states = {}
+
+        tps = getattr(assignment, "tps", None)
+        if not isinstance(tps, (list, set, tuple, frozenset)):
+            return frozenset()
+
+        changed = []
+        for tp in tps:
+            leader_id = self._client.cluster.leader_for_partition(tp)
+            if leader_id is None or leader_id == -1:
+                continue
+
+            tp_state = assignment.state_value(tp)
+            position = (
+                tp_state.position
+                if tp_state is not None and tp_state.has_valid_position
+                else None
+            )
+            state = self._leader_states.get(tp)
+
+            if state is None:
+                self._leader_states[tp] = _LeaderState(
+                    leader_id=leader_id,
+                    generation=0,
+                    verified_generation=0,
+                    probe_offset=position,
+                )
+                continue
+
+            if state.leader_id == leader_id:
+                if position is not None and state.probe_offset is None:
+                    state.probe_offset = position
+                continue
+
+            probe_offset = position if position is not None else state.probe_offset
+            generation = state.generation + 1
+            self._leader_states[tp] = _LeaderState(
+                leader_id=leader_id,
+                generation=generation,
+                verified_generation=None,
+                probe_offset=probe_offset,
+            )
+            # Do not let an older leader's buffered records satisfy the
+            # confirmation required from the new leader.
+            self._records.pop(tp, None)
+            self._preferred_read_replica.pop(tp, None)
+            changed.append(tp)
+
+        return frozenset(changed)
+
+    def _refresh_leader_generations_for_read(self):
+        if not self._client_rack:
+            return
+        subscription = self._subscriptions.subscription
+        assignment = subscription.assignment if subscription is not None else None
+        if assignment is None or not assignment.active:
+            return
+        changed = self._sync_leader_generations(assignment)
+        if changed:
+            self._notify(self._wait_consume_future)
+
     async def _proc_fetch_request(self, assignment, node_id, request):
         needs_wakeup = False
         try:
@@ -753,6 +878,11 @@ class Fetcher:
                 "Discarding fetch response since the assignment changed during fetch"
             )
             return False
+
+        self._sync_leader_generations(assignment)
+        leader_context = vars(request).get("_leader_context", {})
+        if not isinstance(leader_context, dict):
+            leader_context = {}
 
         fetch_offsets = {}
         for topic, partitions in request.topics:
@@ -781,8 +911,35 @@ class Fetcher:
                 tp = TopicPartition(topic, partition)
                 error_type = Errors.for_code(error_code)
                 fetch_offset = fetch_offsets[tp]
+                request_generation, leader_confirmation = leader_context.get(
+                    tp, (None, False)
+                )
+                leader_state = self._leader_states.get(tp)
+                if (
+                    self._client_rack
+                    and request_generation is not None
+                    and leader_state is not None
+                    and request_generation != leader_state.generation
+                ):
+                    log.debug(
+                        "Discarding fetch response for partition %s from stale "
+                        "leader generation %s (current %s)",
+                        tp,
+                        request_generation,
+                        leader_state.generation,
+                    )
+                    continue
+
                 tp_state = assignment.state_value(tp)
-                if not tp_state.has_valid_position or tp_state.position != fetch_offset:
+                leader_probe_without_position = (
+                    leader_confirmation
+                    and leader_state is not None
+                    and fetch_offset == leader_state.probe_offset
+                )
+                if not leader_probe_without_position and (
+                    not tp_state.has_valid_position
+                    or tp_state.position != fetch_offset
+                ):
                     log.debug(
                         "Discarding fetch response for partition %s "
                         "since its offset %s does not match the current "
@@ -793,13 +950,28 @@ class Fetcher:
                     continue
 
                 if error_type is Errors.NoError:
+                    confirming_leader = (
+                        self._client_rack
+                        and leader_state is not None
+                        and leader_state.verified_generation
+                        != leader_state.generation
+                    )
+                    if self._client_rack and leader_state is not None:
+                        leader_state.verified_generation = leader_state.generation
                     if response.API_VERSION >= 11:
                         # part_data layout: [last_stable_offset,
                         # log_start_offset, aborted_transactions,
                         # preferred_read_replica, message_set]
                         lso = part_data[0]
                         aborted_transactions = part_data[2]
-                        if rack_aware:
+                        if (
+                            rack_aware
+                            and not leader_confirmation
+                            and not confirming_leader
+                        ):
+                            # A leader-change probe is only for validation. Do
+                            # not let its hint redirect the offset before the
+                            # regular post-confirmation fetch cycle.
                             self._update_preferred_read_replica(tp, part_data[3])
                     elif response.API_VERSION >= 4:
                         # part_data layout:
@@ -872,6 +1044,12 @@ class Fetcher:
                     # Java consumer. The next fetch will go to the leader
                     # until the broker hints another follower.
                     self._preferred_read_replica.pop(tp, None)
+                    if self._client_rack and leader_state is not None:
+                        # An explicit offset error from the current leader is
+                        # also a valid leadership/offset confirmation.
+                        leader_state.verified_generation = (
+                            leader_state.generation
+                        )
                     if error_type in (
                         Errors.NotLeaderForPartitionError,
                         Errors.UnknownTopicOrPartitionError,
@@ -969,6 +1147,13 @@ class Fetcher:
         if not topic_data:
             return needs_wakeup
 
+        reset_generations = {}
+        for tp in needs_reset:
+            leader_state = self._leader_states.get(tp)
+            reset_generations[tp] = (
+                leader_state.generation if leader_state is not None else 0
+            )
+
         try:
             try:
                 offsets = await self._proc_offset_request(node_id, topic_data)
@@ -980,11 +1165,27 @@ class Fetcher:
             return needs_wakeup
 
         for tp in needs_reset:
+            leader_state = self._leader_states.get(tp)
+            current_generation = (
+                leader_state.generation if leader_state is not None else 0
+            )
+            if reset_generations.get(tp, 0) != current_generation:
+                log.debug(
+                    "Discarding ListOffsets result for %s from stale leader "
+                    "generation %s (current %s)",
+                    tp,
+                    reset_generations.get(tp, 0),
+                    current_generation,
+                )
+                continue
+
             offset = offsets[tp][0]
             tp_state = assignment.state_value(tp)
             # There could have been some `seek` call while fetching offset
             if tp_state.awaiting_reset:
                 tp_state.reset_to(offset)
+                if leader_state is not None:
+                    leader_state.probe_offset = None
         return needs_wakeup
 
     async def _retrieve_offsets(self, timestamps, timeout_ms=None):
@@ -1164,6 +1365,8 @@ class Fetcher:
             if self._closed:
                 raise ConsumerStoppedError()
 
+            self._refresh_leader_generations_for_read()
+
             # While the background routine will fetch new records up till new
             # assignment is finished, we don't want to return records, that may
             # not belong to this instance after rebalance.
@@ -1198,6 +1401,8 @@ class Fetcher:
     async def fetched_records(self, partitions, timeout=0, max_records=None):  # noqa: ASYNC109
         """Returns previously fetched records and updates consumed offsets."""
         while True:
+            self._refresh_leader_generations_for_read()
+
             # While the background routine will fetch new records up till new
             # assignment is finished, we don't want to return records, that may
             # not belong to this instance after rebalance.
