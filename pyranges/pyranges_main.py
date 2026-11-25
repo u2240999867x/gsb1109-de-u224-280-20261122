@@ -644,7 +644,21 @@ class PyRanges:
 
         return result
 
-    def apply_pair(self, other, f, strandedness=None, as_pyranges=True, **kwargs):
+    def apply_pair(
+        self,
+        other,
+        f,
+        strandedness=None,
+        as_pyranges=True,
+        page_size=None,
+        page_callback=None,
+        batch_id=None,
+        checkpoint_path=None,
+        receipt_path=None,
+        index_path=None,
+        warehouse_path=None,
+        **kwargs,
+    ):
         """Apply a function to a pair of PyRanges.
 
         The function is applied to each chromosome or chromosome/strand pair found in at least one
@@ -740,6 +754,35 @@ class PyRanges:
 
         """
 
+        if page_size is None:
+            for alias in ("max_pairs", "pairs_per_page", "page_limit", "batch_size", "limit"):
+                if alias in kwargs:
+                    page_size = kwargs.pop(alias)
+                    break
+
+        if page_size is not None:
+            from pyranges.paginated_apply_pair import PaginatedApplyPair
+
+            runner = PaginatedApplyPair(
+                self,
+                other,
+                batch_id=batch_id,
+                page_size=page_size,
+                receipt_path=receipt_path or checkpoint_path,
+                checkpoint_path=checkpoint_path or receipt_path,
+                index_path=index_path,
+                warehouse_path=warehouse_path,
+                strandedness=strandedness,
+                **kwargs,
+            )
+            callback = (
+                page_callback
+                or kwargs.pop("on_page", None)
+                or kwargs.pop("callback", None)
+                or f
+            )
+            return runner.run(callback)
+
         kwargs.update({"strandedness": strandedness})
         kwargs.update(kwargs.get("kwargs", {}))
         kwargs = fill_kwargs(kwargs)
@@ -750,6 +793,25 @@ class PyRanges:
             return result
         else:
             return PyRanges(result)
+
+    def apply_pair_paginated(self, other, callback=None, page_size=100, **kwargs):
+        """Create or run a bounded, restartable pair-delivery runner."""
+        from pyranges.paginated_apply_pair import PaginatedApplyPair
+
+        runner = PaginatedApplyPair(self, other, page_size=page_size, **kwargs)
+        if callback is None:
+            return runner
+        return runner.run(callback)
+
+    def paginated_apply_pair(self, other, callback=None, page_size=100, **kwargs):
+        """Alias for :meth:`apply_pair_paginated`."""
+        return self.apply_pair_paginated(other, callback=callback, page_size=page_size, **kwargs)
+
+    def apply_pair_pages(self, other, page_size=100, **kwargs):
+        """Return a restartable paginated apply_pair runner."""
+        from pyranges.paginated_apply_pair import PaginatedApplyPair
+
+        return PaginatedApplyPair(self, other, page_size=page_size, **kwargs)
 
     def as_df(self):
         """Return PyRanges as DataFrame.
