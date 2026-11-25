@@ -1,5 +1,8 @@
 import asyncio
+import json
 import operator
+import time
+from contextlib import contextmanager
 from copy import copy
 from unittest.mock import Mock, call, patch
 
@@ -10,8 +13,9 @@ from faust import Event, Record, Stream, Topic, joins
 from faust.exceptions import PartitionsMismatch
 from faust.stores.base import Store
 from faust.tables.base import Collection
-from faust.types import TP
-from faust.windows import Window
+from faust.tables.table import Table
+from faust.types import TP, Message
+from faust.windows import HoppingWindow, TumblingWindow, Window
 from tests.helpers import AsyncMock
 
 TP1 = TP("foo", 0)
@@ -800,3 +804,234 @@ class Test_Collection:
 
         partition = None
         assert table.partition_for_key("k") is partition
+
+
+class Test_Collection_window_corrections:
+    @pytest.fixture
+    def table(self, *, app):
+        return app.Table("name")
+
+    def _event(self, app, *, topic="topic", partition=0, offset=0):
+        message = Message(
+            topic=topic,
+            key="k",
+            value=1,
+            partition=partition,
+            offset=offset,
+            checksum=None,
+            timestamp=0.0,
+            timestamp_type=0,
+            headers={},
+        )
+        return Event(app=app, key="k", value=1, headers={}, message=message)
+
+    @contextmanager
+    def _current_event(self, event):
+        with patch("faust.tables.base.current_event", return_value=event):
+            yield
+
+    def test_correction_marker_survives_changelog_roundtrip(self, *, table):
+        marker = table._correction_marker("k", (1.1, 1.4), ("topic", 0, 41))
+        restored = table._to_key(json.loads(json.dumps(marker)))
+        assert restored == marker
+        assert hash(restored) == hash(marker)
+
+    def test_open_window_write_is_not_delayed(self, *, app, table):
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        event = self._event(app, partition=0, offset=1)
+        with self._current_event(event):
+            table._set_windowed("k", 5, now)
+        window_range = table.window.current(now)
+        assert table.data[("k", window_range)] == 5
+        assert table._window_delivery_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_correction_redelivers_closed_window_once(self, *, app, table):
+        on_window_close = table._on_window_close = AsyncMock(name="on_window_close")
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        window_range = table.window.current(now)
+        # window was already delivered on this partition
+        table._partition_last_closed_window[0] = window_range[0]
+        table.data[("k", window_range)] = 10
+
+        event = self._event(app, partition=0, offset=41)
+        with self._current_event(event):
+            # retract the old reading, record the new one
+            table._apply_window_op(operator.sub, "k", 10, now)
+            table._apply_window_op(operator.add, "k", 12, now)
+
+        assert table.data[("k", window_range)] == 12
+
+        await table._flush_window_deliveries()
+
+        # both writes of the same correction coalesce into one delivery,
+        # carrying the final corrected value
+        on_window_close.assert_called_once_with(("k", window_range), 12)
+        marker = table._correction_marker("k", window_range, ("topic", 0, 41))
+        assert marker in table.data
+
+    @pytest.mark.asyncio
+    async def test_correction_replay_after_recovery_keeps_published_version(
+        self, *, app, table
+    ):
+        table._on_window_close = AsyncMock(name="on_window_close")
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        window_range = table.window.current(now)
+        table._partition_last_closed_window[0] = window_range[0]
+        table.data[("k", window_range)] = 10
+
+        event = self._event(app, partition=0, offset=41)
+        with self._current_event(event):
+            table._apply_window_op(operator.sub, "k", 10, now)
+            table._apply_window_op(operator.add, "k", 12, now)
+        await table._flush_window_deliveries()
+        published = table.data[("k", window_range)]
+        assert published == 12
+
+        # reopen the table: the store (including correction markers) is
+        # recovered from the changelog, in-memory state starts empty.
+        recovered = Table(app, name="name")
+        recovered.window = table.window
+        recovered._data = table.data
+        recovered._partition_last_closed_window[0] = window_range[0]
+        on_window_close = recovered._on_window_close = AsyncMock(
+            name="on_window_close"
+        )
+
+        # the same correction arrives again
+        with self._current_event(event):
+            recovered._apply_window_op(operator.sub, "k", 10, now)
+            recovered._apply_window_op(operator.add, "k", 12, now)
+        await recovered._flush_window_deliveries()
+
+        # the published version is kept: not corrected twice, and the
+        # correction is not delivered again
+        assert recovered.data[("k", window_range)] == published
+        on_window_close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_correction_redelivers_each_closed_hopping_window_once(
+        self, *, app, table
+    ):
+        on_window_close = table._on_window_close = AsyncMock(name="on_window_close")
+        table.window = HoppingWindow(60.0, 10.0, expires=300.0)
+        now = time.time()
+        ranges = table.window.ranges(now)
+        assert len(ranges) > 1
+        table._partition_last_closed_window[0] = max(r[0] for r in ranges)
+        for window_range in ranges:
+            table.data[("k", window_range)] = 10
+
+        event = self._event(app, partition=0, offset=9)
+        with self._current_event(event):
+            table._apply_window_op(operator.sub, "k", 10, now)
+            table._apply_window_op(operator.add, "k", 12, now)
+        await table._flush_window_deliveries()
+
+        assert on_window_close.call_count == len(ranges)
+        for window_range in ranges:
+            assert call(("k", window_range), 12) in on_window_close.mock_calls
+
+    @pytest.mark.asyncio
+    async def test_set_windowed_on_closed_window_corrects(self, *, app, table):
+        on_window_close = table._on_window_close = AsyncMock(name="on_window_close")
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        window_range = table.window.current(now)
+        table._partition_last_closed_window[0] = window_range[0]
+        table.data[("k", window_range)] = 10
+
+        event = self._event(app, partition=0, offset=3)
+        with self._current_event(event):
+            table._set_windowed("k", 42, now)
+
+        assert table.data[("k", window_range)] == 42
+        await table._flush_window_deliveries()
+        on_window_close.assert_called_once_with(("k", window_range), 42)
+
+    @pytest.mark.asyncio
+    async def test_late_record_points_at_original_delivery(self, *, app, table):
+        on_window_late = table._on_window_late = AsyncMock(name="on_window_late")
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        # window closed long ago: beyond the correctable period
+        ts = now - 1000.0
+        window_range = table.window.current(ts)
+        table._partition_last_closed_window[0] = window_range[0]
+
+        event = self._event(app, partition=0, offset=7)
+        with self._current_event(event):
+            table._apply_window_op(operator.add, "k", 5, ts)
+
+        # the expired window is not recreated
+        assert ("k", window_range) not in table.data
+
+        await table._flush_window_deliveries()
+
+        # one late record, pointing at the original delivery
+        on_window_late.assert_called_once_with(("k", window_range), 5)
+
+        # the same correction does not produce a second late record
+        with self._current_event(event):
+            table._apply_window_op(operator.add, "k", 5, ts)
+        await table._flush_window_deliveries()
+        on_window_late.assert_called_once_with(("k", window_range), 5)
+
+    @pytest.mark.asyncio
+    async def test_late_record_reports_latest_value_of_correction(
+        self, *, app, table
+    ):
+        on_window_late = table._on_window_late = AsyncMock(name="on_window_late")
+        table.window = TumblingWindow(60.0, expires=300.0)
+        now = time.time()
+        ts = now - 1000.0
+        window_range = table.window.current(ts)
+        table._partition_last_closed_window[0] = window_range[0]
+
+        event = self._event(app, partition=0, offset=8)
+        with self._current_event(event):
+            table._apply_window_op(operator.sub, "k", 10, ts)
+            table._apply_window_op(operator.add, "k", 12, ts)
+
+        await table._flush_window_deliveries()
+        on_window_late.assert_called_once_with(("k", window_range), 12)
+
+    @pytest.mark.asyncio
+    async def test_on_window_late__default(self, *, table):
+        assert table._on_window_late is None
+        await table.on_window_late(("boo", (1.1, 1.4)), "BOO")
+
+    @pytest.mark.asyncio
+    async def test_window_close_progress_is_per_partition(self, *, app, table):
+        on_window_close = table._on_window_close = AsyncMock(name="on_window_close")
+        table.window = Mock(name="window")
+        table._window_ranges = Mock(name="_window_ranges", return_value=[])
+        table._data = {
+            ("boo", (1.1, 1.4)): "BOO",
+            ("zoo", (1.1, 1.4)): "ZOO",
+        }
+        # partition 1 (line B) closes the period first; partition 0
+        # (line A) must still deliver its own keys for the same window.
+        table._partition_timestamps = {1: [1.4], 0: [1.4]}
+        table._partition_timestamp_keys = {
+            (1, 1.4): [("zoo", (1.1, 1.4))],
+            (0, 1.4): [("boo", (1.1, 1.4))],
+        }
+        table.window.stale = Mock(name="stale", return_value=True)
+
+        await table._del_old_keys()
+
+        on_window_close.assert_has_calls(
+            [
+                call.__bool__(),
+                call(("zoo", (1.1, 1.4)), "ZOO"),
+                call.__bool__(),
+                call(("boo", (1.1, 1.4)), "BOO"),
+            ]
+        )
+        assert table._partition_last_closed_window[0] == 1.1
+        assert table._partition_last_closed_window[1] == 1.1
+        assert table.last_closed_window == 1.1

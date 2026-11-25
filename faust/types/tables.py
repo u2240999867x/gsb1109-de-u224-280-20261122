@@ -54,6 +54,7 @@ __all__ = [
     "GlobalTableT",
     "TableManagerT",
     "WindowCloseCallback",
+    "WindowLateCallback",
     "WindowSetT",
     "WindowedItemsViewT",
     "WindowedValuesViewT",
@@ -66,6 +67,7 @@ RelativeHandler = Callable[[Optional[EventT]], Union[float, datetime]]
 RecoverCallback = Callable[[], Awaitable[None]]
 ChangelogEventCallback = Callable[[EventT], Awaitable[None]]
 WindowCloseCallback = Callable[[Any, Any], Union[None, Awaitable[None]]]
+WindowLateCallback = Callable[[Any, Any], Union[None, Awaitable[None]]]
 RelativeArg = Optional[
     Union[
         _FieldDescriptorT,
@@ -122,6 +124,7 @@ class CollectionT(ServiceT, JoinableT):
         options: Optional[Mapping[str, Any]] = None,
         use_partitioner: bool = False,
         on_window_close: Optional[WindowCloseCallback] = None,
+        on_window_late: Optional[WindowLateCallback] = None,
         **kwargs: Any,
     ) -> None: ...
 
@@ -165,6 +168,9 @@ class CollectionT(ServiceT, JoinableT):
 
     @abc.abstractmethod
     async def on_window_close(self, key: Any, value: Any) -> None: ...
+
+    @abc.abstractmethod
+    async def on_window_late(self, key: Any, value: Any) -> None: ...
 
     @abc.abstractmethod
     async def on_rebalance(

@@ -395,6 +395,50 @@ You can override this default behavior when accessing data in the table:
   latest window for a given timestamp and we have no way of modifying this
   behavior.
 
+.. _windowed-table-late:
+
+Window close, corrections and late records
+------------------------------------------
+
+A windowed table using ``expires`` delivers every window once it closes,
+through the ``on_window_close`` callback.  Closing progresses independently
+per partition, so one partition closing a time range never suppresses the
+same window's delivery on another partition.
+
+Writes arriving after a window was delivered are handled according to the
+window's correctable period:
+
+- If the window is closed but still within ``expires``, the write is applied
+  as a *correction*: the stored window is updated (for example the old
+  reading is retracted and the new one recorded) and the window is
+  re-delivered through ``on_window_close`` exactly once per correction,
+  carrying the corrected value.
+
+- If the window is closed and past ``expires``, the write can no longer be
+  applied.  Instead the ``on_window_late`` callback receives a late record
+  whose key is the ``(key, window_range)`` tuple of the original delivery,
+  and whose value is the late value that could not be applied.
+
+.. sourcecode:: python
+
+    async def publish(key, value):
+        ...
+
+    async def report_late(key, value):
+        ...
+
+    views = app.Table(
+        'views',
+        default=int,
+        on_window_close=publish,
+        on_window_late=report_late,
+    ).tumbling(timedelta(minutes=5), expires=timedelta(hours=1))
+
+Corrections are identified by the coordinates (topic, partition, offset) of
+the event being processed, and recorded in the table changelog.  When the
+table is reopened and the same correction is received again, it is not
+applied twice: the version the window already published is kept.
+
 .. _windowed-table-iter:
 
 Iterating over keys/values/items in a windowed table.

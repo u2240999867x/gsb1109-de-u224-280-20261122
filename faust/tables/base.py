@@ -1,6 +1,7 @@
 """Base class Collection for Table and future data structures."""
 
 import abc
+import asyncio
 import time
 from collections import defaultdict
 from contextlib import suppress
@@ -52,12 +53,22 @@ from faust.types.tables import (
     RecoverCallback,
     RelativeHandler,
     WindowCloseCallback,
+    WindowLateCallback,
 )
 from faust.types.windows import WindowRange, WindowT
 
 __all__ = ["Collection"]
 
 TABLE_CLEANING = "CLEANING"
+
+#: Prefix used for the changelog-backed markers recording that a
+#: correction (identified by the correction event's message coordinates)
+#: has already been applied to a closed window.
+_CORRECTION_MARKER_KEY = "__faust_correction__"
+
+#: Kinds of pending window deliveries.
+_WINDOW_DELIVERY_CORRECTION = "correction"
+_WINDOW_DELIVERY_LATE = "late"
 
 E_SOURCE_PARTITIONS_MISMATCH = """\
 The source topic {source_topic!r} for table {table_name!r}
@@ -79,6 +90,7 @@ class Collection(Service, CollectionT):
     ]
     _partition_timestamps: MutableMapping[int, List[float]]
     _partition_latest_timestamp: MutableMapping[int, float]
+    _partition_last_closed_window: MutableMapping[Any, float]
     _recover_callbacks: MutableSet[RecoverCallback]
     _data: Optional[StoreT] = None
     _changelog_compacting: Optional[bool] = True
@@ -123,6 +135,7 @@ class Collection(Service, CollectionT):
         options: Optional[Mapping[str, Any]] = None,
         use_partitioner: bool = False,
         on_window_close: Optional[WindowCloseCallback] = None,
+        on_window_late: Optional[WindowLateCallback] = None,
         is_global: bool = False,
         synchronize_all_active_partitions: bool = False,
         **kwargs: Any,
@@ -149,6 +162,7 @@ class Collection(Service, CollectionT):
         self.standby_buffer_size = standby_buffer_size or recovery_buffer_size
         self.use_partitioner = use_partitioner
         self._on_window_close = on_window_close
+        self._on_window_late = on_window_late
         self.last_closed_window = 0.0
         self.is_global = is_global
         self.synchronize_all_active_partitions = synchronize_all_active_partitions
@@ -168,6 +182,17 @@ class Collection(Service, CollectionT):
         self._partition_timestamp_keys = defaultdict(set)
         self._partition_timestamps = defaultdict(list)
         self._partition_latest_timestamp = defaultdict(int)
+
+        # Window close progress is tracked per partition: each partition's
+        # stream time advances independently, so one partition closing a
+        # window must not suppress the same window's delivery on another.
+        self._partition_last_closed_window = defaultdict(float)
+
+        # Late/correction deliveries pending for closed windows, and the
+        # changelog-restorable record of corrections already applied.
+        self._pending_window_deliveries: Set[Tuple] = set()
+        self._pending_late_values: Dict[Tuple, Any] = {}
+        self._window_delivery_queue: asyncio.Queue = asyncio.Queue()
 
         self._recover_callbacks = set(recover_callbacks or [])
         if on_recover:
@@ -217,6 +242,31 @@ class Collection(Service, CollectionT):
         if self._data is None:
             self._data = self._new_store()
         return self._data
+
+    @property
+    def last_closed_window(self) -> float:
+        """Highest window start closed so far, across all partitions.
+
+        Closing progress is tracked per partition in
+        ``_partition_last_closed_window``; this is the global maximum,
+        kept for reporting and backward compatibility.  Assigning to it
+        sets a manual floor that suppresses delivery of older windows on
+        every partition.
+        """
+        return max(
+            [self._last_closed_window, *self._partition_last_closed_window.values()]
+        )
+
+    @last_closed_window.setter
+    def last_closed_window(self, value: float) -> None:
+        self._last_closed_window = value
+
+    def _closed_window_watermark(self, partition: Any) -> float:
+        """Return the close watermark in effect for a single partition."""
+        return max(
+            self._last_closed_window,
+            self._partition_last_closed_window[partition],
+        )
 
     async def on_start(self) -> None:
         """Call when table starts."""
@@ -412,6 +462,7 @@ class Collection(Service, CollectionT):
                 )
                 window_data: Dict[Any, List[Any]] = {}
                 if keys_to_remove:
+                    closed_before = self._closed_window_watermark(partition)
                     for windows in triggered_windows:
                         if windows:
                             for processed_window in windows:
@@ -426,7 +477,7 @@ class Collection(Service, CollectionT):
 
                     for key_to_remove in keys_to_remove:
                         value = self.data.pop(key_to_remove, None)
-                        if key_to_remove[1][0] > self.last_closed_window:
+                        if key_to_remove[1][0] > closed_before:
                             await self.on_window_close(
                                 key_to_remove,
                                 (
@@ -435,14 +486,156 @@ class Collection(Service, CollectionT):
                                     else value
                                 ),
                             )
-                    self.last_closed_window = max(
-                        self.last_closed_window,
+                    self._partition_last_closed_window[partition] = max(
+                        self._partition_last_closed_window[partition],
                         max(key[1][0] for key in keys_to_remove),
                     )
 
     async def on_window_close(self, key: Any, value: Any) -> None:
+        """Call when a window is closed, with the key and final value."""
         if self._on_window_close:
             await maybe_async(self._on_window_close(key, value))
+
+    async def on_window_late(self, key: Any, value: Any) -> None:
+        """Call when a write arrives for a window that is closed and expired.
+
+        The window can no longer be corrected, so the write is not applied.
+        Instead this callback receives a late record: ``key`` is the
+        ``(key, window_range)`` tuple identifying the original window
+        delivery the record belongs to, and ``value`` is the late value
+        that could not be applied.
+        """
+        if self._on_window_late:
+            await maybe_async(self._on_window_late(key, value))
+
+    @staticmethod
+    def _correction_id(event: Optional[EventT]) -> Optional[Tuple]:
+        """Identify a correction by the coordinates of its message."""
+        if event is None:
+            return None
+        message = event.message
+        return (message.topic, message.partition, message.offset)
+
+    def _correction_marker(
+        self, key: Any, window_range: WindowRange, correction_id: Tuple
+    ) -> Tuple:
+        # The marker lives in the table store and travels through the
+        # changelog, so it survives recovery: after the table is reopened
+        # the same correction is recognized and not applied twice.
+        topic, partition, offset = correction_id
+        return (
+            _CORRECTION_MARKER_KEY,
+            (topic, partition, offset, key, window_range),
+        )
+
+    def _correction_already_applied(
+        self, key: Any, window_range: WindowRange, event: Optional[EventT]
+    ) -> bool:
+        correction_id = self._correction_id(event)
+        if correction_id is None:
+            return False
+        return self._correction_marker(key, window_range, correction_id) in self.data
+
+    def _persist_correction_marker(
+        self, key: Any, window_range: WindowRange, correction_id: Tuple
+    ) -> None:
+        marker = self._correction_marker(key, window_range, correction_id)
+        self.data[marker] = True
+        self.send_changelog(correction_id[1], marker, True)
+
+    def _prepare_window_write(
+        self, key: Any, window_range: WindowRange, value: Any
+    ) -> bool:
+        """Classify a windowed write and apply late/correction policy.
+
+        Returns :const:`True` when the write should go to the store.
+
+        Writes to windows that are still open proceed unchanged.  Writes
+        to a window that was already delivered but is still within its
+        correctable period are applied and the window is re-delivered
+        exactly once per correction.  Writes to a window past its
+        correctable period are dropped and emitted as a late record
+        pointing at the original delivery.
+        """
+        window = self.window
+        if window is None or not window.expires:
+            return True
+        event = current_event()
+        partition = event.message.partition if event is not None else None
+        if window_range[0] > self._closed_window_watermark(partition):
+            # window has not been delivered yet: normal write.
+            return True
+        if self._correction_already_applied(key, window_range, event):
+            # same correction seen again (e.g. replayed after recovery):
+            # keep the version this window already published.
+            return False
+        if window.stale(window_range[1], time.time()):
+            # window delivered and beyond the correctable period.
+            self._queue_late_record(key, window_range, value, event)
+            return False
+        # window delivered but still correctable: apply and re-deliver.
+        self._queue_window_correction(key, window_range, event)
+        return True
+
+    def _enqueue_window_delivery(self, token: Tuple) -> None:
+        if token not in self._pending_window_deliveries:
+            self._pending_window_deliveries.add(token)
+            self._window_delivery_queue.put_nowait(token)
+
+    def _queue_window_correction(
+        self, key: Any, window_range: WindowRange, event: Optional[EventT]
+    ) -> None:
+        self._enqueue_window_delivery(
+            (
+                _WINDOW_DELIVERY_CORRECTION,
+                key,
+                window_range,
+                self._correction_id(event),
+            )
+        )
+
+    def _queue_late_record(
+        self, key: Any, window_range: WindowRange, value: Any, event: Optional[EventT]
+    ) -> None:
+        token = (
+            _WINDOW_DELIVERY_LATE,
+            key,
+            window_range,
+            self._correction_id(event),
+        )
+        # if several writes of the same correction target the same expired
+        # window, the latest value is the one reported.
+        self._pending_late_values[token] = value
+        self._enqueue_window_delivery(token)
+
+    async def _deliver_window_token(self, token: Tuple) -> None:
+        kind, key, window_range, correction_id = token
+        if kind == _WINDOW_DELIVERY_LATE:
+            value = self._pending_late_values.pop(token, None)
+            await self.on_window_late((key, window_range), value)
+        else:
+            await self.on_window_close(
+                (key, window_range), self.data.get((key, window_range))
+            )
+        if correction_id is not None:
+            self._persist_correction_marker(key, window_range, correction_id)
+
+    async def _flush_window_deliveries(self) -> None:
+        """Deliver all pending window corrections and late records."""
+        while True:
+            try:
+                token = self._window_delivery_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._pending_window_deliveries.discard(token)
+            await self._deliver_window_token(token)
+
+    @Service.task
+    async def _window_delivery_worker(self) -> None:
+        while True:
+            token = await self._window_delivery_queue.get()
+            self._pending_window_deliveries.discard(token)
+            await self._deliver_window_token(token)
 
     def _should_expire_keys(self) -> bool:
         window = self.window
@@ -557,15 +750,18 @@ class Collection(Service, CollectionT):
         get_ = self._get_key
         set_ = self._set_key
         for window_range in self._window_ranges(timestamp):
-            set_((key, window_range), op(get_((key, window_range)), value))
+            if self._prepare_window_write(key, window_range, value):
+                set_((key, window_range), op(get_((key, window_range)), value))
 
     def _set_windowed(self, key: Any, value: Any, timestamp: float) -> None:
         for window_range in self._window_ranges(timestamp):
-            self._set_key((key, window_range), value)
+            if self._prepare_window_write(key, window_range, value):
+                self._set_key((key, window_range), value)
 
     def _del_windowed(self, key: Any, timestamp: float) -> None:
         for window_range in self._window_ranges(timestamp):
-            self._del_key((key, window_range))
+            if self._prepare_window_write(key, window_range, None):
+                self._del_key((key, window_range))
 
     def _window_ranges(self, timestamp: float) -> Iterator[WindowRange]:
         window = cast(WindowT, self.window)
@@ -683,8 +879,9 @@ class Collection(Service, CollectionT):
     def _to_key(self, k: Any) -> Any:
         if isinstance(k, list):
             # Lists are not hashable, and windowed-keys are json
-            # serialized into a list.
-            return tuple(tuple(v) if isinstance(v, list) else v for v in k)
+            # serialized into a list.  Convert recursively so nested
+            # tuple keys (e.g. correction markers) are restored too.
+            return tuple(self._to_key(v) for v in k)
         return k
 
     def _to_value(self, v: Any) -> Any:

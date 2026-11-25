@@ -14,6 +14,20 @@ resumes the Keep a Changelog format.
 ## [Unreleased]
 
 ### Added
+- Windowed tables now deliver the effect of late corrections. A write whose
+  timestamp falls in a window that was already delivered (`on_window_close`
+  fired) but is still within `expires` is applied to the stored window and
+  the window is re-delivered exactly once per correction, with the corrected
+  value. A write to a window that is closed *and* past `expires` is not
+  applied; instead the new `on_window_late` callback receives a late record
+  whose key is the `(key, window_range)` of the original delivery.
+  Corrections are identified by the coordinates (topic, partition, offset)
+  of the event being processed and recorded in the changelog, so after the
+  table is reopened the same correction is recognized and the already
+  published version is kept instead of being corrected twice. Window close
+  progress is now tracked per partition, so one partition closing a time
+  range no longer suppresses the same window's delivery on another
+  partition; `last_closed_window` still reports the global maximum.
 - Per-endpoint feature flags for the built-in web endpoints:
   `web_stats_enabled`, `web_graph_enabled`, `web_router_enabled`,
   `web_tables_enabled` and `web_metrics_enabled`. Previously `debug` was the
