@@ -10,6 +10,16 @@ New features:
 * Introduce ``ProducerListener`` in ``aiokafka.listeners`` and allow multiple
   producer event listeners through ``listeners=[...]``. Preserve batch callback
   arguments and synchronous delivery (pr #1213 by @Gleb-Shipilov).
+* Add the optional ``consumer_record_error_handler`` consumer argument. When
+  enabled, a key/value deserialization failure on one record no longer raises
+  out of ``getone``/``getmany`` or drops the good records following it in the
+  same fetched batch. The bad record is returned as an
+  ``aiokafka.consumer.records.RecordDecodeFailure`` report carrying its
+  partition, offset, raw key/value and whether the key or value failed, and
+  can be explicitly retried (re-decoding only the failed part) or skipped
+  using the batch already in memory, without a broker refetch. Batch-level CRC
+  corruption still raises ``CorruptRecordException`` and has no per-record
+  skip entry.
 
 Bugfixes:
 

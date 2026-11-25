@@ -224,6 +224,23 @@ class AIOKafkaConsumer:
             ``replica.selector.class`` such as ``RackAwareReplicaSelector``),
             the consumer will fetch from the closest in-sync replica
             instead of the leader (KIP-392). Default: ``None`` (disabled).
+        consumer_record_error_handler (bool or callable, optional): When
+            truthy, a failure of ``key_deserializer`` or
+            ``value_deserializer`` on a single record no longer raises out of
+            :meth:`.getone`/:meth:`.getmany` and the good records following
+            it in the same fetched batch are preserved. The bad record is
+            returned as a
+            :class:`~aiokafka.consumer.records.RecordDecodeFailure` carrying
+            its partition, offset, raw key/value and whether the key or the
+            value failed to decode. The report must be resolved with an
+            explicit ``await report.retry()`` (re-decode only the failed
+            part) or ``await report.skip()`` before that partition can
+            advance. A callable is invoked with each new failure report.
+            Default: ``None`` - legacy behavior where the error is raised
+            and the whole batch has to be refetched. Note that batch-level
+            CRC corruption still raises
+            :class:`~aiokafka.errors.CorruptRecordException` and has no
+            per-record skip entry.
 
     Note:
         Many configuration parameters are taken from Java Client:
@@ -276,6 +293,7 @@ class AIOKafkaConsumer:
         sasl_oauth_token_provider=None,
         client_rack=None,
         receive_message_max_bytes=DEFAULT_RECEIVE_MESSAGE_MAX_BYTES,
+        consumer_record_error_handler=None,
     ):
         if loop is None:
             loop = get_running_loop()
@@ -345,6 +363,7 @@ class AIOKafkaConsumer:
         self._rebalance_timeout_ms = rebalance_timeout_ms
         self._max_poll_interval_ms = max_poll_interval_ms
         self._client_rack = client_rack
+        self._consumer_record_error_handler = consumer_record_error_handler
 
         self._check_crcs = check_crcs
         self._subscription = SubscriptionState(loop=loop)
@@ -405,6 +424,7 @@ class AIOKafkaConsumer:
             auto_offset_reset=self._auto_offset_reset,
             isolation_level=self._isolation_level,
             client_rack=self._client_rack,
+            record_error_handler=self._consumer_record_error_handler,
         )
 
         if self._group_id is not None:

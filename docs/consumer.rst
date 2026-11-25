@@ -41,6 +41,66 @@ cluster. It also interacts with the broker to allow groups of consumers to load
 balance consumption using :ref:`Consumer Groups <consumer-groups>`.
 
 
+.. _consumer-deserialization-failures:
+
+Handling records that fail to deserialize
+-----------------------------------------
+
+By default an exception raised by ``key_deserializer`` or
+``value_deserializer`` propagates out of :meth:`~.AIOKafkaConsumer.getone`
+and :meth:`~.AIOKafkaConsumer.getmany`; the remaining good records of the
+fetched batch are lost and have to be fetched from the broker again.
+
+Pass ``consumer_record_error_handler=True`` to opt into per-record failure
+handling instead. The good records keep flowing through the same
+``getone``/``getmany`` calls in their usual format, and a record whose key or
+value cannot be decoded is returned as a
+:class:`~aiokafka.consumer.records.RecordDecodeFailure` report. The report
+exposes the ``topic``/``partition``, ``offset``, the raw ``raw_key`` and
+``raw_value`` bytes, the ``failed_part`` (``"key"`` or ``"value"``) and the
+original ``exception``. The partition position stays parked on that record
+until the report is resolved::
+
+    consumer = AIOKafkaConsumer(
+        "archive",
+        bootstrap_servers="localhost:9092",
+        key_deserializer=decode_key,
+        value_deserializer=decode_value,
+        consumer_record_error_handler=True,
+    )
+
+    batch = await consumer.getmany()
+    for tp, records in batch.items():
+        for item in records:
+            if isinstance(item, RecordDecodeFailure):
+                if can_fix_now(item):
+                    # Re-runs only the failed deserializer using the
+                    # deserializers currently configured on the consumer.
+                    record = await item.retry()
+                else:
+                    # Drop the record and advance past its offset.
+                    await item.skip()
+            else:
+                await archive(item)
+
+Notes:
+
+* A report is single use and bound to one specific record. Retrying or
+  skipping an already resolved report raises ``IllegalStateError``; a record
+  can only be skipped through its own report.
+* A failed :meth:`~aiokafka.consumer.records.RecordDecodeFailure.retry`
+  keeps the report valid, so it can be retried later (for example after
+  reloading a dictionary). Only the failed part is decoded again; the other
+  part is reused as decoded during the original pass.
+* Retry and skip operate on the batch already received from the broker - no
+  re-fetch is performed and records already delivered are never decoded
+  twice. Other partitions, including paused ones, keep working normally.
+* Batch-level CRC corruption is different: it continues to raise
+  :class:`~aiokafka.errors.CorruptRecordException` and has no per-record
+  skip entry, because individual records of a corrupt batch cannot be
+  trusted.
+
+
 .. _offset_and_position:
 
 Offsets and Consumer Position

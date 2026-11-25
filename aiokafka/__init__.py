@@ -2,7 +2,7 @@ __version__ = "0.15.0"
 
 from .abc import ConsumerRebalanceListener
 from .client import AIOKafkaClient
-from .consumer import AIOKafkaConsumer
+from .consumer import AIOKafkaConsumer, RecordDecodeFailure
 from .errors import ConsumerStoppedError, IllegalOperation
 from .listeners import ProducerListener
 from .producer import AIOKafkaProducer
@@ -30,4 +30,6 @@ __all__ = [  # noqa: RUF022
     "TopicPartition",
     "OffsetAndTimestamp",
     "OffsetAndMetadata",
+    # Decode failure reports
+    "RecordDecodeFailure",
 ]

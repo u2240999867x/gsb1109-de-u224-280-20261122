@@ -23,6 +23,13 @@ Consumer class
     :members:
 
 
+Consumer decode failure reports
+-------------------------------
+
+.. autoclass:: aiokafka.consumer.records.RecordDecodeFailure
+    :members:
+
+
 Helpers
 -------
 

@@ -6,13 +6,20 @@ import time
 from itertools import chain
 
 import aiokafka.errors as Errors
-from aiokafka.errors import ConsumerStoppedError, KafkaTimeoutError, RecordTooLargeError
+from aiokafka.errors import (
+    ConsumerStoppedError,
+    IllegalStateError,
+    KafkaTimeoutError,
+    RecordTooLargeError,
+)
 from aiokafka.protocol.fetch import FetchRequest
 from aiokafka.protocol.offset import OffsetRequest
 from aiokafka.record.control_record import ABORT_MARKER, ControlRecord
 from aiokafka.record.memory_records import MemoryRecords
 from aiokafka.structs import ConsumerRecord, OffsetAndTimestamp, TopicPartition
 from aiokafka.util import cancel_and_wait, create_future, create_task
+
+from .records import KEY, VALUE, RecordDecodeFailure
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +70,9 @@ class FetchResult:
 
         self._assignment = assignment
 
+        # A RecordDecodeFailure currently parked, waiting for retry/skip
+        self._held_failure = None
+
     def calculate_backoff(self):
         lifetime = time.monotonic() - self._created
         if lifetime < self._backoff:
@@ -78,10 +88,12 @@ class FetchResult:
         # so we should double check that position did not change between each
         # result yielding.
         return_result = True
+        paused = False
         if assignment.active:
             tp = self._topic_partition
             tp_state = assignment.state_value(tp)
             if tp_state.paused:
+                paused = True
                 return_result = False
             else:
                 position = tp_state.position
@@ -98,6 +110,13 @@ class FetchResult:
                 " since it is no fetchable (unassigned or paused)",
                 tp,
             )
+            if paused:
+                # A paused partition keeps its buffered batch (and any held
+                # decode failure) so resuming continues with the same data
+                # instead of refetching it from the broker.
+                return False
+            # An inactive assignment or a seek past the buffer invalidates
+            # the fetched data.
             self._partition_records = None
             return False
         return True
@@ -110,8 +129,17 @@ class FetchResult:
         tp = self._topic_partition
         if not self.check_assignment(tp) or not self.has_more():
             return None
+        if self._held_failure is not None:
+            # The parked bad record can only move through its own report
+            return self._held_failure
 
         msg = next(self._partition_records, None)
+        if isinstance(msg, RecordDecodeFailure):
+            # The bad record is held until the user retries or skips it via
+            # the report. Position is parked on that record's offset.
+            self._held_failure = msg
+            self._update_position()
+            return msg
         # We should update position in any case
         self._update_position()
         if msg is None:
@@ -122,18 +150,45 @@ class FetchResult:
         tp = self._topic_partition
         if not self.check_assignment(tp) or not self.has_more():
             return []
+        if self._held_failure is not None:
+            return [self._held_failure]
 
         ret_list = []
+        exhausted = False
         for msg in self._partition_records:
+            if isinstance(msg, RecordDecodeFailure):
+                # Stop the batch at the bad record and surface its report.
+                # It stays held until the user explicitly retries or skips
+                # it; following good records keep their place in the same
+                # fetched buffer and are never refetched.
+                self._held_failure = msg
+                ret_list.append(msg)
+                break
             ret_list.append(msg)
             if max_records is not None and len(ret_list) >= max_records:
-                self._update_position()
                 break
         else:
-            self._update_position()
-            self._partition_records = None
+            exhausted = True
 
+        self._update_position()
+        if exhausted:
+            self._partition_records = None
         return ret_list
+
+    @property
+    def held_failure(self):
+        return self._held_failure
+
+    @property
+    def is_paused(self):
+        assignment = self._assignment
+        if not assignment.active:
+            return False
+        return assignment.state_value(self._topic_partition).paused
+
+    def clear_held_failure(self):
+        # Called by PartitionRecords once retry/skip consumed the held report
+        self._held_failure = None
 
     def has_more(self):
         return self._partition_records is not None
@@ -173,6 +228,8 @@ class PartitionRecords:
         value_deserializer,
         check_crcs,
         isolation_level,
+        record_error_handler=None,
+        failure_resolver=None,
     ):
         self._tp = tp
         self._records = records
@@ -184,6 +241,12 @@ class PartitionRecords:
         self._value_deserializer = value_deserializer
         self._check_crcs = check_crcs
         self._isolation_level = isolation_level
+        # Truthy enables per-record failure reports instead of raising out of
+        # the whole batch. A callable is notified about every new report.
+        self._record_error_handler = record_error_handler
+        # Async callable provided by the Fetcher to wire a report's
+        # retry/skip back to position bookkeeping.
+        self._failure_resolver = failure_resolver
 
         # Even without consuming any records we may need to force position to
         # a next offset. In cases like aborted transactions, control batches,
@@ -191,6 +254,10 @@ class PartitionRecords:
         self.next_fetch_offset = fetch_offset
 
         self._records_iterator = self._unpack_records()
+
+        # State of the bad record that is currently waiting for retry/skip
+        self._held = None
+        self._held_report = None
 
     def __iter__(self):
         return self
@@ -213,6 +280,7 @@ class PartitionRecords:
             if self._check_crcs and not next_batch.validate_crc():
                 # This iterator will be closed after the exception, so we don't
                 # try to drain other batches here. They will be refetched.
+                # CRC failures are batch-level and have no per-record skip.
                 raise Errors.CorruptRecordException(f"Invalid CRC - {tp}")
 
             if (
@@ -256,8 +324,12 @@ class PartitionRecords:
                 if record.offset < self.next_fetch_offset:
                     # Probably just a compressed messageset, it's ok to skip.
                     continue
-                consumer_record = self._consumer_record(tp, record)
-                self.next_fetch_offset = record.offset + 1
+                # Park the position on the record before decoding so a
+                # deserialization failure leaves position pointing at it.
+                self.next_fetch_offset = record.offset
+                consumer_record = self._decode_record(tp, record)
+                if isinstance(consumer_record, ConsumerRecord):
+                    self.next_fetch_offset = record.offset + 1
                 yield consumer_record
 
             # Message format v2 preserves the last offset in a batch even if
@@ -292,19 +364,9 @@ class PartitionRecords:
             ) from None
         return ControlRecord.parse(control_record.key) == ABORT_MARKER
 
-    def _consumer_record(self, tp, record):
+    def _build_consumer_record(self, tp, record, key, value):
         key_size = len(record.key) if record.key is not None else -1
         value_size = len(record.value) if record.value is not None else -1
-
-        if self._key_deserializer:
-            key = self._key_deserializer(record.key)
-        else:
-            key = record.key
-        if self._value_deserializer:
-            value = self._value_deserializer(record.value)
-        else:
-            value = record.value
-
         return ConsumerRecord(
             tp.topic,
             tp.partition,
@@ -318,6 +380,113 @@ class PartitionRecords:
             value_size,
             tuple(record.headers),
         )
+
+    def _decode_record(self, tp, record):
+        key = record.key
+        decoded_key = _NOT_DECODED
+        try:
+            if self._key_deserializer:
+                key = self._key_deserializer(record.key)
+            decoded_key = key
+        except Exception as exc:
+            if not self._record_error_handler:
+                raise
+            return self._report_failure(tp, record, KEY, exc, decoded_key)
+
+        value = record.value
+        try:
+            if self._value_deserializer:
+                value = self._value_deserializer(record.value)
+        except Exception as exc:
+            if not self._record_error_handler:
+                raise
+            return self._report_failure(tp, record, VALUE, exc, decoded_key)
+
+        return self._build_consumer_record(tp, record, key, value)
+
+    def _report_failure(self, tp, record, failed_part, exc, decoded_key):
+        self._held = {
+            "record": record,
+            "failed_part": failed_part,
+            "decoded_key": decoded_key,
+        }
+
+        async def resume(retry, owner=self):
+            return await owner._failure_resolver(owner, report, retry)
+
+        report = RecordDecodeFailure(
+            tp,
+            record.offset,
+            failed_part,
+            record.key,
+            record.value,
+            exc,
+            resume,
+        )
+        self._held_report = report
+        if callable(self._record_error_handler):
+            self._record_error_handler(report)
+        return report
+
+    async def resolve_failure(self, report, retry):
+        """Retry or skip the currently held bad record.
+
+        Called by the Fetcher through the report bound to this batch.
+        """
+        if self._held is None or report is not self._held_report:
+            raise IllegalStateError(
+                "This decode failure report has already been resolved or is "
+                "no longer valid"
+            )
+        held = self._held
+        record = held["record"]
+
+        if not retry:
+            self._held = None
+            self._held_report = None
+            # Skip: move past the record. The unpack generator stays parked
+            # at the failure yield and will continue with the following
+            # record on the next iteration - no broker re-fetch happens.
+            self.next_fetch_offset = record.offset + 1
+            return None
+
+        consumer_record = self._redecode_held(self._tp, held)
+        self._held = None
+        self._held_report = None
+        self.next_fetch_offset = record.offset + 1
+        return consumer_record
+
+    def _redecode_held(self, tp, held):
+        record = held["record"]
+        if held["failed_part"] == KEY:
+            # The value deserializer never ran for this record
+            key = (
+                self._key_deserializer(record.key)
+                if self._key_deserializer
+                else record.key
+            )
+            value = (
+                self._value_deserializer(record.value)
+                if self._value_deserializer
+                else record.value
+            )
+        else:
+            # Reuse the key decoded during the original attempt; only the
+            # value deserializer is invoked again.
+            key = held["decoded_key"]
+            value = (
+                self._value_deserializer(record.value)
+                if self._value_deserializer
+                else record.value
+            )
+        return self._build_consumer_record(tp, record, key, value)
+
+    @property
+    def held_report(self):
+        return self._held_report
+
+
+_NOT_DECODED = object()
 
 
 class Fetcher:
@@ -374,6 +543,15 @@ class Fetcher:
         client_rack (str): A rack identifier for this client. This is sent to
             the broker on FetchRequest v11+ to enable rack-aware fetching
             from the closest replica (KIP-392). Default: ``None`` (disabled).
+        record_error_handler (bool or callable, optional): Enables per-record
+            deserialization failure reports. When truthy a deserializer
+            failure no longer raises out of ``getone``/``getmany`` and does
+            not drop the remaining good records of the fetched batch: the
+            bad record is returned as a
+            :class:`~aiokafka.consumer.records.RecordDecodeFailure` that can
+            be explicitly retried or skipped. A callable is invoked with
+            every new failure report. Default: ``None`` (legacy behavior:
+            the error is raised and the batch has to be refetched).
     """
 
     def __init__(
@@ -394,6 +572,7 @@ class Fetcher:
         auto_offset_reset="latest",
         isolation_level="read_uncommitted",
         client_rack=None,
+        record_error_handler=None,
     ):
         self._client = client
         self._loop = client._loop
@@ -410,6 +589,7 @@ class Fetcher:
         self._subscriptions = subscriptions
         self._default_reset_strategy = OffsetResetStrategy.from_str(auto_offset_reset)
         self._client_rack = client_rack
+        self._record_error_handler = record_error_handler
         # KIP-392: cache of preferred read replica per partition.
         # tp -> (node_id, expires_at_monotonic)
         self._preferred_read_replica: dict[TopicPartition, tuple[int, float]] = {}
@@ -837,6 +1017,8 @@ class Fetcher:
                             self._value_deserializer,
                             self._check_crcs,
                             self._isolation_level,
+                            record_error_handler=self._record_error_handler,
+                            failure_resolver=self._resolve_failure,
                         )
 
                         self._records[tp] = FetchResult(
@@ -1151,6 +1333,21 @@ class Fetcher:
                     raise error_type(partition)
         return res_offsets
 
+    async def _resolve_failure(self, partition_records, report, retry):
+        """Wire a RecordDecodeFailure retry/skip to position bookkeeping.
+
+        The retry/skip itself is handled by the ``PartitionRecords`` using
+        the batch already in memory - no broker re-fetch is performed.
+        """
+        result = await partition_records.resolve_failure(report, retry)
+        fetch_result = self._records.get(partition_records._tp)
+        if fetch_result is not None:
+            fetch_result.clear_held_failure()
+            # Position follows the resolved record: retry delivers it, skip
+            # advances past it.
+            fetch_result._update_position()
+        return result
+
     async def next_record(self, partitions):
         """Return one fetched records
 
@@ -1178,6 +1375,16 @@ class Fetcher:
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) is FetchResult:
+                    if res_or_error.is_paused:
+                        # Paused partitions keep their buffered batch; skip
+                        # them here so other partitions can still drain.
+                        continue
+                    if res_or_error.held_failure is not None:
+                        if not partitions or tp in partitions:
+                            # The partition is blocked on this bad record;
+                            # hand its report back so it can be resolved.
+                            return res_or_error.held_failure
+                        continue
                     message = res_or_error.getone()
                     if message is None:
                         # We already processed all messages, request new ones
@@ -1214,16 +1421,28 @@ class Fetcher:
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) is FetchResult:
+                    if res_or_error.is_paused:
+                        # Paused partitions keep their buffered batch; skip
+                        # them here so other partitions can still drain.
+                        continue
+                    if res_or_error.held_failure is not None:
+                        if not partitions or tp in partitions:
+                            # Hand the parked bad record's report back so it
+                            # can be retried or skipped.
+                            drained[tp] = [res_or_error.held_failure]
+                            return drained
+                        continue
                     records = res_or_error.getall(max_records)
                     if not res_or_error.has_more():
-                        # We processed all messages - request new ones
+                        # We processed all messages - request new ones. A
+                        # held failure keeps the FetchResult in place.
                         del self._records[tp]
                         self._notify(self._wait_consume_future)
                     if not records:
                         continue
                     drained[tp] = records
                     if max_records is not None:
-                        max_records -= len(drained[tp])
+                        max_records -= len(records)
                         assert max_records >= 0  # Just in case
                         if max_records == 0:
                             break
