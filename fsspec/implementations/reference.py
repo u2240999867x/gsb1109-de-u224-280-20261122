@@ -94,20 +94,22 @@ def _protocol_groups(paths, references):
 
 class RefsValuesView(collections.abc.ValuesView):
     def __iter__(self):
-        for val in self._mapping.zmetadata.values():
-            yield json.dumps(val).encode()
-        yield from self._mapping._items.values()
-        for field in self._mapping.listdir():
-            chunk_sizes = self._mapping._get_chunk_sizes(field)
-            if len(chunk_sizes) == 0:
-                yield self._mapping[field + "/0"]
+        # Follow the mapping's iteration so keys and values stay aligned even
+        # when some chunk slots in a record have been deleted.
+        for key in self._mapping:
+            try:
+                yield self._mapping[key]
+            except KeyError:
                 continue
-            yield from self._mapping._generate_all_records(field)
 
 
 class RefsItemsView(collections.abc.ItemsView):
     def __iter__(self):
-        return zip(self._mapping.keys(), self._mapping.values())
+        for key in self._mapping:
+            try:
+                yield key, self._mapping[key]
+            except KeyError:
+                continue
 
 
 def ravel_multi_index(idx, sizes):
@@ -117,6 +119,70 @@ def ravel_multi_index(idx, sizes):
         val += i * mult
         mult *= s
     return val
+
+
+def unravel_multi_index(value, sizes):
+    """Inverse of :func:`ravel_multi_index` for a full chunk index."""
+    idx = []
+    for size in reversed(sizes):
+        idx.append(value % size)
+        value //= size
+    return tuple(reversed(idx))
+
+
+def _is_null(value):
+    """Whether a value read back from parquet represents a missing entry."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return math.isnan(value)
+    # pandas' NA/NaT scalars are not equal to themselves, but comparing them
+    # yields NA rather than a bool, so test the type name instead.
+    return type(value).__name__ in ("NAType", "NaTType")
+
+
+def _as_raw_bytes(value):
+    """Store inline reference payloads in the on-disk byte representation."""
+    if hasattr(value, "to_bytes"):
+        value = value.to_bytes()
+    if isinstance(value, str):
+        return value.encode()
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    return value
+
+
+def _chunk_index(key):
+    """Parse the dotted chunk coordinate at the end of a reference key."""
+    _, chunk = key.rsplit("/", 1)
+    try:
+        return tuple(int(c) for c in chunk.split("."))
+    except ValueError as exc:
+        raise KeyError(key) from exc
+
+
+def _within(index, grid):
+    """Whether a full chunk coordinate lies inside a chunk grid."""
+    return len(index) == len(grid) and all(i < g for i, g in zip(index, grid))
+
+
+def _grid_product(grid):
+    return math.prod(grid) if grid else 1
+
+
+def _proc_raw(value):
+    """Normalize an inline reference for the ``raw`` parquet column.
+
+    Readers decode a ``base64:`` marker themselves, so the stored bytes must be
+    the same representation an inline reference would have in a JSON index.
+    """
+    if hasattr(value, "to_bytes"):
+        value = value.to_bytes()
+    if isinstance(value, str):
+        value = value.encode()
+    if isinstance(value, (bytearray, memoryview)):
+        value = bytes(value)
+    return value
 
 
 class LazyReferenceMapper(collections.abc.MutableMapping):
@@ -192,15 +258,37 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         # This way `self` reference is not held on class level.
         # WARNING: However, this means that self and its members are not reflected
         # in the cache key, so we expect they won't be mutated once a value is cached.
-        self.listdir = lru_cache()(self.listdir)
-        self._key_to_record = lru_cache(maxsize=4096)(self._key_to_record)
+        # The listing only depends on the metadata snapshot and is cleared whenever
+        # metadata changes; chunk coordinates are intentionally *not* cached because
+        # a shape edit changes every coordinate's physical location.
+        if not hasattr(self.listdir, "cache_clear"):
+            self.listdir = lru_cache()(self.listdir)
+
+    _LAZY_ATTRS = (
+        "_items",
+        "record_size",
+        "zmetadata",
+        "_chunk_overlay",
+        "_shape_transitions",
+        "_base_grid",
+        "_grid_cache",
+    )
 
     def __getattr__(self, item):
-        if item in ("_items", "record_size", "zmetadata"):
+        if item in self._LAZY_ATTRS:
             self.setup()
             # avoid possible recursion if setup fails somehow
             return self.__dict__[item]
         raise AttributeError(item)
+
+    @staticmethod
+    def _grid_from_zarray(zarray):
+        """Logical chunk grid implied by an array's ``shape`` and ``chunks``."""
+        shape = zarray.get("shape", [])
+        chunks = zarray.get("chunks", [])
+        grid = tuple(math.ceil(s / c) for s, c in zip(shape, chunks))
+        # A scalar array has no dimensions but still has one reference (``field/0``).
+        return grid or (1,)
 
     def setup(self):
         self._items = {}
@@ -211,6 +299,26 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         self.record_size = met["record_size"]
         self.zmetadata = met["metadata"]
 
+        # The base index is immutable for the lifetime of a revision: reads of
+        # untouched keys keep resolving against the original root, while edits
+        # live in the overlay below.
+        self._base_grid = {}
+        for key, value in self.zmetadata.items():
+            if key.endswith("/.zarray"):
+                self._base_grid[key[: -len("/.zarray")]] = self._grid_from_zarray(
+                    value
+                )
+        # Overlay values are keyed by *logical* chunk coordinate, not by their
+        # position in a physical parquet record. A shape change therefore cannot
+        # move a value onto a different key.
+        self._chunk_overlay = {}
+        # Shape changes record which old coordinates were removed. This makes a
+        # shrink destructive, matching zarr resize semantics: widening the array
+        # again must not resurrect the truncated references.
+        self._shape_transitions = {}
+        self._grid_cache = {}
+        self.chunk_sizes = self._grid_cache
+
         # Define function to open and decompress refs
         @lru_cache(maxsize=self.cache_size)
         def open_refs(field, record):
@@ -218,7 +326,16 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
             path = self.url.format(field=field, record=record)
             data = io.BytesIO(self.fs.cat_file(path))
             try:
-                df = self.pd.read_parquet(data, engine=self.engine)
+                try:
+                    df = self.pd.read_parquet(data, engine=self.engine)
+                except ImportError:
+                    # The metadata does not record which parquet engine wrote
+                    # the store. If the configured engine is unavailable, the
+                    # other supported engine can still read the same files.
+                    if self.engine == "fastparquet":
+                        df = self.pd.read_parquet(data, engine="pyarrow")
+                    else:
+                        raise
                 refs = {c: df[c].to_numpy(copy=True) for c in df.columns}
             except OSError:
                 refs = None
@@ -300,6 +417,13 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
             ]
             return sorted(dirinfo + fileinfo, key=lambda s: s["name"])
         field = path
+        if not any(
+            name.startswith(f"{path}/")
+            for name in chain(self.zmetadata, self._items)
+        ) and f"{path}/.zarray" not in self.zmetadata:
+            # Not a known directory or array: preserve a KeyError so callers can
+            # fall back (ReferenceFileSystem.ls raises FileNotFoundError).
+            raise KeyError(path)
         others = set(
             [name for name in self.zmetadata if name.startswith(f"{path}/")]
             + [name for name in self._items if name.startswith(f"{path}/")]
@@ -319,13 +443,23 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         keys = self._keys_in_field(field)
 
         if detail is False:
-            return list(others) + list(keys)
-        recs = self._generate_all_records(field)
-        recinfo = [
-            {"name": name, "type": "file", "size": rec[-1]}
-            for name, rec in zip(keys, recs)
-            if rec[0]  # filters out path==None, deleted/missing
-        ]
+            return list(others) + [k for k in keys if k in self]
+        recinfo = []
+        for name in keys:
+            try:
+                rec = self[name]
+            except KeyError:
+                # filters out path==None, deleted/missing or out-of-shape keys
+                continue
+            if isinstance(rec, bytes):
+                size = len(_inline_data(rec))
+            elif isinstance(rec, str):
+                size = len(_inline_data(rec))
+            elif len(rec) == 1:
+                size = None
+            else:
+                size = rec[-1]
+            recinfo.append({"name": name, "type": "file", "size": size})
         return fileinfo + recinfo
 
     def _load_one_key(self, key):
@@ -334,78 +468,130 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         Returns bytes, one-element list or three-element list.
         """
         if key in self._items:
-            return self._items[key]
+            value = self._items[key]
+            if value is None:
+                raise KeyError(key)
+            return value
         elif key in self.zmetadata:
             return json.dumps(self.zmetadata[key]).encode()
         elif "/" not in key or self._is_meta(key):
             raise KeyError(key)
         field, _ = key.rsplit("/", 1)
-        record, ri, chunk_size = self._key_to_record(key)
-        maybe = self._items.get((field, record), {}).get(ri, False)
-        if maybe is None:
-            # explicitly deleted
-            raise KeyError
-        elif maybe:
-            return maybe
-        elif chunk_size == 0:
-            return b""
+        index = _chunk_index(key)
+        grid = self._get_chunk_sizes(field, index)
+        if not _within(index, grid):
+            # Out of shape: this reference is missing, regardless of whether an
+            # old physical record still happens to hold data for the slot.
+            raise KeyError(key)
+        return self._value_at(field, index)
 
+    def _value_at(self, field, index):
+        """Resolve one logical chunk coordinate against overlay then base index."""
+        overlay = self._chunk_overlay.get(field)
+        if overlay is not None and index in overlay:
+            value = overlay[index]
+            if value is None:
+                raise KeyError(f"{field}/{'.'.join(map(str, index))}")
+            return value
+        if self._removed(field, index):
+            raise KeyError(f"{field}/{'.'.join(map(str, index))}")
+        base_grid = self._base_grid.get(field)
+        if not base_grid or not _within(index, base_grid):
+            raise KeyError(f"{field}/{'.'.join(map(str, index))}")
+        return self._load_base_key(field, index, base_grid)
+
+    def _load_base_key(self, field, index, grid):
+        record, ri = self._locate(field, index, grid)
         # Chunk keys can be loaded from row group and cached in LRU cache
         try:
             refs = self.open_refs(field, record)
         except (ValueError, TypeError, FileNotFoundError) as exc:
-            raise KeyError(key) from exc
+            raise KeyError(f"{field}/{'.'.join(map(str, index))}") from exc
+        if refs is None:
+            raise KeyError(f"{field}/{'.'.join(map(str, index))}")
         columns = ["path", "offset", "size", "raw"]
+        if ri >= len(next(iter(refs.values()), ())):
+            # Padding row: a record covers ``record_size`` slots, but the array
+            # may have fewer chunks than that at the tail.
+            raise KeyError(f"{field}/{'.'.join(map(str, index))}")
         selection = [refs[c][ri] if c in refs else None for c in columns]
         raw = selection[-1]
-        if raw is not None:
-            return raw
-        if selection[0] is None:
-            raise KeyError("This reference does not exist or has been deleted")
-        if selection[1:3] == [0, 0]:
+        if not _is_null(raw):
+            return _as_raw_bytes(raw)
+        if _is_null(selection[0]):
+            raise KeyError(
+                f"{field}/{'.'.join(map(str, index))} does not exist or was deleted"
+            )
+        offset, size = selection[1], selection[2]
+        if _is_null(offset) and _is_null(size):
             # URL only
-            return selection[:1]
-        # URL, offset, size
-        return selection[:3]
+            return [selection[0]]
+        offset = 0 if _is_null(offset) else offset
+        size = 0 if _is_null(size) else size
+        if offset == 0 and size == 0:
+            return [selection[0]]
+        return [selection[0], offset, size]
 
-    def _key_to_record(self, key):
-        """Details needed to construct a reference for one key"""
-        field, chunk = key.rsplit("/", 1)
-        chunk_sizes = self._get_chunk_sizes(field)
-        if len(chunk_sizes) == 0:
-            return 0, 0, 0
-        chunk_idx = [int(c) for c in chunk.split(".")]
-        chunk_number = ravel_multi_index(chunk_idx, chunk_sizes)
-        record = chunk_number // self.record_size
-        ri = chunk_number % self.record_size
-        return record, ri, len(chunk_sizes)
+    def _locate(self, field, index, grid):
+        """Map a logical chunk coordinate to (record, row) in the base index."""
+        chunk_number = ravel_multi_index(index, grid)
+        return chunk_number // self.record_size, chunk_number % self.record_size
 
-    def _get_chunk_sizes(self, field):
-        """The number of chunks along each axis for a given field"""
-        if field not in self.chunk_sizes:
-            zarray = self.zmetadata[f"{field}/.zarray"]
-            size_ratio = [
-                math.ceil(s / c) for s, c in zip(zarray["shape"], zarray["chunks"])
-            ]
-            self.chunk_sizes[field] = size_ratio or [1]
-        return self.chunk_sizes[field]
+    def _get_chunk_sizes(self, field, index=None):
+        """The number of chunks along each axis for a given field
+
+        Lookups use the *current* grid derived from ``.zarray`` metadata. A key
+        written with a different number of dimensions is treated as missing
+        rather than indexing into an unrelated shape.
+        """
+        if field not in self._grid_cache:
+            zarray = self.zmetadata.get(f"{field}/.zarray")
+            if zarray is None:
+                self._grid_cache[field] = ()
+            else:
+                self._grid_cache[field] = self._grid_from_zarray(zarray)
+        grid = self._grid_cache[field]
+        if index is not None and len(index) != len(grid):
+            return ()
+        return grid
+
+    def _removed(self, field, index):
+        """Whether a coordinate was cut away by an earlier shape shrink."""
+        transitions = self._shape_transitions.get(field)
+        if not transitions:
+            return False
+        for old_grid, new_grid in transitions:
+            if _within(index, new_grid):
+                continue
+            if _within(index, old_grid):
+                # It existed before the shrink and is outside the smaller shape.
+                return True
+        return False
 
     def _generate_record(self, field, record):
         """The references for a given parquet file of a given field"""
         refs = self.open_refs(field, record)
+        if refs is None:
+            return iter(())
         it = iter(zip(*refs.values()))
         if len(refs) == 3:
             # All urls
             return (list(t) for t in it)
         elif len(refs) == 1:
             # All raws
-            return refs["raw"]
+            return iter(refs["raw"])
         else:
             # Mix of urls and raws
-            return (list(t[:3]) if not t[3] else t[3] for t in it)
+            return (
+                _as_raw_bytes(t[3]) if not _is_null(t[3]) else list(t[:3])
+                for t in it
+            )
 
     def _generate_all_records(self, field):
-        """Load all the references within a field by iterating over the parquet files"""
+        """Load all the references within a field by iterating over the parquet files
+
+        This reflects the original on-disk index, not pending edits.
+        """
         nrec = 1
         for ch in self._get_chunk_sizes(field):
             nrec *= ch
@@ -427,97 +613,128 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
 
     def __setitem__(self, key, value):
         if "/" in key and not self._is_meta(key):
-            field, chunk = key.rsplit("/", 1)
-            record, i, _ = self._key_to_record(key)
-            subdict = self._items.setdefault((field, record), {})
-            subdict[i] = value
-            if len(subdict) == self.record_size:
-                self.write(field, record)
+            field, _ = key.rsplit("/", 1)
+            index = _chunk_index(key)
+            # Edits are indexed by their logical coordinate, so later shape
+            # changes never shuffle them onto a different key.
+            self._chunk_overlay.setdefault(field, {})[index] = value
         else:
             # metadata or top-level
             if hasattr(value, "to_bytes"):
-                val = value.to_bytes().decode()
-            elif isinstance(value, bytes):
+                value = value.to_bytes()
+            if isinstance(value, bytes):
                 val = value.decode()
-            else:
+            elif isinstance(value, str):
                 val = value
-            self._items[key] = val
-            new_value = json.loads(val)
-            self.zmetadata[key] = {**self.zmetadata.get(key, {}), **new_value}
+            else:
+                # allow a dict (or other JSON-serializable object)
+                val = json.dumps(value)
+            is_zarray = key != ".zarray" and key.endswith("/.zarray")
+            field = key[: -len("/.zarray")] if is_zarray else ""
+            old_grid = self._get_chunk_sizes(field) if is_zarray else ()
+            try:
+                new_value = json.loads(val)
+            except ValueError:
+                # A plain inline value, not JSON metadata.
+                new_value = None
+            if isinstance(new_value, dict):
+                merged = {**self.zmetadata.get(key, {}), **new_value}
+                self.zmetadata[key] = merged
+                # Keep the in-memory view canonical, so reading the metadata key
+                # back shows the same merged object flush will write.
+                self._items[key] = json.dumps(merged)
+            else:
+                self._items[key] = val
+            if is_zarray:
+                self._update_grid(field, old_grid)
+            self.listdir.cache_clear()
+
+    def _update_grid(self, field, old_grid):
+        """Recompute a field's chunk grid and apply destructive resizes."""
+        new_grid = self._grid_from_zarray(self.zmetadata[f"{field}/.zarray"])
+        if (
+            old_grid
+            and len(old_grid) == len(new_grid)
+            and old_grid != new_grid
+        ):
+            # A shrink is destructive: coordinates cut off now are gone for good
+            # even if the array is later widened again.
+            if any(n < o for n, o in zip(new_grid, old_grid)):
+                self._shape_transitions.setdefault(field, []).append(
+                    (old_grid, new_grid)
+                )
+                overlay = self._chunk_overlay.get(field)
+                if overlay:
+                    for index in list(overlay):
+                        if not _within(index, new_grid):
+                            del overlay[index]
+                    if not overlay:
+                        self._chunk_overlay.pop(field, None)
+        self._grid_cache[field] = new_grid
+        self.listdir.cache_clear()
 
     @staticmethod
     def _is_meta(key):
         return key.startswith(".z") or "/.z" in key
 
     def __delitem__(self, key):
-        if key in self._items:
-            del self._items[key]
-        elif key in self.zmetadata:
+        if key in self.zmetadata:
             del self.zmetadata[key]
+            self._items.pop(key, None)
+            if key != ".zarray" and key.endswith("/.zarray"):
+                field = key[: -len("/.zarray")]
+                self._grid_cache.pop(field, None)
+            self.listdir.cache_clear()
+        elif "/" in key and not self._is_meta(key):
+            field, _ = key.rsplit("/", 1)
+            index = _chunk_index(key)
+            self._chunk_overlay.setdefault(field, {})[index] = None
+        elif key in self._items:
+            self._items[key] = None
         else:
-            if "/" in key and not self._is_meta(key):
-                field, _ = key.rsplit("/", 1)
-                record, i, _ = self._key_to_record(key)
-                subdict = self._items.setdefault((field, record), {})
-                subdict[i] = None
-                if len(subdict) == self.record_size:
-                    self.write(field, record)
-            else:
-                # metadata or top-level
-                self._items[key] = None
+            # metadata or top-level
+            self._items[key] = None
 
-    def write(self, field, record, base_url=None, storage_options=None):
-        # extra requirements if writing
-        import kerchunk.df
+    def _dirty_records(self, field, grid):
+        """Records of an unchanged grid that hold pending edits."""
+        return {
+            ravel_multi_index(index, grid) // self.record_size
+            for index in self._chunk_overlay.get(field, {})
+            if _within(index, grid)
+        }
+
+    def _index_engine(self):
+        """Parquet engine to use for writing, degrading to pyarrow if needed."""
+        from importlib.util import find_spec
+
+        if self.engine == "fastparquet" and find_spec("fastparquet") is None:
+            if find_spec("pyarrow") is not None:
+                return "pyarrow"
+        return self.engine
+
+    def _write_record(self, field, record, rows, base_url=None, storage_options=None):
+        """Write one parquet record from already-resolved values."""
         import numpy as np
         import pandas as pd
 
-        partition = self._items[(field, record)]
-        original = False
-        if len(partition) < self.record_size:
-            try:
-                original = self.open_refs(field, record)
-            except OSError:
-                pass
-
-        if original:
-            paths = original["path"]
-            offsets = original["offset"]
-            sizes = original["size"]
-            raws = original["raw"]
-        else:
-            paths = np.full(self.record_size, np.nan, dtype="O")
-            offsets = np.zeros(self.record_size, dtype="int64")
-            sizes = np.zeros(self.record_size, dtype="int64")
-            raws = np.full(self.record_size, np.nan, dtype="O")
-        for j, data in partition.items():
-            if isinstance(data, list):
-                if (
-                    str(paths.dtype) == "category"
-                    and data[0] not in paths.dtype.categories
-                ):
-                    paths = paths.add_categories(data[0])
+        paths = np.full(self.record_size, np.nan, dtype="O")
+        offsets = np.zeros(self.record_size, dtype="int64")
+        sizes = np.zeros(self.record_size, dtype="int64")
+        raws = np.full(self.record_size, np.nan, dtype="O")
+        for j, data in enumerate(rows):
+            if data is None:
+                # delete / missing
+                paths[j] = None
+                raws[j] = None
+            elif isinstance(data, (list, tuple)):
                 paths[j] = data[0]
                 if len(data) > 1:
                     offsets[j] = data[1]
                     sizes[j] = data[2]
-            elif data is None:
-                # delete
-                paths[j] = None
-                offsets[j] = 0
-                sizes[j] = 0
-                raws[j] = None
             else:
-                # this is the only call into kerchunk, could remove
-                raws[j] = kerchunk.df._proc_raw(data)
-        # TODO: only save needed columns
+                raws[j] = _proc_raw(data)
         df = pd.DataFrame(
-            {
-                "path": paths,
-                "offset": offsets,
-                "size": sizes,
-                "raw": raws,
-            },
+            {"path": paths, "offset": offsets, "size": sizes, "raw": raws},
             copy=False,
         )
         if df.path.count() / (df.path.nunique() or 1) > self.cat_thresh:
@@ -525,31 +742,107 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         object_encoding = {"raw": "bytes", "path": "utf8"}
         has_nulls = ["path", "raw"]
 
-        fn = f"{base_url or self.out_root}/{field}/refs.{record}.parq"
-        self.fs.mkdirs(f"{base_url or self.out_root}/{field}", exist_ok=True)
+        root = base_url or self.out_root
+        fn = f"{root}/{field}/refs.{record}.parq"
+        self.fs.makedirs(f"{root}/{field}", exist_ok=True)
 
-        if self.engine == "pyarrow":
-            df_backend_kwargs = {"write_statistics": False}
-        elif self.engine == "fastparquet":
-            df_backend_kwargs = {
-                "stats": False,
-                "object_encoding": object_encoding,
-                "has_nulls": has_nulls,
-            }
+        engine = self._index_engine()
+        pyarrow_kwargs = {
+            "write_statistics": False,
+            "compression": "zstd",
+            "index": False,
+        }
+        fastparquet_kwargs = {"compression": "zstd", "index": False}
+        if engine == "fastparquet":
+            fastparquet_kwargs.update(
+                stats=False,
+                object_encoding=object_encoding,
+                has_nulls=has_nulls,
+            )
+        elif engine != "pyarrow":
+            raise NotImplementedError(f"{engine} not supported")
+
+        if engine == "pyarrow":
+            # Writing through a file handle works for URL/path and non-file
+            # backends alike, without pandas having to infer a filesystem.
+            with self.fs.open(fn, "wb") as f:
+                df.to_parquet(f, engine="pyarrow", **pyarrow_kwargs)
         else:
-            raise NotImplementedError(f"{self.engine} not supported")
-        df.to_parquet(
-            fn,
-            engine=self.engine,
-            storage_options=storage_options
-            or getattr(self.fs, "storage_options", None),
-            compression="zstd",
-            index=False,
-            **df_backend_kwargs,
+            # fastparquet requires a path and uses the fsspec URL machinery.
+            full = self.fs.unstrip_protocol(fn)
+            df.to_parquet(
+                full,
+                engine="fastparquet",
+                storage_options=storage_options
+                or getattr(self.fs, "storage_options", None),
+                **fastparquet_kwargs,
+            )
+
+    def _resolve_record(self, field, record, grid):
+        """Resolve one record's worth of logical coordinates from base+overlay."""
+        total = _grid_product(grid)
+        start = record * self.record_size
+        rows = []
+        for pos in range(start, start + self.record_size):
+            if pos >= total:
+                rows.append(None)
+                continue
+            try:
+                rows.append(self._value_at(field, unravel_multi_index(pos, grid)))
+            except KeyError:
+                rows.append(None)
+        return rows
+
+    def write(self, field, record, base_url=None, storage_options=None):
+        """Materialize a single record of a field into the output index.
+
+        This is the low-level counterpart of ``flush``; ordinary callers only
+        need ``flush``.
+        """
+        grid = self._get_chunk_sizes(field)
+        if not grid:
+            return
+        rows = self._resolve_record(field, record, grid)
+        self._write_record(
+            field,
+            record,
+            rows,
+            base_url=base_url,
+            storage_options=storage_options,
         )
 
-        partition.clear()
-        self._items.pop((field, record))
+    def _copy_index_record(self, field, record, out_root):
+        """Copy one parquet index record without touching payload data."""
+        src = f"{self.root}/{field}/refs.{record}.parq"
+        dst = f"{out_root}/{field}/refs.{record}.parq"
+        if not self.fs.exists(src):
+            return
+        self.fs.makedirs(f"{out_root}/{field}", exist_ok=True)
+        self.fs.cp_file(src, dst)
+
+    def _copy_other_field(self, field, out_root):
+        """Copy index files of a field that is not a shaped array."""
+        try:
+            entries = self.fs.ls(f"{self.root}/{field}", detail=True)
+        except FileNotFoundError:
+            return
+        for entry in entries:
+            if entry.get("type") != "file":
+                continue
+            name = entry["name"]
+            if not name.endswith(".parq"):
+                continue
+            dst = f"{out_root}/{field}/{name.rsplit('/', 1)[-1]}"
+            self.fs.makedirs(f"{out_root}/{field}", exist_ok=True)
+            self.fs.cp_file(name, dst)
+
+    def _current_fields(self):
+        fields = {
+            k[: -len("/.zarray")] for k in self.zmetadata if k.endswith("/.zarray")
+        }
+        fields.update(self._chunk_overlay)
+        fields.update(self._base_grid)
+        return fields
 
     def flush(self, base_url=None, storage_options=None):
         """Output any modified or deleted keys
@@ -559,32 +852,95 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
         base_url: str
             Location of the output
         """
+        out_root = self.fs._strip_protocol(base_url or self.out_root)
+        self.fs.makedirs(out_root, exist_ok=True)
+        in_place = out_root == self.fs._strip_protocol(self.root)
 
-        # write what we have so far and clear sub chunks
-        for thing in list(self._items):
-            if isinstance(thing, tuple):
-                field, record = thing
-                self.write(
+        # Write every field that was touched, and copy the parquet index of
+        # untouched fields, so the output directory is a complete index on its
+        # own. No payload object is ever read or copied here.
+        for field in sorted(self._current_fields()):
+            grid = self._get_chunk_sizes(field)
+            if not grid:
+                if not in_place:
+                    self._copy_other_field(field, out_root)
+                continue
+            total = _grid_product(grid)
+            nrec = math.ceil(total / self.record_size)
+            base_grid = self._base_grid.get(field)
+            transitions = self._shape_transitions.get(field)
+            if base_grid == grid and not transitions:
+                # Coordinates did not move; only records holding an edit need
+                # rewriting, the rest can be copied verbatim.
+                dirty = self._dirty_records(field, grid)
+                for record in range(nrec):
+                    if record not in dirty:
+                        if not in_place:
+                            self._copy_index_record(field, record, out_root)
+                        continue
+                    rows = self._resolve_record(field, record, grid)
+                    self._write_record(
+                        field,
+                        record,
+                        rows,
+                        base_url=out_root,
+                        storage_options=storage_options,
+                    )
+                continue
+            for record in range(nrec):
+                rows = self._resolve_record(field, record, grid)
+                self._write_record(
                     field,
                     record,
-                    base_url=base_url,
+                    rows,
+                    base_url=out_root,
                     storage_options=storage_options,
                 )
 
         # gather .zmetadata from self._items and write that too
         for k in list(self._items):
             if k != ".zmetadata" and ".z" in k:
-                self.zmetadata[k] = json.loads(self._items.pop(k))
+                value = self._items.pop(k)
+                if value is None:
+                    # deleted metadata
+                    self.zmetadata.pop(k, None)
+                    continue
+                try:
+                    parsed = json.loads(value)
+                except ValueError:
+                    continue
+                if isinstance(parsed, dict):
+                    # Merge, because a caller may have supplied only a subset of
+                    # the metadata fields (e.g. just ``shape``).
+                    self.zmetadata[k] = {**self.zmetadata.get(k, {}), **parsed}
+                else:
+                    self.zmetadata[k] = parsed
         met = {"metadata": self.zmetadata, "record_size": self.record_size}
-        self._items.clear()
-        self._items[".zmetadata"] = json.dumps(met).encode()
-        self.fs.pipe(
-            "/".join([base_url or self.out_root, ".zmetadata"]),
-            self._items[".zmetadata"],
-        )
+        encoded = json.dumps(met).encode()
+        self.fs.pipe(f"{out_root}/.zmetadata", encoded)
 
-        # TODO: only clear those that we wrote to?
-        self.open_refs.cache_clear()
+        if hasattr(self.open_refs, "cache_clear"):
+            self.open_refs.cache_clear()
+        if in_place:
+            # Reads now resolve against the files we just wrote.
+            self._base_grid = {
+                f: self._get_chunk_sizes(f)
+                for f in self._current_fields()
+                if self._get_chunk_sizes(f)
+            }
+            self._chunk_overlay.clear()
+            self._shape_transitions.clear()
+            self._grid_cache.clear()
+            self._items.clear()
+            self._items[".zmetadata"] = encoded
+        else:
+            # The revision is now self-contained; read it back from the output
+            # so this mapper reflects the flushed index (the source stays
+            # untouched and no longer needs to be reachable).
+            self.root = out_root
+            self.url = self.root + "/{field}/refs.{record}.parq"
+            self.listdir.cache_clear()
+            self.setup()
 
     def __len__(self):
         # Caveat: This counts expected references, not actual - but is fast
@@ -593,17 +949,23 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
             if field.startswith("."):
                 count += 1
             else:
-                count += math.prod(self._get_chunk_sizes(field))
+                count += _grid_product(self._get_chunk_sizes(field))
         count += len(self.zmetadata)  # all metadata keys
         # any other files not in reference partitions
-        count += sum(1 for _ in self._items if not isinstance(_, tuple))
+        count += sum(
+            1
+            for k, v in self._items.items()
+            if not isinstance(k, tuple) and v is not None
+        )
         return count
 
     def __iter__(self):
         # Caveat: returns only existing keys, so the number of these does not
         #  match len(self)
         metas = set(self.zmetadata)
-        metas.update(self._items)
+        metas.update(
+            k for k, v in self._items.items() if isinstance(k, str) and v is not None
+        )
         for bit in metas:
             if isinstance(bit, str):
                 yield bit
@@ -624,9 +986,11 @@ class LazyReferenceMapper(collections.abc.MutableMapping):
 
         Produces strings like "field/x.y" appropriate from the chunking of the array
         """
-        chunk_sizes = self._get_chunk_sizes(field)
+        if f"{field}/.zarray" not in self.zmetadata:
+            chunk_sizes = ()
+        else:
+            chunk_sizes = self._get_chunk_sizes(field)
         if len(chunk_sizes) == 0:
-            yield field + "/0"
             return
         inds = itertools.product(*(range(i) for i in chunk_sizes))
         for ind in inds:

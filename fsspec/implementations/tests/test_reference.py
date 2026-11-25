@@ -1197,3 +1197,172 @@ def test_no_default_jinja_execution():
 
     with pytest.raises(ZeroDivisionError):
         fsspec.filesystem("reference", fo=manifest, simple_templates=False)
+
+
+def _lazy_store(root, fs, record_size=3):
+    """A parquet reference store with a couple of two-dimensional arrays."""
+    fs.pipe(
+        "/".join([root, ".zmetadata"]),
+        json.dumps({"metadata": {}, "record_size": record_size}).encode(),
+    )
+    lz = LazyReferenceMapper(root, fs=fs)
+    for field, shape in [("t", [2, 3]), ("other", [2, 2])]:
+        lz[field + "/.zarray"] = {
+            "shape": shape,
+            "chunks": [1, 1],
+            "dtype": "u1",
+            "compressor": None,
+            "filters": None,
+            "fill_value": 0,
+            "order": "C",
+            "zarr_format": 2,
+        }
+    for key, value in [
+        ("t/0.0", b"A"),
+        ("t/0.1", b"B"),
+        ("t/0.2", b"C"),
+        ("t/1.0", b"D"),
+        ("t/1.1", b"E"),
+        ("t/1.2", b"F"),
+        ("other/0.0", b"A"),
+        ("other/0.1", b"B"),
+        ("other/1.0", b"D"),
+        ("other/1.1", b"E"),
+    ]:
+        lz[key] = value
+    lz.flush()
+    return lz
+
+
+def test_lazy_resize_keeps_coordinates_and_values_aligned(m):
+    pytest.importorskip("pandas")
+    lz = _lazy_store("memory://orig", m)
+    # warm the second row in the revision mapper before editing
+    rev = LazyReferenceMapper("memory://orig", fs=m, out_root="memory://rev")
+    assert rev["t/1.0"] == b"D"
+    assert rev["t/1.1"] == b"E"
+    assert rev["t/1.2"] == b"F"
+
+    rev["t/1.0"] = b"W"
+    rev["t/1.1"] = b"R"
+    del rev["t/1.2"]
+    # changes are visible immediately, without a flush
+    assert rev["t/1.0"] == b"W"
+    assert rev["t/1.1"] == b"R"
+    assert "t/1.2" not in rev
+
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 4]}
+    )
+    assert rev["t/0.0"] == b"A"
+    assert rev["t/0.1"] == b"B"
+    assert rev["t/0.2"] == b"C"
+    assert rev["t/1.0"] == b"W"
+    assert rev["t/1.1"] == b"R"
+    assert "t/1.2" not in rev
+    assert "t/0.3" not in rev
+
+    rev["t/0.3"] = [b"P"]
+    assert rev["t/0.3"] == [b"P"]
+
+    # shrinking is destructive; widening must not resurrect old references
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 2]}
+    )
+    for key in ["t/0.2", "t/0.3", "t/1.2", "t/1.3"]:
+        assert key not in rev
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 4]}
+    )
+    assert "t/0.2" not in rev
+    assert "t/0.3" not in rev
+    rev["t/1.2"] = b"Q"
+    assert rev["t/1.2"] == b"Q"
+
+    # membership and iteration agree with individual lookups before any flush
+    listed = set(rev)
+    for key in ["t/0.0", "t/0.1", "t/0.2", "t/0.3", "t/1.0", "t/1.1", "t/1.2"]:
+        assert (key in listed) == (key in rev)
+
+
+def test_lazy_revision_flush_is_self_contained(m, monkeypatch):
+    pytest.importorskip("pandas")
+    _lazy_store("memory://orig", m)
+    # ranges over a shared payload object, as used by real sensor archives
+    m.pipe("payload/blob", b"xxPPPPxxQQQQxx")
+    url = "memory://payload/blob"
+    rev = LazyReferenceMapper("memory://orig", fs=m, out_root="memory://rev")
+    rev["t/1.0"] = [url, 2, 4]
+    rev["t/1.1"] = b"R"
+    del rev["t/1.2"]
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 4]}
+    )
+    rev["t/0.3"] = [url, 2, 4]
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 2]}
+    )
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 4]}
+    )
+    rev["t/1.2"] = [url, 8, 4]
+
+    # Flushing the index must never read target payload objects. Reads of the
+    # *source index* are allowed (needed to carry over untouched records), but
+    # the payload filesystem should not see any traffic.
+    seen = []
+    real_cat_file = m.cat_file
+
+    def tracked_cat_file(path, *args, **kwargs):
+        seen.append(m._strip_protocol(path))
+        return real_cat_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(m, "cat_file", tracked_cat_file)
+    rev.flush()
+    assert not [p for p in seen if p.startswith("/payload/")]
+
+    # reading the revised index works, including through a fresh filesystem
+    fs = ReferenceFileSystem(fo=rev, skip_instance_cache=True)
+    assert json.loads(fs.references["t/.zarray"])["shape"] == [2, 4]
+    keys = sorted(
+        k for k in fs.references if k.startswith("t/") and not k.startswith("t/.")
+    )
+    assert keys == ["t/0.0", "t/0.1", "t/1.0", "t/1.1", "t/1.2"]
+    assert "t/0.3" not in fs.references  # P was cut by the shrink and is gone
+    assert "t/0.2" not in fs.references  # C was cut by the shrink too
+    assert fs.cat("t/1.0") == b"PPPP"  # range reference
+    assert fs.cat("t/1.1") == b"R"  # inline reference
+    assert fs.cat("t/1.2") == b"QQQQ"  # written after restoring the shape
+    # an array that was not part of the revision is copied and still readable
+    assert fs.cat("other/0.0") == b"A"
+    assert fs.cat("other/1.1") == b"E"
+
+
+def test_lazy_revision_leaves_source_untouched(m):
+    pytest.importorskip("pandas")
+    _lazy_store("memory://orig", m)
+    # a reader opened before the revision, with the second row already cached
+    hot = ReferenceFileSystem(fo="memory://orig", skip_instance_cache=True)
+    assert hot.cat("t/1.0") == b"D"
+    assert hot.cat("t/1.2") == b"F"
+
+    rev = LazyReferenceMapper("memory://orig", fs=m, out_root="memory://rev")
+    rev["t/1.0"] = b"W"
+    rev["t/.zarray"] = json.dumps(
+        {**json.loads(rev["t/.zarray"]), "shape": [2, 1]}
+    )
+    rev.flush()
+
+    for reader in [
+        hot,
+        ReferenceFileSystem(fo="memory://orig", skip_instance_cache=True),
+    ]:
+        assert json.loads(reader.references["t/.zarray"])["shape"] == [2, 3]
+        assert [reader.cat(f"t/{i}.{j}") for i in range(2) for j in range(3)] == [
+            b"A",
+            b"B",
+            b"C",
+            b"D",
+            b"E",
+            b"F",
+        ]

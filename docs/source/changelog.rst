@@ -20,6 +20,11 @@ Enhancements
 
 Fixes
 
+- Keep ``LazyReferenceMapper`` chunk coordinates aligned with the current
+  ``.zarray`` shape, so references written before a resize are still read from
+  the right slot and shrinking an array cannot resurrect old references. A
+  revision written through ``out_root`` is a complete, self-contained index.
+
 - Remove custom request headers on cross-origin HTTP redirects to avoid forwarding credentials to another host (#2206).
 
 - Handle a single Path in the asynchronous methods like its string
