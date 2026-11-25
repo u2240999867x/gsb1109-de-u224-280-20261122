@@ -1163,6 +1163,7 @@ class Model(metaclass=ModelMeta):
         :raises OperationalError: If update_fields include pk field.
         """
         await self._set_async_default_field()
+        update_fields = tuple(update_fields) if update_fields is not None else None
         db = using_db or self._choose_db(True)
         executor = db.executor_class(model=self.__class__, db=db)
         if self._partial:
@@ -1239,7 +1240,7 @@ class Model(metaclass=ModelMeta):
         self,
         fields: Iterable[str] | None = None,
         using_db: BaseDBAsyncClient | None = None,
-    ) -> None:
+    ) -> Self:
         """
         Refresh latest data from db. When this method is called without arguments
         all db fields of the model are updated to the values currently present in the database.
@@ -1250,6 +1251,7 @@ class Model(metaclass=ModelMeta):
 
         :param fields: An iterable of field names to refresh.
         :param using_db: Specific DB connection to use instead of default bound.
+        :return: The same model instance.
 
         :raises OperationalError: If object has never been persisted.
         """
@@ -1264,6 +1266,10 @@ class Model(metaclass=ModelMeta):
 
         for field in fields or self._meta.fields_db_projection:
             setattr(self, field, getattr(obj, field, None))
+
+        if not fields:
+            self._partial = False
+        return self
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:
