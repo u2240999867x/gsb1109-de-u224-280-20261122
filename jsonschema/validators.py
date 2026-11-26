@@ -504,6 +504,30 @@ def create(
             error = next(self.iter_errors(instance), None)
             return error is None
 
+        def iter_batch_errors(self, records, *, spool_dir=None):
+            """
+            Lazily yield validation errors for a single-pass record stream.
+
+            The records are validated as if they were the elements of one
+            JSON array under this validator's schema, but without holding
+            the whole batch in memory. See `jsonschema.batch.iter_errors`
+            for the supported keywords and the ``spool_dir`` argument.
+            """
+            from jsonschema.batch import iter_errors
+
+            return iter_errors(self, records, spool_dir=spool_dir)
+
+        def is_valid_batch(self, records, *, spool_dir=None):
+            """
+            Check whether a single-pass record stream is valid as one batch.
+
+            The acceptance verdict matches validating the same records as
+            one ordinary list. See `jsonschema.batch.is_valid`.
+            """
+            from jsonschema.batch import is_valid
+
+            return is_valid(self, records, spool_dir=spool_dir)
+
     evolve_fields = [
         (field.name, field.alias) for field in fields(Validator) if field.init
     ]

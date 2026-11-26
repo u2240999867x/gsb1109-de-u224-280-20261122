@@ -1,6 +1,9 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.batch``, streaming validation of single-pass record iterables against array-shaped schemas, with verdicts matching plain list validation.
+  The new ``iter_batch_errors`` / ``is_valid_batch`` validator methods (and the module-level ``jsonschema.batch.iter_errors`` / ``jsonschema.batch.is_valid``) support ``prefixItems``, ``items``, ``contains`` with its bounds, ``minItems`` / ``maxItems``, ``allOf``, ``anyOf``, ``oneOf``, ``unevaluatedItems: false`` and ``uniqueItems`` at the batch level, spilling uniqueness bookkeeping to a caller-provided staging directory to keep working memory bounded.
+
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
