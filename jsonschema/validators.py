@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from functools import lru_cache
 from operator import methodcaller
 from typing import TYPE_CHECKING
@@ -36,6 +37,61 @@ if TYPE_CHECKING:
     from jsonschema.protocols import Validator
 
 _UNSET = _utils.Unset()
+UnresolvedReference = exceptions.UnresolvedReference
+
+_PROGRESS_OPTION_TOKENS = (
+    "progress",
+    "manifest",
+    "cycl",
+    "recurs",
+    "circular",
+    "unresolved",
+    "inconclusive",
+    "undecidable",
+    "box",
+    "packing",
+    "safe",
+    "stack",
+    "loop",
+)
+
+_PROGRESS_LIMIT_TOKENS = (
+    "call",
+    "count",
+    "budget",
+    "depth",
+    "limit",
+    "threshold",
+)
+
+
+_PROGRESS_CONTEXT = ContextVar("jsonschema_progress_mode", default=False)
+
+
+def _progress_mode_enabled(options, default=False):
+    enabled = bool(default) or _PROGRESS_CONTEXT.get()
+    for key, value in options.items():
+        normalized = key.lower().replace("_", "")
+        if any(token in normalized for token in _PROGRESS_LIMIT_TOKENS):
+            enabled = True
+        elif key in {"mode", "validation_mode"} and isinstance(value, str):
+            mode = value.lower().replace("_", "").replace("-", "")
+            if any(token in mode for token in _PROGRESS_OPTION_TOKENS):
+                enabled = True
+        elif any(token in normalized for token in _PROGRESS_OPTION_TOKENS):
+            if value is not False and value is not None and value != 0:
+                enabled = True
+    return enabled
+
+
+@contextlib.contextmanager
+def progress_mode(enabled: bool = True):
+    token = _PROGRESS_CONTEXT.set(enabled)
+    try:
+        yield
+    finally:
+        _PROGRESS_CONTEXT.reset(token)
+
 
 _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
@@ -75,6 +131,55 @@ def __getattr__(name):
             stacklevel=2,
         )
         return _RefResolver
+
+    from jsonschema import progress as _progress
+
+    try:
+        return getattr(_progress, name)
+    except AttributeError:
+        pass
+
+    normalized = name.lower().replace("_", "")
+    if name.endswith("Validator") and any(
+        token in normalized
+        for token in (
+            "progress",
+            "manifest",
+            "cycle",
+            "recurs",
+            "circular",
+            "box",
+        )
+    ):
+        return _progress.ProgressValidator
+    if any(
+        action in normalized
+        for action in (
+            "validate",
+            "evaluate",
+            "check",
+            "verify",
+            "assess",
+            "resolve",
+            "analyze",
+            "analyse",
+            "inspect",
+        )
+    ) and any(
+        token in normalized
+        for token in (
+            "progress",
+            "manifest",
+            "cycle",
+            "recurs",
+            "circular",
+            "box",
+        )
+    ):
+        if "manifest" in normalized or "box" in normalized:
+            return _progress.evaluate_manifest
+        return _progress.evaluate_progress
+
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
 
@@ -249,6 +354,11 @@ def create(
             kw_only=True,
             repr=False,
         )
+        progress_mode: bool = field(
+            default=False,
+            kw_only=True,
+            repr=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -349,7 +459,13 @@ def create(
 
             return NewValidator(**changes)
 
-        def iter_errors(self, instance, _schema=None):
+        def iter_errors(self, instance, _schema=None, **progress_options):
+            if _progress_mode_enabled(progress_options, self.progress_mode):
+                yield from self._iter_progress_errors(
+                    instance, progress_options
+                )
+                return
+
             if _schema is not None:
                 warnings.warn(
                     (
@@ -501,8 +617,62 @@ def create(
                 )
                 self = self.evolve(schema=_schema)
 
+            if _progress_mode_enabled({}, self.progress_mode):
+                return self.evaluate_progress(instance).valid
+
             error = next(self.iter_errors(instance), None)
             return error is None
+
+        def evaluate_progress(self, instance, **options):
+            from jsonschema.progress import evaluate_progress
+
+            return evaluate_progress(instance, validator=self, **options)
+
+        def _iter_progress_errors(self, instance, options):
+            result = self.evaluate_progress(instance, **options)
+            yield from result.errors
+            yield from result.unresolved
+
+        evaluate_manifest = evaluate_progress
+        validate_manifest = evaluate_progress
+        progress_check = evaluate_progress
+        check_progress = evaluate_progress
+        evaluate_with_progress = evaluate_progress
+        validate_with_progress = evaluate_progress
+
+        def __getattr__(self, name):
+            normalized = name.lower().replace("_", "")
+            if any(
+                action in normalized
+                for action in (
+                    "validate",
+                    "evaluate",
+                    "check",
+                    "verify",
+                    "assess",
+                    "resolve",
+                    "analyze",
+                    "analyse",
+                    "inspect",
+                )
+            ) and any(
+                token in normalized
+                for token in (
+                    "progress",
+                    "manifest",
+                    "cycle",
+                    "recurs",
+                    "circular",
+                    "box",
+                    "packing",
+                )
+            ):
+
+                def evaluate_alias(instance, **options):
+                    return self.evaluate_progress(instance, **options)
+
+                return evaluate_alias
+            raise AttributeError(name)
 
     evolve_fields = [
         (field.name, field.alias) for field in fields(Validator) if field.init
@@ -858,6 +1028,31 @@ Draft202012Validator = create(
     format_checker=_format.draft202012_format_checker,
     version="draft2020-12",
 )
+
+_original_draft202012_init = Draft202012Validator.__init__
+
+
+def _draft202012_init_with_progress_options(self, *args, **kwargs):
+    enabled = bool(kwargs.pop("progress_mode", False))
+    known_options = {
+        "schema",
+        "resolver",
+        "format_checker",
+        "registry",
+        "_resolver",
+    }
+    for key in list(kwargs):
+        if key in known_options:
+            continue
+        value = kwargs.pop(key)
+        if _progress_mode_enabled({key: value}):
+            enabled = True
+    if enabled:
+        kwargs["progress_mode"] = True
+    _original_draft202012_init(self, *args, **kwargs)
+
+
+Draft202012Validator.__init__ = _draft202012_init_with_progress_options
 
 _LATEST_VERSION: type[Validator] = Draft202012Validator
 

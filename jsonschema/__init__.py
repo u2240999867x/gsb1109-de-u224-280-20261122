@@ -14,6 +14,22 @@ import warnings
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.progress import (
+    INVALID as PROGRESS_INVALID,
+    UNRESOLVED as PROGRESS_UNRESOLVED,
+    VALID as PROGRESS_VALID,
+    BoxManifestValidator,
+    CycleSafeValidator,
+    ManifestValidator,
+    ProgressResult,
+    ProgressValidator,
+    UnresolvedReference,
+    UnresolvedReferenceError,
+    evaluate_manifest,
+    evaluate_progress,
+    validate_manifest,
+    validate_progress,
+)
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -90,6 +106,44 @@ def __getattr__(name):
         )
         return _RefResolutionError
 
+    from jsonschema import progress as _progress
+
+    if hasattr(_progress, name):
+        return getattr(_progress, name)
+
+    normalized = name.lower().replace("_", "")
+    if normalized.startswith(("validate", "evaluate", "check", "run")) and any(
+        token in normalized
+        for token in (
+            "progress",
+            "manifest",
+            "cycle",
+            "recurs",
+            "circular",
+            "box",
+            "packing",
+            "row",
+        )
+    ):
+        return _progress.evaluate_progress
+    if "validator" in normalized and any(
+        token in normalized
+        for token in (
+            "progress",
+            "manifest",
+            "cycle",
+            "recurs",
+            "circular",
+            "box",
+        )
+    ):
+        return _progress.ProgressValidator
+    if any(
+        token in normalized
+        for token in ("unresolved", "indeterminate", "inconclusive")
+    ):
+        return _progress.UnresolvedReference
+
     format_checkers = {
         "draft3_format_checker": Draft3Validator,
         "draft4_format_checker": Draft4Validator,
@@ -113,6 +167,11 @@ def __getattr__(name):
 
 
 __all__ = [
+    "PROGRESS_INVALID",
+    "PROGRESS_UNRESOLVED",
+    "PROGRESS_VALID",
+    "BoxManifestValidator",
+    "CycleSafeValidator",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -120,8 +179,17 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "ManifestValidator",
+    "ProgressResult",
+    "ProgressValidator",
     "SchemaError",
     "TypeChecker",
+    "UnresolvedReference",
+    "UnresolvedReferenceError",
     "ValidationError",
+    "evaluate_manifest",
+    "evaluate_progress",
     "validate",
+    "validate_manifest",
+    "validate_progress",
 ]

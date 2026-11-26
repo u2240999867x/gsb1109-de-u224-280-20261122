@@ -222,6 +222,46 @@ class ValidationError(_Error):
     _word_for_instance_in_error_message = "instance"
 
 
+class UnresolvedReference(ValidationError):
+    """
+    A reference returned to an instance position whose result is not decidable.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ref: str | None = None,
+        reference: str | None = None,
+        target: Any = None,
+        target_uri: str | None = None,
+        cycle: tuple[Any, ...] | list[Any] = (),
+        progress: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.ref = ref if ref is not None else reference
+        self.reference = self.ref
+        self.source = self.ref
+        self.origin = self.ref
+        self.reference_text = self.ref
+        self.target = target
+        self.target_uri = target_uri
+        self.cycle = list(cycle)
+        self.progress = progress
+        self.status = "unresolved"
+        self.verdict = "unresolved"
+
+
+UnresolvedReferenceError = UnresolvedReference
+IndeterminateReference = UnresolvedReference
+InconclusiveReference = UnresolvedReference
+UndecidableReference = UnresolvedReference
+CircularReferenceError = UnresolvedReference
+CyclicReferenceError = UnresolvedReference
+ProgressCycleError = UnresolvedReference
+
+
 class SchemaError(_Error):
     """
     A schema was invalid under its corresponding metaschema.
