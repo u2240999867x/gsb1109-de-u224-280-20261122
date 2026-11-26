@@ -20,6 +20,7 @@ __all__ = (
     "NotFoundError",
     "RepositoryError",
     "SerializationError",
+    "SharedObjectUnavailableError",
     "wrap_sqlalchemy_exception",
 )
 
@@ -354,6 +355,19 @@ class NotFoundError(RepositoryError):
     """Not found error.
 
     This exception is raised when a requested resource is not found.
+
+    Args:
+        *args: Variable length argument list passed to parent class.
+        detail: Detailed error message.
+    """
+
+
+class SharedObjectUnavailableError(AdvancedAlchemyError):
+    """Shared stored object is no longer available for adoption.
+
+    Raised when an attempt is made to attach a shared stored object whose
+    retention cleanup has already been handed to the storage backend, so the
+    referenced bytes can no longer be guaranteed to exist.
 
     Args:
         *args: Variable length argument list passed to parent class.

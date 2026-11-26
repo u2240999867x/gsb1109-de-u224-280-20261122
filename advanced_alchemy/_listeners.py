@@ -159,13 +159,16 @@ class FileObjectInspector:
                 continue
 
             is_multiple = getattr(attr.expression.type, "multiple", False)
+            is_shared = getattr(attr.expression.type, "shared", False)
             if not is_multiple:
-                FileObjectInspector.handle_single_attribute(attr_state, tracker)
+                FileObjectInspector.handle_single_attribute(attr_state, tracker, shared=is_shared)
             else:
-                FileObjectInspector.handle_multiple_attribute(instance, attr_name, attr_state, tracker)
+                FileObjectInspector.handle_multiple_attribute(
+                    instance, attr_name, attr_state, tracker, shared=is_shared
+                )
 
     @staticmethod
-    def handle_single_attribute(attr_state: Any, tracker: FileObjectSessionTracker) -> None:
+    def handle_single_attribute(attr_state: Any, tracker: FileObjectSessionTracker, shared: bool = False) -> None:
         """Handle inspection of a single FileObject attribute."""
         history = attr_state.history
         current_value: Optional[FileObject] = history.added[0] if history.added else None
@@ -175,12 +178,17 @@ class FileObjectInspector:
             pending_content = getattr(current_value, "_pending_source_content", None)
             pending_source_path = getattr(current_value, "_pending_source_path", None)
             if pending_content is not None:
-                tracker.add_pending_save(current_value, pending_content)
+                tracker.add_pending_save(current_value, pending_content, shared=shared)
             elif pending_source_path is not None:
-                tracker.add_pending_save(current_value, pending_source_path)
+                tracker.add_pending_save(current_value, pending_source_path, shared=shared)
+            if shared:
+                tracker.add_pending_acquire(current_value)
 
         if original_value and original_value.path:
-            tracker.add_pending_delete(original_value)
+            if shared:
+                tracker.add_pending_release(original_value)
+            else:
+                tracker.add_pending_delete(original_value)
 
     @staticmethod
     def handle_multiple_attribute(
@@ -188,11 +196,13 @@ class FileObjectInspector:
         attr_name: str,
         attr_state: Any,
         tracker: FileObjectSessionTracker,
+        shared: bool = False,
     ) -> None:
         """Handle inspection of multiple FileObject attributes (MutableList)."""
         history = attr_state.history
         items_to_delete: set[FileObject] = set()
         items_to_save: dict[FileObject, Any] = {}
+        items_to_acquire: set[FileObject] = set()
 
         current_list_instance: Optional[MutableList[FileObject]] = instance.__dict__.get(attr_name)
         original_list_from_history: Optional[MutableList[FileObject]] = history.deleted[0] if history.deleted else None
@@ -227,12 +237,16 @@ class FileObjectInspector:
                     len(removed_due_to_replacement),
                 )
                 items_to_delete.update(removed_due_to_replacement)
+            if shared:
+                items_to_acquire.update(current_items_set - original_items_set)
 
         if isinstance(current_list_instance, MutableList):
             pending_append = getattr(current_list_instance, "_pending_append", [])
             if pending_append:
                 logger.debug("[Multiple-Mutation] Found %d items in _pending_append list.", len(pending_append))
                 for item in pending_append:
+                    if shared and item:
+                        items_to_acquire.add(item)
                     pending_content = getattr(item, "_pending_source_content", None)
                     pending_source_path = getattr(item, "_pending_source_path", None)
                     if pending_content is not None:
@@ -263,15 +277,41 @@ class FileObjectInspector:
                 logger.debug("[Multiple] Calling _finalize_pending on list instance.")
                 finalize_method()
 
+        if (
+            shared
+            and not original_list_from_history
+            and current_list_from_history
+            and FileObjectInspector._is_pending_instance(instance)
+        ):
+            # New instances reference every item of their initial list.
+            items_to_acquire.update(item for item in current_list_from_history if item)
+
         if items_to_delete:
             logger.debug("[Multiple] Scheduling %d items for deletion.", len(items_to_delete))
             for item_to_delete in items_to_delete:
-                tracker.add_pending_delete(item_to_delete)
+                if shared:
+                    tracker.add_pending_release(item_to_delete)
+                else:
+                    tracker.add_pending_delete(item_to_delete)
 
         if items_to_save:
             logger.debug("[Multiple] Scheduling %d items for saving.", len(items_to_save))
             for item_to_save, data in items_to_save.items():
-                tracker.add_pending_save(item_to_save, data)
+                tracker.add_pending_save(item_to_save, data, shared=shared)
+
+        if items_to_acquire:
+            logger.debug("[Multiple] Acquiring %d shared references.", len(items_to_acquire))
+            for item_to_acquire in items_to_acquire:
+                tracker.add_pending_acquire(item_to_acquire)
+
+    @staticmethod
+    def _is_pending_instance(instance: Any) -> bool:
+        """Return whether the instance is pending (new) in its session."""
+        try:
+            state = inspect(instance)
+        except Exception:
+            return False
+        return bool(getattr(state, "pending", False))
 
     @staticmethod
     def process_deleted_instance(
@@ -283,15 +323,22 @@ class FileObjectInspector:
         for attr_name, attr in mapper.column_attrs.items():
             if isinstance(attr.expression.type, StoredObject):
                 is_multiple = getattr(attr.expression.type, "multiple", False)
+                is_shared = getattr(attr.expression.type, "shared", False)
                 original_value: Any = getattr(instance, attr_name, None)
                 if original_value is None:
                     continue
 
                 if not is_multiple:
-                    tracker.add_pending_delete(original_value)
+                    if is_shared:
+                        tracker.add_pending_release(cast("FileObject", original_value))
+                    else:
+                        tracker.add_pending_delete(original_value)
                 elif isinstance(original_value, (list, MutableList)):
                     for item in original_value:  # pyright: ignore
-                        tracker.add_pending_delete(cast("FileObject", item))
+                        if is_shared:
+                            tracker.add_pending_release(cast("FileObject", item))
+                        else:
+                            tracker.add_pending_delete(cast("FileObject", item))
 
 
 class BaseFileObjectListener:

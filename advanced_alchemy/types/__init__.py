@@ -13,10 +13,13 @@ from advanced_alchemy.types.encrypted_string import (
 from advanced_alchemy.types.file_object import (
     FileObject,
     FileObjectList,
+    SharedObjectCleanup,
+    SharedObjectRegistry,
     StorageBackend,
     StorageBackendT,
     StorageRegistry,
     StoredObject,
+    shared_objects,
     storages,
 )
 from advanced_alchemy.types.guid import GUID, NANOID_INSTALLED, UUID_UTILS_INSTALLED
@@ -53,6 +56,8 @@ __all__ = (
     "OneTimeCode",
     "PGCryptoBackend",
     "PasswordHash",
+    "SharedObjectCleanup",
+    "SharedObjectRegistry",
     "StorageBackend",
     "StorageBackendT",
     "StorageRegistry",
@@ -65,6 +70,7 @@ __all__ = (
     "generate_one_time_code",
     "generate_totp_secret",
     "password_hash",
+    "shared_objects",
     "storages",
     "totp",
 )

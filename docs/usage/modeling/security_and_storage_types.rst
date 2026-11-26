@@ -136,3 +136,43 @@ Instead of storing binary payloads inside SQL columns, ``StoredObject`` persists
     storages.clear_backends()
 
 See :doc:`/usage/frameworks/litestar_storage` and :doc:`/usage/frameworks/fastapi_storage` for complete file-upload web examples.
+
+Shared retention
+~~~~~~~~~~~~~~~~
+
+When several rows (or several fields) reference the same stored object, detaching one of them would normally delete the bytes out from under the others. Opt a field into shared retention with ``shared=True`` to coordinate cleanup through the process-wide ``shared_objects`` registry:
+
+.. code-block:: python
+
+    from typing import Optional
+    from sqlalchemy.orm import Mapped, mapped_column
+    from advanced_alchemy.base import UUIDBase
+    from advanced_alchemy.types import FileObject, FileObjectList, StoredObject
+
+
+    class ReworkOrder(UUIDBase):
+        __tablename__ = "rework_order"
+
+        attachment: Mapped[Optional[FileObject]] = mapped_column(
+            StoredObject(backend="documents", shared=True),
+            nullable=True,
+        )
+
+
+    class QualityOrder(UUIDBase):
+        __tablename__ = "quality_order"
+
+        attachments: Mapped[Optional[FileObjectList]] = mapped_column(
+            StoredObject(backend="documents", multiple=True, shared=True),
+            nullable=True,
+        )
+
+Both single (``multiple=False``) and list (``multiple=True``) fields are supported. With shared retention:
+
+- References are acquired at flush time and released after commit; the object is only deleted once the last reference is released.
+- Attaching an object whose delete is already being handed to the storage backend fails the transaction with :class:`SharedObjectUnavailableError <advanced_alchemy.exceptions.SharedObjectUnavailableError>` instead of committing an unreadable attachment.
+- Every save of new bytes to a tracked path starts a new generation, so a stale or replayed cleanup request never deletes newer bytes stored at the same path.
+- Tracking is keyed per storage backend, so identical paths in different backends are cleaned up independently.
+
+The registry is process-local; use it for fields whose cleanup must be coordinated within a single application process.
+

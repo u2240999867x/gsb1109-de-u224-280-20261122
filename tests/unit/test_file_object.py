@@ -1100,7 +1100,7 @@ def test_handle_single_attribute_added() -> None:
 
     FileObjectInspector.handle_single_attribute(attr_state, tracker)
 
-    tracker.add_pending_save.assert_called_with(mock_file, b"content")
+    tracker.add_pending_save.assert_called_with(mock_file, b"content", shared=False)
 
 
 def test_handle_single_attribute_deleted() -> None:
@@ -1209,8 +1209,8 @@ def test_handle_multiple_attribute_append_and_new() -> None:
 
     FileObjectInspector.handle_multiple_attribute(instance, attr_name, attr_state, tracker)
 
-    tracker.add_pending_save.assert_any_call(item1, b"d1")
-    tracker.add_pending_save.assert_any_call(item2, "p2")
+    tracker.add_pending_save.assert_any_call(item1, b"d1", shared=False)
+    tracker.add_pending_save.assert_any_call(item2, "p2", shared=False)
 
 
 def test_process_deleted_instance() -> None:
@@ -1574,8 +1574,8 @@ def test_handle_multiple_attribute_pending_save_branches() -> None:
 
     FileObjectInspector.handle_multiple_attribute(instance, attr_name, attr_state, tracker)
 
-    tracker.add_pending_save.assert_any_call(item1, "p1")
-    tracker.add_pending_save.assert_any_call(item2, b"d2")
+    tracker.add_pending_save.assert_any_call(item1, "p1", shared=False)
+    tracker.add_pending_save.assert_any_call(item2, b"d2", shared=False)
 
 
 def test_process_deleted_instance_multiple() -> None:
@@ -1694,7 +1694,7 @@ def test_handle_single_attribute_pending_source_path() -> None:
 
     FileObjectInspector.handle_single_attribute(attr_state, tracker)
 
-    tracker.add_pending_save.assert_called_with(mock_file, "/path/to/source")
+    tracker.add_pending_save.assert_called_with(mock_file, "/path/to/source", shared=False)
 
 
 def test_before_flush_processes_new_dirty_deleted() -> None:
@@ -1998,7 +1998,7 @@ def test_handle_multiple_attribute_reads_pending_source_content_and_skips_unload
 
     FileObjectInspector.handle_multiple_attribute(instance, "files", attr_state, tracker)
 
-    tracker.add_pending_save.assert_called_once_with(real_obj, b"real-bytes")
+    tracker.add_pending_save.assert_called_once_with(real_obj, b"real-bytes", shared=False)
     assert len(mlist._pending_append) == 0
 
     tracker.reset_mock()

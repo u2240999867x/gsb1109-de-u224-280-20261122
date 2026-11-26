@@ -13,6 +13,7 @@ from advanced_alchemy.types.file_object.data_type import StoredObject
 from advanced_alchemy.types.file_object.file import FileObject, FileObjectList
 from advanced_alchemy.types.file_object.registry import StorageRegistry, storages
 from advanced_alchemy.types.file_object.session_tracker import FileObjectSessionTracker
+from advanced_alchemy.types.file_object.shared import SharedObjectCleanup, SharedObjectRegistry, shared_objects
 
 __all__ = [
     "AsyncDataLike",
@@ -20,9 +21,12 @@ __all__ = [
     "FileObjectList",
     "FileObjectSessionTracker",
     "PathLike",
+    "SharedObjectCleanup",
+    "SharedObjectRegistry",
     "StorageBackend",
     "StorageBackendT",
     "StorageRegistry",
     "StoredObject",
+    "shared_objects",
     "storages",
 ]

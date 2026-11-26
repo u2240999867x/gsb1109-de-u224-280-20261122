@@ -19,6 +19,12 @@ class StoredObject(TypeDecorator[OptionalFileObjectOrList]):
 
     Stores file metadata in JSONB and handles file validation, processing,
     and storage operations through a configured storage backend.
+
+    Set ``shared=True`` on fields whose stored objects may be referenced by
+    more than one row (or field). Shared fields participate in the
+    process-wide :data:`shared_objects` retention registry: the underlying
+    object is only deleted once the last reference is released, and stale
+    cleanup requests never delete newer bytes stored at the same path.
     """
 
     impl = JsonB
@@ -26,6 +32,7 @@ class StoredObject(TypeDecorator[OptionalFileObjectOrList]):
 
     # Default settings
     multiple: bool
+    shared: bool
     _raw_backend: Union[str, StorageBackend]
     _resolved_backend: "Optional[StorageBackend]" = None
 
@@ -54,6 +61,7 @@ class StoredObject(TypeDecorator[OptionalFileObjectOrList]):
         self,
         backend: Union[str, StorageBackend],
         multiple: bool = False,
+        shared: bool = False,
         *args: "Any",
         **kwargs: "Any",
     ) -> None:
@@ -62,19 +70,26 @@ class StoredObject(TypeDecorator[OptionalFileObjectOrList]):
         Args:
             backend: Key to retrieve the backend or from the storage registry or storage backend to use.
             multiple: If True, stores a list of files; otherwise, a single file.
+            shared: If True, objects referenced by this field are retained until the
+                    last reference across all shared fields is released.
             *args: Additional positional arguments for TypeDecorator.
             **kwargs: Additional keyword arguments for TypeDecorator.
 
         """
         super().__init__(*args, **kwargs)
         self.multiple = multiple
+        self.shared = shared
         self._raw_backend = backend
 
     def __repr__(self) -> str:
         """Return a string representation of the StoredObject."""
+        options = []
         if self.multiple:
-            return f"StoredObject(backend='{self.backend.key}', multiple=True)"
-        return f"StoredObject(backend='{self.backend.key}')"
+            options.append("multiple=True")
+        if self.shared:
+            options.append("shared=True")
+        suffix = f", {', '.join(options)}" if options else ""
+        return f"StoredObject(backend='{self.backend.key}'{suffix})"
 
     def process_bind_param(
         self,
