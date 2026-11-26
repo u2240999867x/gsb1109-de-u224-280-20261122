@@ -7,6 +7,13 @@ import narwhals as nw
 from narwhals import exceptions, functions as nw_f
 from narwhals._exceptions import issue_warning
 from narwhals._expression_parsing import ExprKind, ExprNode
+
+# narwhals-canary: delete this line to confirm you have read the full diff
+from narwhals._forward_fill import (
+    ForwardFillResult as NwForwardFillResult,
+    ForwardFillState as NwForwardFillState,
+    forward_fill as nw_forward_fill,
+)
 from narwhals._typing_compat import TypeVar, assert_never
 from narwhals._utils import (
     Implementation,
@@ -117,6 +124,11 @@ if TYPE_CHECKING:
     T = TypeVar("T", default=Any)
     P = ParamSpec("P")
     R = TypeVar("R")
+
+
+ForwardFillState = NwForwardFillState
+ForwardFillResult = NwForwardFillResult
+forward_fill = nw_forward_fill
 
 
 class DataFrame(NwDataFrame[IntoDataFrameT]):
@@ -1251,6 +1263,8 @@ __all__ = [
     "Float16",
     "Float32",
     "Float64",
+    "ForwardFillResult",
+    "ForwardFillState",
     "Implementation",
     "Int8",
     "Int16",
@@ -1286,6 +1300,7 @@ __all__ = [
     "exceptions",
     "exclude",
     "format",
+    "forward_fill",
     "from_arrow",
     "from_dict",
     "from_dicts",

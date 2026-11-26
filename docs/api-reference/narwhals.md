@@ -17,6 +17,7 @@ Here are the top-level functions available in Narwhals.
         - cov
         - exclude
         - format
+        - forward_fill
         - from_arrow
         - from_dict
         - from_dicts

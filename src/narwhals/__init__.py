@@ -95,6 +95,10 @@ from narwhals.translate import (
     to_py_scalar,
 )
 
+# narwhals-canary: delete this line to confirm you have read the full diff
+if _t.TYPE_CHECKING:  # pragma: no cover
+    from narwhals._forward_fill import ForwardFillResult, ForwardFillState, forward_fill
+
 __version__: str
 
 __all__ = [
@@ -113,6 +117,8 @@ __all__ = [
     "Float16",
     "Float32",
     "Float64",
+    "ForwardFillResult",
+    "ForwardFillState",
     "Implementation",
     "Int8",
     "Int16",
@@ -148,6 +154,7 @@ __all__ = [
     "exceptions",
     "exclude",
     "format",
+    "forward_fill",
     "from_arrow",
     "from_dict",
     "from_dicts",
@@ -199,6 +206,10 @@ if not _t.TYPE_CHECKING:
 
             __version__ = metadata.version(__name__)
             return __version__
+        if name in {"forward_fill", "ForwardFillResult", "ForwardFillState"}:
+            from narwhals import _forward_fill
+
+            return getattr(_forward_fill, name)
         msg = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(msg)
 else:  # pragma: no cover
