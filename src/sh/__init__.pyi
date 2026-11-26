@@ -31,7 +31,14 @@ from typing import (
 from typing_extensions import TypeVar
 
 _CommandIn: TypeAlias = (
-    str | bytes | IO[Any] | Queue[Any] | RunningCommand | Iterable[Any]
+    str
+    | bytes
+    | IO[Any]
+    | Queue[Any]
+    | RunningCommand
+    | Iterable[Any]
+    | "InputHub"
+    | "InputAttachment"
 )
 _CommandOut: TypeAlias = str | int | IO[Any] | Callable[..., Any]
 _CommandTarget: TypeAlias = bool | Literal["out", "err"]
@@ -1378,6 +1385,379 @@ class StreamBufferer:
     def change_buffering(self, new_type: int) -> None: ...
     def process(self, chunk: bytes) -> list[bytes]: ...
     def flush(self) -> list[bytes]: ...
+
+# ---------------------------------------------------------------------------
+# Multiplexed stdin — InputHub, InputAttachment, and the events they produce
+# ---------------------------------------------------------------------------
+
+class InputSourceError(Exception):
+    attachment: InputAttachment | None
+    def __init__(
+        self, message: str, *, attachment: InputAttachment | None = ...
+    ) -> None: ...
+
+class InputReceipt:
+    attachment: InputAttachment
+    kind: str
+    data: bytes | str | None
+    error: BaseException | None
+    accepted: bool
+    stale: bool
+    def __init__(
+        self,
+        attachment: InputAttachment,
+        kind: str,
+        data: bytes | str | None = ...,
+        error: BaseException | None = ...,
+    ) -> None: ...
+    def done(self) -> bool: ...
+    def wait(self, timeout: float | None = ...) -> bool: ...
+    @property
+    def delivered(self) -> bool: ...
+
+class InputControl:
+    CHUNK: ClassVar[str]
+    END: ClassVar[str]
+    ERROR: ClassVar[str]
+    NOT_READY: ClassVar[str]
+    kind: str
+    data: bytes | str | None
+    name: Any
+    generation: int | None
+    attachment: InputAttachment | None
+    error: BaseException | None
+    def __init__(
+        self,
+        kind: str,
+        data: bytes | str | None = ...,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+        error: BaseException | None = ...,
+    ) -> None: ...
+    @classmethod
+    def chunk(
+        cls,
+        data: bytes | str,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+    ) -> InputControl: ...
+    @classmethod
+    def end(
+        cls,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+    ) -> InputControl: ...
+    @classmethod
+    def fail(
+        cls,
+        error: BaseException | str,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+    ) -> InputControl: ...
+    @classmethod
+    def not_ready(
+        cls,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+    ) -> InputControl: ...
+
+class InputEvent:
+    CHUNK: ClassVar[str]
+    END: ClassVar[str]
+    ERROR: ClassVar[str]
+    NOT_READY: ClassVar[str]
+    kind: str
+    attachment: InputAttachment
+    data: bytes | str | None
+    error: BaseException | None
+    receipt: InputReceipt | None
+    accepted: bool
+    stale: bool
+    def __init__(
+        self,
+        kind: str,
+        attachment: InputAttachment,
+        data: bytes | str | None = ...,
+        error: BaseException | None = ...,
+        receipt: InputReceipt | None = ...,
+    ) -> None: ...
+    @property
+    def source(self) -> InputAttachment: ...
+    @property
+    def name(self) -> Any: ...
+    @property
+    def generation(self) -> int: ...
+    @property
+    def attachment_id(self) -> str: ...
+    @property
+    def empty(self) -> bool: ...
+    @property
+    def is_chunk(self) -> bool: ...
+    @property
+    def is_end(self) -> bool: ...
+    @property
+    def is_error(self) -> bool: ...
+
+class InputAttachment:
+    hub: InputHub
+    name: Any
+    generation: int
+    attachment_id: str
+    superseded: bool
+    superseded_by: InputAttachment | None
+    ended: bool
+    failed: bool
+    failure: BaseException | None
+    stale_failure: BaseException | None
+    def __init__(
+        self,
+        hub: InputHub,
+        name: Any,
+        generation: int,
+        queue: Queue[Any] | None = ...,
+        callback: Callable[[], bytes | str | None] | None = ...,
+    ) -> None: ...
+    @property
+    def active(self) -> bool: ...
+    @property
+    def terminated(self) -> bool: ...
+    @property
+    def state(self) -> str: ...
+    @property
+    def accepted_chunks(self) -> tuple[bytes | str, ...]: ...
+    @property
+    def chunks(self) -> tuple[bytes | str, ...]: ...
+    @property
+    def accepted_count(self) -> int: ...
+    @property
+    def accepted_empty_count(self) -> int: ...
+    @property
+    def accepted_empty(self) -> bool: ...
+    @property
+    def accepted_an_empty_chunk(self) -> bool: ...
+    @property
+    def empty_acknowledged(self) -> bool: ...
+    @property
+    def acknowledged(self) -> tuple[bytes | str, ...]: ...
+    @property
+    def last_accepted(self) -> bytes | str | None: ...
+    @property
+    def error(self) -> BaseException | None: ...
+    @property
+    def not_ready_count(self) -> int: ...
+    @property
+    def events(self) -> tuple[InputEvent, ...]: ...
+    @property
+    def stale_events(self) -> tuple[InputEvent, ...]: ...
+    def send(
+        self,
+        data: bytes | str | None,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def feed(
+        self,
+        data: bytes | str | None,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def put(
+        self,
+        data: bytes | str | None,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def end(self, *, wait: bool = ..., timeout: float | None = ...) -> InputReceipt: ...
+    def finish(
+        self, *, wait: bool = ..., timeout: float | None = ...
+    ) -> InputReceipt: ...
+    def close(
+        self, *, wait: bool = ..., timeout: float | None = ...
+    ) -> InputReceipt: ...
+    def fail(
+        self,
+        error: BaseException | str,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def report_failure(
+        self,
+        error: BaseException | str,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def fail_source(
+        self,
+        error: BaseException | str,
+        *,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def wait_accepted(self, count: int = ..., timeout: float | None = ...) -> bool: ...
+    def wait_for_acceptance(
+        self, count: int = ..., timeout: float | None = ...
+    ) -> bool: ...
+
+class InputHub:
+    events: Queue[InputEvent]
+    published: list[InputEvent]
+    event_callback_errors: list[Exception]
+    def __init__(
+        self,
+        queue: Queue[Any] | None = ...,
+        callback: Callable[[], bytes | str | None] | None = ...,
+        *,
+        producers: dict[Any, Any] | None = ...,
+        on_event: Callable[[InputEvent], Any] | None = ...,
+        notify_not_ready: bool = ...,
+    ) -> None: ...
+    @classmethod
+    def from_producers(
+        cls,
+        producers: dict[Any, Any],
+        *,
+        on_event: Callable[[InputEvent], Any] | None = ...,
+        notify_not_ready: bool = ...,
+    ) -> InputHub: ...
+    @classmethod
+    def from_queue(
+        cls, queue: Queue[Any], name: Any = ..., **kwargs: Any
+    ) -> InputHub: ...
+    @classmethod
+    def from_callback(
+        cls, callback: Callable[[], bytes | str | None], name: Any = ..., **kwargs: Any
+    ) -> InputHub: ...
+    @classmethod
+    def from_queue_and_callback(
+        cls,
+        queue: Queue[Any],
+        callback: Callable[[], bytes | str | None],
+        name: Any = ...,
+        **kwargs: Any,
+    ) -> InputHub: ...
+    def with_name(self, name: Any) -> InputHub: ...
+    @property
+    def attachments(self) -> tuple[InputAttachment, ...]: ...
+    @property
+    def active_attachments(self) -> tuple[InputAttachment, ...]: ...
+    @property
+    def failures(self) -> tuple[InputEvent, ...]: ...
+    @property
+    def stale_failures(self) -> tuple[InputEvent, ...]: ...
+    @property
+    def history(self) -> tuple[InputEvent, ...]: ...
+    @property
+    def closed(self) -> bool: ...
+    def current(self, name: Any) -> InputAttachment | None: ...
+    def get(self, name: Any) -> InputAttachment | None: ...
+    def failure_for(
+        self, name: Any, generation: int | None = ...
+    ) -> BaseException | None: ...
+    def failure_event_for(
+        self, name: Any, generation: int | None = ...
+    ) -> InputEvent | None: ...
+    @property
+    def sources(self) -> dict[Any, InputAttachment]: ...
+    def get_chunk(self) -> bytes | str: ...
+    def attachment(
+        self, name: Any, generation: int | None = ...
+    ) -> InputAttachment | None: ...
+    def put(
+        self, message: Any, *, wait: bool = ..., timeout: float | None = ...
+    ) -> InputEvent | None: ...
+    def post(
+        self, message: Any, *, wait: bool = ..., timeout: float | None = ...
+    ) -> InputEvent | None: ...
+    def send(
+        self,
+        data: bytes | str | None,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def feed(
+        self,
+        data: bytes | str | None,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def end(
+        self,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def fail(
+        self,
+        error: BaseException | str,
+        *,
+        name: Any = ...,
+        generation: int | None = ...,
+        attachment: InputAttachment | None = ...,
+        wait: bool = ...,
+        timeout: float | None = ...,
+    ) -> InputReceipt: ...
+    def attach(
+        self,
+        name: Any = ...,
+        producer: Any = ...,
+        *,
+        queue: Queue[Any] | None = ...,
+        callback: Callable[[], bytes | str | None] | None = ...,
+        source: Any = ...,
+    ) -> InputAttachment: ...
+    def add_source(
+        self,
+        name: Any = ...,
+        producer: Any = ...,
+        *,
+        queue: Queue[Any] | None = ...,
+        callback: Callable[[], bytes | str | None] | None = ...,
+        source: Any = ...,
+    ) -> InputAttachment: ...
+    def connect(
+        self,
+        name: Any = ...,
+        producer: Any = ...,
+        *,
+        queue: Queue[Any] | None = ...,
+        callback: Callable[[], bytes | str | None] | None = ...,
+        source: Any = ...,
+    ) -> InputAttachment: ...
+    def detach(self, name: Any) -> InputAttachment | None: ...
+    def close(self) -> None: ...
+    def finish(self) -> None: ...
+
+MultiSourceInput: TypeAlias = InputHub
+InputMultiplexer: TypeAlias = InputHub
+
+INPUT_END: Final[Any]
+NOT_READY: Final[Any]
 
 # ---------------------------------------------------------------------------
 # pushd — context manager for temporary directory changes

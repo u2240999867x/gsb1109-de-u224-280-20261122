@@ -11,6 +11,7 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -3752,6 +3753,254 @@ time.sleep(2)
         p.wait()
 
 
+@requires_posix
+class InputHubTests(BaseTests):
+    """multi-source stdin: named attachments, handoff, empty chunks, failures"""
+
+    def setUp(self):
+        super().setUp()
+        self.bootstrappers = []
+        self.hubs = []
+        self.reader_files = []
+
+    def tearDown(self):
+        for hub in self.hubs:
+            hub.close()
+        for proc in self.bootstrappers:
+            if proc.is_alive():
+                proc.kill()
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+        for py in self.reader_files:
+            try:
+                py.close()
+            except Exception:
+                pass
+        super().tearDown()
+
+    def make_reader(self):
+        py = create_tmp_test(
+            """
+import sys
+data = sys.stdin.buffer.read()
+sys.stdout.buffer.write(data)
+sys.stdout.flush()
+"""
+        )
+        self.reader_files.append(py)
+        return py
+
+    def start_reader(self, hub, **kwargs):
+        py = self.make_reader()
+        proc = python(
+            "-u",
+            py.name,
+            _in=hub,
+            _bg=True,
+            _tty_out=False,
+            _in_bufsize=0,
+            _timeout=10,
+            **kwargs,
+        )
+        self.bootstrappers.append(proc)
+        return proc
+
+    def new_hub(self, **kwargs):
+        hub = sh.InputHub(**kwargs)
+        self.hubs.append(hub)
+        return hub
+
+    def wait_bytes(self, proc, timeout=10):
+        proc.wait()
+        return proc.process.stdout
+
+    def test_two_workstations_and_handoff(self):
+        fd, ack_name = tempfile.mkstemp()
+        os.close(fd)
+        os.unlink(ack_name)
+        self.addCleanup(lambda: exists(ack_name) and os.unlink(ack_name))
+        py = create_tmp_test(
+            """
+import sys
+received = []
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    received.append(line)
+    if line == b"B001\\n":
+        with open({ack!r}, "w") as f:
+            f.write("B-acked")
+sys.stdout.buffer.write(b"".join(received))
+sys.stdout.flush()
+""".format(ack=ack_name)
+        )
+
+        hub = self.new_hub()
+        gate = threading.Event()
+        calls = []
+
+        def old_producer():
+            calls.append(len(calls))
+            if len(calls) == 1:
+                return b"A1\n"
+            gate.wait(5)
+            if len(calls) == 2:
+                return b"LATE\n"
+            raise sh.DoneReadingForever()
+
+        old_a = hub.attach("A", callback=old_producer)
+        b = hub.attach("B")
+        proc = python("-u", py.name, _in=hub, _bg=True, _tty_out=False, _timeout=10)
+        self.bootstrappers.append(proc)
+
+        self.assertTrue(old_a.wait_accepted(1, timeout=5))
+        self.assertEqual(old_a.accepted_chunks, (b"A1\n",))
+
+        new_a = hub.attach("A")
+        b.send(b"B001\n", timeout=5)
+
+        # B's line must reach the child while old A is still blocked.
+        deadline = time.time() + 5
+        while not exists(ack_name) and time.time() < deadline:
+            time.sleep(0.02)
+        with open(ack_name) as f:
+            self.assertEqual(f.read(), "B-acked")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(gate.is_set())
+
+        hub.put(sh.InputControl.end(name="A", generation=1), wait=True, timeout=5)
+        self.assertEqual(old_a.state, "ended")
+
+        late = hub.put(
+            sh.InputControl.chunk(b"LATE\n", name="A", generation=1),
+            wait=True,
+            timeout=5,
+        )
+        self.assertFalse(late.accepted)
+        self.assertTrue(late.stale)
+        self.assertIs(late.attachment, old_a)
+
+        hub.put(
+            sh.InputControl.fail(RuntimeError("old boom"), name="A", generation=1),
+            wait=True,
+            timeout=5,
+        )
+        self.assertEqual(hub.failures, ())
+        self.assertEqual(len(hub.stale_failures), 1)
+        self.assertIs(hub.stale_failures[0].attachment, old_a)
+
+        gate.set()
+        late_again = old_a.send(b"LATE\n", timeout=5)
+        self.assertFalse(late_again.accepted)
+        stale_failure = old_a.fail(RuntimeError("old boom"), timeout=5)
+        self.assertFalse(stale_failure.accepted)
+        self.assertTrue(stale_failure.stale)
+        self.assertEqual(hub.failures, ())
+
+        new_a.send(b"", timeout=5)
+        self.assertTrue(new_a.accepted_empty)
+        new_a.send(b"A2\n", timeout=5)
+        new_a.end(timeout=5)
+        b.end(timeout=5)
+
+        self.assertEqual(self.wait_bytes(proc), b"A1\nB001\nA2\n")
+        self.assertEqual(new_a.accepted_chunks, (b"", b"A2\n"))
+        self.assertEqual(old_a.accepted_chunks, (b"A1\n",))
+        self.assertEqual(hub.failures, ())
+        self.assertIs(late.attachment, old_a)
+
+    def test_replacement_failure_after_accepted_suffix(self):
+        hub = self.new_hub()
+
+        old_a = hub.attach("A")
+        b = hub.attach("B")
+        proc = self.start_reader(hub)
+
+        old_a.send(b"A1\n", timeout=5)
+        b.send(b"B001\n", timeout=5)
+
+        new_a = hub.attach("A")
+        new_a.send(b"A2\n", timeout=5)
+        self.assertEqual(new_a.accepted_chunks, (b"A2\n",))
+
+        receipt = new_a.fail(RuntimeError("replacement failed"), timeout=5)
+        self.assertTrue(receipt.accepted)
+        self.assertEqual(len(hub.failures), 1)
+        self.assertIs(hub.failures[0].attachment, new_a)
+        self.assertIn("replacement failed", str(hub.failures[0].error))
+
+        b.end(timeout=5)
+        self.assertEqual(self.wait_bytes(proc), b"A1\nB001\nA2\n")
+
+    def test_empty_chunk_is_not_eof(self):
+        hub = self.new_hub()
+        a = hub.attach("A")
+        seen = []
+        a.send(b"", timeout=5)
+        self.assertEqual(a.accepted_count, 1)
+        self.assertTrue(a.accepted_empty)
+        a.send(b"after\n", timeout=5)
+        a.end(timeout=5)
+        try:
+            while True:
+                seen.append(hub.get_chunk())
+        except sh.DoneReadingForever:
+            pass
+        self.assertEqual(seen, [b"", b"after\n"])
+
+    def test_one_ending_source_does_not_end_child(self):
+        hub = self.new_hub()
+        a = hub.attach("A")
+        b = hub.attach("B")
+        proc = self.start_reader(hub)
+
+        a.send(b"A1\n", timeout=5)
+        b.send(b"B001\n", timeout=5)
+        a.end(timeout=5)
+        time.sleep(0.2)
+        self.assertTrue(proc.is_alive())
+        b.end(timeout=5)
+        self.assertEqual(self.wait_bytes(proc), b"A1\nB001\n")
+
+    def test_not_ready_is_distinct_from_empty(self):
+        hub = self.new_hub(notify_not_ready=True)
+        returns = [sh.NOT_READY, b"", sh.NOT_READY, b"data\n", sh.NOT_READY]
+
+        def producer():
+            if not returns:
+                raise sh.DoneReadingForever()
+            return returns.pop(0)
+
+        a = hub.attach("A", callback=producer)
+        self.assertTrue(a.wait_accepted(2, timeout=5))
+        a.end(timeout=5)
+        self.assertGreaterEqual(a.not_ready_count, 1)
+        self.assertTrue(a.accepted_empty)
+        self.assertEqual(a.accepted_chunks, (b"", b"data\n"))
+
+    def test_single_source_queue_and_callback_unchanged(self):
+        from queue import Queue
+
+        py = create_stdin_transform_test()
+        run = pythons.bake(_tty_out=False)
+        q = Queue()
+        q.put("one\n")
+        q.put("two\n")
+        q.put(None)
+        self.assertEqual(run(py.name, _in=q).strip(), "ONE\nTWO")
+
+        outputs = ["a", "b", None]
+
+        def producer():
+            return outputs.pop(0)
+
+        self.assertEqual(run(py.name, _in=producer).strip(), "AB")
+
+
+@requires_posix
 class StreamBuffererTests(unittest.TestCase):
     def test_unbuffered(self):
         from sh import StreamBufferer

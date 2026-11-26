@@ -2789,6 +2789,1045 @@ class NotYetReadyToRead(Exception):
     pass
 
 
+class _InputSentinel:
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+    __str__ = __repr__
+
+
+INPUT_END = _InputSentinel("INPUT_END")
+NOT_READY = _InputSentinel("NOT_READY")
+DEFAULT_INPUT_NAME = None
+
+
+class InputSourceError(Exception):
+    """A failure reported by an input producer."""
+
+    def __init__(self, message, *, attachment=None):
+        super().__init__(message)
+        self.attachment = attachment
+
+
+class InputControl:
+    """A queue-routable control message for an :class:`InputHub`.
+
+    ``name`` and ``generation`` identify the attachment the message belongs
+    to.  When ``generation`` is omitted, the current attachment for ``name``
+    receives it; passing an old generation is how a producer addresses the
+    attachment it belongs to after the workbench has been re-attached.
+    """
+
+    CHUNK = "chunk"
+    END = "end"
+    ERROR = "error"
+    NOT_READY = "not_ready"
+
+    def __init__(
+        self,
+        kind,
+        data=None,
+        *,
+        name=None,
+        generation=None,
+        attachment=None,
+        error=None,
+    ):
+        if kind not in (self.CHUNK, self.END, self.ERROR, self.NOT_READY):
+            raise ValueError(f"unknown input control kind: {kind!r}")
+        self.kind = kind
+        self.data = data
+        self.name = name
+        self.generation = generation
+        self.attachment = attachment
+        self.error = error
+
+    @classmethod
+    def chunk(cls, data, *, name=None, generation=None, attachment=None):
+        return cls(
+            cls.CHUNK,
+            data,
+            name=name,
+            generation=generation,
+            attachment=attachment,
+        )
+
+    @classmethod
+    def end(cls, *, name=None, generation=None, attachment=None):
+        return cls(cls.END, name=name, generation=generation, attachment=attachment)
+
+    @classmethod
+    def fail(cls, error, *, name=None, generation=None, attachment=None):
+        return cls(
+            cls.ERROR,
+            error=error,
+            name=name,
+            generation=generation,
+            attachment=attachment,
+        )
+
+    @classmethod
+    def not_ready(cls, *, name=None, generation=None, attachment=None):
+        return cls(
+            cls.NOT_READY, name=name, generation=generation, attachment=attachment
+        )
+
+    def __repr__(self):
+        target = self.attachment
+        if target is None:
+            target = f"{self.name}:{self.generation}"
+        return f"<InputControl {self.kind} {target}>"
+
+
+class InputReceipt:
+    """Acknowledgement for one accepted input event.
+
+    A receipt is completed when the hub has processed the event.  ``accepted``
+    is true only when the event came from the current attachment and was
+    eligible to be written to the child process.
+    """
+
+    def __init__(self, attachment, kind, data=None, error=None):
+        self.attachment = attachment
+        self.kind = kind
+        self.data = data
+        self.error = error
+        self.accepted = False
+        self.stale = False
+        self._done = threading.Event()
+
+    def done(self):
+        return self._done.is_set()
+
+    def wait(self, timeout=None):
+        return self._done.wait(timeout)
+
+    @property
+    def delivered(self):
+        return self.accepted and not self.stale
+
+
+class InputEvent:
+    """An event produced by one attachment of an :class:`InputHub`."""
+
+    CHUNK = "chunk"
+    END = "end"
+    ERROR = "error"
+    NOT_READY = "not_ready"
+
+    def __init__(self, kind, attachment, data=None, error=None, receipt=None):
+        self.kind = kind
+        self.attachment = attachment
+        self.data = data
+        self.error = error
+        self.receipt = receipt
+        self.accepted = False
+        self.stale = False
+
+    @property
+    def source(self):
+        return self.attachment
+
+    @property
+    def name(self):
+        return self.attachment.name
+
+    @property
+    def generation(self):
+        return self.attachment.generation
+
+    @property
+    def attachment_id(self):
+        return self.attachment.attachment_id
+
+    @property
+    def empty(self):
+        return self.kind == self.CHUNK and self.data in (b"", "")
+
+    @property
+    def is_chunk(self):
+        return self.kind == self.CHUNK
+
+    @property
+    def is_end(self):
+        return self.kind == self.END
+
+    @property
+    def is_error(self):
+        return self.kind == self.ERROR
+
+    def __repr__(self):
+        att = self.attachment
+        return (
+            f"<InputEvent {self.kind} {att.attachment_id} "
+            f"accepted={self.accepted} stale={self.stale}>"
+        )
+
+
+class InputAttachment:
+    """One attachment (producer session) of an :class:`InputHub`."""
+
+    def __init__(self, hub, name, generation, queue=None, callback=None):
+        self.hub = hub
+        self.name = name
+        self.generation = generation
+        attachment_id = f"{name}:{generation}"
+        self.attachment_id = "input:1" if name is None else attachment_id
+        self.superseded = False
+        self.superseded_by = None
+        self.ended = False
+        self.failed = False
+        self.failure = None
+        self.stale_failure = None
+        self._queue = queue
+        self._callback = callback
+        self._accepted = []
+        self._accepted_empty_count = 0
+        self._not_ready_count = 0
+        self._events = []
+
+    @property
+    def active(self):
+        return not (self.superseded or self.ended or self.failed)
+
+    @property
+    def terminated(self):
+        return self.ended or self.failed
+
+    @property
+    def state(self):
+        if self.failed:
+            return "failed"
+        if self.ended:
+            return "ended"
+        if self.superseded:
+            return "superseded"
+        return "active"
+
+    @property
+    def accepted_chunks(self):
+        return tuple(self._accepted)
+
+    @property
+    def chunks(self):
+        return tuple(self._accepted)
+
+    @property
+    def accepted_count(self):
+        return len(self._accepted)
+
+    @property
+    def accepted_empty_count(self):
+        return self._accepted_empty_count
+
+    @property
+    def accepted_empty(self):
+        return self._accepted_empty_count > 0
+
+    @property
+    def accepted_an_empty_chunk(self):
+        return self._accepted_empty_count > 0
+
+    @property
+    def last_accepted(self):
+        return self._accepted[-1] if self._accepted else None
+
+    @property
+    def error(self):
+        return self.failure
+
+    @property
+    def acknowledged(self):
+        return tuple(self._accepted)
+
+    @property
+    def empty_acknowledged(self):
+        return self._accepted_empty_count > 0
+
+    @property
+    def not_ready_count(self):
+        return self._not_ready_count
+
+    @property
+    def events(self):
+        return tuple(self._events)
+
+    @property
+    def stale_events(self):
+        return tuple(event for event in self._events if event.stale)
+
+    def send(self, data, *, wait=True, timeout=None):
+        """Submit a chunk.  Empty ``bytes``/``str`` are valid chunks."""
+        if data is None or data is INPUT_END:
+            return self.end(wait=wait, timeout=timeout)
+        if isinstance(data, BaseException):
+            return self.fail(data, wait=wait, timeout=timeout)
+        if isinstance(data, InputControl):
+            if data.attachment is None:
+                data.attachment = self
+            return self.hub.put(data, wait=wait, timeout=timeout)
+        if isinstance(data, bytearray):
+            data = bytes(data)
+        elif isinstance(data, memoryview):
+            data = data.tobytes()
+        if not isinstance(data, (bytes, str)):
+            raise TypeError("input chunks must be bytes or str")
+
+        receipt = InputReceipt(self, InputEvent.CHUNK, data=data)
+        event = InputEvent(InputEvent.CHUNK, self, data=data, receipt=receipt)
+        self.hub._enqueue_event(event)
+        if wait:
+            self.hub._pump()
+            receipt.wait(timeout)
+        return receipt
+
+    feed = send
+    put = send
+
+    def end(self, *, wait=True, timeout=None):
+        """End this attachment, leaving other attachments running."""
+        receipt = InputReceipt(self, InputEvent.END)
+        event = InputEvent(InputEvent.END, self, receipt=receipt)
+        self.hub._enqueue_event(event)
+        if wait:
+            self.hub._pump()
+            receipt.wait(timeout)
+        return receipt
+
+    finish = end
+    close = end
+
+    def fail(self, error, *, wait=True, timeout=None):
+        """Report a failure for this attachment only."""
+        if isinstance(error, str):
+            error = InputSourceError(error, attachment=self)
+        elif not isinstance(error, BaseException):
+            error = InputSourceError(repr(error), attachment=self)
+
+        receipt = InputReceipt(self, InputEvent.ERROR, error=error)
+        event = InputEvent(InputEvent.ERROR, self, error=error, receipt=receipt)
+        self.hub._enqueue_event(event)
+        if wait:
+            self.hub._pump()
+            receipt.wait(timeout)
+        return receipt
+
+    report_failure = fail
+    fail_source = fail
+
+    def wait_accepted(self, count=1, timeout=None):
+        return self.hub._wait_accepted(self, count, timeout)
+
+    wait_for_acceptance = wait_accepted
+
+    def __repr__(self):
+        return f"<InputAttachment {self.attachment_id} {self.state}>"
+
+
+class InputHub:
+    """Multiplexes several named input producers into one ``_in`` stream.
+
+    Each ``attach(name, ...)`` call creates a new attachment generation.
+    Attaching the same name again supersedes the old attachment without
+    disturbing data that the old attachment already delivered and had
+    acknowledged.  Later events from the old attachment are retained on that
+    attachment and marked ``stale`` instead of being written to the child.
+    """
+
+    def __init__(
+        self,
+        queue=None,
+        callback=None,
+        *,
+        producers=None,
+        on_event=None,
+        notify_not_ready=False,
+    ):
+        self._on_event = on_event
+        self._notify_not_ready = notify_not_ready
+        self._condition = threading.Condition(threading.RLock())
+        self._attachments = []
+        self._current = {}
+        self._generations = {}
+        self._history = []
+        self._failures = []
+        self._stale_failures = []
+        self._unrouted = []
+        self._buffer = deque()
+        self._incoming = Queue()
+        self._control = Queue()
+        self._queue_cursor = 0
+        self._closed = False
+        self._shutdown = False
+        self._dispatch_lock = threading.RLock()
+        self._default = None
+        self.events = Queue()
+        self.event_callback_errors = []
+        self.published = []
+        self._dispatcher = threading.Thread(
+            target=InputHub._dispatch_loop,
+            args=(weakref.ref(self),),
+            name="input hub dispatcher",
+            daemon=True,
+        )
+        self._dispatcher.start()
+
+        if producers:
+            for name, producer in producers.items():
+                self.attach(name, producer)
+        if queue is not None or callback is not None:
+            self._default = self.attach(
+                DEFAULT_INPUT_NAME, queue=queue, callback=callback
+            )
+
+    @classmethod
+    def from_producers(cls, producers, *, on_event=None, notify_not_ready=False):
+        return cls(
+            producers=producers,
+            on_event=on_event,
+            notify_not_ready=notify_not_ready,
+        )
+
+    @classmethod
+    def from_queue(cls, queue, name=None, **kwargs):
+        return cls(queue=queue, **kwargs).with_name(name)
+
+    @classmethod
+    def from_callback(cls, callback, name=None, **kwargs):
+        return cls(callback=callback, **kwargs).with_name(name)
+
+    @classmethod
+    def from_queue_and_callback(cls, queue, callback, name=None, **kwargs):
+        return cls(queue=queue, callback=callback, **kwargs).with_name(name)
+
+    def with_name(self, name):
+        if name is not None and self._default is not None:
+            with self._condition:
+                self._default.name = name
+                self._default.attachment_id = f"{name}:{self._default.generation}"
+                self._current.pop(None, None)
+                self._current[name] = self._default
+        return self
+
+    @property
+    def attachments(self):
+        return tuple(self._attachments)
+
+    @property
+    def active_attachments(self):
+        with self._condition:
+            return tuple(self._current.values())
+
+    @property
+    def failures(self):
+        return tuple(self._failures)
+
+    @property
+    def stale_failures(self):
+        return tuple(self._stale_failures)
+
+    @property
+    def history(self):
+        return tuple(self._history)
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def current(self, name):
+        with self._condition:
+            return self._current.get(name)
+
+    get = current
+
+    def failure_for(self, name, generation=None):
+        attachment = self.attachment(name, generation)
+        return attachment.failure if attachment is not None else None
+
+    def failure_event_for(self, name, generation=None):
+        attachment = self.attachment(name, generation)
+        if attachment is None or attachment.failure is None:
+            return None
+        for event in reversed(self._failures):
+            if event.attachment is attachment:
+                return event
+        for event in reversed(self._stale_failures):
+            if event.attachment is attachment:
+                return event
+        return None
+
+    @property
+    def sources(self):
+        return {att.name: att for att in self.active_attachments}
+
+    def attachment(self, name, generation=None):
+        """Resolve a workbench name (and optionally a generation)."""
+        with self._condition:
+            if generation is None:
+                return self._current.get(name)
+            for attachment in self._attachments:
+                if attachment.name == name and attachment.generation == generation:
+                    return attachment
+        return None
+
+    def put(self, message, *, wait=False, timeout=None):
+        """Put an :class:`InputControl` (or queued data) on the hub queue."""
+        with self._condition:
+            start = len(self._history)
+        self._control.put(message)
+        if wait:
+            return self._wait_control(message, timeout, start)
+        return None
+
+    post = put
+
+    def send(
+        self,
+        data,
+        *,
+        name=None,
+        generation=None,
+        attachment=None,
+        wait=True,
+        timeout=None,
+    ):
+        target = attachment or self._target(name, generation)
+        return target.send(data, wait=wait, timeout=timeout)
+
+    feed = send
+
+    def end(
+        self, *, name=None, generation=None, attachment=None, wait=True, timeout=None
+    ):
+        target = attachment or self._target(name, generation)
+        return target.end(wait=wait, timeout=timeout)
+
+    def fail(
+        self,
+        error,
+        *,
+        name=None,
+        generation=None,
+        attachment=None,
+        wait=True,
+        timeout=None,
+    ):
+        target = attachment or self._target(name, generation)
+        return target.fail(error, wait=wait, timeout=timeout)
+
+    def _target(self, name, generation):
+        if name is None and generation is None:
+            with self._condition:
+                if self._default is not None:
+                    return self._default
+                current = list(self._current.values())
+            if len(current) != 1:
+                raise ValueError("input hub has more than one active source")
+            return current[0]
+        attachment = self.attachment(name, generation)
+        if attachment is None:
+            raise KeyError(f"no input attachment {name!r} generation {generation!r}")
+        return attachment
+
+    def _wait_control(self, message, timeout, start=0):
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            self._pump()
+            with self._condition:
+                for event in reversed(self._history[start:]):
+                    if not isinstance(message, InputControl):
+                        return event
+                    if event.kind != message.kind:
+                        continue
+                    if message.data is not None and event.data != message.data:
+                        continue
+                    if (
+                        message.attachment is not None
+                        and event.attachment is not message.attachment
+                    ):
+                        continue
+                    if message.name is not None and event.name != message.name:
+                        continue
+                    if (
+                        message.generation is not None
+                        and event.generation != message.generation
+                    ):
+                        continue
+                    return event
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return None
+                if not self._condition.wait(min(remaining or 0.01, 0.01)):
+                    continue
+
+    def attach(
+        self,
+        name=None,
+        producer=None,
+        *,
+        queue=None,
+        callback=None,
+        source=None,
+    ):
+        """Create a new attachment generation for ``name``.
+
+        ``producer`` may be a :class:`queue.Queue`-like object or a callable.
+        Queue and callback producers may also be supplied together.  With
+        neither, the returned attachment is driven with ``send``/``end``/
+        ``fail``.
+        """
+        if source is not None:
+            if producer is not None or queue is not None or callback is not None:
+                raise TypeError("pass source or another producer, not both")
+            producer = source
+        if isinstance(producer, tuple):
+            if len(producer) != 2:
+                raise TypeError("a producer tuple must be (queue, callback)")
+            queue, callback = producer
+        elif producer is not None:
+            if queue is None and callback is None:
+                if self._is_queue(producer):
+                    queue = producer
+                elif callable(producer):
+                    callback = producer
+                else:
+                    raise TypeError("producer must be a queue or a callable")
+            else:
+                raise TypeError("pass producer or queue/callback, not both")
+        if queue is not None and not self._is_queue(queue):
+            raise TypeError("queue must be a Queue-like object")
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable")
+
+        with self._condition:
+            generations = self._generations
+            generation = generations.get(name, 0) + 1
+            generations[name] = generation
+
+            old = self._current.get(name)
+            if old is not None:
+                old.superseded = True
+
+            attachment = InputAttachment(
+                self, name, generation, queue=queue, callback=callback
+            )
+            if old is not None:
+                old.superseded_by = attachment
+            self._attachments.append(attachment)
+            self._current[name] = attachment
+            self._condition.notify_all()
+
+        if callback is not None:
+            thread = threading.Thread(
+                target=self._callback_loop,
+                args=(attachment,),
+                name=f"input callback for {attachment.attachment_id}",
+                daemon=True,
+            )
+            thread.start()
+
+        return attachment
+
+    add_source = attach
+    connect = attach
+
+    def detach(self, name):
+        with self._condition:
+            attachment = self._current.pop(name, None)
+            if attachment is not None:
+                attachment.superseded = True
+                self._condition.notify_all()
+            return attachment
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._pump()
+
+    finish = close
+
+    @staticmethod
+    def _is_queue(obj):
+        return isinstance(obj, Queue) or hasattr(obj, "get_nowait")
+
+    def _enqueue_event(self, event):
+        self._incoming.put(event)
+
+    def _callback_loop(self, attachment):
+        callback = attachment._callback
+        while True:
+            with self._condition:
+                if self._closed:
+                    return
+            try:
+                value = callback()
+            except NotYetReadyToRead:
+                self._record_not_ready(attachment)
+                time.sleep(0.01)
+                continue
+            except DoneReadingForever:
+                self._enqueue_event(InputEvent(InputEvent.END, attachment))
+                return
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self._enqueue_event(
+                    InputEvent(InputEvent.ERROR, attachment, error=error)
+                )
+                return
+
+            if value is NOT_READY:
+                self._record_not_ready(attachment)
+                time.sleep(0.01)
+                continue
+            if value is None or value is INPUT_END:
+                self._enqueue_event(InputEvent(InputEvent.END, attachment))
+                return
+            if isinstance(value, BaseException):
+                self._enqueue_event(
+                    InputEvent(InputEvent.ERROR, attachment, error=value)
+                )
+                return
+            if isinstance(value, InputEvent):
+                if value.attachment is None:
+                    value.attachment = attachment
+                self._enqueue_event(value)
+                receipt = value.receipt
+                if receipt is not None:
+                    receipt.wait()
+                continue
+            if isinstance(value, InputControl):
+                value.attachment = value.attachment or attachment
+                self._enqueue_event(self._control_event(value, attachment))
+                continue
+            if isinstance(value, bytearray):
+                value = bytes(value)
+            elif isinstance(value, memoryview):
+                value = value.tobytes()
+            if not isinstance(value, (bytes, str)):
+                type_error = TypeError("input callback must return bytes or str")
+                self._enqueue_event(
+                    InputEvent(InputEvent.ERROR, attachment, error=type_error)
+                )
+                return
+
+            receipt = InputReceipt(attachment, InputEvent.CHUNK, data=value)
+            event = InputEvent(
+                InputEvent.CHUNK, attachment, data=value, receipt=receipt
+            )
+            self._enqueue_event(event)
+            receipt.wait()
+
+    def _record_not_ready(self, attachment):
+        event = InputEvent(InputEvent.NOT_READY, attachment)
+        with self._condition:
+            attachment._not_ready_count += 1
+            attachment._events.append(event)
+            self._history.append(event)
+            self._condition.notify_all()
+        if self._notify_not_ready or self._on_event is not None:
+            self._publish(event)
+
+    def _queue_event(self, attachment, item):
+        if item is None or item is INPUT_END:
+            return InputEvent(InputEvent.END, attachment)
+        if item is NOT_READY:
+            return InputEvent(InputEvent.NOT_READY, attachment)
+        if isinstance(item, DoneReadingForever):
+            return InputEvent(InputEvent.END, attachment)
+        if isinstance(item, BaseException):
+            return InputEvent(InputEvent.ERROR, attachment, error=item)
+        if isinstance(item, InputEvent):
+            if item.attachment is None:
+                item.attachment = attachment
+            return item
+        if isinstance(item, InputControl):
+            return self._control_event(item, attachment)
+        if isinstance(item, bytearray):
+            item = bytes(item)
+        elif isinstance(item, memoryview):
+            item = item.tobytes()
+        if not isinstance(item, (bytes, str)):
+            type_error = TypeError("queued input must be bytes or str")
+            return InputEvent(InputEvent.ERROR, attachment, error=type_error)
+        return InputEvent(InputEvent.CHUNK, attachment, data=item)
+
+    def _control_event(self, message, attachment, explicit_only=False):
+        target = message.attachment
+        if target is None and message.name is not None:
+            target = self.attachment(message.name, message.generation)
+        if target is None:
+            target = attachment
+        if target is None and not explicit_only:
+            target = self._resolve_control(message)
+        if message.kind == InputControl.CHUNK:
+            return InputEvent(InputEvent.CHUNK, target, data=message.data)
+        if message.kind == InputControl.END:
+            return InputEvent(InputEvent.END, target)
+        if message.kind == InputControl.ERROR:
+            return InputEvent(InputEvent.ERROR, target, error=message.error)
+        return InputEvent(InputEvent.NOT_READY, target)
+
+    def _resolve_control(self, message):
+        if message.attachment is not None:
+            return message.attachment
+        if message.name is not None:
+            return self.attachment(message.name, message.generation)
+        with self._condition:
+            current = list(self._current.values())
+        if self._default is not None and self._default in current:
+            return self._default
+        if len(current) == 1:
+            return current[0]
+        return None
+
+    def _next_event(self):
+        """Return the next pending event, or None if every source is quiet."""
+        try:
+            return self._incoming.get_nowait()
+        except Empty:
+            pass
+
+        while True:
+            try:
+                message = self._control.get_nowait()
+            except Empty:
+                break
+            if isinstance(message, InputControl):
+                if message.attachment is None and message.name is None:
+                    attachment = self._resolve_control(message)
+                else:
+                    attachment = self._control_target(message)
+                if attachment is None:
+                    with self._condition:
+                        self._unrouted.append(message)
+                    continue
+                return self._control_event(message, attachment)
+            with self._condition:
+                current = list(self._current.values())
+                default = self._default if self._default in current else None
+            if len(current) == 1:
+                return self._queue_event(current[0], message)
+            if default is not None:
+                return self._queue_event(default, message)
+            with self._condition:
+                self._unrouted.append(message)
+            # With several live sources a bare message has no unambiguous
+            # owner; it stays parked until a name is resolvable.
+
+        with self._condition:
+            unrouted = self._unrouted
+            self._unrouted = []
+        still_unrouted = []
+        for message in unrouted:
+            if isinstance(message, InputControl):
+                attachment = self._control_target(message)
+                if attachment is not None:
+                    return self._control_event(message, attachment)
+            still_unrouted.append(message)
+        with self._condition:
+            self._unrouted = still_unrouted + self._unrouted
+
+        with self._condition:
+            attachments = list(self._attachments)
+            start = self._queue_cursor
+
+        count = len(attachments)
+        for offset in range(count):
+            index = (start + offset) % count
+            attachment = attachments[index]
+            queue = attachment._queue
+            if queue is None:
+                continue
+            try:
+                item = queue.get_nowait()
+            except Empty:
+                continue
+            self._queue_cursor = (index + 1) % count
+            return self._queue_event(attachment, item)
+
+        return None
+
+    def _control_target(self, message):
+        """Resolve a control message without falling back to a live source."""
+        if message.attachment is not None:
+            return message.attachment
+        if message.name is not None:
+            return self.attachment(message.name, message.generation)
+        return None
+
+    def _pump(self):
+        with self._dispatch_lock:
+            while True:
+                with self._condition:
+                    if self._shutdown:
+                        return
+                event = self._next_event()
+                if event is None:
+                    return
+                self._process_event(event)
+
+    @staticmethod
+    def _dispatch_loop(hub_ref):
+        while True:
+            hub = hub_ref()
+            if hub is None:
+                return
+            hub._pump()
+            closed = hub._closed
+            del hub
+            if closed:
+                return
+            time.sleep(0.01)
+
+    def _process_event(self, event):
+        publish = False
+        with self._condition:
+            attachment = event.attachment
+            if event.kind == InputEvent.NOT_READY:
+                attachment._not_ready_count += 1
+                attachment._events.append(event)
+                self._history.append(event)
+                self._condition.notify_all()
+                publish = self._notify_not_ready
+            else:
+                event.stale = bool(
+                    attachment.superseded
+                    or attachment.ended
+                    or attachment.failed
+                    or self._closed
+                )
+                if event.kind == InputEvent.CHUNK:
+                    if event.stale:
+                        event.accepted = False
+                    else:
+                        event.accepted = True
+                        attachment._accepted.append(event.data)
+                        if event.data in (b"", ""):
+                            attachment._accepted_empty_count += 1
+                        self._buffer.append(event.data)
+                elif event.kind == InputEvent.END:
+                    attachment.ended = True
+                    event.accepted = not event.stale
+                elif event.kind == InputEvent.ERROR:
+                    event.accepted = not event.stale
+                    if event.stale:
+                        attachment.stale_failure = event.error
+                        self._stale_failures.append(event)
+                    else:
+                        if attachment.failure is None:
+                            attachment.failure = event.error
+                        attachment.failed = True
+                        self._failures.append(event)
+                else:
+                    raise ValueError(f"unknown input event kind: {event.kind!r}")
+
+                attachment._events.append(event)
+                self._history.append(event)
+                if event.receipt is not None:
+                    event.receipt.accepted = event.accepted
+                    event.receipt.stale = event.stale
+                    event.receipt._done.set()
+                self._condition.notify_all()
+                publish = True
+
+        if publish:
+            self._publish(event)
+
+    def _publish(self, event):
+        self.events.put(event)
+        self.published.append(event)
+        callback = self._on_event
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception as error:
+                self.event_callback_errors.append(error)
+
+    def _all_done(self):
+        with self._condition:
+            if self._closed:
+                return True
+            if not self._current:
+                return bool(self._attachments)
+            return all(att.terminated for att in self._current.values())
+
+    def get_chunk(self):
+        while True:
+            self._pump()
+            with self._condition:
+                if self._buffer:
+                    return self._buffer.popleft()
+                if self._closed:
+                    raise DoneReadingForever
+                if not self._current:
+                    if not self._attachments:
+                        raise NotYetReadyToRead
+                    return self._remaining_or_raise()
+                if all(att.terminated for att in self._current.values()):
+                    return self._remaining_or_raise()
+            raise NotYetReadyToRead
+
+    def _remaining_or_raise(self):
+        if self._buffer:
+            return self._buffer.popleft()
+        raise DoneReadingForever
+
+    def _wait_accepted(self, attachment, count, timeout):
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            self._pump()
+            with self._condition:
+                if len(attachment._accepted) >= count:
+                    return True
+                if attachment.terminated or attachment.superseded:
+                    return False
+                if deadline is None:
+                    remaining = 0.01
+                else:
+                    remaining = min(deadline - time.time(), 0.01)
+                    if remaining <= 0:
+                        return False
+                self._condition.wait(remaining)
+
+
+MultiSourceInput = InputHub
+InputMultiplexer = InputHub
+
+
+def is_queue_and_callback_pair(obj):
+    if not isinstance(obj, tuple) or len(obj) != 2:
+        return False
+    queue, callback = obj
+    queue_ok = queue is None or InputHub._is_queue(queue)
+    callback_ok = callback is None or callable(callback)
+    return queue_ok and callback_ok and (queue is not None or callback is not None)
+
+
+def input_is_producer_mapping(obj):
+    if not isinstance(obj, Mapping) or isinstance(obj, (str, bytes)):
+        return False
+    if not obj:
+        return False
+    for name, producer in obj.items():
+        if isinstance(producer, tuple):
+            if not is_queue_and_callback_pair(producer):
+                return False
+        elif not (InputHub._is_queue(producer) or callable(producer)):
+            return False
+        if not isinstance(name, str):
+            return False
+    return True
+
+
 def determine_how_to_read_input(input_obj):
     """given some kind of input object, return a function that knows how to
     read chunks of that input object.
@@ -2801,7 +3840,25 @@ def determine_how_to_read_input(input_obj):
     will take care of that.  these functions just need to return a
     reasonably-sized chunk of data."""
 
-    if isinstance(input_obj, Queue):
+    if isinstance(input_obj, InputHub):
+        log_msg = "input hub"
+        get_chunk = input_obj.get_chunk
+
+    elif isinstance(input_obj, InputAttachment):
+        log_msg = "input attachment"
+        get_chunk = input_obj.hub.get_chunk
+
+    elif input_is_producer_mapping(input_obj):
+        log_msg = "input hub"
+        hub = InputHub.from_producers(dict(input_obj))
+        get_chunk = hub.get_chunk
+
+    elif is_queue_and_callback_pair(input_obj):
+        log_msg = "input hub"
+        hub = InputHub.from_queue_and_callback(*input_obj)
+        get_chunk = hub.get_chunk
+
+    elif isinstance(input_obj, Queue):
         log_msg = "queue"
         get_chunk = get_queue_chunk_reader(input_obj)
 
@@ -3439,6 +4496,16 @@ class Environment(dict):
         "DEFAULT_ENCODING",
         "DoneReadingForever",
         "ErrorReturnCode",
+        "INPUT_END",
+        "InputAttachment",
+        "InputControl",
+        "InputEvent",
+        "InputHub",
+        "InputMultiplexer",
+        "InputReceipt",
+        "InputSourceError",
+        "MultiSourceInput",
+        "NOT_READY",
         "NotYetReadyToRead",
         "SignalException",
         "ForkException",
