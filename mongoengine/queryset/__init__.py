@@ -2,6 +2,7 @@ from mongoengine.errors import *
 from mongoengine.queryset.field_list import *
 from mongoengine.queryset.manager import *
 from mongoengine.queryset.queryset import *
+from mongoengine.queryset.recycle import *
 from mongoengine.queryset.transform import *
 from mongoengine.queryset.visitor import *
 
@@ -18,6 +19,11 @@ __all__ = (
     "CASCADE",
     "DENY",
     "PULL",
+    "RecyclePreview",
+    "RecycleResult",
+    "BlockingPath",
+    "PathEdge",
+    "FieldClear",
     # Errors that might be related to a queryset, mostly here for backward
     # compatibility
     "DoesNotExist",

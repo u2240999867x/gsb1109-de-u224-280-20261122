@@ -7,6 +7,12 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add ``QuerySet.recycle_preview()``: a read-only recycling approval preview
+  that dry-runs the reverse delete rules (``CASCADE`` / ``DENY`` /
+  ``NULLIFY`` / ``PULL``) for the documents on the current queryset page,
+  reporting the documents recyclable together, the blocking references and
+  the fields that surviving documents would have to clear, without writing
+  to the database or triggering delete signals.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

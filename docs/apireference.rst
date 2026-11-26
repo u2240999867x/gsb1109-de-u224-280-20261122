@@ -68,6 +68,18 @@ Querying
 
     .. autofunction:: mongoengine.queryset.queryset_manager
 
+    .. autoclass:: mongoengine.queryset.RecyclePreview
+      :members:
+
+    .. autoclass:: mongoengine.queryset.RecycleResult
+      :members:
+
+    .. autoclass:: mongoengine.queryset.BlockingPath
+      :members:
+
+    .. autoclass:: mongoengine.queryset.FieldClear
+      :members:
+
 Fields
 ======
 

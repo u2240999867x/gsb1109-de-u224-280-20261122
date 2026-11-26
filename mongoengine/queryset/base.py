@@ -436,6 +436,24 @@ class BaseQuerySet:
         self._cursor_obj = None
         return count
 
+    def recycle_preview(self):
+        """Open a read-only recycling approval preview for this queryset.
+
+        The queryset page currently returned by the database is captured
+        once, together with the reverse delete rules (``CASCADE`` /
+        ``DENY`` / ``NULLIFY`` / ``PULL``) reachable from those documents.
+        The returned :class:`~mongoengine.queryset.recycle.RecyclePreview`
+        can then be evaluated repeatedly for different selections without
+        further database access; call this method again to pick up changes
+        made in the database afterwards.
+
+        The preview never writes anything and never triggers delete
+        signals; use it to dry-run :meth:`delete`.
+        """
+        from mongoengine.queryset.recycle import build_recycle_preview
+
+        return build_recycle_preview(self)
+
     def delete(self, write_concern=None, _from_doc_delete=False, cascade_refs=None):
         """Delete the documents matched by the query.
 

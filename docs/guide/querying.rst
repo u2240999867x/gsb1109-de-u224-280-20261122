@@ -795,3 +795,46 @@ following example shows how the substitutions are made::
         return comments;
     }
     """)
+
+Recycling approval preview
+==========================
+Before actually calling :meth:`~mongoengine.queryset.QuerySet.delete`, an
+approval UI can open a read-only preview with
+:meth:`~mongoengine.queryset.QuerySet.recycle_preview`.  The queryset page
+currently returned by the database is captured once, together with the
+reverse delete rules (``CASCADE`` / ``DENY`` / ``NULLIFY`` / ``PULL``)
+reachable from those documents.  The returned
+:class:`~mongoengine.queryset.RecyclePreview` never writes to the database and
+never triggers delete signals.
+
+Calling the preview (or :meth:`~mongoengine.queryset.RecyclePreview.evaluate`)
+with the ticked candidate documents -- or their ids, with ``None`` meaning
+every candidate -- returns a :class:`~mongoengine.queryset.RecycleResult`
+with:
+
+* ``recycled_documents`` -- the largest group that can be recycled together
+  for the current selection, including documents pulled in by ``CASCADE``;
+* ``retained_documents`` -- the selected candidates that have to stay;
+* ``blocking_paths`` / ``blocking_paths_for`` -- the surviving ``DENY``
+  references, including any ``CASCADE`` chain that connects a retained
+  candidate to the document carrying the ``DENY`` reference;
+* ``field_clears`` -- ``NULLIFY`` / ``PULL`` cleanup that surviving
+  documents would undergo, reported with both the model field name and the
+  stored database field name.
+
+A preview is a point-in-time snapshot: changing the selection reuses the
+documents and references seen when it was opened, so ticking and unticking
+candidates always yields the same answer for the same selection.  Reopen the
+preview to recompute against the current database state::
+
+    preview = Page.objects.recycle_preview()
+    result = preview()                       # dry-run for every candidate
+    result = preview([first_page, second_page])  # a different selection
+
+    # ... database changes happen ...
+
+    fresh = Page.objects.recycle_preview()   # reopen to pick up changes
+
+Documents outside the captured page can still be involved: the reverse rules
+of the models are followed, so an off-page document may cascade into the
+recycled group or block a candidate that is on the page.
