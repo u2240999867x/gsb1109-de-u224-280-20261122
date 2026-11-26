@@ -6,6 +6,14 @@ from .delete import Delete
 from .drop_index import DropIndex
 from .exists import Exists
 from .insert import Insert
+from .insert_manifest import (
+    ManifestConflict,
+    ManifestQuery,
+    ManifestResource,
+    ManifestResult,
+    ManifestRow,
+    insert_manifest,
+)
 from .objects import Objects
 from .raw import Raw
 from .refresh import Refresh
@@ -22,6 +30,12 @@ __all__ = (
     "DropIndex",
     "Exists",
     "Insert",
+    "ManifestConflict",
+    "ManifestQuery",
+    "ManifestResource",
+    "ManifestResult",
+    "ManifestRow",
+    "insert_manifest",
     "Objects",
     "Raw",
     "Refresh",

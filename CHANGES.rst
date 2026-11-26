@@ -1,6 +1,39 @@
 Changes
 =======
 
+Unreleased
+----------
+
+Handover manifests
+~~~~~~~~~~~~~~~~~~
+
+Added ``Table.insert_manifest`` (also available as ``Table.insert_page``,
+``Table.insert_batch``, and ``Table.insert(..., manifest=True)``). It writes a
+whole page of rows in one transaction, treating unique values such as site
+numbers and access ports as resources which can be handed over between rows:
+
+.. code-block:: python
+
+  result = await Device.insert_manifest(
+      [
+          Device(device_number="A", site_number="h2", access_port="p1"),
+          Device(device_number="B", site_number="h1", access_port="p3"),
+      ],
+      resources=[
+          ["warehouse", "site_number"],
+          ["warehouse", "access_port"],
+      ],
+  )
+
+  for receipt in result:
+      print(receipt.primary_key, receipt.accepted, receipt.rules)
+
+Rows which share any current or proposed resource are accepted or rejected
+together, while independent rows can still be committed. Existing primary keys
+and non-resource columns (such as acquisition history) are preserved.
+
+-------------------------------------------------------------------------------
+
 1.39.0
 ------
 

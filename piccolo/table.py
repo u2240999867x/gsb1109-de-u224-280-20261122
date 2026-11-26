@@ -48,6 +48,7 @@ from piccolo.query import (
 )
 from piccolo.query.methods.create_index import CreateIndex
 from piccolo.query.methods.indexes import Indexes
+from piccolo.query.methods.insert_manifest import ManifestQuery
 from piccolo.query.methods.objects import GetRelated, UpdateSelf
 from piccolo.query.methods.refresh import Refresh
 from piccolo.querystring import QueryString
@@ -1110,8 +1111,12 @@ class Table(metaclass=TableMetaclass):
 
     @classmethod
     def insert(
-        cls: type[TableInstance], *rows: TableInstance
-    ) -> Insert[TableInstance]:
+        cls: type[TableInstance],
+        *rows: TableInstance,
+        manifest: bool = False,
+        primary_key: Optional[str] = None,
+        resources: Optional[Sequence[Sequence[str]]] = None,
+    ) -> Union[Insert[TableInstance], ManifestQuery]:
         """
         Insert rows into the database.
 
@@ -1121,11 +1126,128 @@ class Table(metaclass=TableMetaclass):
                 Band(name="Pythonistas", popularity=500, manager=1)
             )
 
+        This method also supports a manifest / handover mode, which analyses
+        a whole page of rows before writing anything. See
+        :meth:`insert_manifest` for details::
+
+            await Device.insert(rows, manifest=True)
+
         """
+        if manifest:
+            return cls.insert_manifest(
+                rows, primary_key=primary_key, resources=resources
+            )
+
+        if primary_key is not None or resources is not None:
+            raise TypeError(
+                "`primary_key` and `resources` are only used when "
+                "`manifest=True`."
+            )
+
         query = Insert(table=cls).returning(cls._meta.primary_key)
         if rows:
             query.add(*rows)
         return query
+
+    @classmethod
+    def insert_manifest(
+        cls: type[TableInstance],
+        rows: Union[TableInstance, Sequence[TableInstance]],
+        *args: TableInstance,
+        primary_key: Optional[str] = None,
+        resources: Optional[Sequence[Sequence[str]]] = None,
+    ) -> ManifestQuery:
+        """
+        Insert / update a page of a manifest, treating handovers atomically.
+
+        This is useful when rows exchange resources which must stay unique -
+        for example, swapping two devices' site numbers and access ports. The
+        page is analysed as a whole, so rows can temporarily have no
+        assignment while the swap takes place.
+
+        Every row is returned as a :class:`ManifestRow
+        <piccolo.query.methods.insert_manifest.ManifestRow>` receipt, in the
+        same order as the input. Use ``accepted`` to find out whether a row
+        was written, and ``rules`` / ``devices`` / ``error`` to find out why
+        a row was rejected.
+
+        .. code-block:: python
+
+            result = await Device.insert_manifest(
+                [
+                    Device(device_no="A", site_number="h2", access_port="p1"),
+                    Device(device_no="B", site_number="h1", access_port="p3"),
+                ]
+            )
+            result[0].primary_key
+            result[0].accepted
+
+        Unlike :meth:`insert`, the query is executed immediately, and the
+        table's unique constraints define which resources must not clash.
+
+        :param rows:
+            The rows from the manifest. Either pass a single sequence, or
+            pass the rows as positional arguments.
+        :param primary_key:
+            The permanent identity column. Defaults to the table's primary
+            key.
+        :param resources:
+            Override the resource rules. Each rule is a sequence of column
+            names, for example
+            ``[["warehouse", "site_number"], ["warehouse", "access_port"]]``.
+
+        """
+        from piccolo.query.methods.insert_manifest import ManifestQuery
+
+        flattened: list[TableInstance] = []
+        for item in (rows, *args):
+            if isinstance(item, (list, tuple)):
+                flattened.extend(item)
+            else:
+                flattened.append(item)
+
+        return ManifestQuery(
+            cls,
+            flattened,
+            primary_key=primary_key,
+            resources=resources,
+        )
+
+    @classmethod
+    def insert_page(
+        cls: type[TableInstance],
+        rows: Union[TableInstance, Sequence[TableInstance]],
+        *args: TableInstance,
+        primary_key: Optional[str] = None,
+        resources: Optional[Sequence[Sequence[str]]] = None,
+    ) -> ManifestQuery:
+        """
+        An alias for :meth:`insert_manifest`.
+        """
+        return cls.insert_manifest(
+            rows,
+            *args,
+            primary_key=primary_key,
+            resources=resources,
+        )
+
+    @classmethod
+    def insert_batch(
+        cls: type[TableInstance],
+        rows: Union[TableInstance, Sequence[TableInstance]],
+        *args: TableInstance,
+        primary_key: Optional[str] = None,
+        resources: Optional[Sequence[Sequence[str]]] = None,
+    ) -> ManifestQuery:
+        """
+        An alias for :meth:`insert_manifest`.
+        """
+        return cls.insert_manifest(
+            rows,
+            *args,
+            primary_key=primary_key,
+            resources=resources,
+        )
 
     @classmethod
     def raw(cls, sql: str, *args: Any) -> Raw:
