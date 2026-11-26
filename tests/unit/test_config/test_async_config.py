@@ -41,10 +41,10 @@ def test_create_session_maker_standard_path() -> None:
         result = config.create_session_maker()
 
     assert result is mock_session_maker
-    # Should register: before_flush, after_commit, after_rollback for file object
-    #                  before_flush for timestamp
-    #                  after_commit, after_rollback for cache
-    assert mock_listen.call_count == 6
+    # Should register: before_flush, before_commit, after_commit, after_rollback
+    #                  for file object; before_flush for timestamp;
+    #                  after_commit, after_rollback for cache.
+    assert mock_listen.call_count == 7
 
     # Verify session_maker.configure was called with the sync_maker
     mock_session_maker.configure.assert_called_once_with(sync_session_class=mock_sync_maker)
@@ -57,6 +57,7 @@ def test_create_session_maker_standard_path() -> None:
     # Verify file object listeners
     listener_events = [c.args[1] for c in mock_listen.call_args_list]
     assert "before_flush" in listener_events
+    assert "before_commit" in listener_events
     assert "after_commit" in listener_events
     assert "after_rollback" in listener_events
 
@@ -103,8 +104,8 @@ def test_create_session_maker_timestamp_listener_disabled() -> None:
     ):
         config.create_session_maker()
 
-    # Without timestamp: file object (3) + cache (2) = 5
-    assert mock_listen.call_count == 5
+    # Without timestamp: file object (4) + cache (2) = 6
+    assert mock_listen.call_count == 6
 
 
 def test_post_init_routing_and_connection_string_conflict() -> None:

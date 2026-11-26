@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
 
@@ -680,6 +681,67 @@ def test_session_tracker_add_pending_delete_ignores_none_path() -> None:
     tracker.add_pending_delete(file_obj)
 
     assert file_obj not in tracker.pending_deletes
+
+
+def test_session_tracker_savepoint_rollback_restores_parent_state() -> None:
+    """Rolling back a savepoint discards saves tracked inside it."""
+    tracker = FileObjectSessionTracker()
+    old_file = Mock(spec=FileObject)
+    old_file.path = "O"
+    a_file = Mock(spec=FileObject)
+    a_file.path = "A"
+    b_file = Mock(spec=FileObject)
+    b_file.path = "B"
+    c_file = Mock(spec=FileObject)
+    c_file.path = "C"
+
+    parent_savepoint = SimpleNamespace(nested=True)
+    child_savepoint = SimpleNamespace(nested=True)
+
+    tracker.add_pending_save(a_file, b"A")
+    tracker.add_pending_delete(old_file)
+
+    tracker.capture_savepoint(parent_savepoint)
+    tracker.add_pending_save(b_file, b"B")
+    tracker.add_pending_delete(a_file)
+
+    tracker.capture_savepoint(child_savepoint)
+    tracker.add_pending_save(c_file, b"C")
+
+    tracker.rollback_to_savepoint(parent_savepoint)
+
+    assert tracker.pending_saves == {a_file: b"A"}
+    assert tracker.pending_deletes == {old_file}
+    assert b_file not in tracker.pending_saves
+    assert c_file not in tracker.pending_saves
+    assert id(parent_savepoint) not in tracker._savepoints
+    assert id(child_savepoint) not in tracker._savepoints
+
+
+@pytest.mark.asyncio
+async def test_prepare_commit_async_cleans_object_failing_after_write() -> None:
+    """An object whose backend metadata read fails after PUT is deleted."""
+    tracker = FileObjectSessionTracker(raise_on_error=True)
+    saved = Mock(spec=FileObject)
+    saved.path = "A"
+    saved.save_async = AsyncMock(return_value=None)
+    saved.delete_async = AsyncMock()
+    failed = Mock(spec=FileObject)
+    failed.path = "C"
+    failed.save_async = AsyncMock(side_effect=RuntimeError("head failed"))
+    failed.delete_async = AsyncMock()
+
+    tracker.add_pending_save(saved, b"A")
+    tracker.add_pending_save(failed, b"C")
+
+    with pytest.raises(RuntimeError, match="head failed"):
+        await tracker.prepare_commit_async()
+
+    saved.delete_async.assert_awaited_once_with()
+    failed.delete_async.assert_awaited_once_with()
+    assert not tracker.pending_saves
+    assert not tracker._save_attempts
+    assert not tracker._saved_in_transaction
 
 
 def test_session_tracker_rollback_ignores_file_not_found_sync() -> None:

@@ -171,6 +171,7 @@ class SQLAlchemySyncConfig(GenericSQLAlchemyConfig[Engine, Session, sessionmaker
         if event_target is not None:
             if self.enable_file_object_listener:
                 event.listen(event_target, "before_flush", SyncFileObjectListener.before_flush)
+                event.listen(event_target, "before_commit", SyncFileObjectListener.before_commit)
                 event.listen(event_target, "after_commit", SyncFileObjectListener.after_commit)
                 event.listen(event_target, "after_rollback", SyncFileObjectListener.after_rollback)
             if self.enable_touch_updated_timestamp_listener:

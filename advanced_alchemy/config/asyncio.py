@@ -185,6 +185,7 @@ class SQLAlchemyAsyncConfig(GenericSQLAlchemyConfig[AsyncEngine, AsyncSession, a
             )
             if self.enable_file_object_listener:
                 event.listen(sync_maker, "before_flush", AsyncFileObjectListener.before_flush)
+                event.listen(sync_maker, "before_commit", AsyncFileObjectListener.before_commit)
                 event.listen(sync_maker, "after_commit", AsyncFileObjectListener.after_commit)
                 event.listen(sync_maker, "after_rollback", AsyncFileObjectListener.after_rollback)
             if self.enable_touch_updated_timestamp_listener:

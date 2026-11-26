@@ -37,6 +37,7 @@ _active_cache_operations: set[asyncio.Task[Any]] = set()
 _FILE_TRACKER_KEY = "_aa_file_tracker"
 _CACHE_TRACKER_KEY = "_aa_cache_tracker"
 _PENDING_ASYNC_TASKS_KEY = "_aa_pending_async_tasks"
+_COMMIT_LISTENER_KEY = "_aa_file_commit_listener_registered"
 
 logger = logging.getLogger("advanced_alchemy")
 
@@ -87,6 +88,56 @@ def get_file_tracker(
         tracker = FileObjectSessionTracker(raise_on_error=raise_on_error)
         session.info[_FILE_TRACKER_KEY] = tracker
     return tracker
+
+
+def _transaction_is_nested(session: Session) -> bool:
+    """Return whether the active transaction event belongs to a SAVEPOINT."""
+    transaction = getattr(session, "_transaction", None)
+    return getattr(transaction, "nested", False) is True
+
+
+def _pop_file_tracker(session: Any, tracker: FileObjectSessionTracker) -> None:
+    """Remove a tracker only when it is still the active session tracker."""
+    session_info = getattr(session, "info", None)
+    if isinstance(session_info, dict) and session_info.get(_FILE_TRACKER_KEY) is tracker:
+        session_info.pop(_FILE_TRACKER_KEY, None)
+
+
+def _ensure_commit_listener(session: Session, listener_cls: type[Any]) -> None:
+    """Register a session-local before_commit hook for manually wired sessions."""
+    session_info = getattr(session, "info", None)
+    if not isinstance(session_info, dict) or session_info.get(_COMMIT_LISTENER_KEY):
+        return
+    if not isinstance(session, Session):
+        return
+
+    event.listen(session, "before_commit", listener_cls.before_commit)
+    session_info[_COMMIT_LISTENER_KEY] = True
+
+
+def _track_session_file_changes(session: Session, tracker: FileObjectSessionTracker) -> None:
+    """Inspect all session states for FileObject changes."""
+    for instance in session.new:
+        FileObjectInspector.inspect_instance(instance, tracker)
+
+    for instance in session.dirty:
+        FileObjectInspector.inspect_instance(instance, tracker)
+
+    for instance in session.deleted:
+        state = inspect(instance)
+        if not state:
+            continue
+        mapper = state.mapper
+        if not mapper:
+            continue
+
+        has_stored_object = any(
+            isinstance(attr.expression.type, StoredObject) for attr in mapper.column_attrs.values()
+        )
+        if not has_stored_object:
+            continue
+
+        FileObjectInspector.process_deleted_instance(instance, mapper, tracker)
 
 
 def set_async_context(is_async: bool = True) -> None:  # noqa: ARG001
@@ -307,27 +358,28 @@ class BaseFileObjectListener:
         if not tracker:
             return
 
-        for instance in session.new:
-            FileObjectInspector.inspect_instance(instance, tracker)
+        tracker.capture_transaction_stack(getattr(session, "_transaction", None))
+        _ensure_commit_listener(session, cls)
+        _track_session_file_changes(session, tracker)
 
-        for instance in session.dirty:
-            FileObjectInspector.inspect_instance(instance, tracker)
+    @classmethod
+    def before_commit(cls, session: Session) -> None:
+        """Hook for subclasses to persist files before the DB commit."""
+        _ = session
 
-        for instance in session.deleted:
-            state = inspect(instance)
-            if not state:
-                continue
-            mapper = state.mapper
-            if not mapper:
-                continue
+    @classmethod
+    def _prepare_commit_tracker(cls, session: Session) -> Optional[FileObjectSessionTracker]:
+        """Resolve final changes and return a root-commit tracker."""
+        if not cls._is_listener_enabled(session) or _transaction_is_nested(session):
+            return None
 
-            has_stored_object = any(
-                isinstance(attr.expression.type, StoredObject) for attr in mapper.column_attrs.values()
-            )
-            if not has_stored_object:
-                continue
+        tracker = get_file_tracker(session, create=False)
+        if tracker is None:
+            return None
 
-            FileObjectInspector.process_deleted_instance(instance, mapper, tracker)
+        tracker.capture_transaction_stack(getattr(session, "_transaction", None))
+        _track_session_file_changes(session, tracker)
+        return tracker
 
     @classmethod
     def _is_listener_enabled(cls, session: Session) -> bool:
@@ -338,30 +390,77 @@ class SyncFileObjectListener(BaseFileObjectListener):
     """Synchronous FileObject listener."""
 
     @classmethod
+    def before_commit(cls, session: Session) -> None:
+        """Upload new files before the root database transaction commits."""
+        tracker = cls._prepare_commit_tracker(session)
+        if tracker is not None:
+            tracker.prepare_commit()
+
+    @classmethod
     def after_commit(cls, session: Session) -> None:
-        """Process file operations after a successful commit."""
+        """Delete replaced files after the root DB commit succeeds."""
         tracker = get_file_tracker(session, create=False)
-        if tracker:
+        if tracker is None:
+            return
+
+        transaction = getattr(session, "_transaction", None)
+        if _transaction_is_nested(session):
+            tracker.release_savepoint(transaction)
+            return
+
+        try:
             tracker.commit()
-            session.info.pop(_FILE_TRACKER_KEY, None)
+        finally:
+            _pop_file_tracker(session, tracker)
 
     @classmethod
     def after_rollback(cls, session: Session) -> None:
-        """Clean up pending file operations after a rollback."""
+        """Restore savepoint state or clean up after a root rollback."""
         tracker = get_file_tracker(session, create=False)
-        if tracker:
+        if tracker is None:
+            return
+
+        transaction = getattr(session, "_transaction", None)
+        if _transaction_is_nested(session):
+            tracker.rollback_to_savepoint(transaction)
+            return
+
+        try:
             tracker.rollback()
-            session.info.pop(_FILE_TRACKER_KEY, None)
+        finally:
+            _pop_file_tracker(session, tracker)
 
 
 class AsyncFileObjectListener(BaseFileObjectListener):
     """Asynchronous FileObject listener."""
 
     @classmethod
+    def before_commit(cls, session: Session) -> None:
+        """Upload new files while the root DB transaction can still abort."""
+        tracker = cls._prepare_commit_tracker(session)
+        if tracker is None:
+            return
+
+        async def _do_async_prepare() -> None:
+            await tracker.prepare_commit_async()
+
+        t = asyncio.create_task(_do_async_prepare())
+        _active_file_operations.add(t)
+        t.add_done_callback(_active_file_operations.discard)
+        _register_session_async_task(session, t)
+        if in_greenlet():
+            await_only(t)
+
+    @classmethod
     def after_commit(cls, session: Session) -> None:
-        """Process file operations after a successful commit."""
+        """Delete replaced files after a successful root DB commit."""
         tracker = get_file_tracker(session, create=False)
         if not tracker:
+            return
+
+        transaction = getattr(session, "_transaction", None)
+        if _transaction_is_nested(session):
+            tracker.release_savepoint(transaction)
             return
 
         async def _do_async_commit() -> None:
@@ -370,7 +469,7 @@ class AsyncFileObjectListener(BaseFileObjectListener):
             except Exception as e:
                 logger.debug("An error occurred while committing a file object: %s", e.__cause__)
             finally:
-                session.info.pop(_FILE_TRACKER_KEY, None)
+                _pop_file_tracker(session, tracker)
 
         t = asyncio.create_task(_do_async_commit())
         _active_file_operations.add(t)
@@ -381,9 +480,14 @@ class AsyncFileObjectListener(BaseFileObjectListener):
 
     @classmethod
     def after_rollback(cls, session: Session) -> None:
-        """Clean up pending file operations after a rollback."""
+        """Restore savepoint state or asynchronously clean root attempts."""
         tracker = get_file_tracker(session, create=False)
         if not tracker:
+            return
+
+        transaction = getattr(session, "_transaction", None)
+        if _transaction_is_nested(session):
+            tracker.rollback_to_savepoint(transaction)
             return
 
         async def _do_async_rollback() -> None:
@@ -392,7 +496,7 @@ class AsyncFileObjectListener(BaseFileObjectListener):
             except Exception as e:
                 logger.debug("An error occurred during async FileObject rollback: %s", e.__cause__)
             finally:
-                session.info.pop(_FILE_TRACKER_KEY, None)
+                _pop_file_tracker(session, tracker)
 
         t = asyncio.create_task(_do_async_rollback())
         _active_file_operations.add(t)
@@ -408,6 +512,13 @@ class FileObjectListener(SyncFileObjectListener, AsyncFileObjectListener):
     .. deprecated:: 1.9.0
         Use :class:`SyncFileObjectListener` or :class:`AsyncFileObjectListener` instead.
     """
+
+    @classmethod
+    def before_commit(cls, session: Session) -> None:
+        if is_async_context():
+            AsyncFileObjectListener.before_commit(session)
+        else:
+            SyncFileObjectListener.before_commit(session)
 
     @classmethod
     def after_commit(cls, session: Session) -> None:
@@ -433,6 +544,7 @@ def setup_file_object_listeners(registry: Optional[StorageRegistry] = None) -> N
     """
     listeners = {
         "before_flush": FileObjectListener.before_flush,
+        "before_commit": FileObjectListener.before_commit,
         "after_commit": FileObjectListener.after_commit,
         "after_rollback": FileObjectListener.after_rollback,
     }
