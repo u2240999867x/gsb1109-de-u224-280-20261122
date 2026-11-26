@@ -48,6 +48,18 @@ __version__: str
 __project_url__: str
 DEFAULT_ENCODING: str
 
+class IterationStatus(str):
+    def __call__(self) -> IterationStatus: ...
+
+ITER_READY: IterationStatus
+ITER_EMPTY: IterationStatus
+ITER_BACKPRESSURE: IterationStatus
+ITER_EOF: IterationStatus
+READY: IterationStatus
+EMPTY: IterationStatus
+BACKPRESSURE: IterationStatus
+EOF: IterationStatus
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -511,6 +523,14 @@ class OProc:
     def change_in_bufsize(self, buf: int) -> None: ...
     def change_out_bufsize(self, buf: int) -> None: ...
     def change_err_bufsize(self, buf: int) -> None: ...
+    @property
+    def iter_queue(self) -> Any: ...
+    @property
+    def iter_status(self) -> IterationStatus: ...
+    @property
+    def iter_buffered_bytes(self) -> int: ...
+    @property
+    def iter_peak_bytes(self) -> int: ...
 
     # some private properties accessed by the tests
     _pipe_queue: Queue
@@ -571,6 +591,13 @@ class RunningCommand(str):
     def __await__(self) -> Generator[Any, None, RunningCommand]: ...
     def __aiter__(self) -> AsyncIterator[str]: ...
     async def __anext__(self) -> str: ...
+    @property
+    def iter_status(self) -> IterationStatus: ...
+    def iter_state(self) -> IterationStatus: ...
+    @property
+    def iter_buffered_bytes(self) -> int: ...
+    @property
+    def iter_peak_bytes(self) -> int: ...
 
     #
     def __iter__(self) -> Self: ...
@@ -629,6 +656,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -680,6 +708,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -731,6 +760,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -782,6 +812,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -833,6 +864,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -950,6 +982,12 @@ class Command(Generic[_ReturnT_co]):
 
         _iter_poll_time : float, default 0.1
             Seconds to sleep between polls of the output queue when iterating.
+
+        _iter_bufsize : int, default 64*1024
+            Maximum bytes of unconsumed iterated output held in the parent.
+            When the cap is reached sh stops reading that stream, so the child
+            blocks in ``write(2)`` and real backpressure applies.  The other
+            stream (usually stderr) keeps flowing.  ``0`` means unbounded.
 
         _ok_code : _CommandOkCode, default 0
             Exit code(s) considered successful.  If the process exits with a
@@ -1098,6 +1136,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -1149,6 +1188,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -1200,6 +1240,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -1251,6 +1292,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,
@@ -1302,6 +1344,7 @@ class Command(Generic[_ReturnT_co]):
         _iter: _CommandTarget | None = ...,
         _iter_noblock: _CommandTarget | None = ...,
         _iter_poll_time: float = ...,
+        _iter_bufsize: int = ...,
         _ok_code: _CommandOkCode = ...,
         _cwd: str | None = ...,
         _long_sep: str | None = ...,

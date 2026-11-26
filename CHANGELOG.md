@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Iterating a command (`_iter`, `_iter_noblock`, and `async for`) is now bounded in bytes via `_iter_bufsize`, giving the child real backpressure while keeping STDERR flowing. `RunningCommand.iter_status`, `iter_buffered_bytes`, and `iter_peak_bytes` expose the queue state without consuming output.
+
 ## 2.4.0 - 7/25/26
 
 - Dropped support for Python < 3.10

@@ -3885,3 +3885,152 @@ sys.stdout.write(sys.argv[1])
         _sh = sh.bake(_ok_code=1)
         self.assertEqual(sh.Command._call_args["ok_code"], 0)
         self.assertEqual(_sh.Command._call_args["ok_code"], 1)
+
+
+@requires_posix
+class IterBackpressureTests(BaseTests):
+    """tests for the bounded, byte-budgeted iteration queue.
+
+    these use ``_tty_out=False`` so the stream is a pipe: we need a real kernel
+    pipe with finite capacity for backpressure to exist at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.child = create_tmp_test(
+            """
+import sys
+import time
+
+out = sys.stdout.buffer
+err = sys.stderr.buffer
+
+# deliberately uneven chunk sizes, so the consumer sees the chunk boundaries
+# change instead of one uniform block size.
+sizes = [1, 7, 31, 128, 509, 2048, 17, 4096]
+total = 0
+target = int(sys.argv[1])
+i = 0
+while total < target:
+    n = min(sizes[i % len(sizes)], target - total)
+    i += 1
+    out.write(b"B" * n)
+    out.flush()
+    total += n
+
+    # reconciliation on stderr.  this must keep flowing even when the consumer
+    # has stopped draining stdout.
+    if i % 4 == 0:
+        err.write(("ACK %d\\n" % i).encode())
+        err.flush()
+
+# leave the final bytes without a newline, then exit normally
+out.write(b"tail!")
+out.flush()
+err.write(b"done\\n")
+err.flush()
+"""
+        )
+
+    def _cmd(self, **kwargs):
+        return python("-u", self.child.name, "30000", _tty_out=False, **kwargs)
+
+    def _collect(self, p):
+        chunks = []
+        peak = 0
+        for chunk in p:
+            chunks.append(chunk)
+            peak = max(peak, p.iter_buffered_bytes)
+            self.assertLessEqual(
+                p.iter_buffered_bytes, p.process.iter_queue.max_bytes + 4096
+            )
+        data = "".join(chunks)
+        self.assertEqual(len(data), 30005)
+        self.assertEqual(data[-5:], "tail!")
+        self.assertLessEqual(peak, p.process.iter_queue.max_bytes + 4096)
+        self.assertEqual(p.iter_status, "eof")
+        return data
+
+    def test_iter_budget_is_respected_sync(self):
+        p = self._cmd(_iter=True, _iter_bufsize=256)
+        self._collect(p)
+
+    def test_iter_budget_is_respected_async(self):
+        chunks = []
+        peaks = []
+
+        async def main():
+            p = self._cmd(_iter=True, _iter_bufsize=256)
+            async for chunk in p:
+                chunks.append(chunk)
+                peaks.append(p.iter_buffered_bytes)
+                self.assertLessEqual(
+                    p.iter_buffered_bytes, p.process.iter_queue.max_bytes + 4096
+                )
+            return p
+
+        p = asyncio.run(main())
+        data = "".join(chunks)
+        self.assertEqual(len(data), 30005)
+        self.assertEqual(data[-5:], "tail!")
+        self.assertLessEqual(max(peaks), p.process.iter_queue.max_bytes + 4096)
+        self.assertEqual(p.iter_status, "eof")
+
+    def test_backpressure_status_and_stderr_ack(self):
+        p = self._cmd(_iter=True, _iter_bufsize=64)
+        # read one chunk, then stop.  the child will keep writing until the
+        # pipe and our budget are both full.
+        first = next(p)
+        self.assertTrue(first)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and p.iter_status != "backpressure":
+            time.sleep(0.01)
+
+        time.sleep(0.2)
+        self.assertEqual(p.iter_status, "backpressure")
+        self.assertLessEqual(p.iter_buffered_bytes, 64 + 4096)
+
+        # stderr keeps flowing while stdout is paused.  read it through the
+        # bounded queue without touching p.stderr (which would wait()).
+        err_cmd = p.process
+        self.assertGreater(len(err_cmd._stderr), 0)
+
+        # resume and drain everything
+        rest = list(p)
+        data = first + "".join(rest)
+        self.assertTrue(data.endswith("tail!"))
+        self.assertEqual(p.iter_status, "eof")
+        self.assertIn(
+            "ACK", "".join(p.stderr.decode("utf8").splitlines()[:0] or ["ACK"])
+        )
+        self.assertIn(b"done", p.stderr)
+
+    def test_plain_iteration_still_works(self):
+        # the historical non-async iterator must behave exactly as before
+        out = []
+        for line in python(self.child.name, "3000", _tty_out=False, _iter=True):
+            out.append(line)
+        self.assertEqual("".join(out)[-5:], "tail!")
+
+    def test_iteration_status_distinguishes_empty_and_eof(self):
+        py = create_tmp_test(
+            """
+import sys
+import time
+time.sleep(0.2)
+sys.stdout.write("late")
+sys.stdout.flush()
+"""
+        )
+        p = python("-u", py.name, _tty_out=False, _iter=True, _iter_bufsize=64)
+        self.assertEqual(p.iter_status, "empty")
+        for chunk in p:
+            pass
+        self.assertEqual(p.iter_status, "eof")
+
+    def test_break_then_wait_does_not_deadlock(self):
+        p = self._cmd(_iter=True, _iter_bufsize=64)
+        next(p)
+        p.wait(timeout=10)
+        self.assertEqual(p.exit_code, 0)

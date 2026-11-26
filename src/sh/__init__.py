@@ -246,6 +246,264 @@ if HAS_POLL and not FORCE_USE_SELECT:
     Poller = PollPoller
 
 
+class IterationStatus(str):
+    """the state of an iterable command's bounded output queue.
+
+    this is a ``str`` subclass so it compares equal both to another
+    ``IterationStatus`` and to its plain string value.  the string values are
+    stable and are what :attr:`RunningCommand.iter_status` reports.  it is also
+    callable, so both ``cmd.iter_status`` and ``cmd.iter_status()`` work.
+    """
+
+    def __repr__(self):
+        return f"IterationStatus({str(self)!r})"
+
+    def __call__(self):
+        return self
+
+
+ITER_READY = IterationStatus("ready")
+ITER_EMPTY = IterationStatus("empty")
+ITER_BACKPRESSURE = IterationStatus("backpressure")
+ITER_EOF = IterationStatus("eof")
+
+# friendly aliases, so callers don't have to remember the ITER_ prefix
+READY = ITER_READY
+EMPTY = ITER_EMPTY
+BACKPRESSURE = ITER_BACKPRESSURE
+EOF = ITER_EOF
+
+
+def resolve_iter_budget(call_args):
+    """resolve the byte budget for iterated output.
+
+    ``None`` means "use the default", ``0`` or a negative number means
+    "unbounded" (the legacy behavior), and a positive number is a hard byte
+    cap.  a ``True`` is treated as the default; ``False`` as unbounded.
+    """
+    value = call_args.get("iter_bufsize")
+    if value is None:
+        value = 64 * 1024
+    if isinstance(value, bool):
+        value = 64 * 1024 if value else 0
+    value = int(value)
+    if value <= 0:
+        return None
+    return value
+
+
+class IterByteQueue:
+    """a queue for iterated output that is bounded by *bytes*, not by item
+    count.
+
+    the producer is the STDOUT/ERR thread.  it never blocks: instead, it asks
+    :meth:`remaining` how much room is left and only reads that many bytes from
+    the child.  this is what makes the kernel pipe apply backpressure to the
+    child, while leaving the other stream (typically STDERR) free to be read.
+    """
+
+    def __init__(self, max_bytes):
+        self.max_bytes = max(1, int(max_bytes))
+        self._chunks = deque()
+        self._bytes = 0
+        self._peak_bytes = 0
+        self._producer_done = False
+        self._consumer_eof = False
+        self._producer_paused = False
+        self._abandoned = False
+        self._cond = threading.Condition()
+        self._space_event = threading.Event()
+        self._space_event.set()
+        # fired whenever the consumer frees space, so the output thread can
+        # wake immediately instead of waiting out a poll timeout.
+        self._drain_event = threading.Event()
+        # optional thread-safe callback fired when data (or EOF) arrives, so an
+        # asyncio consumer can be woken without polling.
+        self._notifier = None
+
+    @property
+    def drain_event(self):
+        return self._drain_event
+
+    def set_notifier(self, notifier):
+        with self._cond:
+            self._notifier = notifier
+
+    def _notify(self):
+        notifier = self._notifier
+        if notifier is not None:
+            notifier()
+
+    @property
+    def space_event(self):
+        return self._space_event
+
+    @property
+    def bytes(self):
+        with self._cond:
+            return self._bytes
+
+    @property
+    def buffered_bytes(self):
+        return self.bytes
+
+    @property
+    def peak_bytes(self):
+        with self._cond:
+            return self._peak_bytes
+
+    @property
+    def producer_done(self):
+        with self._cond:
+            return self._producer_done
+
+    @property
+    def eof(self):
+        with self._cond:
+            return self._consumer_eof
+
+    @property
+    def paused(self):
+        with self._cond:
+            return self._producer_paused
+
+    @property
+    def abandoned(self):
+        with self._cond:
+            return self._abandoned
+
+    def abandon(self):
+        """the consumer is done and will not drain any more data.
+
+        this releases the producer from the byte budget, letting the output
+        thread keep draining the child so that it can exit.  it is called when
+        iteration is explicitly ended (for example by ``wait()``) so that a
+        consumer breaking out of a loop does not deadlock the child.
+        """
+        with self._cond:
+            self._abandoned = True
+            self._bytes = 0
+            self._chunks.clear()
+            self._space_event.set()
+            self._cond.notify_all()
+        self._notify()
+
+    def note_buffered(self, extra_bytes):
+        """account for bytes held outside the queue (for example a partial
+        line in the reader's bufferer) and track the total high-water mark."""
+        with self._cond:
+            total = self._bytes + max(0, extra_bytes)
+            if total > self._peak_bytes:
+                self._peak_bytes = total
+
+    def set_producer_paused(self, paused):
+        with self._cond:
+            self._producer_paused = bool(paused)
+            self._cond.notify_all()
+
+    def remaining(self):
+        with self._cond:
+            if self._abandoned:
+                return self.max_bytes
+            return max(0, self.max_bytes - self._bytes)
+
+    def empty(self):
+        with self._cond:
+            return not self._chunks
+
+    def qsize(self):
+        with self._cond:
+            return len(self._chunks)
+
+    def full(self):
+        with self._cond:
+            return self._bytes >= self.max_bytes
+
+    def put(self, chunk):
+        """enqueue a chunk.  ``None`` is the EOF sentinel.
+
+        the caller is responsible for not exceeding the byte budget; this is
+        checked so a programming error fails loudly instead of silently
+        growing the queue.
+        """
+        with self._cond:
+            if chunk is None:
+                if not self._producer_done:
+                    self._producer_done = True
+                    self._chunks.append(None)
+                    self._space_event.set()
+                    self._cond.notify_all()
+                    self._notify()
+                return True
+
+            if self._abandoned:
+                # the consumer is gone.  accept and discard so the output
+                # thread can keep draining the child with a flat footprint.
+                return True
+
+            size = len(chunk)
+            if size == 0:
+                return True
+            # a single chunk larger than the whole budget must still be
+            # deliverable when the queue is empty, otherwise a small budget
+            # with large chunks (a long line, a big read) would deadlock.  the
+            # effective bound is therefore the budget plus at most one chunk.
+            if self._chunks and self._bytes + size > self.max_bytes:
+                return False
+
+            self._chunks.append(chunk)
+            self._bytes += size
+            # a single chunk may exceed the budget (that is what keeps a huge
+            # line from deadlocking).  record the honest parent-side footprint.
+            if self._bytes > self._peak_bytes:
+                self._peak_bytes = self._bytes
+            if size > self._peak_bytes:
+                self._peak_bytes = size
+            if self._bytes >= self.max_bytes:
+                self._space_event.clear()
+            self._cond.notify_all()
+            self._notify()
+            return True
+
+    def get(self, block=True, timeout=None):
+        with self._cond:
+            if not self._chunks:
+                if not block:
+                    raise Empty
+                if not self._cond.wait_for(lambda: bool(self._chunks), timeout):
+                    raise Empty
+
+            chunk = self._chunks.popleft()
+            if chunk is None:
+                self._consumer_eof = True
+            else:
+                self._bytes -= len(chunk)
+                if self._bytes < 0:
+                    self._bytes = 0
+            if self._bytes < self.max_bytes:
+                self._space_event.set()
+            self._cond.notify_all()
+            self._drain_event.set()
+            return chunk
+
+    def close(self):
+        return self.put(None)
+
+    def state(self):
+        with self._cond:
+            if self._consumer_eof:
+                return ITER_EOF
+            if self._producer_done:
+                # only None (EOF) may be left
+                if not self._chunks or all(c is None for c in self._chunks):
+                    return ITER_EOF
+            if self._bytes >= self.max_bytes:
+                return ITER_BACKPRESSURE
+            if not self._chunks:
+                return ITER_EMPTY
+            return ITER_READY
+
+
 class ForkException(Exception):
     def __init__(self, orig_exc):
         msg = f"""
@@ -730,6 +988,20 @@ class RunningCommand:
             if should_wait:
                 self.wait()
 
+    def _abandon_iteration(self):
+        """stop enforcing the iteration byte budget.
+
+        called when the consumer is finished: without it, a consumer that breaks
+        out of a loop and then waits would deadlock, because the child could be
+        blocked writing into a queue nobody drains.
+        """
+        process = self.process
+        if process is None:
+            return
+        queue = getattr(process, "iter_queue", None)
+        if queue is not None:
+            queue.abandon()
+
     def wait(self, timeout=None):
         """waits for the running command to finish.  this is called on all
         running commands, eventually, except for ones that run in the background
@@ -741,6 +1013,7 @@ class RunningCommand:
         the command itself as it was
         launched, or because of a timeout passed into this method.
         """
+        self._abandon_iteration()
         if not self._waited_until_completion:
             # if we've been given a timeout, we need to poll is_alive()
             if timeout is not None:
@@ -835,6 +1108,15 @@ class RunningCommand:
         return self.process.exit_code
 
     def __len__(self):
+        # ``len()`` must not consume an in-progress iteration.  ``str(self)``
+        # waits for completion, which would abandon a bounded iteration and
+        # drop data.  during iteration, report the bytes buffered so far.
+        if (
+            getattr(self, "process", None) is not None
+            and getattr(self.process, "iter_queue", None) is not None
+            and not self._waited_until_completion
+        ):
+            return self.process.iter_queue.bytes
         return len(str(self))
 
     def __enter__(self):
@@ -853,7 +1135,9 @@ class RunningCommand:
         if self._stopped_iteration:
             raise StopIteration()
 
-        pq = self.process._pipe_queue
+        pq = self.process.iter_queue
+        if pq is None:
+            pq = self.process._pipe_queue
 
         # the idea with this is, if we're using regular `_iter` (non-asyncio), then we
         # want to have blocking be True when we read from the pipe queue, so our cpu
@@ -883,6 +1167,32 @@ class RunningCommand:
                 except UnicodeDecodeError:
                     return chunk
 
+    @property
+    def iter_status(self):
+        """report the state of this command's iterated output without
+        consuming any of it.
+
+        the value is an :class:`IterationStatus` (a ``str`` subclass) that is
+        one of ``"ready"``, ``"empty"``, ``"backpressure"``, or ``"eof"``.  it
+        is also callable, so ``cmd.iter_status`` and ``cmd.iter_status()`` are
+        equivalent.
+        """
+        return self.process.iter_status
+
+    def iter_state(self):
+        return self.iter_status
+
+    @property
+    def iter_buffered_bytes(self):
+        """bytes of unconsumed iterated output currently held in the parent
+        process, across the queue and any thread-side buffering."""
+        return self.process.iter_buffered_bytes
+
+    @property
+    def iter_peak_bytes(self):
+        """high-water mark of :attr:`iter_buffered_bytes`."""
+        return self.process.iter_peak_bytes
+
     def __await__(self):
         async def wait_for_completion():
             await self.aio_output_complete.wait()
@@ -897,28 +1207,46 @@ class RunningCommand:
         return wait_for_completion().__await__()
 
     def __aiter__(self):
-        # maxsize is critical to making sure our queue_connector function below yields
-        # when it awaits _aio_queue.put(chunk). if we didn't have a maxsize, our loop
-        # would happily iterate through `chunk in self` and put onto the queue without
-        # any blocking, and therefore no yielding, which would prevent other coroutines
-        # from running.
         self._aio_queue = AQueue(maxsize=1)
         self._force_noblock_iter = True
 
-        # the sole purpose of this coroutine is to connect our pipe_queue (which is
-        # being populated by a thread) to an asyncio-friendly queue. then, in __anext__,
-        # we can iterate over that asyncio queue.
+        loop = asyncio.get_running_loop()
+        self._aio_event = asyncio.Event()
+
+        # the connector consumes the same bounded queue that plain iteration
+        # uses, so it cannot get ahead of the byte budget.  the asyncio queue
+        # holds at most one chunk for hand-off to __anext__; it is not an
+        # unbounded staging area.
+        queue = self.process.iter_queue
+        if queue is not None:
+            # wake the connector as soon as the output thread enqueues data or
+            # EOF.  this avoids polling and keeps async throughput high.
+            def notifier():
+                try:
+                    loop.call_soon_threadsafe(self._aio_event.set)
+                except RuntimeError:
+                    # the loop is already closed
+                    pass
+
+            queue.set_notifier(notifier)
+
         async def queue_connector():
             try:
-                # this will spin as fast as possible if there's no data to read,
-                # thanks to self._force_noblock_iter. so we sleep below.
-                for chunk in self:
+                while True:
+                    self._aio_event.clear()
+                    try:
+                        chunk = self.__next__()
+                    except StopIteration:
+                        break
                     if chunk == errno.EWOULDBLOCK:
-                        # let us have better coroutine yielding.
-                        await asyncio.sleep(0.01)
-                    else:
-                        await self._aio_queue.put(chunk)
+                        await self._aio_event.wait()
+                        continue
+                    if queue is not None and queue.abandoned:
+                        break
+                    await self._aio_queue.put(chunk)
             finally:
+                if queue is not None:
+                    queue.set_notifier(None)
                 await self._aio_queue.put(None)
 
         task = asyncio.create_task(queue_connector())
@@ -934,6 +1262,24 @@ class RunningCommand:
             if exc is not None:
                 raise exc
             raise StopAsyncIteration
+
+    async def aclose(self):
+        """stop asynchronous iteration early.
+
+        this releases the iteration byte budget and cancels the connector, so a
+        consumer that stops iterating does not strand a producing child on a
+        full pipe.  it is called automatically by :meth:`wait`.
+        """
+        self._abandon_iteration()
+        task = getattr(self, "_aio_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        queue = getattr(self, "_aio_queue", None)
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.call_args["with"] and get_prepend_stack():
@@ -1203,6 +1549,12 @@ class Command:
         "iter_noblock": None,
         # the amount of time to sleep between polling for the iter output queue
         "iter_poll_time": 0.1,
+        # the maximum number of bytes of unconsumed iterated output that sh
+        # will hold in the parent process.  once this is reached, sh stops
+        # reading that stream, which lets the kernel pipe apply backpressure to
+        # the child, without blocking the other stream (usually STDERR).  ``0``
+        # disables the cap and restores the legacy unbounded behavior.
+        "iter_bufsize": 64 * 1024,
         "ok_code": 0,
         "cwd": None,
         # the separator delimiting between a long-argument's name and its value
@@ -2265,6 +2617,23 @@ class OProc:
             # thread-safe Queue), or at a potentially later time
             self._pipe_queue = Queue()
 
+            # an iterable command gets its own bounded hand-off queue.  unlike
+            # _pipe_queue, this one is capped in *bytes*; the output thread
+            # will not read past the cap, so the child blocks in write(2) and
+            # we get real end-to-end backpressure.
+            self._iter_queue = None
+            self._iter_stream_name = None
+            iter_budget = None
+            if ca["iter"] or ca["iter_noblock"]:
+                iter_budget = resolve_iter_budget(ca)
+                self._iter_stream_name = (
+                    "err"
+                    if (ca["iter"] == "err" or ca["iter_noblock"] == "err")
+                    else "out"
+                )
+                if iter_budget is not None:
+                    self._iter_queue = IterByteQueue(iter_budget)
+
             # this is used to prevent a race condition when we're waiting for
             # a process to end, and the OProc's internal threads are also checking
             # for the processes's end
@@ -2306,11 +2675,24 @@ class OProc:
             if pipe is OProc.STDOUT and not ca["no_pipe"]:
                 stdout_pipe = self._pipe_queue
 
+            iter_stdout_queue = None
+            iter_stderr_queue = None
+            if self._iter_queue is not None:
+                if self._iter_stream_name == "out":
+                    iter_stdout_queue = self._iter_queue
+                else:
+                    iter_stderr_queue = self._iter_queue
+
             # this represents the connection from a process's STDOUT fd to
             # wherever it has to go, sometimes a pipe Queue (that we will use
             # to pipe data to other processes), and also an internal deque
             # that we use to aggregate all the output
             save_stdout = not ca["no_out"] and (tee_out or stdout is None)
+            if iter_stdout_queue is not None:
+                # the bounded iteration queue is the authoritative cache for
+                # this stream.  keeping a second aggregate would double the
+                # parent-side memory and escape the byte budget.
+                save_stdout = False
 
             pipe_out = ca["piped"] in ("out", True)
             pipe_err = ca["piped"] in ("err",)
@@ -2333,6 +2715,7 @@ class OProc:
                     ca["decode_errors"],
                     stdout_pipe,
                     save_data=save_stdout,
+                    iter_queue=iter_stdout_queue,
                 )
 
             elif self._stdout_parent_fd:
@@ -2354,6 +2737,8 @@ class OProc:
                     stderr_pipe = self._pipe_queue
 
                 save_stderr = not ca["no_err"] and (tee_err or stderr is None)
+                if iter_stderr_queue is not None:
+                    save_stderr = False
 
                 if callable(stderr):
                     stderr = construct_streamreader_callback(self, stderr)
@@ -2368,6 +2753,7 @@ class OProc:
                     ca["decode_errors"],
                     stderr_pipe,
                     save_data=save_stderr,
+                    iter_queue=iter_stderr_queue,
                 )
 
             elif self._stderr_parent_fd:
@@ -2467,7 +2853,11 @@ class OProc:
             else:
 
                 def output_complete():
-                    loop.call_soon_threadsafe(self.command.aio_output_complete.set)
+                    try:
+                        loop.call_soon_threadsafe(self.command.aio_output_complete.set)
+                    except RuntimeError:
+                        # the consumer's event loop has already closed
+                        pass
 
             self._output_thread_exc_queue = Queue(1)
             thread_name = f"STDOUT/ERR thread for pid {self.pid}"
@@ -2496,6 +2886,45 @@ class OProc:
 
     def change_err_bufsize(self, buf):
         self._stderr_stream.stream_bufferer.change_buffering(buf)
+
+    @property
+    def iter_queue(self):
+        return self._iter_queue
+
+    @property
+    def iter_status(self):
+        if self._iter_queue is not None:
+            return self._iter_queue.state()
+        # an unbounded iteration falls back to the legacy pipe queue
+        if self._iter_stream_name is None:
+            return ITER_EOF
+        if self._pipe_queue.empty():
+            if self.exit_code is not None:
+                return ITER_EOF
+            return ITER_EMPTY
+        return ITER_READY
+
+    @property
+    def iter_buffered_bytes(self):
+        if self._iter_queue is not None:
+            total = self._iter_queue.bytes
+        else:
+            total = 0
+        # the queue already includes the reader's staged chunks; only the
+        # bufferer's partial line is additional.  count the max of the two
+        # reader paths to avoid double-counting a shared stream.
+        extra = 0
+        for stream in (self._stdout_stream, self._stderr_stream):
+            if stream is None or stream.iter_queue is None:
+                continue
+            extra = max(extra, stream.stream_bufferer.buffered_bytes())
+        return total + extra
+
+    @property
+    def iter_peak_bytes(self):
+        if self._iter_queue is None:
+            return 0
+        return self._iter_queue.peak_bytes
 
     @property
     def stdout(self):
@@ -2735,29 +3164,121 @@ def output_thread(
     its done"""
 
     poller = Poller()
+    registered = set()
+
+    def can_read(f):
+        if f is None or f.iter_queue is None or f.eof:
+            return False
+        if f.iter_queue.abandoned:
+            # the consumer is gone; drain the child without any budget so it
+            # can exit instead of blocking forever on a full pipe.
+            return True
+        return f.iter_queue.remaining() > f.buffered_bytes()
+
     if stdout is not None:
         poller.register_read(stdout)
+        registered.add(stdout)
     if stderr is not None:
         poller.register_read(stderr)
+        registered.add(stderr)
 
     # this is our poll loop for polling stdout or stderr that is ready to
     # be read and processed.  if one of those streamreaders indicate that it
     # is done altogether being read from, we remove it from our list of
     # things to poll.  when no more things are left to poll, we leave this
     # loop and clean up
-    while poller:
-        changed = no_interrupt(poller.poll, 0.1)
+    def any_open_stream():
+        for f in (stdout, stderr):
+            if f is not None and not f.eof:
+                return True
+        return False
+
+    while any_open_stream():
+        # a stream at its byte budget must not be polled: the fd stays readable
+        # (the child is blocked mid-write) and read() would refuse to consume,
+        # which would busy-spin.  unregister those until space frees up.
+        for f in (stdout, stderr):
+            if f is None or f.iter_queue is None or f.eof:
+                continue
+            if can_read(f):
+                if f not in registered:
+                    poller.register_read(f)
+                    registered.add(f)
+            else:
+                if f in registered:
+                    poller.unregister(f)
+                    registered.discard(f)
+
+        # when a stream is paused at its byte budget, it will be re-registered
+        # only after the consumer drains.  if there is nothing else to poll,
+        # block on the drain event so we wake the instant space is freed.
+        paused_stream = any(
+            f is not None and f.iter_queue is not None and not f.eof and not can_read(f)
+            for f in (stdout, stderr)
+        )
+        if paused_stream and not registered:
+            drained = False
+            for f in (stdout, stderr):
+                if f is not None and f.iter_queue is not None and not f.eof:
+                    if f.iter_queue.drain_event.wait(0.05):
+                        f.iter_queue.drain_event.clear()
+                        drained = True
+            if drained:
+                continue
+        poll_timeout = 0.005 if paused_stream else 0.1
+        changed = no_interrupt(poller.poll, poll_timeout)
+        paused_any = False
+        progressed = False
         for f, events in changed:
             if events & (POLLER_EVENT_READ | POLLER_EVENT_HUP):
                 log.debug("%r ready to be read from", f)
+                before = f.iter_queue.bytes if f.iter_queue is not None else None
                 done = f.read()
                 if done:
                     poller.unregister(f)
-            elif events & POLLER_EVENT_ERROR:
+                    registered.discard(f)
+                elif f.iter_queue is not None and not can_read(f):
+                    # we are at the byte budget.  remember that this stream is
+                    # paused; it will be retried after the consumer drains.
+                    paused_any = True
+                if (
+                    f.iter_queue is not None
+                    and before is not None
+                    and f.iter_queue.bytes != before
+                ):
+                    progressed = True
+            elif events & (POLLER_EVENT_ERROR):
                 # for some reason, we have to just ignore streams that have had an
                 # error.  i'm not exactly sure why, but don't remove this until we
                 # figure that out, and create a test for it
                 pass
+
+        # a quiet stream may still be holding a partial line in its bufferer.
+        # hand those bytes off so the consumer can see them even though no more
+        # kernel data has arrived yet.
+        for f in (stdout, stderr):
+            if f is not None and f.iter_queue is not None:
+                if f.flush_iter_buffer():
+                    progressed = True
+
+        if paused_any and not progressed:
+            # block until the consumer frees budget rather than spinning on a
+            # hot pipe.  the drain event wakes us as soon as space is available;
+            # the timeout keeps shutdown responsive.
+            events = [
+                f.iter_queue.drain_event
+                for f in (stdout, stderr)
+                if f is not None and f.iter_queue is not None and not can_read(f)
+            ]
+            for event in events:
+                event.wait(0.05)
+                event.clear()
+
+        # a stream that is merely paused is not done.  keep the loop alive so
+        # it can be re-registered when the consumer drains.
+        if not registered and not any(can_read(f) for f in (stdout, stderr)):
+            if not any_open_stream():
+                break
 
         if timeout_event and timeout_event.is_set():
             break
@@ -3167,6 +3688,7 @@ class StreamReader:
         decode_errors,
         pipe_queue=None,
         save_data=True,
+        iter_queue=None,
     ):
         self.stream = stream
         self.buffer = buffer
@@ -3177,6 +3699,12 @@ class StreamReader:
         self.pipe_queue = None
         if pipe_queue:
             self.pipe_queue = weakref.ref(pipe_queue)
+
+        # when this reader feeds an iterated stream, it is bounded by a byte
+        # budget shared with the consumer.  we never read more than the queue
+        # can hold; instead we leave the data in the kernel pipe, which is what
+        # gives the child real backpressure.
+        self.iter_queue = iter_queue
 
         self.log = log
 
@@ -3190,26 +3718,74 @@ class StreamReader:
         )
 
         self.should_quit = False
+        self.eof = False
+
+        # chunks that could not fit in the iter queue, but were already
+        # produced by the bufferer.  these stay in order and count against the
+        # budget, so nothing has to be pushed to an unbounded side queue.
+        self._pending = deque()
 
     def fileno(self):
         """defining this allows us to do poll on an instance of this
         class"""
         return self.stream
 
+    def pending_bytes(self):
+        return sum(len(chunk) for chunk in self._pending)
+
+    def buffered_bytes(self):
+        """all parent-side bytes this reader is holding for an iterated stream:
+        the bufferer's partial data plus anything pending delivery."""
+        pending = self.stream_bufferer.buffered_bytes() + self.pending_bytes()
+        if self.iter_queue is not None:
+            self.iter_queue.note_buffered(pending)
+        return pending
+
+    def iter_capacity(self):
+        """how many more bytes we may read from the kernel right now.  ``None``
+        means unbounded."""
+        if self.iter_queue is None or self.iter_queue.abandoned:
+            return None
+        return max(0, self.iter_queue.remaining() - self.buffered_bytes())
+
     def close(self):
+        if self.iter_queue is not None and self.iter_queue.abandoned:
+            self.finish_chunk_processor()
+            self.iter_queue.close()
+            os.close(self.stream)
+            self.eof = True
+            return
+
         chunk = self.stream_bufferer.flush()
         self.log.debug("got chunk size %d to flush: %r", len(chunk), chunk[:30])
         if chunk:
-            self.write_chunk(chunk)
+            self._accept(chunk)
+
+        # deliver staged and final bytes before EOF.  at this point the child
+        # is gone (or being drained), so it is safe to block until the consumer
+        # makes room; dropping the tail here would silently truncate output.
+        if self.iter_queue is not None:
+            while self._pending:
+                if self._flush_pending():
+                    continue
+                # queue is full; wait for the consumer to make room.  if the
+                # queue was abandoned, put() discards and this can't spin.
+                if self.iter_queue.abandoned:
+                    self._pending.clear()
+                    break
+                self.iter_queue.space_event.wait(0.05)
 
         self.finish_chunk_processor()
 
-        if self.pipe_queue and self.save_data:
+        if self.iter_queue is not None:
+            self.iter_queue.close()
+        elif self.pipe_queue and self.save_data:
             self.pipe_queue().put(None)
 
         os.close(self.stream)
+        self.eof = True
 
-    def write_chunk(self, chunk):
+    def _deliver(self, chunk):
         # in PY3, the chunk coming in will be bytes, so keep that in mind
 
         if not self.should_quit:
@@ -3222,21 +3798,136 @@ class StreamReader:
                 self.log.debug("putting chunk onto pipe: %r", chunk[:30])
                 self.pipe_queue().put(chunk)
 
+    def _accept(self, chunk):
+        """hand a chunk to the downstream consumers in order.
+
+        for a bounded iter queue, the chunk must be enqueued before it is
+        delivered.  if there is no room, it is staged in ``_pending`` and the
+        caller is responsible for trying again later.
+        """
+        if self.iter_queue is None:
+            self._deliver(chunk)
+            return True
+
+        if self.iter_queue.abandoned:
+            # the queue discards everything, so delivering here would only
+            # append to the aggregate that we deliberately stopped saving.
+            self.iter_queue.put(chunk)
+            return True
+
+        if self._pending:
+            self._pending.append(chunk)
+            return False
+
+        if self.iter_queue.put(chunk):
+            self._deliver(chunk)
+            return True
+
+        self._pending.append(chunk)
+        return False
+
+    def _flush_pending(self):
+        while self._pending:
+            chunk = self._pending[0]
+            if not self.iter_queue.put(chunk):
+                return False
+            self._pending.popleft()
+            self._deliver(chunk)
+        return True
+
+    def write_chunk(self, chunk):
+        self._accept(chunk)
+
+    def flush_iter_buffer(self):
+        """move thread-side buffered bytes into the iter queue, but only when
+        the byte budget is what is blocking progress.
+
+        the line bufferer may be holding a partial line while the queue is at
+        its cap.  in that case the consumer cannot drain (there is nothing to
+        drain) and the producer cannot read (there is no room), so we must hand
+        the partial line over.  while there is still budget, we leave it alone
+        so line buffering keeps its normal semantics.
+        """
+        if self.iter_queue is None or self.iter_queue.abandoned:
+            return False
+
+        buffered = self.buffered_bytes()
+        must_flush = (
+            self.iter_queue.remaining() <= buffered
+            and self.stream_bufferer.buffered_bytes() > 0
+        )
+        pending = bool(self._pending)
+        if not must_flush and not pending:
+            return False
+
+        if self._pending:
+            self._flush_pending()
+
+        if must_flush and not self._pending:
+            partial = self.stream_bufferer.flush()
+            if partial:
+                self._accept(partial)
+            if self._pending:
+                self._flush_pending()
+
+        if self._pending:
+            self.iter_queue.set_producer_paused(True)
+        return must_flush or pending
+
     def read(self):
-        # if we're PY3, we're reading bytes, otherwise we're reading
-        # str
+        if self.iter_queue is not None:
+            if self.iter_queue.abandoned:
+                # discard anything staged and read straight through, so the
+                # child can finish without the parent growing.
+                self._pending.clear()
+                self.stream_bufferer.flush()
+            elif self._pending and not self._flush_pending():
+                self.iter_queue.set_producer_paused(True)
+                return False
+
+            capacity = self.iter_capacity()
+            if capacity is not None and capacity <= 0:
+                # the budget is full.  drain the reader's own partial line into
+                # the queue if it is what filled it, then re-check.
+                if self.stream_bufferer.buffered_bytes():
+                    partial = self.stream_bufferer.flush()
+                    if partial:
+                        self.log.debug(
+                            "flushing partial buffered chunk size %d", len(partial)
+                        )
+                        self._accept(partial)
+                        self._flush_pending()
+
+                capacity = self.iter_capacity()
+                if capacity is None or capacity <= 0:
+                    self.iter_queue.set_producer_paused(True)
+                    return False
+
+        read_size = self.bufsize
+        if self.iter_queue is not None:
+            if capacity is None:
+                read_size = self.bufsize
+            else:
+                read_size = max(1, min(read_size, capacity))
         try:
-            chunk = no_interrupt(os.read, self.stream, self.bufsize)
+            chunk = no_interrupt(os.read, self.stream, read_size)
         except OSError as e:
             self.log.debug("got errno %d, done reading", e.errno)
             return True
         if not chunk:
             self.log.debug("got no chunk, done reading")
+            self.eof = True
+            self._flush_pending()
             return True
 
         self.log.debug("got chunk size %d: %r", len(chunk), chunk[:30])
-        for chunk in self.stream_bufferer.process(chunk):
-            self.write_chunk(chunk)
+        for buffered_chunk in self.stream_bufferer.process(chunk):
+            self._accept(buffered_chunk)
+
+        if self.iter_queue is not None and self._pending:
+            self._flush_pending()
+
+        return False
 
 
 class StreamBufferer:
@@ -3281,6 +3972,13 @@ class StreamBufferer:
         finally:
             self._buffering_lock.release()
             self.log.debug("released buffering lock for changing buffering")
+
+    def buffered_bytes(self):
+        """bytes currently held in this bufferer, not yet handed to the output
+        handler.  this is the thread-side portion of the parent's buffering and
+        counts against an iterated stream's byte budget."""
+        with self._buffering_lock:
+            return sum(len(chunk) for chunk in self.buffer)
 
     def process(self, chunk):
         # MAKE SURE THAT THE INPUT IS PY3 BYTES
@@ -3444,6 +4142,17 @@ class Environment(dict):
         "ForkException",
         "TimeoutException",
         "StreamBufferer",
+        "IterationStatus",
+        "IterByteQueue",
+        "ITER_READY",
+        "ITER_EMPTY",
+        "ITER_BACKPRESSURE",
+        "ITER_EOF",
+        "READY",
+        "EMPTY",
+        "BACKPRESSURE",
+        "EOF",
+        "resolve_iter_budget",
         "_aggregate_keywords",
         "__project_url__",
         "__version__",

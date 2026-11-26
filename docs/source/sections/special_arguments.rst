@@ -361,6 +361,37 @@ output to iterate over.  Instead, the output from the command will be
 
 .. seealso:: :ref:`iterable`.
 
+.. _iter_bufsize:
+
+_iter_bufsize
+-------------
+|def| ``64 * 1024`` bytes
+
+The maximum number of bytes of unconsumed iterated output that sh will hold in
+the parent process.  When the cap is reached, sh stops reading the iterated
+stream, which lets the kernel pipe fill and the child block in ``write(2)`` --
+real end-to-end backpressure.  Iteration resumes as soon as the consumer drains
+a chunk.
+
+The cap covers *all* parent-side buffering for that stream: the hand-off queue,
+the reader's staging area, and the thread-side line buffer.  Bytes that have not
+been read yet stay in the kernel pipe, not in an unbounded Python queue.
+
+The other stream keeps flowing: if you iterate STDOUT, STDERR and its callbacks
+are still read and delivered while STDOUT is paused (and vice versa).  This is
+what lets a producer emit reconciliation messages on STDERR that unblock a slow
+STDOUT consumer.
+
+.. code-block:: python
+
+    async for line in sh.cat("/tmp/big", _iter=True, _iter_bufsize=64 * 1024):
+        await slow_sink.write(line)
+
+Set this to ``0`` to disable the cap and restore the old unbounded behavior.
+The budget only applies to the iterated stream; other commands are unaffected.
+
+.. seealso:: :ref:`iterable`, :ref:`iter_status`.
+
 .. _with:
 
 _with

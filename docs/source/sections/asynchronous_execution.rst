@@ -53,6 +53,51 @@ changing the buffer size of the command's output with :ref:`out_bufsize`.
     the current iteration would block, :py:data:`errno.EWOULDBLOCK` will be
     returned, otherwise you'll receive a chunk of output, as normal.
 
+.. _iter_status:
+
+Backpressure and iteration status
+---------------------------------
+
+Iteration is bounded: sh will not hold more than :ref:`iter_bufsize` bytes
+(64 KB by default) of unconsumed output in the parent process.  When the cap is
+hit, the output thread stops reading that stream, so the pipe fills and the
+child blocks in ``write(2)``.  The other stream (STDERR, if you are iterating
+STDOUT) keeps being read, so diagnostics are never stuck behind a slow data
+consumer.
+
+This matters for ``async for`` loops whose body awaits a slow sink.  The loop
+naturally applies backpressure: a fast producer cannot make the parent buffer
+grow without bound.
+
+.. code-block:: python
+
+	async for chunk in sh.cat("/tmp/huge", _iter=True, _iter_bufsize=64 * 1024):
+	    await slow_storage.write(chunk)
+
+You can inspect the state without consuming anything:
+:attr:`RunningCommand.iter_status` reports one of:
+
+* ``"ready"`` -- unconsumed data is available right now
+* ``"empty"`` -- the producer is alive but nothing is buffered; more may come
+* ``"backpressure"`` -- the byte budget is full; sh is making the child wait
+* ``"eof"`` -- the stream is finished (including the final partial line)
+
+.. code-block:: python
+
+	cmd = sh.cat("/tmp/huge", _iter=True, _iter_bufsize=4096)
+	next(cmd)
+	if cmd.iter_status == "backpressure":
+	    ...  # consumer is slower than the producer
+
+:attr:`RunningCommand.iter_buffered_bytes` reports the current parent-side
+footprint and :attr:`RunningCommand.iter_peak_bytes` its high-water mark.
+
+.. note::
+
+    If you stop iterating and then call :meth:`RunningCommand.wait`, sh
+    releases the byte budget and drains the remaining output so the child can
+    exit.  It does not accumulate that discarded data in memory.
+
 .. _background:
 	
 Background Processes
