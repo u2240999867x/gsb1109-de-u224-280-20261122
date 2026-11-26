@@ -132,6 +132,7 @@ XML files
 ^^^^^^^^^
 
 .. autofunction:: petl.io.xml.fromxml
+.. autofunction:: petl.io.xml.fromxmlstream
 .. autofunction:: petl.io.xml.toxml
 
 

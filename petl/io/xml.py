@@ -9,12 +9,17 @@ try:
 except ImportError:
     import xml.etree.ElementTree as etree
 
+from array import array
+from contextlib import contextmanager
+from io import BytesIO
 from operator import attrgetter
 import itertools
 import re
+from tempfile import TemporaryFile
+from xml.parsers import expat
 from xml.sax.saxutils import escape as _xml_escape
 from string import Formatter
-from petl.compat import string_types, text_type
+from petl.compat import pickle, string_types, text_type
 
 
 # internal dependencies
@@ -127,8 +132,9 @@ def fromxml(source, *args, **kwargs):
     If `lxml <http://lxml.de/>`_ is installed, full XPath expressions can be
     used.
 
-    Note that the implementation is currently **not** streaming, i.e.,
-    the whole document is loaded into memory.
+    Note that the default implementation is **not** streaming, i.e., the whole
+    document is loaded into memory. See ``stream=True`` below for a
+    forward-only alternative.
 
     If multiple elements match a given field, all values are reported as a
     tuple.
@@ -143,10 +149,94 @@ def fromxml(source, *args, **kwargs):
         ... my_parser = etree.XMLParser(resolve_entities=False) # doctest: +SKIP
         ... table4 = etl.fromxml('example.file1.xml', 'tr', 'td', parser=my_parser) # doctest: +SKIP
 
+    For large documents, pass ``stream=True`` to use a forward-only,
+    incremental reader with the same field mapping syntax, e.g.
+    ``fromxml(source, 'record', mapping, stream=True)``. Records are selected
+    by namespace URI (``urn:shipment`` by default, configurable with the
+    ``namespace`` argument). Only records having that URI are emitted, and
+    prefix changes within the document are handled transparently. The record
+    tag defaults to ``'record'``; use ``record='...'`` or pass it as the first
+    positional argument, and pass the mapping as the second.
+
+    In streaming mode, a row is produced as soon as its direct same-namespace
+    ``detail`` child has closed and all records that started before it have
+    been produced. Records without a ``detail`` are completed when the record
+    closes. Nested records are emitted too, in record start-tag order. A field
+    mapping value may be a path to an element in the record's ``detail``
+    (text), or a ``(path, attribute)`` pair; ``('.', attribute)`` reads an
+    attribute of the record itself. Paths may be ``detail/...``, and
+    ``.//`` descendant paths are supported. Only direct details and elements
+    below the record's own detail are considered, so a same-named element
+    under a different namespace, or an element attached to another record,
+    does not contribute. Rows that are ready but cannot yet be emitted are
+    spooled to a temporary file (``tempdir=`` selects its location). Closing
+    the returned iterator releases the source and temporary resources
+    immediately; a read or XML syntax error at the end of the input is still
+    raised after all available rows have been produced.
+
+    The same rules as the tree reader apply to values: no matching element
+    yields ``missing`` (``None`` by default), one matching element yields its
+    text or attribute, and several matching elements yield a tuple. Attributes
+    with no value yield ``None``.
+
     """
 
+    streaming = kwargs.pop('stream', False) or kwargs.pop('streaming', False)
+    if streaming:
+        source = _as_stream_source(source)
+        return XmlStreamView(source, *args, **kwargs)
     source = read_source_from_arg(source)
     return XmlView(source, *args, **kwargs)
+
+
+def _as_stream_source(source):
+    if hasattr(source, 'open') or hasattr(source, 'read'):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        return BytesIO(source)
+    if isinstance(source, string_types):
+        return read_source_from_arg(source)
+    if hasattr(source, '__iter__'):
+        return _IterableReader(source)
+    return read_source_from_arg(source)
+
+
+class _IterableReader(object):
+    """Adapt a forward-only iterable of chunks to a binary reader."""
+
+    def __init__(self, iterable):
+        self.iterator = iter(iterable)
+        self.done = False
+
+    def read(self, size=-1):
+        if self.done:
+            return b''
+        try:
+            chunk = next(self.iterator)
+        except StopIteration:
+            self.done = True
+            return b''
+        if isinstance(chunk, text_type):
+            return chunk.encode('utf-8')
+        return chunk
+
+    def close(self):
+        self.done = True
+        close = getattr(self.iterator, 'close', None)
+        if close is not None:
+            close()
+
+
+def fromxmlstream(source, *args, **kwargs):
+    """Explicit streaming variant of :func:`fromxml`.
+
+    Equivalent to calling :func:`fromxml` with ``stream=True``.
+    """
+    kwargs['stream'] = True
+    return fromxml(source, *args, **kwargs)
+
+
+fromxml_stream = fromxmlstream
 
 
 class XmlView(Table):
@@ -228,6 +318,499 @@ class XmlView(Table):
                 for rowelm in tree.iterfind(self.rmatch):
                     yield tuple(vgetters[f](rowelm.findall(vmatches[f]))
                                 for f in flds)
+
+
+_DEFAULT_STREAM_NAMESPACE = 'urn:shipment'
+_NS_SEPARATOR = '\x1f'
+_STREAM_CHUNK = 65536
+_STREAM_COMPACT = 65536
+_RECORD_OPEN = 0
+_RECORD_READY = 1
+_RECORD_DONE = 2
+
+
+class XmlStreamView(Table):
+
+    def __init__(self, source, *args, **kwargs):
+        self.source = source
+        self.namespace = kwargs.pop('namespace', _DEFAULT_STREAM_NAMESPACE)
+        if self.namespace is None:
+            self.namespace = kwargs.pop('ns', None)
+        if self.namespace in ('', '*'):
+            self.namespace = None
+        self.missing = kwargs.pop('missing', None)
+        self.tempdir = kwargs.pop('tempdir', None)
+        record_tag = kwargs.pop('record', None)
+        record_tag = kwargs.pop('row', record_tag)
+        record_tag = kwargs.pop('tag', record_tag)
+        mapping = kwargs.pop('mapping', None)
+        if mapping is None:
+            mapping = kwargs.pop('columns', None)
+        if mapping is None:
+            mapping = kwargs.pop('fields', None)
+        remaining = list(args)
+        if remaining and isinstance(remaining[0], dict) and mapping is None:
+            mapping = remaining.pop(0)
+        if remaining and isinstance(remaining[0], string_types):
+            record_tag = remaining[0]
+            remaining.pop(0)
+        if remaining and isinstance(remaining[0], dict) and mapping is None:
+            mapping = remaining[0]
+        if mapping is None:
+            raise ValueError('stream=True requires a field mapping')
+        self.record_tag = _normalize_stream_tag(record_tag or 'record')
+        self.mapping = mapping
+        items = sorted(mapping.items(), key=lambda i: text_type(i[0]))
+        self._header = tuple(text_type(k) for k, _ in items)
+        self._fields = self._header
+        self._field_paths = tuple(_split_stream_path(v, self.record_tag)
+                                  for _, v in items)
+
+    def __iter__(self):
+        return _stream_rows(self)
+
+    def __len__(self):
+        raise TypeError('a streaming XML view has no length')
+
+
+def _normalize_stream_tag(tag):
+    if not isinstance(tag, string_types):
+        raise ValueError('stream=True requires a record tag name')
+    tag = tag.strip()
+    if tag.startswith('{') and '}' in tag:
+        tag = tag.split('}', 1)[1]
+    tag = tag.replace('.//', '/').replace('//', '/')
+    tag = tag.lstrip('./').lstrip('/')
+    if '/' in tag:
+        tag = tag.rsplit('/', 1)[1]
+    if ':' in tag:
+        tag = tag.rsplit(':', 1)[1]
+    if not tag:
+        raise ValueError('stream=True requires a record tag name')
+    return tag
+
+
+def _split_stream_path(value, record_tag=None):
+    if isinstance(value, string_types):
+        path, attr = value, None
+        if path.startswith('@'):
+            return (), path[1:], False
+        if '/@' in path:
+            path, attr = path.rsplit('/@', 1)
+    else:
+        try:
+            path, attr = value
+        except (TypeError, ValueError):
+            raise ValueError('invalid field mapping value: %r' % (value,))
+        if not isinstance(path, string_types):
+            raise ValueError('invalid field mapping value: %r' % (value,))
+    descendant = './/' in path or '//' in path
+    if descendant:
+        path = path.replace('.//', '/').replace('//', '/')
+    parts = tuple(p for p in path.split('/') if p and p != '.')
+    if len(parts) > 1 and parts[0] == 'detail':
+        parts = parts[1:]
+    return parts, attr, descendant
+
+
+def _stream_rows(view):
+    with _open_stream_source(view.source) as xmlf:
+        reader = _StreamingReader(xmlf, view.namespace, view.record_tag,
+                                  view._fields, view._field_paths,
+                                  view.missing, view.tempdir)
+        rows = reader.rows()
+        try:
+            yield view._header
+            for row in rows:
+                yield row
+        finally:
+            rows.close()
+            reader.close()
+
+
+@contextmanager
+def _open_stream_source(source):
+    opener = getattr(source, 'open', None)
+    if opener is None:
+        try:
+            yield source
+        finally:
+            close = getattr(source, 'close', None)
+            if close is not None:
+                close()
+        return
+    result = opener('rb')
+    if hasattr(result, '__enter__'):
+        with result as handle:
+            yield handle
+    else:
+        try:
+            yield result
+        finally:
+            close = getattr(result, 'close', None)
+            if close is not None:
+                close()
+
+
+class _StreamingReader(object):
+
+    def __init__(self, src, namespace, record_tag, fields, field_paths,
+                 missing, tempdir=None):
+        self.src = src
+        self.namespace = namespace
+        self.record_tag = record_tag
+        self.fields = fields
+        self.field_paths = field_paths
+        self.missing = missing
+        self.status = bytearray()
+        self.offsets = array('Q')
+        self.lengths = array('I')
+        self.base = 0
+        self.records_started = 0
+        self.next_emit = 0
+        self.spool = TemporaryFile(mode='w+b')
+        if tempdir is not None:
+            self.spool.close()
+            self.spool = TemporaryFile(mode='w+b', dir=tempdir)
+        self._closed = False
+
+    def start_record(self):
+        seq = self.records_started
+        self.records_started += 1
+        self.status.append(_RECORD_OPEN)
+        self.offsets.append(0)
+        self.lengths.append(0)
+        return _Record(seq, self)
+
+    def complete(self, record):
+        if record.ready:
+            return
+        sparse = record.sparse()
+        payload = pickle.dumps(sparse, protocol=pickle.HIGHEST_PROTOCOL)
+        self.spool.seek(0, 2)
+        offset = self.spool.tell()
+        self.spool.write(payload)
+        index = record.seq - self.base
+        self.offsets[index] = offset
+        self.lengths[index] = len(payload)
+        self.status[index] = _RECORD_READY
+        record.ready = True
+        record.release()
+
+    def _can_emit(self):
+        index = self.next_emit - self.base
+        return 0 <= index < len(self.status) \
+            and self.status[index] == _RECORD_READY
+
+    def _pop(self):
+        index = self.next_emit - self.base
+        self.spool.seek(self.offsets[index])
+        sparse = pickle.loads(self.spool.read(self.lengths[index]))
+        missing = self.missing
+        row = tuple(missing if field not in sparse else sparse[field]
+                    for field in self.fields)
+        self.status[index] = _RECORD_DONE
+        self.next_emit += 1
+        self._compact()
+        return row
+
+    def _compact(self):
+        done = self.next_emit - self.base
+        if done >= _STREAM_COMPACT and done * 2 >= len(self.status):
+            del self.status[:done]
+            del self.offsets[:done]
+            del self.lengths[:done]
+            self.base = self.next_emit
+
+    def rows(self):
+        parser = expat.ParserCreate(namespace_separator=_NS_SEPARATOR)
+        parser.buffer_text = True
+        state = _ParseState(self)
+        parser.StartElementHandler = state.start
+        parser.EndElementHandler = state.end
+        parser.CharacterDataHandler = state.chars
+        reader = getattr(self.src, 'read1', None) or self.src.read
+        error = None
+        try:
+            while True:
+                while self._can_emit():
+                    yield self._pop()
+                try:
+                    data = reader(_STREAM_CHUNK)
+                except Exception as read_error:
+                    error = read_error
+                    break
+                if not data:
+                    break
+                try:
+                    parser.Parse(data, False)
+                except expat.ExpatError as parse_error:
+                    error = _xml_parse_error(parse_error)
+                    break
+            if error is None:
+                try:
+                    parser.Parse(b'', True)
+                except expat.ExpatError as parse_error:
+                    error = _xml_parse_error(parse_error)
+            while self._can_emit():
+                yield self._pop()
+            if error is not None:
+                raise error
+            if state.has_open_records():
+                raise ValueError('unterminated record in XML stream')
+        finally:
+            self.close()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self.spool is not None:
+            try:
+                self.spool.close()
+            finally:
+                self.spool = None
+        self.status = bytearray()
+        self.offsets = array('Q')
+        self.lengths = array('I')
+
+
+class _ParseState(object):
+
+    def __init__(self, reader):
+        self.reader = reader
+        self.stack = []
+        self.active = []
+        self.open_records = 0
+
+    def has_open_records(self):
+        return self.open_records > 0
+
+    def start(self, qname, attrs):
+        ns, local = _split_qname(qname)
+        parent = self.stack[-1] if self.stack else None
+        if parent is not None:
+            parent.had_child = True
+        frame = _Frame(ns, local, attrs, parent)
+        is_record = self._in_scope(ns) and local == self.reader.record_tag
+
+        if is_record:
+            record = self.reader.start_record()
+            record.ns = ns
+            record.frame = frame
+            record.attrs = attrs
+            frame.record = record
+            self.open_records += 1
+            self._own_values(record, attrs, frame)
+
+        if parent is not None and self._in_scope(ns) and local == 'detail':
+            owner = parent.record
+            if owner is not None and owner.frame is parent \
+                    and owner.detail_frame is None:
+                owner.detail_frame = frame
+                frame.owner = owner
+                self.active.append(owner)
+                for field, parts, attr, descendant in self._paths(owner):
+                    if parts and not descendant:
+                        if frame.path_matches is None:
+                            frame.path_matches = {}
+                        frame.path_matches[(owner, field)] = -1
+
+        if parent is not None and parent.path_matches:
+            self._nested_values(frame, parent, ns, local, attrs)
+        if self.active:
+            self._descendant_values(frame, ns, local, attrs)
+
+        self.stack.append(frame)
+
+    def end(self, qname):
+        frame = self.stack.pop()
+        if frame.text_sinks:
+            text = ''.join(frame.text_parts) if frame.text_parts else None
+            for record, field in frame.text_sinks:
+                record.add(field, text)
+        if frame.owner is not None:
+            owner = frame.owner
+            owner.detail_done = True
+            self.active.remove(owner)
+            self.reader.complete(owner)
+        if frame.record is not None:
+            record = frame.record
+            record.finished = True
+            self.open_records -= 1
+            if not record.detail_done:
+                self.reader.complete(record)
+
+    def chars(self, data):
+        if not self.stack:
+            return
+        frame = self.stack[-1]
+        if frame.text_sinks and not frame.had_child:
+            frame.text_parts.append(data)
+
+    def _in_scope(self, ns):
+        return self.reader.namespace is None or ns == self.reader.namespace
+
+    def _paths(self, record):
+        for field, spec in zip(self.reader.fields, self.reader.field_paths):
+            parts, attr, descendant = spec
+            yield field, parts, attr, descendant
+
+    def _own_values(self, record, attrs, frame):
+        for field, parts, attr, descendant in self._paths(record):
+            if parts:
+                continue
+            if attr is not None:
+                record.add(field, _get_attr(attrs, attr))
+            else:
+                frame.text_sinks.append((record, field))
+
+    def _nested_values(self, frame, parent, ns, local, attrs):
+        for record in self.active:
+            for field, parts, attr, descendant in self._paths(record):
+                if descendant or not parts:
+                    continue
+                pos = parent.path_matches.get((record, field))
+                if pos is None or len(parts) <= pos + 1:
+                    continue
+                if not _match(parts[pos + 1], ns, local, record.ns):
+                    continue
+                if frame.path_matches is None:
+                    frame.path_matches = {}
+                pos += 1
+                frame.path_matches[(record, field)] = pos
+                if pos == len(parts) - 1:
+                    self._terminal(record, field, attr, attrs, frame)
+
+    def _descendant_values(self, frame, ns, local, attrs):
+        for record in self.active:
+            for field, parts, attr, descendant in self._paths(record):
+                if not descendant or not parts:
+                    continue
+                if _match(parts[-1], ns, local, record.ns) \
+                        and _ancestors(parts[:-1], frame, record):
+                    self._terminal(record, field, attr, attrs, frame)
+
+    @staticmethod
+    def _terminal(record, field, attr, attrs, frame):
+        if attr is not None:
+            record.add(field, _get_attr(attrs, attr))
+        else:
+            frame.text_sinks.append((record, field))
+
+
+class _Frame(object):
+
+    __slots__ = ('ns', 'local', 'attrs', 'parent', 'record', 'owner',
+                 'path_matches', 'text_sinks', 'text_parts', 'had_child')
+
+    def __init__(self, ns, local, attrs, parent):
+        self.ns = ns
+        self.local = local
+        self.attrs = attrs
+        self.parent = parent
+        self.record = None
+        self.owner = None
+        self.path_matches = None
+        self.text_sinks = []
+        self.text_parts = []
+        self.had_child = False
+
+
+class _Record(object):
+
+    __slots__ = ('seq', 'reader', 'ns', 'frame', 'attrs', 'detail_frame',
+                 'detail_done', 'finished', 'values', 'ready')
+
+    def __init__(self, seq, reader):
+        self.seq = seq
+        self.reader = reader
+        self.ns = None
+        self.frame = None
+        self.attrs = None
+        self.detail_frame = None
+        self.detail_done = False
+        self.finished = False
+        self.values = {}
+        self.ready = False
+
+    def add(self, field, value):
+        current = self.values.get(field)
+        if current is None:
+            self.values[field] = [value]
+        else:
+            current.append(value)
+
+    def row(self):
+        row = []
+        for field in self.reader.fields:
+            values = self.values.get(field)
+            if not values:
+                row.append(self.reader.missing)
+            elif len(values) == 1:
+                row.append(values[0])
+            else:
+                row.append(tuple(values))
+        return tuple(row)
+
+    def sparse(self):
+        return dict((field, values[0] if len(values) == 1 else tuple(values))
+                    for field, values in self.values.items())
+
+    def release(self):
+        self.values = {}
+        self.frame = None
+        self.attrs = None
+        self.detail_frame = None
+
+
+def _split_qname(qname):
+    if _NS_SEPARATOR in qname:
+        ns, local = qname.split(_NS_SEPARATOR, 1)
+        return ns, local
+    return '', qname
+
+
+def _xml_parse_error(error):
+    try:
+        from xml.etree.ElementTree import ParseError
+    except ImportError:
+        return error
+    return ParseError(str(error))
+
+
+def _get_attr(attrs, name):
+    if name in attrs:
+        return attrs[name]
+    if name.startswith('{') and '}' in name:
+        ns, local = name[1:].split('}', 1)
+        return attrs.get(ns + _NS_SEPARATOR + local)
+    return None
+
+
+def _match(token, ns, local, record_ns):
+    if token == '*':
+        return True
+    if token.startswith('{') and '}' in token:
+        token_ns, token = token[1:].split('}', 1)
+        return token == local and token_ns == ns
+    if ':' in token:
+        token = token.rsplit(':', 1)[1]
+    if token != local:
+        return False
+    return record_ns is None or ns == record_ns
+
+
+def _ancestors(prefix, frame, record):
+    index = len(prefix) - 1
+    node = frame.parent
+    while node is not None and node is not record.detail_frame:
+        if index < 0:
+            return True
+        if _match(prefix[index], node.ns, node.local, record.ns):
+            index -= 1
+        node = node.parent
+    return index < 0
 
 
 def _create_xml_parser(user_parser):

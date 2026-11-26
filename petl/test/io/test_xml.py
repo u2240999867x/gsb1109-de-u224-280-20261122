@@ -8,7 +8,7 @@ import pytest
 
 from petl.test.helpers import ieq
 from petl.util import nrows, look
-from petl.io.xml import fromxml, toxml
+from petl.io.xml import fromxml, fromxmlstream, toxml
 from petl.compat import urlopen
 
 try:
@@ -948,3 +948,152 @@ def test_toxml_rejects_forbidden_formatted_output():
 
     with pytest.raises(ValueError):
         toxml([('label',), (Formatted(),)], MemorySource(), escape=True)
+
+
+class _ChunkSource(object):
+
+    def __init__(self, chunks):
+        self.initial = list(chunks)
+        self.handle = None
+
+    def open(self, mode='rb'):
+        self.handle = _ChunkHandle(self)
+        return self.handle
+
+
+class _ChunkHandle(object):
+
+    def __init__(self, source):
+        self.source = source
+        self.chunks = list(source.initial)
+        self.reads = 0
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def read(self, size=-1):
+        if self.closed:
+            raise AssertionError('read after close')
+        self.reads += 1
+        if not self.chunks:
+            return b''
+        return self.chunks.pop(0)
+
+
+_STREAM_NS = ('xmlns:r="urn:shipment" xmlns:s="urn:shipment" '
+              'xmlns:o="urn:other"')
+
+
+def test_fromxml_stream_namespace_and_order():
+    xml = ('''<root %s>
+      <r:record id="O"><r:detail>
+        <s:record id="I"><s:label>X</s:label>
+          <s:detail><s:label>Y</s:label></s:detail></s:record>
+        <o:record id="N"><o:label>Z</o:label></o:record>
+        <r:entries>
+          <r:record id="e1"><r:detail><r:n>1</r:n></r:detail></r:record>
+          <s:record id="e2"><s:label>L2</s:label></s:record>
+        </r:entries>
+      </r:detail></r:record>
+    </root>''' % _STREAM_NS).encode('utf-8')
+    mapping = {'id': ('.', 'id'), 'child_label': 'record/label',
+               'label': 'label'}
+    actual = list(iter(fromxml(_ChunkSource([xml]), 'record', mapping,
+                               stream=True)))
+    expect = [('child_label', 'id', 'label'),
+              ('X', 'O', None),
+              (None, 'I', 'Y'),
+              (None, 'e1', None),
+              (None, 'e2', None)]
+    assert actual == expect
+
+
+def test_fromxml_stream_yields_main_record_before_close():
+    head = ('''<root %s><r:record id="O"><r:detail>
+      <s:record id="I"><s:label>X</s:label>
+        <s:detail><s:label>Y</s:label></s:detail></s:record>
+      <r:entries>
+        <r:record id="e1"><r:detail><r:n>1</r:n></r:detail></r:record>
+      </r:entries>
+    </r:detail>''' % _STREAM_NS).encode('utf-8')
+    tail = b'</r:record></root>'
+    source = _ChunkSource([head])
+    it = iter(fromxml(source, 'record',
+                      {'id': ('.', 'id'), 'child_label': 'record/label'},
+                      stream=True))
+    assert next(it) == ('child_label', 'id')
+    assert next(it) == ('X', 'O')
+    assert source.handle.reads == 1
+    source.handle.chunks.append(tail)
+    it.close()
+    assert source.handle.closed
+    assert source.handle.reads == 1
+
+
+def test_fromxml_stream_close_early_releases_source():
+    head = ('''<root %s><r:record id="O"><r:detail><r:n>1</r:n>
+    </r:detail></r:record>''' % _STREAM_NS).encode('utf-8')
+    source = _ChunkSource([head])
+    it = iter(fromxml(source, 'record', {'id': ('.', 'id')}, stream=True))
+    assert next(it) == ('id',)
+    assert next(it) == ('O',)
+    it.close()
+    assert source.handle.closed
+    assert source.handle.reads == 1
+
+
+def test_fromxml_stream_tail_read_error():
+    head = ('''<root %s><r:record id="O"><r:detail><r:n>1</r:n>
+    </r:detail></r:record>''' % _STREAM_NS).encode('utf-8')
+
+    class Broken(_ChunkSource):
+        def open(self, mode='rb'):
+            return _BrokenHandle(self)
+
+    class _BrokenHandle(_ChunkHandle):
+        def read(self, size=-1):
+            if not self.chunks:
+                raise IOError('tail failure')
+            return _ChunkHandle.read(self, size)
+
+    source = Broken([head])
+    rows = []
+    with pytest.raises(IOError):
+        for row in iter(fromxml(source, 'record', {'id': ('.', 'id')},
+                                stream=True)):
+            rows.append(row)
+    assert rows == [('id',), ('O',)]
+
+
+def test_fromxml_stream_tail_syntax_error():
+    xml = ('''<root %s><r:record id="O"><r:detail><r:n>1</r:n>
+    </r:detail></r:record><bad></root>''' % _STREAM_NS).encode('utf-8')
+    rows = []
+    with pytest.raises(Exception):
+        for row in iter(fromxml(_ChunkSource([xml]), 'record',
+                                {'id': ('.', 'id')}, stream=True)):
+            rows.append(row)
+    assert rows == [('id',), ('O',)]
+
+
+def test_fromxml_stream_missing_detail_and_values():
+    xml = ('''<root %s>
+      <r:record id="a"><r:detail><r:n>1</r:n><r:n>2</r:n>
+        <r:sub v="z"/></r:detail></r:record>
+      <r:record id="b"/>
+    </root>''' % _STREAM_NS).encode('utf-8')
+    mapping = {'id': ('.', 'id'), 'n': 'n', 'v': ('sub', 'v')}
+    actual = list(iter(fromxml(_ChunkSource([xml]), 'record', mapping,
+                               stream=True, missing='NA')))
+    assert actual == [('id', 'n', 'v'),
+                      ('a', ('1', '2'), 'z'),
+                      ('b', 'NA', 'NA')]
+
+
+def test_fromxml_stream_requires_mapping():
+    with pytest.raises(ValueError):
+        fromxml(_ChunkSource([b'<root/>']), 'record', stream=True)
