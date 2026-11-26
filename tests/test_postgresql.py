@@ -46,7 +46,9 @@ from alembic import testing
 from alembic import util
 from alembic.autogenerate import api
 from alembic.autogenerate.compare.tables import _compare_tables
+from alembic.ddl.postgresql import PostgresqlImpl
 from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.operations import ops
 from alembic.script import ScriptDirectory
 from alembic.testing import assert_raises_message
@@ -75,6 +77,9 @@ if True:
     )  # noqa: E501
     from alembic.autogenerate.compare.server_defaults import (
         _dialect_impl_compare_server_default as _compare_server_default,
+    )
+    from alembic.autogenerate.compare.server_defaults import (
+        _setup_autoincrement,
     )
 
 
@@ -1061,6 +1066,532 @@ class PostgresqlDetectSerialTest(TestBase):
             Column("x", Integer, autoincrement=False, primary_key=True),
             schema,
         )
+
+
+class PostgresqlSequenceDefaultParseTest(TestBase):
+    def test_parse_sequence_default(self):
+        from alembic.ddl.postgresql import _parse_sequence_default
+
+        eq_(
+            _parse_sequence_default("nextval('live.event_id_seq')"),
+            "live.event_id_seq",
+        )
+        eq_(
+            _parse_sequence_default(
+                "nextval('archive.event_id_seq'::regclass)"
+            ),
+            "archive.event_id_seq",
+        )
+        eq_(
+            _parse_sequence_default('nextval(\'"Live"."Event_ID_Seq"\')'),
+            '"Live"."Event_ID_Seq"',
+        )
+        eq_(_parse_sequence_default(None), None)
+        eq_(_parse_sequence_default("5"), None)
+        eq_(_parse_sequence_default("nextval('a') + 1"), None)
+
+
+class PostgresqlReflectSequenceDefaultTest(TestBase):
+    """``autogen_column_reflect()`` must record and normalize sequence
+    defaults using the catalog.
+
+    PostgreSQL renders an unqualified ``nextval()`` reference when the
+    referenced sequence is visible in ``search_path``, and SQLAlchemy may
+    then re-qualify it using the table's schema, which can be the wrong
+    schema.  The reflected default must be rewritten to name the sequence
+    that's actually referenced.
+
+    """
+
+    def setUp(self):
+        from alembic.ddl.postgresql import _SEQUENCE_INFO_KEY
+        from sqlalchemy.dialects import postgresql as pg
+
+        self.pg = pg
+        self._sequence_info_key = _SEQUENCE_INFO_KEY
+        self.impl = PostgresqlImpl(
+            dialect=pg.dialect(),
+            connection=None,
+            as_sql=False,
+            transactional_ddl=None,
+            output_buffer=None,
+            context_opts={},
+        )
+
+    def _reflect(self, column_info, catalog_row):
+        table = Table(
+            "event", MetaData(), Column("id", Integer), schema="live"
+        )
+        with mock.patch.object(
+            self.impl,
+            "_get_column_sequence_info",
+            return_value=catalog_row,
+        ):
+            self.impl.autogen_column_reflect(None, table, column_info)
+        return column_info
+
+    def test_requalifies_wrong_table_schema(self):
+        column_info = self._reflect(
+            {
+                "name": "id",
+                "type": self.pg.INTEGER(),
+                "default": 'nextval(\'"live".event_id_seq\'::regclass)',
+            },
+            ("archive", "event_id_seq", "archive", "event", "id"),
+        )
+        eq_(
+            column_info["default"],
+            "nextval('archive.event_id_seq'::regclass)",
+        )
+        eq_(
+            column_info["info"][self._sequence_info_key],
+            ("archive", "event_id_seq"),
+        )
+
+    def test_requalifies_unqualified_reference(self):
+        column_info = self._reflect(
+            {
+                "name": "id",
+                "type": self.pg.INTEGER(),
+                "default": "nextval('event_id_seq'::regclass)",
+            },
+            ("archive", "event_id_seq", "archive", "event", "id"),
+        )
+        eq_(
+            column_info["default"],
+            "nextval('archive.event_id_seq'::regclass)",
+        )
+
+    def test_owned_serial_still_omitted(self):
+        column_info = self._reflect(
+            {
+                "name": "id",
+                "type": self.pg.INTEGER(),
+                "default": "nextval('live.event_id_seq'::regclass)",
+            },
+            ("live", "event_id_seq", "live", "event", "id"),
+        )
+        assert "default" not in column_info
+        eq_(
+            column_info["info"][self._sequence_info_key],
+            ("live", "event_id_seq"),
+        )
+
+
+class PostgresqlCompareSequenceDefaultTest(TestBase):
+    """Comparison of sequence-backed defaults must use the catalog.
+
+    The rendered text of a reflected default depends on ``search_path``;
+    the comparison instead uses the catalog identity recorded on the
+    reflected column, or resolves the text against the catalog.  The
+    ``nextval()`` expression itself is never evaluated.
+
+    """
+
+    def setUp(self):
+        from alembic.ddl.postgresql import _SEQUENCE_INFO_KEY
+
+        self._sequence_info_key = _SEQUENCE_INFO_KEY
+
+        ctx_opts = {
+            "sqlalchemy_module_prefix": "sa.",
+            "alembic_module_prefix": "op.",
+            "target_metadata": MetaData(),
+            "compare_server_default": True,
+        }
+        self.migration_context = MigrationContext.configure(
+            dialect_name="postgresql", opts=ctx_opts
+        )
+        self.autogen_context = api.AutogenContext(self.migration_context)
+
+    def _compare(
+        self,
+        conn_default,
+        conn_info,
+        metadata_schema="live",
+        model_schema="live",
+    ):
+        seq = Sequence("event_id_seq", schema=metadata_schema)
+        m = MetaData()
+        metadata_table = Table(
+            "event",
+            m,
+            Column(
+                "id",
+                Integer,
+                primary_key=True,
+                autoincrement=True,
+                server_default=seq.next_value(),
+            ),
+            schema=model_schema,
+        )
+
+        conn_table = Table(
+            "event",
+            MetaData(),
+            Column(
+                "id",
+                Integer,
+                primary_key=True,
+                server_default=(
+                    text(conn_default) if conn_default is not None else None
+                ),
+                info=conn_info,
+            ),
+            schema="live",
+        )
+
+        op_obj = ops.AlterColumnOp("event", "id", schema="live")
+        _setup_autoincrement(
+            self.autogen_context,
+            op_obj,
+            "live",
+            "event",
+            "id",
+            conn_table.c.id,
+            metadata_table.c.id,
+        )
+        _compare_server_default(
+            self.autogen_context,
+            op_obj,
+            "live",
+            "event",
+            "id",
+            conn_table.c.id,
+            metadata_table.c.id,
+        )
+        return op_obj
+
+    def test_defaults_differ_unqualified_reflection(self):
+        op_obj = self._compare(
+            "nextval('event_id_seq'::regclass)",
+            {self._sequence_info_key: ("archive", "event_id_seq")},
+        )
+        assert op_obj.has_changes()
+        eq_(
+            op_obj.existing_server_default.arg.text,
+            "nextval('event_id_seq'::regclass)",
+        )
+        eq_(
+            _render_server_default_for_compare(
+                op_obj.modify_server_default, self.autogen_context
+            ),
+            "nextval('live.event_id_seq')",
+        )
+
+    def test_defaults_differ_qualified_reflection(self):
+        op_obj = self._compare(
+            "nextval('live.event_id_seq'::regclass)",
+            {self._sequence_info_key: ("archive", "event_id_seq")},
+        )
+        assert op_obj.has_changes()
+
+    def test_same_sequence_after_upgrade(self):
+        op_obj = self._compare(
+            None, {self._sequence_info_key: ("live", "event_id_seq")}
+        )
+        assert not op_obj.has_changes()
+
+    def test_same_sequence_explicit_default(self):
+        op_obj = self._compare(
+            "nextval('live.event_id_seq'::regclass)",
+            {self._sequence_info_key: ("live", "event_id_seq")},
+        )
+        assert not op_obj.has_changes()
+
+    def test_model_reverted_to_archive(self):
+        op_obj = self._compare(
+            None,
+            {self._sequence_info_key: ("live", "event_id_seq")},
+            metadata_schema="archive",
+        )
+        assert op_obj.has_changes()
+        eq_(
+            _render_server_default_for_compare(
+                op_obj.modify_server_default, self.autogen_context
+            ),
+            "nextval('archive.event_id_seq')",
+        )
+
+
+class PostgresqlSequenceDefaultIntegrationTest(TestBase):
+    """end-to-end test of moving a column's sequence default.
+
+    ``live.event.id`` initially takes its values from
+    ``archive.event_id_seq``; the model expects it to use
+    ``live.event_id_seq``.  Both orders of ``search_path`` must detect the
+    same change, the generated migration must reference the correct
+    sequence regardless of ``search_path``, and re-running the comparison
+    against the upgraded database must produce no changes.
+
+    """
+
+    __only_on__ = "postgresql"
+    __backend__ = True
+
+    @classmethod
+    def setup_class(cls):
+        cls.bind = config.db
+        staging_env()
+
+    @classmethod
+    def teardown_class(cls):
+        with cls.bind.begin() as conn:
+            conn.execute(text("drop schema if exists live cascade"))
+            conn.execute(text("drop schema if exists archive cascade"))
+        clear_staging_env()
+
+    def _execute(self, conn, sql, **kw):
+        conn.execute(text(sql), kw)
+
+    def _set_search_path(self, conn, *schemas):
+        conn.execute(
+            text("SET LOCAL search_path TO " + ", ".join(schemas))
+        )
+
+    def _drop_all(self, conn):
+        self._execute(conn, "drop schema if exists live cascade")
+        self._execute(conn, "drop schema if exists archive cascade")
+
+    def _create_initial(self, conn):
+        self._execute(conn, "create schema archive")
+        self._execute(conn, "create schema live")
+        self._execute(
+            conn,
+            "create table archive.event "
+            "(id serial primary key, name text)",
+        )
+        # live.event.id has its own sequence, but currently takes values
+        # from the archive sequence
+        self._execute(
+            conn,
+            "create sequence live.event_id_seq",
+        )
+        self._execute(
+            conn,
+            "create table live.event "
+            "(id integer not null default "
+            "nextval('archive.event_id_seq') primary key, name text)",
+        )
+        self._execute(
+            conn,
+            "alter sequence live.event_id_seq owned by live.event.id",
+        )
+
+    def _metadata(self):
+        m = MetaData()
+        seq = Sequence("event_id_seq", schema="live")
+        Table(
+            "event",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("name", Text),
+            schema="archive",
+        )
+        Table(
+            "event",
+            m,
+            Column(
+                "id",
+                Integer,
+                primary_key=True,
+                autoincrement=True,
+                server_default=seq.next_value(),
+            ),
+            Column("name", Text),
+            schema="live",
+        )
+        return m
+
+    def _compare(self, conn, metadata, **opts):
+        def include_name(name, type_, parent_names):
+            if type_ == "schema":
+                return name in (None, "archive", "live")
+            elif type_ == "table":
+                return name == "event"
+            else:
+                return True
+
+        ctx_opts = {
+            "compare_type": True,
+            "compare_server_default": True,
+            "include_schemas": True,
+            "include_name": include_name,
+            "target_metadata": metadata,
+            "alembic_module_prefix": "op.",
+            "sqlalchemy_module_prefix": "sa.",
+        }
+        ctx_opts.update(opts)
+        context = MigrationContext.configure(connection=conn, opts=ctx_opts)
+        return autogenerate.produce_migrations(context, metadata)
+
+    def _sequence_identity(self, conn, table_schema, table, column):
+        return conn.execute(
+            text(
+                "select sn.nspname, s.relname "
+                "from pg_attrdef ad "
+                "join pg_class t on t.oid=ad.adrelid "
+                "join pg_namespace tn on tn.oid=t.relnamespace "
+                "join pg_attribute a on a.attrelid=t.oid "
+                "and a.attnum=ad.adnum "
+                "join pg_depend d on d.classid='pg_attrdef'::regclass "
+                "and d.objid=ad.oid "
+                "and d.refclassid='pg_class'::regclass "
+                "join pg_class s on s.oid=d.refobjid and s.relkind='S' "
+                "join pg_namespace sn on sn.oid=s.relnamespace "
+                "where tn.nspname=:ts and t.relname=:t "
+                "and a.attname=:c"
+            ),
+            {"ts": table_schema, "t": table, "c": column},
+        ).one()
+
+    def _sequence_owner(self, conn, seq_schema, seq_name):
+        return conn.execute(
+            text(
+                "select tn.nspname, t.relname, a.attname "
+                "from pg_class s "
+                "join pg_namespace sn on sn.oid=s.relnamespace "
+                "join pg_depend d on d.classid='pg_class'::regclass "
+                "and d.objid=s.oid "
+                "and d.refclassid='pg_class'::regclass "
+                "and d.deptype in ('a', 'i') "
+                "join pg_class t on t.oid=d.refobjid "
+                "join pg_namespace tn on tn.oid=t.relnamespace "
+                "join pg_attribute a on a.attrelid=t.oid "
+                "and a.attnum=d.refobjsubid "
+                "where s.relkind='S' and sn.nspname=:schema "
+                "and s.relname=:name"
+            ),
+            {"schema": seq_schema, "name": seq_name},
+        ).one()
+
+    def _render(self, op_container, conn):
+        context = MigrationContext.configure(
+            connection=conn, opts={"compare_server_default": True}
+        )
+        return autogenerate.render_python_code(
+            op_container, migration_context=context
+        )
+
+    def _apply(self, conn, op_container):
+        operations = Operations(
+            MigrationContext.configure(
+                connection=conn,
+                opts={"compare_server_default": True},
+            )
+        )
+        for op_ in op_container.ops:
+            if hasattr(op_, "ops"):
+                self._apply(conn, op_)
+            else:
+                operations.invoke(op_)
+
+    def test_sequence_default_move(self):
+        metadata = self._metadata()
+
+        with self.bind.begin() as conn:
+            self._drop_all(conn)
+            self._create_initial(conn)
+
+        original_downgrade_ops = None
+
+        # both search_path orders must detect the same difference and
+        # render a migration that targets live.event_id_seq
+        for path in (
+            ("public", "archive", "live"),
+            ("public", "live", "archive"),
+        ):
+            with self.bind.begin() as conn:
+                self._set_search_path(conn, *path)
+                script = self._compare(conn, metadata)
+                upgrade = self._render(script.upgrade_ops, conn)
+                downgrade = self._render(script.downgrade_ops, conn)
+
+            assert "live.event_id_seq" in upgrade
+            assert "archive.event_id_seq" not in upgrade
+
+            # the downgrade must name the archive sequence explicitly so
+            # that it applies the same way under either search_path
+            assert "nextval('archive.event_id_seq'::regclass)" in downgrade
+
+            # the upgrade only alters live.event.id; the archive table is
+            # never part of the changes, and neither sequence changes
+            # ownership
+            diffs = script.upgrade_ops.as_diffs()
+            eq_(len(diffs), 1)
+            eq_(diffs[0][0], "modify_default")
+            eq_(
+                (diffs[0][1], diffs[0][2], diffs[0][3]),
+                ("live", "event", "id"),
+            )
+
+            eq_(
+                self._sequence_owner(conn, "archive", "event_id_seq"),
+                ("archive", "event", "id"),
+            )
+            eq_(
+                self._sequence_owner(conn, "live", "event_id_seq"),
+                ("live", "event", "id"),
+            )
+
+            if original_downgrade_ops is None:
+                original_downgrade_ops = script.downgrade_ops
+
+        # apply the upgrade from the opposite search_path order; it must
+        # still connect to live.event_id_seq
+        with self.bind.begin() as conn:
+            self._set_search_path(conn, "public", "archive", "live")
+            script = self._compare(conn, metadata)
+            self._apply(conn, script.upgrade_ops)
+
+        with self.bind.begin() as conn:
+            eq_(
+                self._sequence_identity(conn, "live", "event", "id"),
+                ("live", "event_id_seq"),
+            )
+            # re-running the comparison must show no changes
+            script = self._compare(conn, metadata)
+            eq_(script.upgrade_ops.as_diffs(), [])
+
+            # the model reverting to the archive sequence must be detected
+            script = self._compare(conn, self._archive_metadata())
+            assert script.upgrade_ops.as_diffs()
+
+        # apply the originally generated downgrade; live.event.id must
+        # refer to archive.event_id_seq again
+        with self.bind.begin() as conn:
+            self._apply(conn, original_downgrade_ops)
+
+        with self.bind.begin() as conn:
+            eq_(
+                self._sequence_identity(conn, "live", "event", "id"),
+                ("archive", "event_id_seq"),
+            )
+
+    def _archive_metadata(self):
+        m = MetaData()
+        seq = Sequence("event_id_seq", schema="archive")
+        Table(
+            "event",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("name", Text),
+            schema="archive",
+        )
+        Table(
+            "event",
+            m,
+            Column(
+                "id",
+                Integer,
+                primary_key=True,
+                autoincrement=True,
+                server_default=seq.next_value(),
+            ),
+            Column("name", Text),
+            schema="live",
+        )
+        return m
 
 
 class PostgresqlAutogenRenderTest(TestBase):

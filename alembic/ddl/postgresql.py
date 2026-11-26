@@ -26,6 +26,7 @@ from sqlalchemy.sql.elements import ColumnClause
 from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.functions import FunctionElement
 from sqlalchemy.types import NULLTYPE
+from sqlalchemy.util import quoted_token_parser
 
 from .base import alter_column
 from .base import alter_table
@@ -73,6 +74,33 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# matches the text PostgreSQL renders for a sequence-backed column default,
+# with or without the ``::regclass`` cast
+_sequence_default_re = re.compile(
+    r"^\s*nextval\('(?P<name>(?:[^']|'')+)'(?:::\s*regclass)?\)\s*$", re.I
+)
+
+# key used within ``Column.info`` to carry the catalog identity of the
+# sequence referenced by a reflected server default
+_SEQUENCE_INFO_KEY = "_alembic_sequence"
+
+
+def _parse_sequence_default(default: str | None) -> str | None:
+    """Return the sequence name referenced by a ``nextval()`` default.
+
+    The returned name is the raw text that was passed to ``nextval()``; it
+    may be schema-qualified or not, and may contain double quotes for
+    identifiers that require quoting.
+
+    """
+
+    if not default:
+        return None
+    match = _sequence_default_re.match(default)
+    if match is None:
+        return None
+    return match.group("name").replace("''", "'")
+
 
 class PostgresqlImpl(DefaultImpl):
     __dialect__ = "postgresql"
@@ -109,12 +137,42 @@ class PostgresqlImpl(DefaultImpl):
         rendered_inspector_default,
     ):
 
-        # don't do defaults for SERIAL columns
+        # an implicitly generated SERIAL default is not compared; a server
+        # default that's explicitly present in the model is always compared,
+        # even on an autoincrementing primary key
         if (
-            metadata_column.primary_key
+            metadata_column.server_default is None
+            and metadata_column.primary_key
             and metadata_column is metadata_column.table._autoincrement_column
         ):
             return False
+
+        conn_seq_name = _parse_sequence_default(rendered_inspector_default)
+        metadata_seq_name = _parse_sequence_default(
+            rendered_metadata_default
+        )
+
+        if conn_seq_name is not None or metadata_seq_name is not None:
+            # sequence defaults must be compared by the identity of the
+            # sequence they refer to, in the catalog, without invoking
+            # nextval().  The rendered text of the reflected default depends
+            # on ``search_path`` and is therefore not reliable; the catalog
+            # relationship recorded for the column's default is used
+            # instead.  When that is not available (e.g. an unconnected
+            # comparison), fall back to resolving the rendered text.
+            conn_info = getattr(inspector_column, "info", None) or {}
+            conn_seq = conn_info.get(_SEQUENCE_INFO_KEY)
+            if conn_seq is None:
+                conn_seq = self._actual_column_sequence(inspector_column)
+            if conn_seq is None and conn_seq_name is not None:
+                conn_seq = self._resolve_sequence(conn_seq_name)
+
+            if metadata_seq_name is not None:
+                metadata_seq = self._resolve_sequence(metadata_seq_name)
+            else:
+                metadata_seq = None
+
+            return conn_seq != metadata_seq
 
         conn_col_default = rendered_inspector_default
 
@@ -126,6 +184,15 @@ class PostgresqlImpl(DefaultImpl):
         defaults_equal = conn_col_default == rendered_metadata_default
         if defaults_equal:
             return False
+
+        # never evaluate a sequence's nextval() expression in order to
+        # compare defaults; if either side still looks like a sequence
+        # default, report a difference based on the text alone
+        if any(
+            default and re.search(r"\bnextval\s*\(", default, re.I)
+            for default in (conn_col_default, rendered_metadata_default)
+        ):
+            return True
 
         if None in (
             conn_col_default,
@@ -205,44 +272,218 @@ class PostgresqlImpl(DefaultImpl):
             **kw,
         )
 
+    def _get_column_sequence_info(self, inspector, table, column_name):
+        """Return catalog information for the sequence referenced by a
+        column's ``nextval()`` default.
+
+        The first two elements are the schema and name of the referenced
+        sequence; the remaining three are the schema, table and column that
+        own that sequence, if any.
+
+        """
+
+        table_schema = table.schema or self.dialect.default_schema_name
+        return sqla_compat._exec_on_inspector(
+            inspector,
+            text(
+                "select sn.nspname, s.relname, "
+                "otn.nspname, ot.relname, oa.attname "
+                "from pg_attrdef ad "
+                "join pg_class t on t.oid=ad.adrelid "
+                "join pg_namespace tn on tn.oid=t.relnamespace "
+                "join pg_attribute a on a.attrelid=t.oid "
+                "and a.attnum=ad.adnum "
+                "join pg_depend d on d.classid='pg_attrdef'::regclass "
+                "and d.objid=ad.oid "
+                "and d.refclassid='pg_class'::regclass "
+                "join pg_class s on s.oid=d.refobjid and s.relkind='S' "
+                "join pg_namespace sn on sn.oid=s.relnamespace "
+                "left join pg_depend od on od.classid='pg_class'::regclass "
+                "and od.objid=s.oid "
+                "and od.refclassid='pg_class'::regclass "
+                "and od.deptype in ('a', 'i') "
+                "left join pg_class ot on ot.oid=od.refobjid "
+                "left join pg_namespace otn on otn.oid=ot.relnamespace "
+                "left join pg_attribute oa on oa.attrelid=ot.oid "
+                "and oa.attnum=od.refobjsubid "
+                "where tn.nspname=:schema and t.relname=:table "
+                "and a.attname=:column"
+            ),
+            schema=table_schema,
+            table=table.name,
+            column=column_name,
+        ).first()
+
+    def _qualified_sequence_name(self, schema, seqname):
+        preparer = self.dialect.identifier_preparer
+        return "%s.%s" % (
+            preparer.quote_schema(schema),
+            preparer.quote(seqname),
+        )
+
+    def _resolve_sequence(self, name):
+        """Resolve a sequence reference to ``(schema, name)``.
+
+        The reference is looked up in the PostgreSQL catalog; the
+        ``nextval()`` expression itself is never executed.  An unqualified
+        name that matches more than one sequence is resolved according to
+        the current ``search_path``, as PostgreSQL would do.
+
+        """
+
+        parts = quoted_token_parser(name)
+        if len(parts) not in (1, 2):
+            return (name,)
+        seqname = parts[-1]
+        schema = parts[0] if len(parts) == 2 else None
+
+        conn = self.connection
+        if conn is None:
+            return (
+                schema or self.dialect.default_schema_name,
+                seqname,
+            )
+
+        if schema is not None:
+            row = conn.execute(
+                text(
+                    "select n.nspname, c.relname "
+                    "from pg_class c "
+                    "join pg_namespace n on n.oid=c.relnamespace "
+                    "where c.relkind='S' and n.nspname=:schema "
+                    "and c.relname=:name"
+                ),
+                {"schema": schema, "name": seqname},
+            ).first()
+            if row:
+                return (row[0], row[1])
+            return (schema, seqname)
+
+        rows = conn.execute(
+            text(
+                "select n.nspname, c.relname "
+                "from pg_class c "
+                "join pg_namespace n on n.oid=c.relnamespace "
+                "where c.relkind='S' and c.relname=:name"
+            ),
+            {"name": seqname},
+        ).all()
+        if len(rows) == 1:
+            return (rows[0][0], rows[0][1])
+        elif len(rows) > 1:
+            row = conn.execute(
+                text(
+                    "select n.nspname, c.relname "
+                    "from pg_class c "
+                    "join pg_namespace n on n.oid=c.relnamespace "
+                    "where c.relkind='S' and c.relname=:name "
+                    "and pg_table_is_visible(c.oid)"
+                ),
+                {"name": seqname},
+            ).first()
+            if row:
+                return (row[0], row[1])
+        return (None, seqname)
+
+    def _actual_column_sequence(self, reflected_column):
+        """Return ``(schema, name)`` of the sequence a reflected column uses.
+
+        The server default may have been omitted during reflection because
+        the sequence is owned by the column; this looks the default up in
+        ``pg_attrdef`` directly, without evaluating it.
+
+        """
+
+        if reflected_column is None:
+            return None
+        table = reflected_column.table
+        if table is None:
+            return None
+        conn = self.connection
+        if conn is None:
+            return None
+        table_schema = table.schema or self.dialect.default_schema_name
+        row = conn.execute(
+            text(
+                "select sn.nspname, s.relname "
+                "from pg_attrdef ad "
+                "join pg_class t on t.oid=ad.adrelid "
+                "join pg_namespace tn on tn.oid=t.relnamespace "
+                "join pg_attribute a on a.attrelid=t.oid "
+                "and a.attnum=ad.adnum "
+                "join pg_depend d on d.classid='pg_attrdef'::regclass "
+                "and d.objid=ad.oid "
+                "and d.refclassid='pg_class'::regclass "
+                "join pg_class s on s.oid=d.refobjid and s.relkind='S' "
+                "join pg_namespace sn on sn.oid=s.relnamespace "
+                "where tn.nspname=:schema and t.relname=:table "
+                "and a.attname=:column"
+            ),
+            {
+                "schema": table_schema,
+                "table": table.name,
+                "column": reflected_column.name,
+            },
+        ).first()
+        if row is None:
+            return None
+        return (row[0], row[1])
+
     def autogen_column_reflect(self, inspector, table, column_info):
         if column_info.get("default") and isinstance(
             column_info["type"], (INTEGER, BIGINT)
         ):
-            seq_match = re.match(
-                r"nextval\('(.+?)'::regclass\)", column_info["default"]
-            )
-            if seq_match:
-                info = sqla_compat._exec_on_inspector(
-                    inspector,
-                    text(
-                        "select c.relname, a.attname "
-                        "from pg_class as c join "
-                        "pg_depend d on d.objid=c.oid and "
-                        "d.classid='pg_class'::regclass and "
-                        "d.refclassid='pg_class'::regclass "
-                        "join pg_class t on t.oid=d.refobjid "
-                        "join pg_attribute a on a.attrelid=t.oid and "
-                        "a.attnum=d.refobjsubid "
-                        "where c.relkind='S' and "
-                        "c.oid=cast(:seqname as regclass)"
-                    ),
-                    seqname=seq_match.group(1),
-                ).first()
+            seqname = _parse_sequence_default(column_info["default"])
+            if seqname:
+                info = self._get_column_sequence_info(
+                    inspector, table, column_info["name"]
+                )
                 if info:
-                    seqname, colname = info
-                    if colname == column_info["name"]:
+                    seq_schema, seq_name, own_schema, own_table, own_col = info
+                    table_schema = (
+                        table.schema or self.dialect.default_schema_name
+                    )
+                    # remember the catalog identity of the referenced
+                    # sequence so that comparison does not need to rely on
+                    # the possibly search_path-dependent rendered text
+                    info_dict = column_info.get("info") or {}
+                    info_dict[_SEQUENCE_INFO_KEY] = (seq_schema, seq_name)
+                    column_info["info"] = info_dict
+                    if (
+                        own_col == column_info["name"]
+                        and own_table == table.name
+                        and own_schema == table_schema
+                    ):
                         log.info(
                             "Detected sequence named '%s' as "
                             "owned by integer column '%s(%s)', "
                             "assuming SERIAL and omitting",
-                            seqname,
+                            seq_name,
                             table.name,
-                            colname,
+                            own_col,
                         )
                         # sequence, and the owner is this column,
                         # its a SERIAL - whack it!
                         del column_info["default"]
+                    else:
+                        # the server renders the reference according to the
+                        # current search_path, and SQLAlchemy may further
+                        # qualify it using the table's schema.  neither is
+                        # reliable when more than one sequence shares a
+                        # name, so render the reference using the schema of
+                        # the sequence that's actually referenced.  a
+                        # sequence in the default schema remains unqualified
+                        if seq_schema == self.dialect.default_schema_name:
+                            rendered = self.dialect.identifier_preparer.quote(
+                                seq_name
+                            )
+                        else:
+                            rendered = self._qualified_sequence_name(
+                                seq_schema, seq_name
+                            )
+                        column_info["default"] = (
+                            "nextval('%s'::regclass)" % rendered
+                        )
 
     def correct_for_autogen_constraints(
         self,
