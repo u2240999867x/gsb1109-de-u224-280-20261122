@@ -359,6 +359,62 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         return True
 
+    def _find_correction_receipt(self, import_number):
+        """Return a durable correction receipt for this document, if any."""
+        from mongoengine import cached_reference
+
+        _, receipt = cached_reference.get_any_receipt(self, import_number)
+        return receipt
+
+    def _mark_cached_correction_fields(self):
+        """Mark cached-reference source fields explicitly assigned ``None``.
+
+        Assigning ``None`` to a field that is currently absent from the stored
+        source does not register as a change because the in-memory value was
+        already ``None``. Such an assignment is still a correction (it turns
+        a deleted field into a stored ``null``) and must allocate a revision.
+        """
+        CachedReferenceField = _import_class("CachedReferenceField")
+        field_list = [
+            field
+            for field in getattr(self.__class__, "_cached_reference_fields", [])
+            if isinstance(field, CachedReferenceField)
+        ]
+        if not field_list:
+            return
+
+        id_field = self._meta["id_field"]
+        raw = self._get_collection().find_one({"_id": self._data.get(id_field)})
+        if raw is None:
+            return
+
+        for field in field_list:
+            for cached in field.fields:
+                try:
+                    lookup = self._lookup_field(cached)
+                except Exception:
+                    continue
+                if not lookup:
+                    continue
+                source_field = lookup[0]
+                if not hasattr(source_field, "name"):
+                    continue
+                if self._data.get(source_field.name) is not None:
+                    continue
+                db_field = self._db_field_map.get(
+                    source_field.name, source_field.name
+                )
+                if db_field in raw:
+                    # It is already stored (as null); assigning None again is
+                    # not a correction to report.
+                    continue
+                if any(
+                    path == db_field or path.startswith(f"{db_field}.")
+                    for path in self._unset_fields
+                ):
+                    continue
+                self._mark_as_changed(source_field.name)
+
     def save(
         self,
         force_insert=False,
@@ -422,6 +478,23 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         if self._meta.get("abstract"):
             raise InvalidDocumentError("Cannot save an abstract document.")
+
+        # Correction metadata is consumed by CachedReferenceField listeners.
+        # It is only forwarded once the write below has committed.
+        import_number = kwargs.pop("import_number", None)
+        source = kwargs.pop("source", None)
+        if import_number is not None:
+            signal_kwargs.setdefault("import_number", import_number)
+            # A retried import must not be re-applied to the source record.
+            # Return the original durable receipt instead of re-saving.
+            existing_receipt = self._find_correction_receipt(import_number)
+            if existing_receipt is not None:
+                return existing_receipt
+            # An explicit ``None`` on a cached field is a correction even when
+            # the in-memory value was already ``None`` (e.g. after a delete).
+            self._mark_cached_correction_fields()
+        if source is not None:
+            signal_kwargs.setdefault("source", source)
 
         signals.pre_save.send(self.__class__, document=self, **signal_kwargs)
 
@@ -496,9 +569,17 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             self.__class__, document=self, created=created, **signal_kwargs
         )
 
+        receipt = None
+        if import_number is not None:
+            from mongoengine import cached_reference
+
+            _, receipt = cached_reference.get_any_receipt(self, import_number)
+
         self._clear_updated_fields()
         self._created = False
 
+        if import_number is not None:
+            return receipt
         return self
 
     def _save_create(self, doc, force_insert, write_concern):

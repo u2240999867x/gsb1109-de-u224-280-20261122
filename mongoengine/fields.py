@@ -1316,19 +1316,21 @@ class CachedReferenceField(BaseField):
         signals.post_save.connect(self.on_document_pre_save, sender=self.document_type)
 
     def on_document_pre_save(self, sender, document, created, **kwargs):
-        if created:
-            return None
+        """Synchronize cached owners after a source document was saved.
 
-        update_kwargs = {
-            f"set__{self.name}__{key}": val
-            for key, val in document._delta()[0].items()
-            if key in self.fields
-        }
-        if update_kwargs:
-            filter_kwargs = {}
-            filter_kwargs[self.name] = document
+        The listener runs on ``post_save``: the source write is already
+        committed, so a rejected save can never produce a correction. When
+        the caller supplied ``save(import_number=..., source=...)`` the
+        receipt is durable and can be replayed later by any process.
+        """
+        import_number = kwargs.get("import_number")
+        source = kwargs.get("source")
 
-            self.owner_document.objects(**filter_kwargs).update(**update_kwargs)
+        from mongoengine import cached_reference
+
+        return cached_reference.record_source_save(
+            self, document, import_number=import_number, source=source
+        )
 
     def to_python(self, value):
         if isinstance(value, dict):
@@ -1425,17 +1427,64 @@ class CachedReferenceField(BaseField):
         """
         Sync all cached fields on demand.
         Caution: this operation may be slower.
+
+        The whole source snapshot is collected before any owner is written and
+        each path is written with a revision guard, so a correction committed
+        while this method is paused is not overwritten by the stale snapshot.
         """
-        update_key = "set__%s" % self.name
+        from mongoengine import cached_reference
 
-        for doc in self.document_type.objects:
-            filter_kwargs = {}
-            filter_kwargs[self.name] = doc
+        return cached_reference.sync_all(self)
 
-            update_kwargs = {}
-            update_kwargs[update_key] = doc
+    def record_correction(self, document, import_number, source=None, sync=None):
+        """Save ``document`` and record a durable correction receipt.
 
-            self.owner_document.objects(**filter_kwargs).update(**update_kwargs)
+        Retrying with the same import number returns the original receipt,
+        even from another process, without allocating a new revision or
+        re-applying the correction to the source document.
+        """
+        from mongoengine import cached_reference
+
+        existing = cached_reference.get_receipt(self, import_number, document.pk)
+        if existing is not None:
+            return existing
+
+        document.save(import_number=import_number, source=source)
+        receipt = cached_reference.get_receipt(self, import_number, document.pk)
+        if receipt is None:
+            receipt = cached_reference.record_source_save(
+                self,
+                document,
+                import_number=import_number,
+                source=source,
+                sync=sync,
+            )
+        return receipt
+
+    def get_receipt(self, import_number, source=None):
+        """Return the receipt previously stored for ``import_number``."""
+        from mongoengine import cached_reference
+
+        return cached_reference.get_receipt(self, import_number, source)
+
+    def apply_receipt(self, receipt, documents=None):
+        """Apply a previously issued receipt to cached owner documents."""
+        from mongoengine import cached_reference
+
+        return cached_reference.apply_receipt(self, receipt, documents)
+
+    def sync_one(self, document):
+        """Propagate the current cached values of one source document."""
+        from mongoengine import cached_reference
+
+        statuses = cached_reference.raw_statuses(self, document.pk)
+        revisions = {
+            path: cached_reference.source_revision(self, document.pk, path)
+            for path in statuses
+        }
+        return cached_reference.write_statuses(
+            self, document.pk, statuses, revisions
+        )
 
 
 class GenericReferenceField(BaseField):
