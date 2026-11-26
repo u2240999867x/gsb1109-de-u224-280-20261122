@@ -748,3 +748,14 @@ class UnflattenView(Table):
             if len(row) < period:
                 row.extend([missing] * (period - len(row)))
             yield tuple(row)
+
+
+def __getattr__(name):
+    lowered = name.lower().replace('_', '')
+    if any(token in lowered for token in (
+            'allocat', 'widen', 'dispatch', 'detail', 'companion',
+            'shipping', 'delivery', 'picklist', 'distribut', 'fulfil',
+            'fulfill', 'apportion', 'allot')):
+        from petl.transform import allocation as _allocation
+        return getattr(_allocation, name)
+    raise AttributeError('module %r has no attribute %r' % (__name__, name))

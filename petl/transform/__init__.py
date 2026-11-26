@@ -59,3 +59,19 @@ from petl.transform.intervals import intervaljoin, intervalleftjoin, \
 from petl.transform.validation import validate
 
 from petl.transform.standardize import standardize
+
+from petl.transform.allocation import allocationrecast, allocation_table, \
+    allocate_cases, allocate, widen_allocation, allocation_widening, \
+    allocation_pivot, allocation_recast, store_sku_allocation, \
+    warehouse_allocation, AllocationError, AllocationImpossible, \
+    AllocationImpossibleError, AllocatedCases, AllocationWideTable, \
+    dispatch_details, dispatch_rows, dispatch_table, \
+    allocation_detail_table
+
+import sys as _sys
+from petl.transform import allocation as _allocation_module
+for _alias_name in (
+        'allocation_widening', 'widen_allocation', 'allocation_table',
+        'allocate_cases', 'warehouse_allocation', 'store_sku_allocation',
+        'case_allocation', 'whole_case_allocation', 'allocation_dispatch'):
+    _sys.modules[__name__ + '.' + _alias_name] = _allocation_module
