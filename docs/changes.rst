@@ -4,6 +4,16 @@ Changes
 Version 1.8.0
 -------------
 
+* Add :func:`petl.io.json.fromresumable` and the ``resumable`` flag on
+  :func:`petl.io.json.fromdicts`, providing a disk-backed table over a
+  dictionary stream that can be read by several independent branches and
+  continued after the stream breaks. Each record carries a consecutive
+  integer sequence number; new streams are verified against the cached
+  records by sequence and header values without adding rows, and failures
+  raise :class:`petl.errors.ResumeError` with the offending sequence.
+  Closing the table stops new readers and streams, while the last reader to
+  leave releases the temporary file and source.
+
 * Keep added column values aligned with their header when input rows are short
   or long in ``addcolumn()``.
 

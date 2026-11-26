@@ -162,6 +162,7 @@ JSON files
 
 .. autofunction:: petl.io.json.fromjson
 .. autofunction:: petl.io.json.fromdicts
+.. autofunction:: petl.io.json.fromresumable
 .. autofunction:: petl.io.json.tojson
 .. autofunction:: petl.io.json.tojsonarrays
 
