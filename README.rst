@@ -82,6 +82,32 @@ Basic examples:
     True
 
 
+Paginated, resumable queries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For large documents, ``PagedFind`` returns matches a page at a time in the
+same order and with the same multiplicity as ``find()``, and exposes a
+persistable *receipt* that lets another process continue the query:
+
+..  code:: pycon
+
+    >>> from jsonpath_ng import PagedFind, parse
+    >>> data = [{'id': 7}, {'id': 7}]
+    >>> finder = PagedFind(data, parse('$..id'), limit=1)
+    >>> [match.value for match in finder.fetch()]
+    [7]
+    >>> receipt = finder.receipt  # JSON-serializable; write it to disk if needed
+    >>> resumed = PagedFind.resume(data, parse('$..id'), receipt, limit=1)
+    >>> [match.value for match in resumed.fetch()]
+    [7]
+
+The receipt pins the original document (by fingerprint) and the expression.
+Reopening a changed document or continuing with a different query raises a
+``DataChangedError`` or ``CursorQueryMismatchError`` respectively. Only field,
+array, wildcard, and descendant traversal are supported; other constructs raise
+an ``UnsupportedPathError``.
+
+
 Using the extended parser:
 
 ..  code:: pycon

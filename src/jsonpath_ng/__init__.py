@@ -3,6 +3,14 @@ import warnings
 from ._deprecations import _DEPRECATED_CLASS_NAMES
 from ._deprecations import _deprecated_class_message
 from .jsonpath import *  # noqa
+from .pagination import CursorMismatchError
+from .pagination import CursorQueryMismatchError
+from .pagination import DataChangedError
+from .pagination import InvalidCursorError
+from .pagination import PagedFind
+from .pagination import PaginationError
+from .pagination import SourceUnavailableError
+from .pagination import UnsupportedPathError
 from .parser import parse  # noqa
 
 
