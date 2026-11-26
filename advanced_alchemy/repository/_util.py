@@ -1341,6 +1341,57 @@ def _filterset_loader_options(
     return statement.options(*options)
 
 
+_CACHE_READ_TRANSACTION_KEY = "_aa_cache_read_transaction"
+
+
+def _root_transaction_for_cache(session: Any) -> tuple[Any, Any]:
+    """Return the session info mapping and root transaction used for cache checks."""
+    sync_session = getattr(session, "sync_session", session)
+    get_transaction = getattr(sync_session, "get_transaction", None)
+    if not callable(get_transaction):
+        return None, None
+    try:
+        transaction = get_transaction()
+    except Exception:  # noqa: BLE001 - introspection must never break repository reads
+        return None, None
+    info = getattr(session, "info", None)
+    if not isinstance(info, dict):
+        return None, transaction
+    return info, transaction
+
+
+def _shared_cache_allowed_for_transaction(session: Any) -> bool:
+    """Whether an already-active transaction can read the shared query cache.
+
+    A transaction that was already active before the repository query may own a
+    read snapshot or contain flushed-but-uncommitted state. Such reads must go to
+    the database and must not repopulate the shared cache. Transactions started
+    by a previous cache miss are marked so repeat reads in the same request can
+    still hit the cache.
+    """
+    in_transaction = getattr(session, "in_transaction", None)
+    if not callable(in_transaction):
+        return True
+    try:
+        is_active = in_transaction()
+    except Exception:  # noqa: BLE001 - mock/proxy sessions may not support introspection
+        return True
+    if is_active is not True:
+        return True
+
+    info, transaction = _root_transaction_for_cache(session)
+    if transaction is None or info is None:
+        return False
+    return info.get(_CACHE_READ_TRANSACTION_KEY) is transaction
+
+
+def _mark_transaction_cache_read_safe(session: Any) -> None:
+    """Mark the current root transaction as one started by a cacheable read."""
+    info, transaction = _root_transaction_for_cache(session)
+    if info is not None and transaction is not None:
+        info[_CACHE_READ_TRANSACTION_KEY] = transaction
+
+
 def _build_cache_key(  # pyright: ignore[reportUnusedFunction]
     *,
     model_name: str,

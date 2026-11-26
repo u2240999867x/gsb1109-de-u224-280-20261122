@@ -231,6 +231,20 @@ class CacheManager:
         """
         return f"{self.config.key_prefix}{key}"
 
+    @staticmethod
+    def _model_version_key(model_name: str, bind_group: Optional[str] = None) -> str:
+        """Build the shared cache key for a model or bind-group model version."""
+        if bind_group:
+            return f"{model_name}:{bind_group}:version"
+        return f"{model_name}:version"
+
+    @staticmethod
+    def _model_version_local_key(model_name: str, bind_group: Optional[str] = None) -> str:
+        """Build the local dictionary key for a model or bind-group version."""
+        if bind_group:
+            return f"{model_name}:{bind_group}"
+        return model_name
+
     # =========================================================================
     # Sync Methods (canonical implementations)
     # =========================================================================
@@ -392,7 +406,7 @@ class CacheManager:
         self.delete_sync(key)
         logger.debug("Invalidated cache for %s:%s (bind_group=%s)", model_name, entity_id, bind_group)
 
-    def bump_model_version_sync(self, model_name: str) -> str:
+    def bump_model_version_sync(self, model_name: str, bind_group: Optional[str] = None) -> str:
         """Bump the version token for a model (sync).
 
         This is used for version-based invalidation of list queries.
@@ -402,38 +416,47 @@ class CacheManager:
 
         Args:
             model_name: The model/table name.
+            bind_group: Optional routing group. When provided, only list cache
+                keys for that bind group are invalidated.
 
         Returns:
             The new version token.
         """
         token = uuid.uuid4().hex
-        self._model_versions[model_name] = token
+        local_key = self._model_version_local_key(model_name, bind_group)
+        version_key = self._model_version_key(model_name, bind_group)
+        self._model_versions[local_key] = token
 
         # Store in cache for distributed consistency
-        self.set_sync(f"{model_name}:version", token)
-        logger.debug("Bumped version token for %s to %s", model_name, token)
+        self.set_sync(version_key, token)
+        logger.debug("Bumped version token for %s (%s) to %s", model_name, bind_group, token)
         return token
 
-    def get_model_version_sync(self, model_name: str) -> str:
+    def get_model_version_sync(self, model_name: str, bind_group: Optional[str] = None) -> str:
         """Get the current version token for a model (sync).
 
         This is used to include the version in list query cache keys,
         ensuring that list caches are invalidated when models change.
 
+        The shared cache is checked on every call so a version bumped by
+        another process is observed immediately. The local dictionary remains
+        as a write-through record for introspection and fallback tooling.
+
         Args:
             model_name: The model/table name.
+            bind_group: Optional routing group. When provided, the version is
+                scoped to that group so writes in one partition do not change
+                cache keys for another partition.
 
         Returns:
             The current version token ("0" if not set).
         """
-        # Check local cache first
-        if model_name in self._model_versions:
-            return self._model_versions[model_name]
+        local_key = self._model_version_local_key(model_name, bind_group)
+        version_key = self._model_version_key(model_name, bind_group)
 
-        # Check distributed cache
-        cached = self.get_sync(f"{model_name}:version")
+        cached = self.get_sync(version_key)
         if cached is not DOGPILE_NO_VALUE and cached is not NO_VALUE and isinstance(cached, str):
-            self._model_versions[model_name] = cached
+            self._model_versions[local_key] = cached
             return cached
 
         return "0"
@@ -744,7 +767,7 @@ class CacheManager:
         """
         await async_(self.invalidate_entity_sync)(model_name, entity_id, bind_group)
 
-    async def bump_model_version_async(self, model_name: str) -> str:
+    async def bump_model_version_async(self, model_name: str, bind_group: Optional[str] = None) -> str:
         """Bump the version token for a model (async).
 
         This is used for version-based invalidation of list queries.
@@ -754,13 +777,14 @@ class CacheManager:
 
         Args:
             model_name: The model/table name.
+            bind_group: Optional routing group to invalidate exclusively.
 
         Returns:
             The new version token.
         """
-        return await async_(self.bump_model_version_sync)(model_name)
+        return await async_(self.bump_model_version_sync)(model_name, bind_group)
 
-    async def get_model_version_async(self, model_name: str) -> str:
+    async def get_model_version_async(self, model_name: str, bind_group: Optional[str] = None) -> str:
         """Get the current version token for a model (async).
 
         This is used to include the version in list query cache keys,
@@ -768,11 +792,12 @@ class CacheManager:
 
         Args:
             model_name: The model/table name.
+            bind_group: Optional routing group whose version should be read.
 
         Returns:
             The current version token ("0" if not set).
         """
-        return await async_(self.get_model_version_sync)(model_name)
+        return await async_(self.get_model_version_sync)(model_name, bind_group)
 
     async def get_many_async(self, key: str, model_class: type[T]) -> Optional[list[T]]:
         """Get a cached list of entities (async)."""

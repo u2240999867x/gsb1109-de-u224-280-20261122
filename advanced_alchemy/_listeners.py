@@ -487,7 +487,15 @@ class CacheInvalidationTracker:
 
     def commit(self) -> None:
         """Process all pending invalidations after successful commit."""
+        pending_invalidations = list(self._pending_invalidations)
         for model_name in self._pending_model_bumps:
+            bind_groups = {
+                bind_group
+                for invalidation_model, _entity_id, bind_group in pending_invalidations
+                if invalidation_model == model_name and bind_group is not None
+            }
+            for bind_group in sorted(bind_groups):
+                self._cache_manager.bump_model_version_sync(model_name, bind_group=bind_group)
             self._cache_manager.bump_model_version_sync(model_name)
         self._pending_model_bumps.clear()
 
@@ -506,7 +514,15 @@ class CacheInvalidationTracker:
         This method performs cache I/O using the CacheManager async APIs so that
         dogpile backends (often sync network clients) never block the event loop.
         """
+        pending_invalidations = list(self._pending_invalidations)
         for model_name in self._pending_model_bumps:
+            bind_groups = {
+                bind_group
+                for invalidation_model, _entity_id, bind_group in pending_invalidations
+                if invalidation_model == model_name and bind_group is not None
+            }
+            for bind_group in sorted(bind_groups):
+                await self._cache_manager.bump_model_version_async(model_name, bind_group=bind_group)
             await self._cache_manager.bump_model_version_async(model_name)
         self._pending_model_bumps.clear()
 

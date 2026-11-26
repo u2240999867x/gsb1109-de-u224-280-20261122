@@ -66,6 +66,8 @@ from advanced_alchemy.repository._util import (
     FilterableRepositoryProtocol,
     LoadSpec,
     _build_cache_key,  # pyright: ignore
+    _mark_transaction_cache_read_safe,  # pyright: ignore[reportPrivateUsage]
+    _shared_cache_allowed_for_transaction,  # pyright: ignore[reportPrivateUsage]
     allows_explicit_none_update,
     column_has_defaults,
     compare_values,
@@ -648,15 +650,15 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
         return bool(uniquify) if uniquify is not None else self._uniquify
 
     def _resolve_bind_group(self, bind_group: Optional[str] = None) -> Optional[str]:
-        """Resolve the bind_group to use, preferring method parameter over instance default.
+        """Resolve the bind_group to use, preferring method parameter over instance default."""
+        if bind_group is not None:
+            return bind_group
+        if self._bind_group is not None:
+            return self._bind_group
 
-        Args:
-            bind_group: Optional override for the bind_group setting.
+        from advanced_alchemy.routing.context import bind_group_var
 
-        Returns:
-            The bind_group to use, or None if not set.
-        """
-        return bind_group if bind_group is not None else self._bind_group
+        return bind_group_var.get()
 
     def _queue_cache_invalidation(self, entity_id: Any, bind_group: Optional[str] = None) -> None:
         """Queue a cache invalidation for an entity.
@@ -780,16 +782,21 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
         Returns:
             The added instance.
         """
-        _ = bind_group  # Reserved for future multi-master routing
         error_messages = self._get_error_messages(
             error_messages=error_messages,
             default_messages=self.error_messages,
         )
+        should_auto_commit = self.auto_commit if auto_commit is None else auto_commit
         with wrap_sqlalchemy_exception(
             error_messages=error_messages, dialect_name=self._dialect.name, wrap_exceptions=self.wrap_exceptions
         ):
             instance = await self._attach_to_session(data)
-            await self._flush_or_commit(auto_commit=auto_commit)
+            await self.session.flush()
+            resolved_bind_group = self._resolve_bind_group(bind_group)
+            self._queue_cache_invalidation(self.get_primary_key_value(instance), resolved_bind_group)
+            if should_auto_commit:
+                await self.session.commit()
+                await flush_pending_async_listener_tasks(self.session)
             await self._refresh(instance, auto_refresh=auto_refresh)
             self._expunge(instance, auto_expunge=auto_expunge)
             return instance
@@ -2458,6 +2465,7 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
         resolved_order_by = order_by if order_by is not None else (self.order_by if self.order_by is not None else [])
 
         cache_manager = self._cache_manager
+        transaction_allows_shared_cache = _shared_cache_allowed_for_transaction(self.session)
         if not (
             use_cache
             and bool(resolved_auto_expunge)
@@ -2465,6 +2473,7 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
             and statement is None
             and load is None
             and not self._default_loader_options
+            and transaction_allows_shared_cache
         ):
             return await self._get_many_and_count_from_db(
                 filters=filters,
@@ -2481,8 +2490,8 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
             )
 
         model_name = cast("str", self.model_type.__tablename__)  # type: ignore[attr-defined]
-        version_token = await cache_manager.get_model_version_async(model_name)
         resolved_bind_group = self._resolve_bind_group(bind_group)
+        version_token = await cache_manager.get_model_version_async(model_name, bind_group=resolved_bind_group)
         cache_key = _build_cache_key(
             model_name=model_name,
             version_token=version_token,
@@ -2514,7 +2523,7 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
         if cached is not None:
             return cached
 
-        return await cache_manager.singleflight_async(
+        result = await cache_manager.singleflight_async(
             cache_key,
             partial(
                 self._get_many_and_count_cached_creator,
@@ -2532,6 +2541,8 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
                 bind_group=bind_group,
             ),
         )
+        _mark_transaction_cache_read_safe(self.session)
+        return result
 
     def _expunge(self, instance: "ModelT", auto_expunge: "Optional[bool]") -> None:
         """Remove instance from session if auto_expunge is enabled.
@@ -3289,8 +3300,8 @@ class SQLAlchemyAsyncRepository(FilterableRepository[ModelT], SQLAlchemyAsyncRep
             )
 
         model_name = cast("str", self.model_type.__tablename__)  # type: ignore[attr-defined]
-        version_token = await cache_manager.get_model_version_async(model_name)
         resolved_bind_group = self._resolve_bind_group(bind_group)
+        version_token = await cache_manager.get_model_version_async(model_name, bind_group=resolved_bind_group)
         cache_key = _build_cache_key(
             model_name=model_name,
             version_token=version_token,
