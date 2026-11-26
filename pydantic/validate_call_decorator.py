@@ -101,7 +101,9 @@ def validate_call(
     Args:
         func: The function to be wrapped.
         config: The configuration dictionary.
-        validate_return: Whether to validate the return value.
+        validate_return: Whether to validate the return value. For `Generator` and
+            `AsyncGenerator` return annotations, yielded and sent values are validated
+            lazily, and a synchronous generator's returned value is also validated.
 
     Returns:
         The decorated function.
