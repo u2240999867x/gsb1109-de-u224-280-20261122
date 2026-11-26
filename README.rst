@@ -194,6 +194,55 @@ Extras
    by extending the library.
 
 
+Object graph queries and corrections
+------------------------------------
+
+The standard queries treat data as a tree.  Python programs often build an
+*object graph* instead, where the same ``dict`` or ``list`` is referenced from
+several places and references may loop back to a container already visited.
+Graph support is opt-in, so ordinary ``.find()`` behavior is unchanged.
+
+``find_graph()`` reports every walk that reaches a value.  When several paths
+reach the same object, each one is returned; when a reference loops back, the
+back edge is reported as a cycle and is not expanded:
+
+..  code:: pycon
+
+    >>> from jsonpath_ng import GraphQuery, find_graph
+    >>> detail = {"score": 7}
+    >>> review = {"item": detail, "links": []}
+    >>> task = {"items": [detail], "review": review}
+    >>> review["links"].append(task)
+    >>> root = {"jobs": {"east": task, "spare": task}, "audit": review}
+    >>> [str(match.path) for match in find_graph("$..score", root)]
+    ['jobs.east.items.[0].score', 'jobs.east.review.item.score', 'jobs.spare.items.[0].score', 'jobs.spare.review.item.score', 'audit.item.score', 'audit.links.[0].items.[0].score']
+    >>> cycle = next(match for match in find_graph("$..links.[0]", root) if match.is_cycle)
+    >>> cycle.cycle.link
+    'jobs.east.review.links.[0]'
+    >>> cycle.cycle.target
+    'jobs.east'
+
+``correct_graph()`` produces corrected copies of selected subgraphs
+("mounts").  The original graph is never modified, each mount is corrected
+independently, and objects that do not change stay shared.  Two paths within
+one mount must agree on the new value of a field, or the whole correction is
+rejected with a ``CorrectionConflict``; cycle references cannot be targets:
+
+..  code:: pycon
+
+    >>> from jsonpath_ng import correct_graph
+    >>> result = correct_graph(
+    ...     root,
+    ...     {"jobs.east.items.[0].score": 9},
+    ...     mounts=GraphQuery("jobs.*"),
+    ...     query=GraphQuery("$..score"),
+    ... )
+    >>> [match.value for match in find_graph("$..score", result[0].value)]
+    [9, 9]
+    >>> root["jobs"]["east"]["items"][0]["score"]
+    7
+
+
 Extensions
 ----------
 

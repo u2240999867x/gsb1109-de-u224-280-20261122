@@ -2,6 +2,14 @@ import warnings
 
 from ._deprecations import _DEPRECATED_CLASS_NAMES
 from ._deprecations import _deprecated_class_message
+from .graph import Correction  # noqa
+from .graph import CorrectionConflict  # noqa
+from .graph import correct_graph  # noqa
+from .graph import Edge  # noqa
+from .graph import find_graph  # noqa
+from .graph import GraphCycle  # noqa
+from .graph import GraphMatch  # noqa
+from .graph import GraphQuery  # noqa
 from .jsonpath import *  # noqa
 from .parser import parse  # noqa
 
