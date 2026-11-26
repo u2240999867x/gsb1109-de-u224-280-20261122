@@ -1,3 +1,11 @@
+v4.28.0
+=======
+
+* Fix the deprecated ``RefResolver`` so that multiple validators sharing one resolver no longer corrupt each other's resolution scope.
+  Each validator now carries its own base URI through nested ``$id`` s instead of mutating the resolver's shared scope stack, so pausing, interleaving, closing early, or abandoning a validation (and then starting another) all resolve references against the correct entry.
+* References are now resolved lazily while iterating errors, so ``iter_errors`` only retrieves the schemas needed for the errors actually consumed; closing an iterator no longer eagerly resolves later (possibly missing) references such as an optional ``audit`` subschema.
+* The module-level ``validate`` function now considers only the first produced error (still via ``best_match`` over that error's context), so it raises the earliest ``ValidationError`` instead of draining the whole document.
+
 v4.27.0
 =======
 

@@ -2615,6 +2615,160 @@ class TestRefResolver(TestCase):
         )
 
 
+class TestSharedRefResolver(TestCase):
+    """
+    Two entry points (east and west) share one offline ``RefResolver``.
+
+    Validation must keep each entry's resolution scope independent even when
+    their generators are paused, interleaved, closed early or abandoned, and
+    must only resolve references for the parts of the document actually read.
+    """
+
+    base_uri = "https://schemas.example/feed/"
+    bad_order = {"lot": "?", "count": 1, "audit": True}
+
+    def setUp(self):
+        self.requested = []
+
+        def schemas(region, letter):
+            root = {"$id": f"{region}/order.json", "$ref": "rules/row.json"}
+            row = {
+                "type": "object",
+                "properties": {
+                    "lot": {"$id": "labels/", "$ref": "lot.json"},
+                    "count": {"$ref": "count.json"},
+                    "audit": {"$ref": "audit.json"},
+                },
+                "required": ["lot", "count"],
+            }
+            lot = {"type": "string", "pattern": f"^{letter}$"}
+            if region == "east":
+                count = {"type": "integer", "minimum": 2}
+            else:
+                count = {"type": "integer", "const": 1}
+            return root, {
+                f"{region}/rules/row.json": row,
+                f"{region}/rules/labels/lot.json": lot,
+                f"{region}/rules/count.json": count,
+            }
+
+        self.east_root, east = schemas("east", "E")
+        self.west_root, west = schemas("west", "W")
+        documents = {
+            self.base_uri + uri: schema
+            for uri, schema in {**east, **west}.items()
+        }
+
+        def handler(uri):
+            self.requested.append(uri)
+            if uri.endswith("audit.json"):
+                raise KeyError(uri)
+            return documents[uri]
+
+        self.resolver = validators._RefResolver(
+            self.base_uri,
+            self.east_root,
+            handlers={"https": handler},
+        )
+        self.east = validators.Draft202012Validator(
+            self.east_root,
+            resolver=self.resolver,
+        )
+        self.west = validators.Draft202012Validator(
+            self.west_root,
+            resolver=self.resolver,
+        )
+
+    def assertPath(self, error, path):
+        self.assertEqual(list(error.absolute_path), path)
+
+    def assertAuditNotRequested(self):
+        self.assertFalse(
+            [uri for uri in self.requested if uri.endswith("audit.json")],
+            self.requested,
+        )
+
+    def test_each_entry_validates_against_its_own_contract(self):
+        self.assertTrue(self.east.is_valid({"lot": "E", "count": 2}))
+        self.assertTrue(self.west.is_valid({"lot": "W", "count": 1}))
+
+        self.assertFalse(self.east.is_valid({"lot": "W", "count": 1}))
+        self.assertFalse(self.west.is_valid({"lot": "E", "count": 2}))
+        # The shared resolver's scope stack is never mutated.
+        self.assertEqual(self.resolver.resolution_scope, self.base_uri)
+
+    def test_the_first_error_is_for_lot_and_does_not_touch_audit(self):
+        errors = self.east.iter_errors(self.bad_order)
+        self.assertPath(next(errors), ["lot"])
+        self.assertAuditNotRequested()
+        errors.close()
+
+    def test_paused_validation_resumes_after_an_interleaved_one(self):
+        east_errors = self.east.iter_errors(self.bad_order)
+        self.assertPath(next(east_errors), ["lot"])
+
+        # A west lookup, which itself calls back into the east entry.
+        self.assertTrue(self.west.is_valid({"lot": "W", "count": 1}))
+        self.assertTrue(self.east.is_valid({"lot": "E", "count": 2}))
+
+        # The paused iterator simply continues where it left off.
+        self.assertPath(next(east_errors), ["count"])
+        self.assertAuditNotRequested()
+        east_errors.close()
+        self.assertAuditNotRequested()
+
+    def test_abandoning_an_iterator_leaves_the_resolver_usable(self):
+        east_errors = self.east.iter_errors(self.bad_order)
+        next(east_errors)
+        east_errors.close()  # abandon before reaching count / audit
+
+        self.assertTrue(self.east.is_valid({"lot": "E", "count": 2}))
+        self.assertTrue(self.west.is_valid({"lot": "W", "count": 1}))
+        self.assertAuditNotRequested()
+        self.assertEqual(self.resolver.resolution_scope, self.base_uri)
+
+    def test_reading_to_the_third_item_raises_for_the_missing_audit_part(self):
+        paths = []
+        with self.assertRaises(exceptions._RefResolutionError) as err:
+            paths.extend(
+                list(error.absolute_path)
+                for error in self.east.iter_errors(self.bad_order)
+            )
+
+        self.assertEqual(paths, [["lot"], ["count"]])
+        self.assertEqual(
+            [uri for uri in self.requested if uri.endswith("audit.json")],
+            [self.base_uri + "east/rules/audit.json"],
+        )
+        self.assertIn("east/rules/audit.json", str(err.exception))
+
+        # No rebuilding needed: both entries still accept good orders.
+        self.assertTrue(self.east.is_valid({"lot": "E", "count": 2}))
+        self.assertTrue(self.west.is_valid({"lot": "W", "count": 1}))
+
+    def test_validate_reports_the_lot_error_without_resolving_audit(self):
+        with self.assertRaises(exceptions.ValidationError) as err:
+            validators.validate(
+                self.bad_order,
+                self.east_root,
+                resolver=self.resolver,
+            )
+        self.assertPath(err.exception, ["lot"])
+        self.assertAuditNotRequested()
+
+    def test_the_resolver_still_resolves_resources_from_either_base(self):
+        _, east_count = self.resolver.resolve(
+            "east/rules/count.json",
+            base_uri=self.base_uri,
+        )
+        _, west_count = self.resolver.resolve(
+            "west/rules/count.json",
+            base_uri=self.base_uri,
+        )
+        self.assertEqual(east_count, {"type": "integer", "minimum": 2})
+        self.assertEqual(west_count, {"type": "integer", "const": 1})
+
+
 def sorted_errors(errors):
     def key(error):
         return (

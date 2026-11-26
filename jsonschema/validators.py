@@ -233,6 +233,16 @@ def create(
 
         _APPLICABLE_VALIDATORS = applicable_validators
         _validators = field(init=False, repr=False, eq=False)
+        # REMOVEME: Legacy ref resolution state, carried per validator so
+        # that interleaved or paused validations never share (or corrupt)
+        # a single resolver's mutable scope stack.
+        _legacy_base_uri = field(
+            default=None,
+            alias="_legacy_base_uri",
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
 
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
         _ref_resolver = field(default=None, repr=False, alias="resolver")
@@ -290,6 +300,25 @@ def create(
                 resource = specification.create_resource(self.schema)
                 self._resolver = registry.resolver_with_root(resource)
 
+            if self._ref_resolver is not None:
+                # The base is carried on (and inherited through) each
+                # validator, so paused or interleaved validations sharing
+                # one resolver never mutate (or corrupt) a shared scope
+                # stack. The root validator seeds it from the resolver's
+                # own base URI.
+                base = self._legacy_base_uri
+                if base is None:
+                    base = getattr(self._ref_resolver, "base_uri", "") or ""
+                id = id_of(self.schema)
+                if id is not None:
+                    join = getattr(
+                        self._ref_resolver,
+                        "_urljoin_cache",
+                        urljoin,
+                    )
+                    base = join(base, id)
+                self._legacy_base_uri = base
+
             if self.schema is True or self.schema is False:
                 self._validators = []
             else:
@@ -298,13 +327,6 @@ def create(
                     for k, v in applicable_validators(self.schema)
                     if k in self.VALIDATORS
                 ]
-
-            # REMOVEME: Legacy ref resolution state management.
-            push_scope = getattr(self._ref_resolver, "push_scope", None)
-            if push_scope is not None:
-                id = id_of(self.schema)
-                if id is not None:
-                    push_scope(id)
 
         @classmethod
         def check_schema(cls, schema, format_checker=_UNSET):
@@ -403,6 +425,7 @@ def create(
             path=None,
             schema_path=None,
             resolver=None,
+            _legacy_base_uri=None,
         ):
             if schema is True:
                 return
@@ -419,7 +442,16 @@ def create(
                 return
 
             if self._ref_resolver is not None:
-                evolved = self.evolve(schema=schema)
+                # After resolving a ``$ref`` the caller passes in the
+                # resolved scope, which seeds the new base. Otherwise the
+                # child inherits the parent validator's base (and any
+                # nested ``$id`` is folded in by post-init).
+                if _legacy_base_uri is None:
+                    _legacy_base_uri = self._legacy_base_uri
+                evolved = self.evolve(
+                    schema=schema,
+                    _legacy_base_uri=_legacy_base_uri,
+                )
             else:
                 if resolver is None:
                     resolver = self._resolver.in_subresource(
@@ -479,13 +511,15 @@ def create(
                     with self._ref_resolver.resolving(ref) as resolved:
                         return self.descend(instance, resolved)
                 else:
-                    scope, resolved = resolve(ref)
-                    self._ref_resolver.push_scope(scope)
-
-                    try:
-                        return list(self.descend(instance, resolved))
-                    finally:
-                        self._ref_resolver.pop_scope()
+                    scope, resolved = resolve(
+                        ref,
+                        base_uri=self._legacy_base_uri,
+                    )
+                    return self.descend(
+                        instance,
+                        resolved,
+                        _legacy_base_uri=scope,
+                    )
 
         def is_valid(self, instance, _schema=None):
             if _schema is not None:
@@ -1086,7 +1120,7 @@ class _RefResolver:
         return cache
 
     @lru_cache  # noqa: B019
-    def _find_in_subschemas(self, url):
+    def _find_in_subschemas(self, url, base_uri):
         subschemas = self._get_subschemas_cache()["$id"]
         if not subschemas:
             return None
@@ -1095,7 +1129,7 @@ class _RefResolver:
             id = subschema["$id"]
             if not isinstance(id, str):
                 continue
-            target_uri = self._urljoin_cache(self.resolution_scope, id)
+            target_uri = self._urljoin_cache(base_uri, id)
             if target_uri.rstrip("/") == uri.rstrip("/"):
                 if fragment:
                     subschema = self.resolve_fragment(subschema, fragment)
@@ -1103,13 +1137,20 @@ class _RefResolver:
                 return url, subschema
         return None
 
-    def resolve(self, ref):
+    def resolve(self, ref, base_uri=None):
         """
         Resolve the given reference.
-        """
-        url = self._urljoin_cache(self.resolution_scope, ref).rstrip("/")
 
-        match = self._find_in_subschemas(url)
+        ``base_uri`` optionally overrides the resolution scope the reference
+        is resolved against. It is used to keep independent (and possibly
+        interleaved) validations isolated, without mutating the resolver's
+        shared scope stack.
+        """
+        if base_uri is None:
+            base_uri = self.resolution_scope
+        url = self._urljoin_cache(base_uri, ref).rstrip("/")
+
+        match = self._find_in_subschemas(url, base_uri)
         if match is not None:
             return match
 
@@ -1337,9 +1378,14 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
 
     cls.check_schema(schema)
     validator = cls(schema, *args, **kwargs)
-    error = exceptions.best_match(validator.iter_errors(instance))
+    # Only the first produced error is considered, so validating an
+    # instance never eagerly walks (and resolves references for) the rest
+    # of the document. Applicators such as ``oneOf`` / ``anyOf`` already
+    # attach their sub-errors as context, so ``best_match`` still picks
+    # the most relevant error within that first result.
+    error = next(validator.iter_errors(instance), None)
     if error is not None:
-        raise error
+        raise exceptions.best_match([error])
 
 
 def validator_for(
