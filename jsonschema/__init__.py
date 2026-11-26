@@ -23,6 +23,16 @@ from jsonschema.validators import (
     Draft202012Validator,
     validate,
 )
+from jsonschema.triage import (
+    ReceiptBook,
+    ReceiptKey,
+    TriageBatch,
+    TriageDecision,
+    TriageJob,
+    classify_batch,
+    receipt_format_checker,
+    triage_batch,
+)
 
 
 def __getattr__(name):
@@ -109,6 +119,27 @@ def __getattr__(name):
         )
         return ValidatorForFormat.FORMAT_CHECKER
 
+    lowered_name = name.lower()
+    if not name.startswith("_") and any(
+        token in lowered_name
+        for token in (
+            "triage",
+            "receipt",
+            "classify",
+            "partition",
+            "intake",
+            "registrar",
+            "desk",
+            "pending_format",
+        )
+    ):
+        from jsonschema import triage as _triage
+
+        try:
+            return getattr(_triage, name)
+        except AttributeError:
+            pass
+
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
 
@@ -120,8 +151,16 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "ReceiptBook",
+    "ReceiptKey",
     "SchemaError",
+    "TriageBatch",
+    "TriageDecision",
+    "TriageJob",
     "TypeChecker",
     "ValidationError",
+    "classify_batch",
+    "receipt_format_checker",
+    "triage_batch",
     "validate",
 ]
