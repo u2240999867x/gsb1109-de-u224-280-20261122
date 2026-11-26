@@ -1,0 +1,5 @@
+{"name": "early-0", "requested": 8, "offset": 0, "n": 8, "hex": "412c30303030300a"}
+{"name": "early-1", "requested": 5, "offset": 0, "n": 5, "hex": "422ce794b2"}
+{"name": "stderr-mode-crc", "requested": 11, "offset": 0, "n": 11, "hex": "4d4f44450a4352433d6f6b"}
+{"name": "late-0", "requested": 5, "offset": 0, "n": 5, "hex": "0a432c330a"}
+{"name": "exit", "code": 0}

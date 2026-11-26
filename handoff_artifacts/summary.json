@@ -1,0 +1,129 @@
+[
+  {
+    "id": "01_second_flush_fails",
+    "exit": 0,
+    "detail": "A,00000\n",
+    "tee_out": "b'A,00000\\n'",
+    "tee_err": "b'MODE\\n'",
+    "err_cb": [
+      "MODE\n"
+    ],
+    "stderr_buffer": "4352433d6f6b",
+    "exc": true
+  },
+  {
+    "id": "01b_second_nonempty_paired_flush_fails",
+    "exit": 0,
+    "detail": "A,00000\n",
+    "tee_out": "b''",
+    "tee_err": "b'MODE\\n'",
+    "err_cb": [
+      "MODE\n"
+    ],
+    "stderr_buffer": "4352433d6f6b",
+    "exc": true
+  },
+  {
+    "id": "02_unpaired_closing_flush_fails",
+    "exit": 0,
+    "detail": "A,00000\nB,\nC,3\n",
+    "tee_out": "b'\\x94\\xb2\\nC,3\\n'",
+    "tee_err": "b'MODE\\n'",
+    "err_cb": [
+      "MODE\n"
+    ],
+    "stderr_buffer": "4352433d6f6b",
+    "exc": true
+  },
+  {
+    "id": "03_switched_healthy_sink",
+    "exit": 0,
+    "detail": "A,00000\nB,\nC,3\n",
+    "tee_out": "b'\\x94\\xb2\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "04_no_switch_healthy_sink",
+    "exit": 0,
+    "detail": "A,00000\nB,甲\nC,3\n",
+    "tee_out": "b'3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "05_len8_zero_jia_before_switch",
+    "exit": 0,
+    "detail": "A,00000\nB,甲\nC,3\n",
+    "tee_out": "b'\\xe7\\x94\\xb2\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "06_len8_two_jia_before_switch",
+    "exit": 0,
+    "detail": "A,00000\nB,\nC,3\n",
+    "tee_out": "b'\\xb2\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "07_len8_three_jia_before_switch",
+    "exit": 0,
+    "detail": "A,00000\nB,甲\nC,3\n",
+    "tee_out": "b'\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "08_len7_one_jia_byte_before_switch",
+    "exit": 0,
+    "detail": "A,0000\nB,\nC,3\n",
+    "tee_out": "b'\\x94\\xb2\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  },
+  {
+    "id": "09_len9_one_jia_byte_before_switch",
+    "exit": 0,
+    "detail": "A,000000\nB,\nC,3\n",
+    "tee_out": "b'\\x94\\xb2\\nC,3\\n'",
+    "tee_err": "b'CRC=ok'",
+    "err_cb": [
+      "MODE\n",
+      "CRC=ok"
+    ],
+    "stderr_buffer": "",
+    "exc": false
+  }
+]

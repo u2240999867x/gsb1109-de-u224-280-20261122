@@ -1,0 +1,110 @@
+
+===== 01_second_flush_fails =====
+exit: 0 exc: True
+out reads: [(8, "b'A,00000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'")]
+err reads: [(11, "b'MODE\\nCRC=ok'")]
+err callbacks: ['MODE\n']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('flush_error', 2, None)]
+file: 'A,00000\n'
+tee out: b'A,00000\n'
+tee err: b'MODE\n'
+stderr buffer hex: 4352433d6f6b
+
+===== 01b_second_nonempty_paired_flush_fails =====
+exit: 0 exc: True
+out reads: [(8, "b'A,00000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'")]
+err reads: [(11, "b'MODE\\nCRC=ok'")]
+err callbacks: ['MODE\n']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,'), ('flush_enter', 3, True), ('flush_error', 3, None)]
+file: 'A,00000\n'
+tee out: b''
+tee err: b'MODE\n'
+stderr buffer hex: 4352433d6f6b
+
+===== 02_unpaired_closing_flush_fails =====
+exit: 0 exc: True
+out reads: [(8, "b'A,00000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,'), ('flush_enter', 3, True), ('append', 3, 'B,'), ('flush_ok', 3, None), ('write', None, '\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('flush_error', 5, None)]
+file: 'A,00000\nB,\nC,3\n'
+tee out: b'\x94\xb2\nC,3\n'
+tee err: b'MODE\n'
+stderr buffer hex: 4352433d6f6b
+
+===== 03_switched_healthy_sink =====
+exit: 0 exc: False
+out reads: [(8, "b'A,00000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,'), ('flush_enter', 3, True), ('append', 3, 'B,'), ('flush_ok', 3, None), ('write', None, '\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('append', 5, ''), ('flush_ok', 5, None)]
+file: 'A,00000\nB,\nC,3\n'
+tee out: b'\x94\xb2\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 04_no_switch_healthy_sink =====
+exit: 0 exc: False
+out reads: [(8, "b'A,00000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, 'B,甲\nC,'), ('flush_enter', 2, True), ('append', 2, 'B,甲\nC,'), ('flush_ok', 2, None), ('write', None, '3\n'), ('flush_enter', 3, True), ('append', 3, '3\n'), ('flush_ok', 3, None), ('flush_enter', 4, False), ('append', 4, ''), ('flush_ok', 4, None)]
+file: 'A,00000\nB,甲\nC,3\n'
+tee out: b'3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 05_len8_zero_jia_before_switch =====
+exit: 0 exc: False
+out reads: [(8, "b'A,00000\\n'"), (2, "b'B,'"), (8, "b'\\xe7\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,'), ('flush_enter', 3, True), ('append', 3, 'B,'), ('flush_ok', 3, None), ('write', None, '甲\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '甲\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('append', 5, ''), ('flush_ok', 5, None)]
+file: 'A,00000\nB,甲\nC,3\n'
+tee out: b'\xe7\x94\xb2\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 06_len8_two_jia_before_switch =====
+exit: 0 exc: False
+out reads: [(8, "b'A,00000\\n'"), (4, "b'B,\\xe7\\x94'"), (6, "b'\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,'), ('flush_enter', 3, True), ('append', 3, 'B,'), ('flush_ok', 3, None), ('write', None, '\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('append', 5, ''), ('flush_ok', 5, None)]
+file: 'A,00000\nB,\nC,3\n'
+tee out: b'\xb2\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 07_len8_three_jia_before_switch =====
+exit: 0 exc: False
+out reads: [(8, "b'A,00000\\n'"), (5, "b'B,\\xe7\\x94\\xb2'"), (5, "b'\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,00000\n'), ('flush_enter', 1, True), ('append', 1, 'A,00000\n'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, 'B,甲'), ('flush_enter', 3, True), ('append', 3, 'B,甲'), ('flush_ok', 3, None), ('write', None, '\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('append', 5, ''), ('flush_ok', 5, None)]
+file: 'A,00000\nB,甲\nC,3\n'
+tee out: b'\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 08_len7_one_jia_byte_before_switch =====
+exit: 0 exc: False
+out reads: [(7, "b'A,0000\\n'"), (3, "b'B,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,0000\nB'), ('flush_enter', 1, True), ('append', 1, 'A,0000\nB'), ('flush_ok', 1, None), ('write', None, ','), ('flush_enter', 2, True), ('append', 2, ','), ('flush_ok', 2, None), ('write', None, '\nC,3\n'), ('flush_enter', 3, True), ('append', 3, '\nC,3\n'), ('flush_ok', 3, None), ('flush_enter', 4, False), ('append', 4, ''), ('flush_ok', 4, None)]
+file: 'A,0000\nB,\nC,3\n'
+tee out: b'\x94\xb2\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 
+
+===== 09_len9_one_jia_byte_before_switch =====
+exit: 0 exc: False
+out reads: [(8, "b'A,000000'"), (4, "b'\\nB,\\xe7'"), (7, "b'\\x94\\xb2\\nC,3\\n'"), (0, "b''")]
+err reads: [(11, "b'MODE\\nCRC=ok'"), (0, "b''")]
+err callbacks: ['MODE\n', 'CRC=ok']
+sink calls: [('write', None, 'A,000000'), ('flush_enter', 1, True), ('append', 1, 'A,000000'), ('flush_ok', 1, None), ('write', None, ''), ('flush_enter', 2, True), ('append', 2, ''), ('flush_ok', 2, None), ('write', None, '\nB,'), ('flush_enter', 3, True), ('append', 3, '\nB,'), ('flush_ok', 3, None), ('write', None, '\nC,3\n'), ('flush_enter', 4, True), ('append', 4, '\nC,3\n'), ('flush_ok', 4, None), ('flush_enter', 5, False), ('append', 5, ''), ('flush_ok', 5, None)]
+file: 'A,000000\nB,\nC,3\n'
+tee out: b'\x94\xb2\nC,3\n'
+tee err: b'CRC=ok'
+stderr buffer hex: 

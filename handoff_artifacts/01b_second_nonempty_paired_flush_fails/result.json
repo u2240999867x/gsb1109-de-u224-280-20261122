@@ -1,0 +1,158 @@
+{
+  "id": "01b_second_nonempty_paired_flush_fails",
+  "description": "A committed; B prefix reaches write() but its paired flush fails",
+  "switch": true,
+  "fail": "second_nonempty",
+  "exit_code": 0,
+  "early_expected_hex": "412c30303030300a422ce7",
+  "late_expected_hex": "94b20a432c330a",
+  "complete_expected_text": "A,00000\nB,甲\nC,3\n",
+  "child_writes": [
+    {
+      "name": "early-0",
+      "requested": 8,
+      "offset": 0,
+      "n": 8,
+      "hex": "412c30303030300a"
+    },
+    {
+      "name": "early-1",
+      "requested": 3,
+      "offset": 0,
+      "n": 3,
+      "hex": "422ce7"
+    },
+    {
+      "name": "stderr-mode-crc",
+      "requested": 11,
+      "offset": 0,
+      "n": 11,
+      "hex": "4d4f44450a4352433d6f6b"
+    },
+    {
+      "name": "late-0",
+      "requested": 7,
+      "offset": 0,
+      "n": 7,
+      "hex": "94b20a432c330a"
+    },
+    {
+      "name": "exit",
+      "code": 0
+    }
+  ],
+  "parent_out_reads": [
+    {
+      "fd": 6,
+      "requested": 8,
+      "n": 8,
+      "hex": "412c30303030300a",
+      "repr": "b'A,00000\\n'"
+    },
+    {
+      "fd": 6,
+      "requested": 8,
+      "n": 3,
+      "hex": "422ce7",
+      "repr": "b'B,\\xe7'"
+    },
+    {
+      "fd": 6,
+      "requested": 8,
+      "n": 7,
+      "hex": "94b20a432c330a",
+      "repr": "b'\\x94\\xb2\\nC,3\\n'"
+    }
+  ],
+  "parent_err_reads": [
+    {
+      "fd": 9,
+      "requested": 1024,
+      "n": 11,
+      "hex": "4d4f44450a4352433d6f6b",
+      "repr": "b'MODE\\nCRC=ok'"
+    }
+  ],
+  "err_callback_calls": [
+    "MODE\n"
+  ],
+  "sink_calls": [
+    {
+      "op": "write",
+      "text": "A,00000\n",
+      "hex": "412c30303030300a"
+    },
+    {
+      "op": "flush_enter",
+      "n": 1,
+      "paired_write": true,
+      "pending": "A,00000\n"
+    },
+    {
+      "op": "append",
+      "n": 1,
+      "text": "A,00000\n"
+    },
+    {
+      "op": "flush_ok",
+      "n": 1
+    },
+    {
+      "op": "write",
+      "text": "",
+      "hex": ""
+    },
+    {
+      "op": "flush_enter",
+      "n": 2,
+      "paired_write": true,
+      "pending": ""
+    },
+    {
+      "op": "append",
+      "n": 2,
+      "text": ""
+    },
+    {
+      "op": "flush_ok",
+      "n": 2
+    },
+    {
+      "op": "write",
+      "text": "B,",
+      "hex": "422c"
+    },
+    {
+      "op": "flush_enter",
+      "n": 3,
+      "paired_write": true,
+      "pending": "B,"
+    },
+    {
+      "op": "flush_error",
+      "n": 3,
+      "error": "simulated disk flush failure: sink commit failed"
+    }
+  ],
+  "detail_file_hex": "412c30303030300a",
+  "detail_file_text": "A,00000\n",
+  "tee_out_hex": "",
+  "tee_out_repr": "b''",
+  "tee_err_hex": "4d4f44450a",
+  "tee_err_repr": "b'MODE\\n'",
+  "stdout_deque": [
+    "b''"
+  ],
+  "stderr_deque": [
+    "b'MODE\\n'"
+  ],
+  "stdout_streamer_buffer_hex": "",
+  "stderr_streamer_buffer_hex": "4352433d6f6b",
+  "output_thread_exc_queue": [
+    "Traceback (most recent call last):\n  File \"/Users/guo/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/threading.py\", line 1075, in _bootstrap_inner\n    self.run()\n  File \"/Users/guo/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/threading.py\", line 1012, in run\n    self._target(*self._args, **self._kwargs)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 1709, in wrap\n    fn(*rgs, **kwargs)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 2753, in output_thread\n    done = f.read()\n           ^^^^^^^^\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3239, in read\n    self.write_chunk(chunk)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3216, in write_chunk\n    self.should_quit = self.process_chunk(chunk)\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3108, in process\n    flush()\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/repro_handoff.py\", line 72, in flush\n    raise err\nDiskFlushError: simulated disk flush failure: sink commit failed\n"
+  ],
+  "threading_excepthook": [
+    "Traceback (most recent call last):\n  File \"/Users/guo/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/threading.py\", line 1075, in _bootstrap_inner\n    self.run()\n  File \"/Users/guo/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/threading.py\", line 1012, in run\n    self._target(*self._args, **self._kwargs)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 1709, in wrap\n    fn(*rgs, **kwargs)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 2753, in output_thread\n    done = f.read()\n           ^^^^^^^^\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3239, in read\n    self.write_chunk(chunk)\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3216, in write_chunk\n    self.should_quit = self.process_chunk(chunk)\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/src/sh/__init__.py\", line 3108, in process\n    flush()\n  File \"/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/repro_handoff.py\", line 72, in flush\n    raise err\nDiskFlushError: simulated disk flush failure: sink commit failed\n"
+  ],
+  "artifacts_dir": "/Users/guo/Documents/GSB/1109/batches/accounts55-u224-20261127/control/questions/GSB1109-20261122-U224-DE-SH-314/workspace/handoff_artifacts/01b_second_nonempty_paired_flush_fails"
+}
