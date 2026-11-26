@@ -80,6 +80,100 @@ KT = TypeVar("KT")
 VT = TypeVar("VT")
 
 
+class TableLookup:
+    """Point lookup of a key, bound to its changelog partition.
+
+    The partition is fixed when the lookup is created.  The value and the
+    applied offset are read from the table every time they are accessed,
+    so a lookup retained across a takeover resolves against the position
+    the table has applied when it is finally consumed -- a response that
+    was computed while a partition was being handed over cannot be
+    delivered as a stale answer.
+
+    A tombstoned (deleted) key has a value of :const:`None`; an applied
+    value of ``0`` is a real value and is returned as such.
+    """
+
+    __slots__ = ("table", "key", "partition", "_value", "_offset", "_bound")
+
+    def __init__(
+        self,
+        table: Any,
+        key: Any,
+        partition: int,
+        value: Any = None,
+        offset: int = -1,
+        *,
+        bound: bool = False,
+    ) -> None:
+        self.table = table
+        self.key = key
+        self.partition = partition
+        self._value = value
+        self._offset = offset
+        self._bound = bound
+
+    @property
+    def value(self) -> Any:
+        """Return the value at the latest applied position."""
+        if self._bound:
+            return self.table.lookup_value(self.key, self.partition)
+        return self._value
+
+    @property
+    def offset(self) -> int:
+        """Return the applied changelog offset the value was read at."""
+        if self._bound:
+            return self.table.lookup_offset(self.key, self.partition)
+        return self._offset
+
+    @property
+    def _fields(self) -> Tuple[Any, int, int]:
+        return self.value, self.partition, self.offset
+
+    def _asdict(self) -> Mapping[str, Any]:
+        value, partition, offset = self._fields
+        return {"value": value, "partition": partition, "offset": offset}
+
+    def _replace(self, **changes: Any) -> "TableLookup":
+        fields = self._asdict()
+        fields.update(changes)
+        return TableLookup(
+            self.table,
+            self.key,
+            fields["partition"],
+            fields["value"],
+            fields["offset"],
+            bound=self._bound,
+        )
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._fields)
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, index: Union[int, slice]) -> Any:
+        return self._fields[index]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, TableLookup):
+            return self._fields == other._fields
+        if isinstance(other, tuple):
+            return self._fields == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._fields)
+
+    def __repr__(self) -> str:
+        value, partition, offset = self._fields
+        return (
+            f"TableLookup(value={value!r}, "
+            f"partition={partition!r}, offset={offset!r})"
+        )
+
+
 class CollectionT(ServiceT, JoinableT):
     app: _AppT
     name: str
@@ -182,10 +276,32 @@ class CollectionT(ServiceT, JoinableT):
     def on_recover(self, fun: RecoverCallback) -> RecoverCallback: ...
 
     @abc.abstractmethod
+    def changelog_partition_for_key(self, key: Any) -> int: ...
+
+    @abc.abstractmethod
+    def partition_ready(self, partition: int) -> bool: ...
+
+    @abc.abstractmethod
+    def ensure_partition_ready(self, partition: int) -> None: ...
+
+    @abc.abstractmethod
+    def lookup(self, key: Any) -> TableLookup: ...
+
+    @abc.abstractmethod
+    def lookup_value(self, key: Any, partition: int) -> Any: ...
+
+    @abc.abstractmethod
+    def lookup_offset(self, key: Any, partition: int) -> int: ...
+
+    @abc.abstractmethod
     async def on_recovery_completed(
         self, active_tps: Set[TP], standby_tps: Set[TP]
     ) -> None: ...
 
+    @abc.abstractmethod
+    async def on_recovery_completed_for_generation(
+        self, generation_id: int, active_tps: Set[TP], standby_tps: Set[TP]
+    ) -> None: ...
     @abc.abstractmethod
     async def call_recover_callbacks(self) -> None: ...
 

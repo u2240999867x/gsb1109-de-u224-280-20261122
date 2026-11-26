@@ -60,6 +60,13 @@ class Table(TableT[KT, VT], Collection):
         )
 
     def __missing__(self, key: KT) -> VT:
+        # A key deleted by a changelog tombstone is gone, even when the table
+        # has a ``default``: returning the default would turn a closed
+        # account with no remaining balance into a zero-balance account.
+        # A stored ``0`` is a real value and is served before this is called.
+        is_tombstone = getattr(self.data, "is_tombstone", None)
+        if callable(is_tombstone) and is_tombstone(key) is True:
+            raise KeyError(key)
         if self.default is not None:
             return self.default()
         raise KeyError(key)

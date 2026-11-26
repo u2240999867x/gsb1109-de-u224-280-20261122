@@ -800,3 +800,104 @@ class Test_Collection:
 
         partition = None
         assert table.partition_for_key("k") is partition
+
+
+class Test_CollectionRecoveryGenerations:
+    @pytest.fixture
+    def table(self, *, app):
+        table = MyTable(app, name="name")
+        table._data = Mock(name="data", autospec=Store, on_rebalance=AsyncMock())
+        return table
+
+    def tps(self, table):
+        topic = table.changelog_topic.get_topic_name()
+        return {TP(topic, 0), TP(topic, 1)}
+
+    def test_begin_recovery_marks_only_new_partitions(self, *, table):
+        tps = self.tps(table)
+        table.begin_recovery(1, tps, tps)
+        assert table.partition_ready(0) is False
+        assert table.partition_ready(1) is False
+
+    @pytest.mark.asyncio
+    async def test_on_rebalance_marks_assigned_unready(self, *, table):
+        tps = self.tps(table)
+        await table.on_rebalance(tps, set(), tps, generation_id=1)
+        assert table.partition_ready(0) is False
+        assert table.partition_ready(1) is False
+
+    def test_begin_recovery_continuing_partition_stays_ready(self, *, table):
+        tps = self.tps(table)
+        table.begin_recovery(1, tps, tps)
+        table.complete_recovery(1, tps)
+        assert table.partition_ready(0)
+        assert table.partition_ready(1)
+        # p0 moves away; p1 continues to be owned by this worker.
+        topic = table.changelog_topic.get_topic_name()
+        table.begin_recovery(2, {TP(topic, 1)}, set())
+        assert not table.partition_ready(0)
+        assert table.partition_ready(1)
+
+    def test_complete_recovery__stale_generation_is_ignored(self, *, table):
+        topic = table.changelog_topic.get_topic_name()
+        table.begin_recovery(2, {TP(topic, 0)}, {TP(topic, 0)})
+        table.complete_recovery(2, {TP(topic, 0)})
+        assert table.partition_ready(0)
+        # A recovery for generation 1 finally completing must not move or
+        # clear the state belonging to generation 2.
+        assert table.complete_recovery(1, {TP(topic, 1)}) is False
+        assert table.partition_ready(0)
+
+    def test_complete_recovery__reintro_marks_unready(self, *, table):
+        topic = table.changelog_topic.get_topic_name()
+        table.begin_recovery(2, {TP(topic, 0)}, {TP(topic, 0)})
+        table.complete_recovery(2, {TP(topic, 0)})
+        table.begin_recovery(3, {TP(topic, 0)}, {TP(topic, 0)})
+        assert not table.partition_ready(0)
+        table.complete_recovery(3, {TP(topic, 0)})
+        assert table.partition_ready(0)
+
+    @pytest.mark.asyncio
+    async def test_recover_callbacks_run_in_background(self, *, app):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_recover():
+            started.set()
+            await release.wait()
+
+        table = MyTable(app, name="name", on_recover=on_recover)
+        table.begin_recovery(1, set(), set())
+        table.complete_recovery(1, set())
+        table.schedule_recover_callbacks(1)
+        await started.wait()
+        # The recovery completion returned while the callback is blocked;
+        # the recovery loop can continue applying the next rebalance.
+        table.begin_recovery(2, set(), set())
+        release.set()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_recovery_completed_for_generation__stale_does_not_prune(
+        self, *, table
+    ):
+        topic = table.changelog_topic.get_topic_name()
+        table.begin_recovery(2, {TP(topic, 0)}, {TP(topic, 0)})
+        table.complete_recovery(2, {TP(topic, 0)})
+        table.data.on_recovery_completed = AsyncMock()
+        table._data = table.data
+        await table.on_recovery_completed_for_generation(
+            1, {TP(topic, 1)}, set()
+        )
+        table.data.on_recovery_completed.assert_not_called()
+        assert table.partition_ready(0)
+
+    def test_changelog_partition_for_key_uses_producer_tp(self, *, table):
+        from faust.types import TP
+
+        producer = Mock(name="producer")
+        producer.key_partition.return_value = TP(
+            table.changelog_topic.get_topic_name(), 3
+        )
+        table.app.producer = producer
+        assert table.changelog_partition_for_key("unseen-key") == 3

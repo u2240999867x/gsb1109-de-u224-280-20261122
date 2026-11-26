@@ -1,6 +1,7 @@
 """Table recovery after rebalancing."""
 
 import asyncio
+import inspect
 import statistics
 import typing
 from asyncio import Event
@@ -627,25 +628,24 @@ class Recovery(Service):
         self.log.info("Restore complete!")
         await self.app.on_rebalance_complete.send()
         self._set_recovery_ended()
-        # This needs to happen if all goes well
-        callback_coros = [
-            asyncio.ensure_future(
-                table.on_recovery_completed(
-                    self.actives_for_table[table],
-                    self.standbys_for_table[table],
-                )
-            )
-            for table in self.tables.values()
-        ]
-        if callback_coros:
-            await asyncio.wait(callback_coros)
-        assignment = consumer.assignment()
         if self.app.consumer_generation_id != generation_id:
+            # Recovery for an assignment that has already been superseded:
+            # new partitions/offsets have been installed by the newer
+            # rebalance, and completing this one would mark them recovered
+            # (and resume them) with the old assignment.
             self.log.warning(
                 f"Recovery rebalancing again app id "
                 f"{self.app.consumer_generation_id} param {generation_id}"
             )
             return
+        # This needs to happen if all goes well
+        callback_coros = [
+            asyncio.ensure_future(self._table_recovery_completed(table, generation_id))
+            for table in self.tables.values()
+        ]
+        if callback_coros:
+            await asyncio.wait(callback_coros)
+        assignment = consumer.assignment()
         consumer.resume_partitions(
             {tp for tp in assignment if not self._is_changelog_tp(tp)}
         )
@@ -665,6 +665,27 @@ class Recovery(Service):
             self.tables.on_standbys_ready()
         self.app.on_rebalance_end()
         self.log.info("Worker ready")
+
+    async def _table_recovery_completed(
+        self, table: CollectionT, generation_id: int
+    ) -> None:
+        """Complete recovery for a single table."""
+        complete_for_generation = getattr(
+            table, "on_recovery_completed_for_generation", None
+        )
+        if complete_for_generation is not None and inspect.iscoroutinefunction(
+            complete_for_generation
+        ):
+            await complete_for_generation(
+                generation_id,
+                self.actives_for_table[table],
+                self.standbys_for_table[table],
+            )
+        else:
+            await table.on_recovery_completed(
+                self.actives_for_table[table],
+                self.standbys_for_table[table],
+            )
 
     async def _build_highwaters(
         self, consumer: ConsumerT, tps: Set[TP], destination: Counter[TP], title: str

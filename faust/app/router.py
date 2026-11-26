@@ -1,6 +1,6 @@
 """Route messages to Faust nodes by partitioning."""
 
-from typing import Tuple
+from typing import Any, Mapping, MutableMapping, Optional, Tuple
 
 from yarl import URL
 
@@ -13,6 +13,26 @@ from faust.types.tables import CollectionT
 from faust.types.topics import TopicT
 from faust.types.web import Request, Response, Web
 from faust.web.exceptions import ServiceUnavailable
+
+__all__ = [
+    "LOOKUP_OFFSET_HEADER",
+    "LOOKUP_PARTITION_HEADER",
+    "Router",
+]
+
+#: Response header carrying the changelog partition a lookup was made on.
+LOOKUP_PARTITION_HEADER = "X-Faust-Table-Partition"
+#: Response header carrying the applied changelog offset of a lookup.
+LOOKUP_OFFSET_HEADER = "X-Faust-Table-Offset"
+
+
+def _table_name_from_path(path: Any) -> Optional[str]:
+    # ``/table/{name}/{key}/`` is the built-in table endpoint.  Used only to
+    # fill in position headers when an answer does not carry them itself.
+    parts = [part for part in str(path).split("/") if part]
+    if len(parts) >= 3 and parts[0] == "table":
+        return parts[1]
+    return None
 
 
 class Router(RouterT):
@@ -74,7 +94,15 @@ class Router(RouterT):
     def _get_table(self, name: str) -> CollectionT:
         return self.app.tables[name]
 
-    async def _route_req(self, dest_url: URL, web: Web, request: Request) -> Response:
+    async def _route_req(
+        self,
+        dest_url: URL,
+        web: Web,
+        request: Request,
+        *,
+        table_name: Optional[str] = None,
+        key: Optional[K] = None,
+    ) -> Response:
         app = self.app
         dest_ident = (host, port) = self._urlident(dest_url)
         if dest_ident == self._urlident(app.conf.canonical_url):
@@ -83,11 +111,58 @@ class Router(RouterT):
         async with app.http_client.request(
             method=request.method, headers=request.headers, url=routed_url
         ) as response:
+            dest_table = table_name
+            if dest_table is None and key is not None:
+                dest_table = _table_name_from_path(request.url.path)
+            headers = self._position_headers(
+                dest_table, key, response.headers if response.headers else {}
+            )
+            if not headers:
+                return web.text(
+                    await response.text(),
+                    content_type=response.content_type,
+                    status=response.status,
+                )
             return web.text(
                 await response.text(),
                 content_type=response.content_type,
                 status=response.status,
+                headers=headers,
             )
+
+    def _position_headers(
+        self,
+        table_name: Optional[str],
+        key: Optional[K],
+        response_headers: Mapping[str, str],
+    ) -> MutableMapping[str, str]:
+        """Return position headers for a forwarded response.
+
+        The destination includes the changelog position its answer was read
+        at; when it does not (an answer from a worker that predates the
+        headers), derive the partition from the table metadata the
+        answering node is registered with, so the caller can still match
+        the response to a partition.
+        """
+        partition = response_headers.get(LOOKUP_PARTITION_HEADER)
+        headers: MutableMapping[str, str] = {}
+        if not isinstance(partition, str):
+            partition = None
+        if partition is None and table_name is not None and key is not None:
+            partition = self._partition_for_key(table_name, key)
+        if partition is not None:
+            headers[LOOKUP_PARTITION_HEADER] = partition
+        offset = response_headers.get(LOOKUP_OFFSET_HEADER)
+        if isinstance(offset, str):
+            headers[LOOKUP_OFFSET_HEADER] = offset
+        return headers
+
+    def _partition_for_key(self, table_name: str, key: K) -> Optional[str]:
+        try:
+            table = self._get_table(table_name)
+            return str(table.changelog_partition_for_key(key))
+        except (KeyError, AttributeError, TypeError):
+            return None
 
     async def route_req(
         self, table_name: str, key: K, web: Web, request: Request
@@ -106,7 +181,9 @@ class Router(RouterT):
         except KeyError:
             raise ServiceUnavailable()
 
-        return await self._route_req(dest_url, web, request)
+        return await self._route_req(
+            dest_url, web, request, table_name=table_name, key=key
+        )
 
     async def route_topic_req(
         self, topic: TopicT, key: K, web: Web, request: Request

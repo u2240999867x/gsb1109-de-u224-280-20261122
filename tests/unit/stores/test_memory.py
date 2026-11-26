@@ -126,3 +126,106 @@ class Test_Store:
 
     def test_reset_state(self, *, store):
         store.reset_state()
+
+    def mock_event_with_offset(
+        self, key=b"key", value=b"value", partition=0, offset=0
+    ):
+        event = self.mock_event(key=key, value=value, partition=partition)
+        event.message.offset = offset
+        return event
+
+    def test_lookup__zero_value_is_not_a_tombstone(self, *, store):
+        event = self.mock_event_with_offset(value=0, offset=40)
+        to_key, to_value = self.mock_to_key_value(event)
+        store.apply_changelog_batch([event], to_key=to_key, to_value=to_value)
+        result = store.lookup(event.key)
+        assert result.value == 0
+        assert result.partition == 0
+        assert result.offset == 40
+
+    def test_lookup__tombstone_reports_deletion_position(self, *, store):
+        event = self.mock_event_with_offset(offset=40)
+        to_key, to_value = self.mock_to_key_value(event)
+        store.apply_changelog_batch([event], to_key=to_key, to_value=to_value)
+        tombstone = self.mock_event_with_offset(value=None, offset=41)
+        store.apply_changelog_batch([tombstone], to_key=to_key, to_value=to_value)
+        result = store.lookup(event.key)
+        assert result.value is None
+        assert result.partition == 0
+        assert result.offset == 41
+
+    def test_apply_changelog_batch__replay_does_not_resurrect(self, *, store):
+        to_key = Mock(name="to_key")
+        to_key.side_effect = lambda key: key
+        to_value = Mock(name="to_value")
+        to_value.side_effect = lambda value: value
+        events = [
+            self.mock_event_with_offset(value=7, offset=40),
+            self.mock_event_with_offset(value=None, offset=41),
+            self.mock_event_with_offset(value=0, offset=42),
+        ]
+        store.apply_changelog_batch(events, to_key=to_key, to_value=to_value)
+        assert store.lookup(b"key").value == 0
+        # Redelivery of an older tombstone must not roll the key back.
+        store.apply_changelog_batch(
+            [self.mock_event_with_offset(value=None, offset=41)],
+            to_key=to_key,
+            to_value=to_value,
+        )
+        assert store.lookup(b"key").value == 0
+        assert store.lookup(b"key").offset == 42
+
+    def test_apply_changelog_batch__mixed_batch_is_offset_ordered(self, *, store):
+        to_key = Mock(name="to_key")
+        to_key.side_effect = lambda key: key
+        to_value = Mock(name="to_value")
+        to_value.side_effect = lambda value: value
+        later_first = [
+            self.mock_event_with_offset(value=0, offset=42),
+            self.mock_event_with_offset(value=None, offset=41),
+        ]
+        store.apply_changelog_batch(later_first, to_key=to_key, to_value=to_value)
+        assert store.lookup(b"key").value == 0
+        assert store.lookup(b"key").offset == 42
+
+    @pytest.mark.asyncio
+    async def test_on_recovery_completed__partition_reapplies_from_scratch(
+        self, *, store
+    ):
+        to_key = Mock(name="to_key")
+        to_key.side_effect = lambda key: key
+        to_value = Mock(name="to_value")
+        to_value.side_effect = lambda value: value
+        event = self.mock_event_with_offset(
+            key=b"key", value=b"value", partition=0, offset=40
+        )
+        store.apply_changelog_batch([event], to_key=to_key, to_value=to_value)
+        await store.on_recovery_completed({TP("foo", 1)}, set())
+        assert store.applied_offset(TP("foo", 0)) is None
+
+    def test_apply_changelog_batch__older_value_after_delete_is_ignored(
+        self, *, store
+    ):
+        to_key = Mock(name="to_key")
+        to_key.side_effect = lambda key: key
+        to_value = Mock(name="to_value")
+        to_value.side_effect = lambda value: value
+        store.apply_changelog_batch(
+            [self.mock_event_with_offset(value=7, offset=40)],
+            to_key=to_key,
+            to_value=to_value,
+        )
+        store.apply_changelog_batch(
+            [self.mock_event_with_offset(value=None, offset=41)],
+            to_key=to_key,
+            to_value=to_value,
+        )
+        # Redelivery of the older value entry must not resurrect the key.
+        store.apply_changelog_batch(
+            [self.mock_event_with_offset(value=7, offset=40)],
+            to_key=to_key,
+            to_value=to_value,
+        )
+        result = store.lookup(b"key")
+        assert result.value is None
+        assert result.offset == 41

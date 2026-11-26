@@ -1,6 +1,7 @@
 """Faust exceptions."""
 
 import typing
+from typing import Optional
 
 __all__ = [
     "FaustError",
@@ -21,6 +22,7 @@ __all__ = [
     "ConsumerNotStarted",
     "PartitionsMismatch",
     "ConsistencyError",
+    "TablePartitionNotReady",
 ]
 
 if typing.TYPE_CHECKING:
@@ -113,3 +115,22 @@ class PartitionsMismatch(FaustError):
 
 class ConsistencyError(FaustError):
     """Persisted table offset is out of sync with changelog topic highwater."""
+
+
+class TablePartitionNotReady(FaustError):
+    """Table changelog partition is being taken over and cannot be read yet."""
+
+    def __init__(
+        self,
+        reason: str = "table partition is being taken over",
+        *,
+        table: Optional[str] = None,
+        partition: Optional[int] = None,
+    ) -> None:
+        self.reason = reason
+        self.table = table
+        self.partition = partition
+        super().__init__(reason, table, partition)
+
+    def __str__(self) -> str:
+        return f"{self.reason} (table={self.table!r}, partition={self.partition!r})"

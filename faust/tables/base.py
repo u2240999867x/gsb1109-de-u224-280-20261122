@@ -1,6 +1,7 @@
 """Base class Collection for Table and future data structures."""
 
 import abc
+import asyncio
 import time
 from collections import defaultdict
 from contextlib import suppress
@@ -29,7 +30,7 @@ from mode.utils.futures import maybe_async
 from yarl import URL
 
 from faust import joins, stores
-from faust.exceptions import PartitionsMismatch
+from faust.exceptions import PartitionsMismatch, TablePartitionNotReady
 from faust.streams import current_event
 from faust.types import (
     TP,
@@ -51,6 +52,7 @@ from faust.types.tables import (
     CollectionT,
     RecoverCallback,
     RelativeHandler,
+    TableLookup,
     WindowCloseCallback,
 )
 from faust.types.windows import WindowRange, WindowT
@@ -83,6 +85,13 @@ class Collection(Service, CollectionT):
     _data: Optional[StoreT] = None
     _changelog_compacting: Optional[bool] = True
     _changelog_deleting: Optional[bool] = None
+
+    #: Generation of the rebalance that recovery state below belongs to.
+    _recovery_generation_id: int = -1
+    #: Changelog partitions that did not finish recovery yet.
+    _unready_partitions: Set[int]
+    #: Changelog partitions owned by this table after the last rebalance.
+    _owned_partitions: Set[int]
 
     @abc.abstractmethod
     def _has_key(self, key: Any) -> bool:  # pragma: no cover
@@ -173,6 +182,10 @@ class Collection(Service, CollectionT):
         if on_recover:
             self.on_recover(on_recover)
 
+        self._recovery_generation_id = -1
+        self._unready_partitions = set()
+        self._owned_partitions = set()
+
         # Aliases
         self._sensor_on_get = self.app.sensors.on_table_get
         self._sensor_on_set = self.app.sensors.on_table_set
@@ -258,6 +271,218 @@ class Collection(Service, CollectionT):
     async def need_active_standby_for(self, tp: TP) -> bool:
         """Return :const:`False` if we have access to partition data."""
         return await self.data.need_active_standby_for(tp)
+
+    def changelog_partition_for_key(self, key: Any) -> int:
+        """Return the changelog partition a key belongs to.
+
+        When the key was seen before, the partition it was last applied
+        from is authoritative: it is the partition a lookup result has to
+        be matched against.  A deleted key keeps its deletion position for
+        exactly this purpose.  Only unknown keys are hashed with the
+        producer partitioner.
+        """
+        key_partition = getattr(self.data, "key_partition", None)
+        if callable(key_partition):
+            recorded = key_partition(key)
+            if isinstance(recorded, int) and not isinstance(recorded, bool):
+                return recorded
+        recorded = self._deleted_partition(key)
+        if recorded is not None:
+            return recorded
+        try:
+            topic = self.changelog_topic.get_topic_name()
+            destination = self.app.producer.key_partition(
+                topic, self._serialize_key(key)
+            )
+        except Exception:
+            destination = None
+        if destination is None:
+            return -1
+        return cast(int, destination.partition)
+
+    def _deleted_partition(self, key: Any) -> Optional[int]:
+        deleted_positions = getattr(self.data, "deleted_positions", None)
+        if callable(deleted_positions):
+            position = deleted_positions(key)
+            if (
+                isinstance(position, tuple)
+                and len(position) == 2
+                and isinstance(position[0], int)
+            ):
+                return position[0]
+        return None
+
+    def _serialize_key(self, key: Any) -> Optional[bytes]:
+        return self.changelog_topic.prepare_key(key, self.key_serializer)[0]
+
+    def partition_ready(self, partition: int) -> bool:
+        """Return :const:`True` if this partition can answer lookups.
+
+        A partition is ready once recovery has completed for every
+        takeover that has assigned it.  A partition that was just handed
+        over (or taken back) is not ready until its changelog has been
+        replayed to the highwater again; partitions that merely continued
+        to be owned by this worker are never blocked by another
+        partition's takeover.
+
+        Partitions this table no longer owns are unreadable: the worker is
+        no longer allowed to answer for them, even if an older recovery
+        callback or a late request still refers to them.
+        """
+        if self._recovery_generation_id < 0:
+            # No rebalance has happened yet: there is no takeover state to
+            # check, so the locally applied data is the best answer there is.
+            return True
+        return (
+            partition in self._owned_partitions
+            and partition not in self._unready_partitions
+        )
+
+    def ensure_partition_ready(self, partition: int) -> None:
+        """Raise :exc:`~faust.exceptions.TablePartitionNotReady` if unready."""
+        if not self.partition_ready(partition):
+            raise TablePartitionNotReady(
+                "table partition is being taken over",
+                table=self.name,
+                partition=partition,
+            )
+
+    def partition_offset(self, partition: int) -> int:
+        """Return the last changelog offset applied for a partition."""
+        return self._applied_offset(partition)
+
+    def lookup(self, key: Any) -> TableLookup:
+        """Look up a key in the table, bound to its changelog partition.
+
+        The partition is resolved with the same partitioner used to write
+        the changelog, so the result can be validated against the partition
+        that answered it.  Values in that partition must have been applied
+        for the lookup to happen; otherwise
+        :exc:`~faust.exceptions.TablePartitionNotReady` is raised so the
+        caller can retry later instead of serving stale data.
+
+        The returned object re-reads the table when its ``value`` and
+        ``offset`` are accessed, so a lookup retained while a partition is
+        being taken over resolves against the position applied when it is
+        finally consumed.
+        """
+        partition = self.changelog_partition_for_key(key)
+        self.ensure_partition_ready(partition)
+        return TableLookup(self, key, partition, bound=True)
+
+    def lookup_value(self, key: Any, partition: int) -> Any:
+        """Return the current value for a lookup bound to ``partition``."""
+        self.ensure_partition_ready(partition)
+        return self._data_lookup(key, partition).value
+
+    def lookup_offset(self, key: Any, partition: int) -> int:
+        """Return the applied changelog offset for a bound lookup."""
+        self.ensure_partition_ready(partition)
+        return self._data_lookup(key, partition).offset
+
+    def _data_lookup(self, key: Any, partition: int) -> TableLookup:
+        lookup = getattr(self.data, "lookup", None)
+        if callable(lookup):
+            result = lookup(key, partition)
+            if isinstance(result, TableLookup):
+                return result
+        offset = self._applied_offset(partition)
+        value = self.data.get(key)
+        return TableLookup(self, key, partition, value, offset)
+
+    def _applied_offset(self, partition: int) -> int:
+        applied_offset = getattr(self.data, "applied_offset", None)
+        if callable(applied_offset):
+            offset = applied_offset(
+                TP(self.changelog_topic.get_topic_name(), partition)
+            )
+            if isinstance(offset, int) and not isinstance(offset, bool):
+                return offset
+        return -1
+
+    @property
+    def recovery_generation_id(self) -> int:
+        """Return the rebalance generation recovery state belongs to."""
+        return self._recovery_generation_id
+
+    def begin_recovery(
+        self, generation_id: int, assigned: Set[TP], newly_assigned: Set[TP]
+    ) -> bool:
+        """Start recovery state for a new rebalance generation.
+
+        Returns :const:`False` when this call belongs to a rebalance that
+        was superseded by a newer one, in which case its callbacks must not
+        run: they would otherwise apply results (or prune state) computed
+        for an assignment that is no longer current.
+
+        Only partitions this worker did not already own are marked as
+        waiting for recovery.  A partition that continued to be assigned
+        keeps answering lookups from its current position while another
+        partition is being taken over.
+        """
+        if generation_id < self._recovery_generation_id:
+            return False
+        topic = self.changelog_topic.get_topic_name()
+        assigned_partitions = {tp.partition for tp in assigned if tp.topic == topic}
+        if generation_id == self._recovery_generation_id:
+            # Same generation re-entered (e.g. recovery restarted): keep the
+            # takeover state already computed for it, it has not completed.
+            new_partitions = self._unready_partitions.intersection(
+                assigned_partitions
+            )
+        else:
+            new_partitions = {
+                tp.partition
+                for tp in newly_assigned
+                if tp.topic == topic and tp.partition in assigned_partitions
+            }
+        self._recovery_generation_id = generation_id
+        self._owned_partitions = assigned_partitions
+        self._unready_partitions = new_partitions
+        return True
+
+    def complete_recovery(
+        self, generation_id: int, active_tps: Set[TP]
+    ) -> bool:
+        """Mark a generation's recovered partitions as ready.
+
+        Returns :const:`False` for a stale generation, leaving the state of
+        the current one untouched.
+        """
+        if generation_id != self._recovery_generation_id:
+            return False
+        recovered = {
+            tp.partition
+            for tp in active_tps
+            if tp.topic == self.changelog_topic.get_topic_name()
+        }
+        self._unready_partitions.difference_update(recovered)
+        return True
+
+    def begin_recovery_callbacks(self, generation_id: int) -> bool:
+        """Return :const:`True` if recovery callbacks should run now."""
+        return generation_id == self._recovery_generation_id
+
+    def end_recovery_callbacks(self, generation_id: int) -> None:
+        """Call after recovery callbacks completed."""
+
+    async def run_recover_callbacks(self, generation_id: int) -> None:
+        """Run recovery callbacks for a generation, without blocking replay.
+
+        The callbacks are user code and may block for an arbitrary time
+        (an ``on_recover`` handler awaiting another node, for example).
+        They must therefore not run inside the recovery loop: a callback
+        that is still running when the next rebalance starts must not
+        prevent that rebalance from applying changelog entries, nor may
+        its completion be mistaken for the newer generation's recovery.
+        """
+        if not self.begin_recovery_callbacks(generation_id):
+            return
+        try:
+            for fun in self._recover_callbacks:
+                await fun()
+        finally:
+            self.end_recovery_callbacks(generation_id)
 
     def reset_state(self) -> None:
         """Reset local state."""
@@ -628,19 +853,65 @@ class Collection(Service, CollectionT):
         generation_id: int = 0,
     ) -> None:
         """Call when cluster is rebalancing."""
+        self.begin_recovery(generation_id, assigned, newly_assigned)
         await self.data.on_rebalance(assigned, revoked, newly_assigned, generation_id)
 
     async def on_recovery_completed(
         self, active_tps: Set[TP], standby_tps: Set[TP]
     ) -> None:
         """Call when recovery has completed after rebalancing."""
+        generation_id = self._recovery_generation_id
+        if generation_id >= 0:
+            self.complete_recovery(generation_id, active_tps)
         await self.data.on_recovery_completed(active_tps, standby_tps)
         await self.call_recover_callbacks()
 
+    async def on_recovery_completed_for_generation(
+        self,
+        generation_id: int,
+        active_tps: Set[TP],
+        standby_tps: Set[TP],
+        *,
+        run_callbacks: bool = True,
+    ) -> None:
+        """Complete recovery for one rebalance generation.
+
+        A completion belonging to an older generation is ignored: it would
+        prune partitions the current generation has just recovered (or is
+        still recovering) and then run callbacks against stale state.
+        """
+        if generation_id != self._recovery_generation_id:
+            return
+        self.complete_recovery(generation_id, active_tps)
+        await self.data.on_recovery_completed(active_tps, standby_tps)
+        if run_callbacks:
+            self.schedule_recover_callbacks(generation_id)
+
+    def schedule_recover_callbacks(self, generation_id: int) -> None:
+        """Run recovery callbacks in the background.
+
+        Callbacks are user code and may block for an arbitrary time (an
+        ``on_recover`` handler waiting for another worker, for example).
+        Running them inline would stall changelog replay for the next
+        rebalance and make a blocked callback look like a partition that
+        has not finished recovering.  They are started as a background
+        task instead; a newer generation supersedes an older callback, and
+        a callback that finishes after its generation ended is ignored.
+        """
+        if not self._recover_callbacks:
+            return
+        asyncio.ensure_future(self.run_recover_callbacks(generation_id))
+
     async def call_recover_callbacks(self) -> None:
         """Call any configured recovery callbacks after rebalancing."""
-        for fun in self._recover_callbacks:
-            await fun()
+        generation_id = self._recovery_generation_id
+        if not self.begin_recovery_callbacks(generation_id):
+            return
+        try:
+            for fun in self._recover_callbacks:
+                await fun()
+        finally:
+            self.end_recovery_callbacks(generation_id)
 
     async def on_changelog_event(self, event: EventT) -> None:
         """Call when a new changelog event is received."""
