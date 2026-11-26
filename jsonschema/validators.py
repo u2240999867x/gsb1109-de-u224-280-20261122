@@ -75,6 +75,13 @@ def __getattr__(name):
             stacklevel=2,
         )
         return _RefResolver
+    elif "migrat" in name.lower() or name in {
+        "OfflineMigrator",
+        "MigrationResult",
+    }:
+        from jsonschema import migration as _migration
+
+        return getattr(_migration, name, _migration.migrate_offline)
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
 

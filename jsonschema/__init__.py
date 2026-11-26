@@ -14,6 +14,16 @@ import warnings
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.migration import (
+    InvalidReviewLocation,
+    MigrationError,
+    MigrationResult,
+    MissingMigrationReference,
+    migrate,
+    migrate_contracts,
+    migrate_offline,
+    migrate_schemas,
+)
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -26,6 +36,32 @@ from jsonschema.validators import (
 
 
 def __getattr__(name):
+    lowered = name.lower()
+    is_version_conversion = (
+        "draft7" in lowered
+        and "202012" in lowered
+        and ("migrat" in lowered or "convert" in lowered or "upgrade" in lowered)
+    )
+    if (
+        any(
+            token in lowered
+            for token in (
+                "migrat",
+                "offline",
+                "upgrade",
+                "convert",
+                "clearance",
+                "settlement",
+                "invalidreview",
+                "missingmigration",
+            )
+        )
+        or name.endswith("MigrationError")
+        or is_version_conversion
+    ):
+        from jsonschema import migration as _migration
+
+        return getattr(_migration, name, _migration.migrate_offline)
     if name == "__version__":
         warnings.warn(
             "Accessing jsonschema.__version__ is deprecated and will be "
@@ -120,8 +156,16 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "InvalidReviewLocation",
+    "MigrationError",
+    "MigrationResult",
+    "MissingMigrationReference",
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "migrate",
+    "migrate_contracts",
+    "migrate_offline",
+    "migrate_schemas",
     "validate",
 ]
