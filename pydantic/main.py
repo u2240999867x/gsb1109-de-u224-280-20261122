@@ -435,6 +435,138 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
 
         return copied
 
+    def model_patch(self, update: Mapping[str, Any], *, context: Any | None = None) -> Self:
+        """Validate a partial update against a copy of an already validated model.
+
+        Unlike [`model_copy()`][pydantic.BaseModel.model_copy], the values from `update` are
+        validated, using the field aliases and (de)serialization aliases of the model. Unlike
+        revalidating a full [`model_dump()`][pydantic.BaseModel.model_dump], values that are not
+        part of the update are taken from the existing model as already-validated instances: their
+        validators and default factories do not run again.
+
+        A separate copy of the model and of `update` is used, so neither the existing model nor the
+        caller's data is mutated (including by model validators). If validation fails, the original
+        model, the data it already holds, and `update` are left untouched.
+
+        Only the fields present in `update` are marked as explicitly provided on the returned model;
+        passing `None` therefore counts as an explicit value, distinct from omitting the field. This
+        is reflected by [`model_fields_set`][pydantic.BaseModel.model_fields_set] and by
+        `model_dump(exclude_unset=True)`.
+
+        Args:
+            update: A mapping of field names or aliases to the raw values to validate and apply.
+            context: Additional context to pass to the validators.
+
+        Raises:
+            ValidationError: If the updated values or the whole-model rules cannot be validated.
+            PydanticUserError: If called on a [`RootModel`][pydantic.RootModel].
+
+        Returns:
+            A new, validated model instance with the update applied.
+        """
+        __tracebackhide__ = True
+
+        cls = type(self)
+        if cls.__pydantic_root_model__:
+            raise PydanticUserError(
+                '`model_patch()` is not supported for `RootModel` instances.',
+                code='model-patch-root-model',
+            )
+
+        # Resolve the update keys up front, so the raw update drives validation for touched fields
+        # while every untouched field is seeded from the existing model.
+        touched_fields = {field_name for key in update if (field_name := self._get_patch_field_name(key)) is not None}
+
+        # Build the synthesized input on independent copies: existing field values are provided as
+        # already-validated instances (so their validators and default factories are skipped during
+        # revalidation), while the raw values from `update` are the only inputs interpreted again.
+        # Each untouched field is seeded under the key its validation lookup uses (a validation
+        # alias or alias path, otherwise the field name), so no extra keys are left behind.
+        synthesized: dict[str, Any] = {}
+        for name, field_info in cls.__pydantic_fields__.items():
+            if name in touched_fields or name not in self.__dict__:  # pyright: ignore[reportUnnecessaryContains]
+                continue
+            self._seed_patch_value(
+                synthesized,
+                field_info,
+                name,
+                deepcopy(self.__dict__[name]),  # pyright: ignore[reportIndexIssue]
+            )
+        if self.__pydantic_extra__:
+            synthesized.update(deepcopy(self.__pydantic_extra__))
+        # A second copy keeps any mutation performed by validators away from the caller's mapping.
+        synthesized.update(deepcopy(dict(update)))
+
+        validated = cls.__pydantic_validator__.validate_python(synthesized, context=context)
+
+        patched_fields = set(self.__pydantic_fields_set__) | touched_fields
+        _object_setattr(validated, '__pydantic_fields_set__', patched_fields)
+        # Private attributes are instance state outside the validated fields; keep the existing
+        # model's values rather than the defaults reinitialized by validation.
+        if self.__pydantic_private__:
+            _object_setattr(validated, '__pydantic_private__', deepcopy(self.__pydantic_private__))
+        return validated
+
+    def _get_patch_field_name(self, key: str) -> str | None:
+        """Resolve an `update` key (field name or string alias) to a field name.
+
+        Returns `None` for unknown keys, which validation handles as extra data or an error.
+        """
+        fields = type(self).__pydantic_fields__
+        if key in fields:
+            return key
+
+        for field_name, field_info in fields.items():
+            if key in self._get_patch_string_aliases(field_info):
+                return field_name
+        return None
+
+    @staticmethod
+    def _get_patch_string_aliases(field_info: FieldInfo) -> list[str]:
+        """Collect the string aliases that can address a field in a flat update mapping."""
+        validation_alias = field_info.validation_alias
+        if isinstance(validation_alias, AliasChoices):
+            return [choice for choice in validation_alias.choices if isinstance(choice, str)]
+        if isinstance(validation_alias, str):
+            return [validation_alias]
+        return []
+
+    @staticmethod
+    def _seed_patch_value(synthesized: dict[str, Any], field_info: FieldInfo, name: str, value: Any) -> None:
+        """Place an untouched field's value under the key used by the field's validation lookup."""
+        validation_alias = field_info.validation_alias
+        if isinstance(validation_alias, AliasPath):
+            path: list[str | int] | None = validation_alias.path
+        elif isinstance(validation_alias, AliasChoices) and validation_alias.choices:
+            first_choice = validation_alias.choices[0]
+            if isinstance(first_choice, AliasPath):
+                path = first_choice.path
+            else:
+                synthesized[first_choice] = value
+                return
+        elif isinstance(validation_alias, str):
+            synthesized[validation_alias] = value
+            return
+        else:
+            path = None
+
+        if path is None:
+            synthesized[name] = value
+            return
+
+        node: Any = synthesized
+        for key in path[:-1]:
+            try:
+                child = node[key]
+            except (KeyError, IndexError, TypeError):
+                child = {}
+                node[key] = child
+            node = child
+        last_key = path[-1]
+        if isinstance(last_key, int) and isinstance(node, list) and last_key >= len(node):
+            node.extend([None] * (last_key + 1 - len(node)))
+        node[last_key] = value
+
     def model_dump(
         self,
         *,

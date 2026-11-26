@@ -2870,6 +2870,294 @@ def test_model_copy_extra():
     assert m5.model_extra == {'b': 3}
 
 
+def test_model_patch_validates_provided_values_only():
+    from pydantic import model_validator
+
+    pack_sizes = {'A': 10, 'B': 12}
+    conversion_inputs: list[object] = []
+    factory_calls: list[int] = []
+
+    class Box(BaseModel):
+        supplier: str
+        pieces: int = Field(validation_alias='cartons')
+
+        @field_validator('pieces', mode='before')
+        @classmethod
+        def _boxes_to_pieces(cls, value, info: ValidationInfo):
+            conversion_inputs.append(value)
+            if isinstance(value, str):
+                return int(value) * pack_sizes[info.data['supplier']]
+            return value
+
+    class Order(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+
+        boxes: list[Box]
+        total: int
+        tag: str = Field(default_factory=lambda: (factory_calls.append(1), 'TAG')[1])
+        remark: str | None = None
+
+        @model_validator(mode='before')
+        @classmethod
+        def _normalize_first_box(cls, data):
+            first_box = data['boxes'][0]
+            if isinstance(first_box, dict) and 'cartons' in first_box:
+                # Mutates the list it receives; the caller's mapping must be protected.
+                first_box['cartons'] = first_box['cartons'].strip()
+            return data
+
+        @model_validator(mode='after')
+        def _check_total(self):
+            if sum(box.pieces for box in self.boxes) != self.total:
+                raise ValueError('total does not match the number of pieces')
+            return self
+
+    order = Order.model_validate(
+        {
+            'boxes': [
+                {'supplier': 'A', 'cartons': '2'},
+                {'supplier': 'B', 'cartons': '3'},
+            ],
+            'total': 56,
+        }
+    )
+    original_dump = order.model_dump()
+    shared_box = order.boxes[1]
+    assert factory_calls == [1]
+    assert order.model_fields_set == {'boxes', 'total'}
+
+    conversion_inputs.clear()
+    update = {
+        'boxes': [{'supplier': 'A', 'cartons': ' 4 '}, shared_box],
+        'total': 76,
+        'remark': None,
+    }
+    update_snapshot = deepcopy(update)
+    patched = order.model_patch(update)
+
+    # The raw corrected box is reinterpreted through its alias and validators; the shared box is not.
+    assert patched.boxes[0].pieces == 40
+    assert patched.boxes[1].pieces == shared_box.pieces == 36
+    assert conversion_inputs == ['4']
+    # The default-only field keeps its generated value without the factory running again.
+    assert patched.tag == 'TAG'
+    assert factory_calls == [1]
+    # Whole-model rules run against the same synthesized data.
+    assert patched.total == 76
+
+    # Only fields actually present in the update are explicitly set; `None` counts as provided.
+    assert patched.model_fields_set == {'boxes', 'total', 'remark'}
+    assert patched.model_dump(exclude_unset=True) == {
+        'boxes': [
+            {'supplier': 'A', 'pieces': 40},
+            {'supplier': 'B', 'pieces': 36},
+        ],
+        'total': 76,
+        'remark': None,
+    }
+
+    # Everything was copied: the old model, the shared box and the caller's mapping stay unchanged.
+    assert order.model_dump() == original_dump
+    assert patched.boxes[1] is not shared_box
+    assert shared_box.pieces == 36
+    assert update == update_snapshot
+
+
+def test_model_patch_failure_keeps_everything_reusable():
+    from pydantic import model_validator
+
+    class Box(BaseModel):
+        supplier: str
+        pieces: int = Field(validation_alias='cartons')
+
+        @field_validator('pieces', mode='before')
+        @classmethod
+        def _boxes_to_pieces(cls, value, info: ValidationInfo):
+            if isinstance(value, str):
+                return int(value) * {'A': 10, 'B': 12}[info.data['supplier']]
+            return value
+
+    class Order(BaseModel):
+        boxes: list[Box]
+        total: int
+
+        @model_validator(mode='after')
+        def _check_total(self):
+            if sum(box.pieces for box in self.boxes) != self.total:
+                raise ValueError('total does not match the number of pieces')
+            return self
+
+    order = Order.model_validate(
+        {
+            'boxes': [
+                {'supplier': 'A', 'cartons': '2'},
+                {'supplier': 'B', 'cartons': '3'},
+            ],
+            'total': 56,
+        }
+    )
+    shared_box = order.boxes[1]
+    original_dump = order.model_dump()
+    bad_update = {
+        'boxes': [{'supplier': 'A', 'cartons': '5'}, shared_box],
+        'total': 999,
+    }
+    bad_update_snapshot = deepcopy(bad_update)
+
+    with pytest.raises(ValidationError, match='total does not match'):
+        order.model_patch(bad_update)
+
+    # The old order, the shared untouched box and the raw patch mapping can still be inspected.
+    assert order.model_dump() == original_dump
+    assert order.total == 56
+    assert shared_box.pieces == 36
+    assert bad_update == bad_update_snapshot
+
+    # A correct patch can still be applied starting from the original model.
+    retried = order.model_patch(
+        {
+            'boxes': [{'supplier': 'A', 'cartons': '4'}, shared_box],
+            'total': 76,
+        }
+    )
+    assert retried.boxes[0].pieces == 40
+    assert retried.boxes[1].pieces == 36
+    assert retried.total == 76
+
+
+def test_model_patch_distinguishes_explicit_none_from_omitted_field():
+    class Model(BaseModel):
+        x: int
+        default_only: str = Field(default_factory=lambda: 'generated')
+        remark: str | None = 'initial'
+
+    model = Model(x=1)
+
+    omitted = model.model_patch({'x': 2})
+    assert omitted.remark == 'initial'
+    assert 'remark' not in omitted.model_fields_set
+    assert 'default_only' not in omitted.model_fields_set
+
+    explicit_none = model.model_patch({'remark': None})
+    assert explicit_none.remark is None
+    assert 'remark' in explicit_none.model_fields_set
+    assert explicit_none.model_dump(exclude_unset=True) == {'x': 1, 'remark': None}
+
+
+def test_model_patch_resolves_field_aliases():
+    from pydantic import AliasChoices
+
+    class Model(BaseModel):
+        quantity: int = Field(alias='cartons')
+        named: int = Field(validation_alias=AliasChoices('named_alias', 'named_other'))
+
+    model = Model.model_validate({'cartons': 2, 'named_alias': 3})
+
+    by_alias = model.model_patch({'cartons': 5})
+    assert by_alias.quantity == 5
+    assert by_alias.model_fields_set == {'quantity', 'named'}
+
+    by_validation_alias = model.model_patch({'named_other': 7})
+    assert by_validation_alias.named == 7
+    assert by_validation_alias.model_fields_set == {'quantity', 'named'}
+
+    class ByNameModel(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        quantity: int = Field(alias='cartons')
+
+    by_name_model = ByNameModel(cartons=2)
+    by_name = by_name_model.model_patch({'quantity': 9})
+    assert by_name.quantity == 9
+    assert 'quantity' in by_name.model_fields_set
+
+
+def test_model_patch_alias_path():
+    from pydantic import AliasPath
+
+    class Model(BaseModel):
+        nested_value: int = Field(validation_alias=AliasPath('nested', 'value'))
+        plain: int = 1
+
+    model = Model.model_validate({'nested': {'value': 5}})
+    patched = model.model_patch({'plain': 2})
+
+    assert patched.nested_value == 5
+    assert patched.plain == 2
+    assert patched.model_fields_set == {'nested_value', 'plain'}
+
+
+def test_model_patch_extra_allow():
+    class Model(BaseModel):
+        model_config = ConfigDict(extra='allow')
+
+        x: int
+
+    model = Model.model_validate({'x': 1, 'y': 2})
+    patched = model.model_patch({'x': 9, 'z': 3})
+
+    assert patched.x == 9
+    assert patched.model_extra == {'y': 2, 'z': 3}
+    assert model.model_dump() == {'x': 1, 'y': 2}
+
+
+def test_model_patch_preserves_private_attributes():
+    class Model(BaseModel):
+        x: int
+        _secret: int = PrivateAttr(default=0)
+
+    model = Model(x=1)
+    model._secret = 42
+    patched = model.model_patch({'x': 2})
+
+    assert patched.x == 2
+    assert patched._secret == 42
+    assert model._secret == 42
+
+
+def test_model_patch_empty_update_keeps_fields_set():
+    class Model(BaseModel):
+        x: int
+        y: int = 2
+
+    model = Model(x=1)
+    patched = model.model_patch({})
+
+    assert patched.model_dump() == {'x': 1, 'y': 2}
+    assert patched.model_fields_set == model.model_fields_set == {'x'}
+
+
+def test_model_patch_passes_context():
+    from pydantic import model_validator
+
+    seen_contexts: list[object] = []
+
+    class Model(BaseModel):
+        x: int
+
+        @model_validator(mode='after')
+        def _record_context(self, info: ValidationInfo):
+            seen_contexts.append(info.context)
+            return self
+
+    model = Model(x=1)
+    model.model_patch({'x': 2}, context={'request_id': 'abc'})
+
+    assert seen_contexts[-1] == {'request_id': 'abc'}
+
+
+def test_model_patch_root_model_not_supported():
+    from pydantic import RootModel
+
+    class Model(RootModel[list[int]]):
+        pass
+
+    model = Model([1, 2])
+    with pytest.raises(PydanticUserError, match='model_patch') as exc_info:
+        model.model_patch({'root': [3]})
+    assert exc_info.value.code == 'model-patch-root-model'
+
+
 def test_model_parametrized_name_not_generic():
     class Model(BaseModel):
         x: int

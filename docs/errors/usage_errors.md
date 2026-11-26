@@ -1307,3 +1307,27 @@ try:
 except PydanticUserError as exc_info:
     assert exc_info.code == 'validate-by-alias-and-name-false'
 ```
+
+## `model_patch()` on a `RootModel` {#model-patch-root-model}
+
+This error is raised when calling [`model_patch()`][pydantic.BaseModel.model_patch] on a
+[`RootModel`][pydantic.RootModel] instance.
+
+A `RootModel` wraps a single `root` value rather than named fields, so there is no field mapping to
+apply a partial update to. Validate and assign the new `root` value instead:
+
+```python
+from pydantic import PydanticUserError, RootModel
+
+
+class Numbers(RootModel[list[int]]):
+    pass
+
+
+numbers = Numbers([1, 2, 3])
+
+try:
+    numbers.model_patch({'root': [4, 5, 6]})
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'model-patch-root-model'
+```

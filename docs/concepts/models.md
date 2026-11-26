@@ -787,6 +787,73 @@ print(id(m.bar) == id(m.model_copy(deep=True).bar))
 #> False
 ```
 
+## Model patch
+
+??? api "API Documentation"
+    [`pydantic.main.BaseModel.model_patch`][pydantic.main.BaseModel.model_patch]<br>
+
+[`model_patch()`][pydantic.BaseModel.model_patch] is the validated counterpart of
+[`model_copy()`][pydantic.BaseModel.model_copy] for an already validated model that only needs a
+partial update. It builds an independent copy, validates the raw values from the update (including
+field aliases and whole-model validators), and returns a new model.
+
+Values that are not part of the update are taken from the existing model as already-validated
+instances, so their validators and default factories do not run again. By contrast, revalidating a
+full [`model_dump()`][pydantic.BaseModel.model_dump] would interpret every value a second time.
+
+```python
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class Box(BaseModel):
+    pieces: int = Field(validation_alias='cartons')
+
+    @field_validator('pieces', mode='before')
+    @classmethod
+    def convert_boxes(cls, value: str | int) -> int:
+        if isinstance(value, str):
+            return int(value) * 10
+        return value
+
+
+class Order(BaseModel):
+    boxes: list[Box]
+    total: int
+    remark: str | None = None
+
+    @model_validator(mode='after')
+    def check_total(self) -> 'Order':
+        if sum(box.pieces for box in self.boxes) != self.total:
+            raise ValueError('total does not match the number of pieces')
+        return self
+
+
+order = Order.model_validate(
+    {'boxes': [{'cartons': '2'}, {'cartons': '3'}], 'total': 50}
+)
+
+# Only the first box, the total and the remark are provided as raw input again.
+patched = order.model_patch(
+    {
+        'boxes': [{'cartons': '4'}, order.boxes[1]],
+        'total': 70,
+        'remark': None,
+    }
+)
+print(patched)
+#> boxes=[Box(pieces=40), Box(pieces=30)] total=70 remark=None
+print(patched.model_fields_set)
+#> {'boxes', 'total', 'remark'}
+print(order.model_fields_set)
+#> {'boxes', 'total'}
+```
+
+The update mapping and the original model are never mutated, and a failed validation leaves both
+untouched. A field included in the update is always marked as explicitly provided — even when its
+value is `None` — while a field that is simply omitted keeps its previous "not explicitly set"
+status. This is visible through [`model_fields_set`][pydantic.BaseModel.model_fields_set] and
+`model_dump(exclude_unset=True)`.
+
 ## Generic models
 
 Pydantic supports the creation of generic models to make it easier to reuse a common model structure. Both the new
