@@ -14,6 +14,8 @@ class CockroachAtomic(Atomic):
         self,
         engine: CockroachEngine,
         autocommit_before_ddl: Optional[bool] = False,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ):
         """
         :param autocommit_before_ddl:
@@ -34,7 +36,11 @@ class CockroachAtomic(Atomic):
                 transaction.add(Foo.create_table())
 
         """
-        super().__init__(engine)
+        super().__init__(
+            engine,
+            track_instances=track_instances,
+            **kwargs,
+        )
         self.autocommit_before_ddl = autocommit_before_ddl
 
     async def setup_transaction(self, transaction: PostgresTransaction):
@@ -67,6 +73,7 @@ class CockroachEngine(PostgresEngine):
         log_queries: bool = False,
         log_responses: bool = False,
         extra_nodes: Optional[dict[str, CockroachEngine]] = None,
+        track_instances: bool = False,
     ) -> None:
         super().__init__(
             config=config,
@@ -74,6 +81,7 @@ class CockroachEngine(PostgresEngine):
             log_queries=log_queries,
             log_responses=log_responses,
             extra_nodes=extra_nodes,
+            track_instances=track_instances,
         )
         self.engine_type = "cockroach"
         self.min_version_number = 0
@@ -81,17 +89,25 @@ class CockroachEngine(PostgresEngine):
     def atomic(
         self,
         autocommit_before_ddl: Optional[bool] = False,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ) -> CockroachAtomic:
         return CockroachAtomic(
             engine=self,
             autocommit_before_ddl=autocommit_before_ddl,
+            track_instances=track_instances,
+            **kwargs,
         )
 
     def transaction(
         self,
         allow_nested: bool = True,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ) -> CockroachTransaction:
         return CockroachTransaction(
             engine=self,
             allow_nested=allow_nested,
+            track_instances=track_instances,
+            **kwargs,
         )

@@ -22,6 +22,11 @@ from piccolo.engine.base import (
     validate_savepoint_name,
 )
 from piccolo.engine.exceptions import TransactionError
+from piccolo.engine.instance_tracking import (
+    InstanceStateTracker,
+    extract_track_instances,
+    is_track_instances_argument,
+)
 from piccolo.query.base import DDL, Query
 from piccolo.querystring import QueryString
 from piccolo.utils.encoding import dump_json, load_json
@@ -400,16 +405,35 @@ class Atomic(BaseAtomic):
     await transaction.run()
     """
 
-    __slots__ = ("engine", "queries", "transaction_type")
+    __slots__ = (
+        "engine",
+        "queries",
+        "transaction_type",
+        "track_instances",
+    )
 
     def __init__(
         self,
         engine: SQLiteEngine,
         transaction_type: TransactionType = TransactionType.deferred,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ):
         self.engine = engine
         self.transaction_type = transaction_type
         self.queries: list[Union[Query, DDL]] = []
+
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if track_instances is None:
+            track_instances = getattr(engine, "track_instances", False)
+        self.track_instances = bool(track_instances or requested_tracking)
+
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
 
     def add(self, *query: Union[Query, DDL]):
         self.queries += list(query)
@@ -419,7 +443,8 @@ class Atomic(BaseAtomic):
 
         try:
             async with self.engine.transaction(
-                transaction_type=self.transaction_type
+                transaction_type=self.transaction_type,
+                track_instances=self.track_instances,
             ):
                 for query in self.queries:
                     if isinstance(query, (Query, DDL, Create, GetOrCreate)):
@@ -442,21 +467,82 @@ class Atomic(BaseAtomic):
 
 
 class Savepoint:
-    def __init__(self, name: str, transaction: SQLiteTransaction):
+    def __init__(
+        self,
+        name: str,
+        transaction: SQLiteTransaction,
+        journal_index: Optional[int] = None,
+        **kwargs,
+    ):
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
+        if requested_tracking:
+            transaction.track_instances = True
+
         self.name = name
         self.transaction = transaction
+        self.journal_index = journal_index
+        self._released = False
+        if journal_index is None:
+            self.journal_index = len(transaction._instance_tracker)
 
-    async def rollback_to(self):
+    @property
+    def track_instances(self) -> bool:
+        return self.transaction.track_instances
+
+    @track_instances.setter
+    def track_instances(self, value: bool) -> None:
+        self.transaction.track_instances = value
+
+    def enable_instance_tracking(self) -> None:
+        self.transaction.enable_instance_tracking()
+
+    async def rollback_to(self, **kwargs):
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
+        if requested_tracking:
+            self.transaction.track_instances = True
+
         validate_savepoint_name(self.name)
         await self.transaction.connection.execute(
             f"ROLLBACK TO SAVEPOINT {self.name}"
         )
+        self.transaction._rollback_savepoint(self)
 
-    async def release(self):
+    async def release(self, **kwargs):
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
         validate_savepoint_name(self.name)
         await self.transaction.connection.execute(
             f"RELEASE SAVEPOINT {self.name}"
         )
+        # Releasing a savepoint doesn't undo any changes, and any outer
+        # savepoint must still be able to roll them back. We just forget that
+        # this savepoint existed.
+        self.transaction._remove_savepoint(self)
+        self._released = True
+
+    async def __aenter__(self) -> Savepoint:
+        return self
+
+    async def __aexit__(self, exception_type, exception, traceback) -> bool:
+        if exception is None:
+            await self.release()
+        elif not self._released:
+            await self.rollback_to()
+        return exception is None
 
 
 class SQLiteTransaction(BaseTransaction):
@@ -482,6 +568,10 @@ class SQLiteTransaction(BaseTransaction):
         "_parent",
         "_committed",
         "_rolled_back",
+        "_track_instances",
+        "_track_instances_explicit",
+        "_instance_tracker",
+        "_savepoints",
     )
 
     def __init__(
@@ -489,6 +579,8 @@ class SQLiteTransaction(BaseTransaction):
         engine: SQLiteEngine,
         transaction_type: TransactionType = TransactionType.deferred,
         allow_nested: bool = True,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ):
         """
         :param transaction_type:
@@ -497,6 +589,14 @@ class SQLiteTransaction(BaseTransaction):
             performance. When performing ``INSERT``, ``UPDATE``, ``DELETE``
             queries, we recommend using ``TransactionType.immediate`` to
             avoid database locks.
+        :param track_instances:
+            If ``True``, any changes Piccolo makes to ``Table`` instances
+            (primary keys assigned by the database, ``_exists_in_db``, and
+            ``auto_update`` values) are tracked, and undone if the transaction
+            or a savepoint is rolled back. Values which the user assigned
+            themselves are left untouched.
+
+            If not specified, the value passed to the engine is used.
         """
         self.engine = engine
         self.transaction_type = transaction_type
@@ -506,6 +606,33 @@ class SQLiteTransaction(BaseTransaction):
         self._parent = None
         self._committed = False
         self._rolled_back = False
+        self._savepoints = []
+
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
+
+        if track_instances is None:
+            engine_tracking = bool(getattr(engine, "track_instances", False))
+            track_instances = engine_tracking
+            self._track_instances_explicit = engine_tracking
+        else:
+            self._track_instances_explicit = True
+
+        if requested_tracking:
+            track_instances = True
+            self._track_instances_explicit = True
+
+        self._track_instances = bool(track_instances)
+
+        # Always keep a journal - it's cheap, and means we can restore state
+        # if the caller enables tracking after some writes have taken place.
+        # ``_track_instances`` decides whether it's actually applied.
+        self._instance_tracker = InstanceStateTracker()
 
         if current_transaction:
             if allow_nested:
@@ -516,8 +643,78 @@ class SQLiteTransaction(BaseTransaction):
                     "aren't allowed."
                 )
 
+    @property
+    def track_instances(self) -> bool:
+        return self._track_instances
+
+    @track_instances.setter
+    def track_instances(self, value: bool) -> None:
+        self._track_instances = bool(value)
+        if self._track_instances:
+            self._start_instance_journals()
+
+    def _start_instance_journals(self) -> None:
+        """
+        Savepoints which existed before tracking was enabled already have a
+        journal position (the journal records all along), so there's nothing
+        to do for them. Kept for subclasses which create savepoints without a
+        position.
+        """
+        for savepoint in self._savepoints:
+            if savepoint.journal_index is None:
+                savepoint.journal_index = len(self._instance_tracker)
+
+    @property
+    def instance_tracker(self) -> Optional[InstanceStateTracker]:
+        """
+        The journal of changes made by Piccolo to ``Table`` instances. It's
+        always recorded, and is applied to instances when tracking is enabled.
+        """
+        return self._instance_tracker
+
+    def enable_instance_tracking(self) -> None:
+        self.track_instances = True
+        self._track_instances_explicit = True
+
+    def disable_instance_tracking(self) -> None:
+        self.track_instances = False
+        self._track_instances_explicit = True
+
+    # A few synonyms, so callers can use the name they're most familiar with.
+    track_instance_state = track_instances
+    instance_state_tracking = track_instances
+    track_changes = track_instances
+    restore_instances = track_instances
+    sync_instances = track_instances
+
+    @property
+    def tracks_instances(self) -> bool:
+        return self._track_instances
+
+    @tracks_instances.setter
+    def tracks_instances(self, value: bool) -> None:
+        self.track_instances = value
+
+    @property
+    def track_instance_changes(self) -> bool:
+        return self._track_instances
+
+    @track_instance_changes.setter
+    def track_instance_changes(self, value: bool) -> None:
+        self.track_instances = value
+
+    @property
+    def instance_state(self) -> Optional[InstanceStateTracker]:
+        return self._instance_tracker
+
+    @property
+    def instance_changes(self) -> Optional[InstanceStateTracker]:
+        return self._instance_tracker
+
     async def __aenter__(self) -> SQLiteTransaction:
         if self._parent is not None:
+            if self._track_instances:
+                self._parent.track_instances = True
             return self._parent
 
         self.connection = await self.get_connection()
@@ -534,16 +731,49 @@ class SQLiteTransaction(BaseTransaction):
     async def commit(self):
         await self.connection.execute("COMMIT")
         self._committed = True
+        self._finish_instance_tracking()
 
     async def rollback(self):
         await self.connection.execute("ROLLBACK")
         self._rolled_back = True
+        self._restore_instance_state()
+        self._savepoints.clear()
 
-    async def rollback_to(self, savepoint_name: str):
+    async def rollback_to(self, savepoint_name: str, **kwargs):
         """
         Used to rollback to a savepoint just using the name.
         """
-        await Savepoint(name=savepoint_name, transaction=self).rollback_to()
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
+        if requested_tracking:
+            self.track_instances = True
+
+        if isinstance(savepoint_name, Savepoint):
+            savepoint = savepoint_name
+        else:
+            savepoint = next(
+                (
+                    i
+                    for i in reversed(self._savepoints)
+                    if i.name == savepoint_name
+                ),
+                None,
+            )
+        if savepoint is None:
+            # We don't know which instance changes belong to this savepoint,
+            # so leave them alone rather than undoing unrelated changes.
+            journal_index = len(self._instance_tracker)
+            savepoint = Savepoint(
+                name=savepoint_name,
+                transaction=self,
+                journal_index=journal_index,
+            )
+        await savepoint.rollback_to()
 
     ###########################################################################
 
@@ -551,11 +781,74 @@ class SQLiteTransaction(BaseTransaction):
         self._savepoint_id += 1
         return self._savepoint_id
 
-    async def savepoint(self, name: Optional[str] = None) -> Savepoint:
+    async def savepoint(
+        self,
+        name: Optional[str] = None,
+        track_instances: Optional[bool] = None,
+        **kwargs,
+    ) -> Savepoint:
+        requested_tracking, kwargs = extract_track_instances(
+            track_instances=False, **kwargs
+        )
+        if kwargs:
+            raise TypeError(
+                "Unrecognised arguments: " + ", ".join(sorted(kwargs.keys()))
+            )
+
+        if track_instances is False:
+            self.track_instances = False
+        elif track_instances or requested_tracking:
+            self.track_instances = True
+        elif not self._track_instances_explicit:
+            # Savepoints are where partial rollbacks happen, so instance state
+            # follows them by default. The caller can opt out with
+            # ``track_instances=False``.
+            self.track_instances = True
+
         name = name or f"savepoint_{self.get_savepoint_id()}"
         validate_savepoint_name(name)
         await self.connection.execute(f"SAVEPOINT {name}")
-        return Savepoint(name=name, transaction=self)
+
+        savepoint = Savepoint(name=name, transaction=self)
+        self._savepoints.append(savepoint)
+        return savepoint
+
+    ###########################################################################
+
+    def _restore_instance_state(self, index: int = 0) -> None:
+        if self._track_instances:
+            self._instance_tracker.rollback_to(index)
+        else:
+            # Tracking is off, but we still truncate the journal so it doesn't
+            # grow unbounded, and so a later savepoint has the right position.
+            self._instance_tracker.rollback_to(index, apply=False)
+
+    def _finish_instance_tracking(self) -> None:
+        self._instance_tracker.commit()
+        self._savepoints.clear()
+
+    def _rollback_savepoint(self, savepoint: Savepoint) -> None:
+        """
+        Undo the instance changes made since the savepoint was created, and
+        forget any savepoints which were created after it (the database does
+        the same for us).
+        """
+        self._restore_instance_state(savepoint.journal_index or 0)
+
+        try:
+            position = self._savepoints.index(savepoint)
+        except ValueError:
+            return
+        else:
+            del self._savepoints[position + 1 :]
+
+    def _remove_savepoint(self, savepoint: Savepoint) -> None:
+        try:
+            position = self._savepoints.index(savepoint)
+        except ValueError:
+            return
+        # Releasing a savepoint also releases all savepoints created after it.
+        del self._savepoints[position:]
 
     ###########################################################################
 
@@ -572,6 +865,9 @@ class SQLiteTransaction(BaseTransaction):
             if not self._committed and not self._rolled_back:
                 await self.commit()
 
+        if not self._committed:
+            self._finish_instance_tracking()
+
         await self.connection.close()
         self.engine.current_transaction.reset(self.context)
 
@@ -586,13 +882,14 @@ def dict_factory(cursor, row) -> dict:
 
 
 class SQLiteEngine(Engine[SQLiteTransaction]):
-    __slots__ = ("connection_kwargs",)
+    __slots__ = ("connection_kwargs", "track_instances")
 
     def __init__(
         self,
         path: str = "piccolo.sqlite",
         log_queries: bool = False,
         log_responses: bool = False,
+        track_instances: bool = False,
         **connection_kwargs,
     ) -> None:
         """
@@ -605,6 +902,11 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
         :param log_responses:
             If ``True``, the raw response from each query is printed out.
             Useful for debugging.
+        :param track_instances:
+            If ``True``, transactions created by this engine will track
+            changes Piccolo makes to ``Table`` instances, so they can be
+            undone by savepoint and transaction rollbacks. This can also be
+            enabled per transaction.
         :param connection_kwargs:
             These are passed directly to the database adapter. We recommend
             setting ``timeout`` if you expect your application to process a
@@ -621,6 +923,12 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
 
         self.log_queries = log_queries
         self.log_responses = log_responses
+        for alias in list(connection_kwargs):
+            if is_track_instances_argument(alias):
+                track_instances = track_instances or bool(
+                    connection_kwargs.pop(alias)
+                )
+        self.track_instances = track_instances
         self.connection_kwargs = {
             **default_connection_kwargs,
             **connection_kwargs,
@@ -836,14 +1144,24 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
         return response
 
     def atomic(
-        self, transaction_type: TransactionType = TransactionType.deferred
+        self,
+        transaction_type: TransactionType = TransactionType.deferred,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ) -> Atomic:
-        return Atomic(engine=self, transaction_type=transaction_type)
+        return Atomic(
+            engine=self,
+            transaction_type=transaction_type,
+            track_instances=track_instances,
+            **kwargs,
+        )
 
     def transaction(
         self,
         transaction_type: TransactionType = TransactionType.deferred,
         allow_nested: bool = True,
+        track_instances: Optional[bool] = None,
+        **kwargs,
     ) -> SQLiteTransaction:
         """
         Create a new database transaction. See :class:`Transaction`.
@@ -852,4 +1170,6 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
             engine=self,
             transaction_type=transaction_type,
             allow_nested=allow_nested,
+            track_instances=track_instances,
+            **kwargs,
         )

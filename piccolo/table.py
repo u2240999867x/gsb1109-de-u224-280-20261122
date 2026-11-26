@@ -32,6 +32,7 @@ from piccolo.columns.reference import LAZY_COLUMN_REFERENCES
 from piccolo.constraints import Constraint
 from piccolo.custom_types import TableInstance
 from piccolo.engine import Engine, engine_finder
+from piccolo.engine.instance_tracking import set_instance_attribute
 from piccolo.query import (
     Alter,
     Count,
@@ -584,7 +585,7 @@ class Table(metaclass=TableMetaclass):
             auto_update_values = cls._meta.get_auto_update_values()
             values.update(auto_update_values)
             for column, value in auto_update_values.items():
-                setattr(self, column._meta.name, value)
+                set_instance_attribute(self, column._meta.name, value)
 
         return cls.update(
             values,  # type: ignore
@@ -640,9 +641,9 @@ class Table(metaclass=TableMetaclass):
         if not primary_key_value:
             raise ValueError("Can only delete pre-existing rows with a PK.")
 
-        setattr(self, self._meta.primary_key._meta.name, None)
+        set_instance_attribute(self, self._meta.primary_key._meta.name, None)
 
-        self._exists_in_db = False
+        set_instance_attribute(self, "_exists_in_db", False)
 
         return self.__class__.delete().where(
             self.__class__._meta.primary_key == primary_key_value

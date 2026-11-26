@@ -176,6 +176,74 @@ This means you can rollback to this savepoint at any point just using the name:
 
     await transaction.rollback_to('my_savepoint')
 
+Instance state
+~~~~~~~~~~~~~~
+
+When a savepoint is rolled back, the database is restored, but Piccolo objects
+in memory would normally keep any state which Piccolo assigned during the
+rollback. For example, a new row's autoincrementing primary key, or the
+``_exists_in_db`` flag.
+
+Pass ``track_instances=True`` to have Piccolo's writes follow the savepoint
+(the recommended approach when using savepoints):
+
+.. code-block:: python
+
+    async with DB.transaction(track_instances=True) as transaction:
+        savepoint = await transaction.savepoint()
+
+        band = Band(name='Pythonistas')
+        await band.save()
+
+        await savepoint.rollback_to()
+
+        # The primary key is cleared, and _exists_in_db is False again.
+        # Saving the object now performs a new INSERT.
+
+When a transaction creates a savepoint without specifying this option,
+tracking is enabled automatically, because that's where partial rollbacks
+occur. Pass ``track_instances=False`` to keep the previous behaviour instead.
+
+Only state assigned by Piccolo is tracked - things like the primary key
+returned by an ``INSERT``, ``_exists_in_db``, and ``auto_update`` values. Any
+values you assigned to the object yourself are left untouched.
+
+Releasing a savepoint doesn't undo its changes, but they can still be undone
+by rolling back an outer savepoint, or the transaction itself. Committing the
+transaction keeps all of the tracked state.
+
+You can also enable this when creating the transaction, savepoint, or atomic
+block:
+
+.. code-block:: python
+
+    async with DB.transaction(track_instances=True):
+        ...
+
+    savepoint = await transaction.savepoint(track_instances=True)
+
+    atomic = DB.atomic(track_instances=True)
+
+Or at the engine level, which applies to all subsequent transactions:
+
+.. code-block:: python
+
+    DB = SQLiteEngine(path='my_app.sqlite', track_instances=True)
+
+You can also enable it after the transaction has started:
+
+.. code-block:: python
+
+    async with DB.transaction() as transaction:
+        transaction.enable_instance_tracking()
+
+The journal records every Piccolo write regardless, so enabling tracking
+later in the transaction still lets a rollback restore writes made before
+tracking was switched on.
+
+Transactions which never create a savepoint and don't enable tracking keep
+the existing behaviour.
+
 -------------------------------------------------------------------------------
 
 Transaction types

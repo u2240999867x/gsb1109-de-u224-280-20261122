@@ -16,6 +16,7 @@ from piccolo.columns.column_types import ForeignKey, ReferencedTable
 from piccolo.columns.combination import And, Where
 from piccolo.custom_types import Combinable, TableInstance
 from piccolo.engine.base import BaseBatch
+from piccolo.engine.instance_tracking import set_instance_attribute
 from piccolo.query.base import Query
 from piccolo.query.methods.select import Select
 from piccolo.query.mixins import (
@@ -71,7 +72,7 @@ class GetOrCreate(
             node=node, in_pool=in_pool
         )
         if instance:
-            instance._was_created = False
+            set_instance_attribute(instance, "_was_created", False)
             return instance
 
         data = {**self.defaults}
@@ -110,7 +111,7 @@ class GetOrCreate(
             )
 
         instance = cast(TableInstance, instance)
-        instance._was_created = True
+        set_instance_attribute(instance, "_was_created", True)
         return instance
 
 
@@ -225,7 +226,7 @@ class UpdateSelf:
         )
 
         for key, value in response[0].items():
-            setattr(self.row, key, value)
+            set_instance_attribute(self.row, key, value)
 
     def __await__(self) -> Generator[None, None, None]:
         """

@@ -12,6 +12,7 @@ from typing import (
 )
 
 from piccolo.custom_types import Combinable, TableInstance
+from piccolo.engine.instance_tracking import set_instance_attribute
 from piccolo.query.base import Query
 from piccolo.query.mixins import (
     AddDelegate,
@@ -94,14 +95,14 @@ class Insert(
         """
         for index, row in enumerate(results):
             table_instance: Table = self.add_delegate._add[index]
-            setattr(
+            set_instance_attribute(
                 table_instance,
                 self.table._meta.primary_key._meta.name,
                 row.get(
                     self.table._meta.primary_key._meta.db_column_name, None
                 ),
             )
-            table_instance._exists_in_db = True
+            set_instance_attribute(table_instance, "_exists_in_db", True)
 
     @property
     def default_querystrings(self) -> Sequence[QueryString]:
