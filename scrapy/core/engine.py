@@ -455,11 +455,74 @@ class ExecutionEngine:
             return
         await self.close_spider_async(reason=reason, error=error)
 
-    def pause(self) -> None:
-        self.paused = True
+    def pause(self, slot: str | None = None, **kwargs: Any) -> Any:
+        if slot is None and not kwargs:
+            self.paused = True
+            return None
+        target = slot if slot is not None else kwargs.pop("download_slot", None)
+        return self.downloader.pause_slot(target, **kwargs)
 
-    def unpause(self) -> None:
-        self.paused = False
+    def unpause(self, slot: str | None = None, **kwargs: Any) -> Any:
+        if slot is None and not kwargs:
+            self.paused = False
+            return None
+        target = slot if slot is not None else kwargs.pop("download_slot", None)
+        return self.downloader.resume_slot(target, **kwargs)
+
+    def pause_slot(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self.downloader.pause_slot(slot, **kwargs)
+
+    pause_download_slot = pause_slot
+    hold_slot = pause_slot
+    suspend_slot = pause_slot
+
+    def resume_slot(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self.downloader.resume_slot(slot, **kwargs)
+
+    resume_download_slot = resume_slot
+    unpause_slot = resume_slot
+    release_slot = resume_slot
+
+    def finish_slot_supplements(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self.downloader.finish_slot_supplements(slot, **kwargs)
+
+    def supply_slot_request(self, *args: Any, **kwargs: Any) -> Any:
+        return self.downloader.supply_slot_request(*args, **kwargs)
+
+    supply_request = supply_slot_request
+    replay_request = supply_slot_request
+    redeliver_request = supply_slot_request
+
+    def finish_supplements(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self.downloader.finish_slot_supplements(slot, **kwargs)
+
+    def slot_request_status(self, identity: Any) -> Any:
+        return self.downloader.slot_request_status(identity)
+
+    describe_request = slot_request_status
+    request_status = slot_request_status
+    get_request_status = slot_request_status
+
+    def is_slot_request_started(self, identity: Any) -> bool:
+        return self.downloader.is_slot_request_started(identity)
+
+    def is_slot_request_deferred(self, identity: Any) -> bool:
+        return self.downloader.is_slot_request_deferred(identity)
+
+    def is_slot_request_missing(self, identity: Any) -> bool:
+        return self.downloader.is_slot_request_missing(identity)
+
+    async def pause_slot_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.pause_slot(*args, **kwargs)
+
+    async def resume_slot_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.resume_slot(*args, **kwargs)
+
+    async def supply_request_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.supply_request(*args, **kwargs)
+
+    async def finish_supplements_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.finish_supplements(*args, **kwargs)
 
     async def _process_start_next(self) -> None:
         """Processes the next item or request from Spider.start().
@@ -568,7 +631,12 @@ class ExecutionEngine:
         assert self._slot is not None  # typing
         assert self.spider is not None  # typing
 
-        request = self._slot.scheduler.next_request()
+        pause_manager = getattr(self.downloader, "_slot_pause", None)
+        request = (
+            pause_manager.next_front_request() if pause_manager is not None else None
+        )
+        if request is None:
+            request = self._slot.scheduler.next_request()
         if request is None:
             self.signals.send_catch_log(signals.scheduler_empty)
             return False
@@ -618,6 +686,11 @@ class ExecutionEngine:
         ):
             return
 
+        if isinstance(result, Request):
+            pause_manager = getattr(self.downloader, "_slot_pause", None)
+            if pause_manager is not None and pause_manager.is_detached(result):
+                return
+
         # downloader middleware can return requests (for example, redirects)
         if isinstance(result, Request):
             self.crawl(result)
@@ -639,6 +712,9 @@ class ExecutionEngine:
         if self._slot.inprogress:  # the downloader may not have these requests yet
             return False
         if self.downloader.active:  # downloader has pending requests
+            return False
+        pause_manager = getattr(self.downloader, "_slot_pause", None)
+        if pause_manager is not None and pause_manager.has_pending_work():
             return False
         if self._start is not None:  # not all start requests are handled
             return False
@@ -1025,6 +1101,12 @@ class ExecutionEngine:
 
         if self._stop_mode == "fast":
             await self._fast_stop_downloader()
+        else:
+            prepare_graceful_stop = getattr(
+                self.downloader, "prepare_graceful_stop", None
+            )
+            if prepare_graceful_stop is not None:
+                await ensure_awaitable(prepare_graceful_stop())
 
         try:
             await self._slot.close()

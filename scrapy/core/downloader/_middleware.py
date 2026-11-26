@@ -222,7 +222,7 @@ class DownloaderMiddlewareManager(MiddlewareManager):  # pylint: disable=abstrac
                     self._count_response_size(response, request)
                 return response
         response = await download_func(request)
-        if response is not None:
+        if response is not None and isinstance(response, Response):
             self._count_response_size(response, request)
         return response
 

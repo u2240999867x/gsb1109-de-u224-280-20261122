@@ -49,6 +49,42 @@ a signal), and resume it later by issuing the same command::
 
     scrapy crawl somespider -s JOBDIR=crawls/somespider-1
 
+Per-slot pause and resume
+=========================
+
+Use :meth:`~scrapy.crawler.Crawler.pause_slot` and
+:meth:`~scrapy.crawler.Crawler.resume_slot` to hold one explicit download slot
+while other slots keep downloading:
+
+.. code-block:: python
+
+    crawler.pause_slot("north")
+
+A request that already entered its download handler finishes normally.
+Requests waiting in the slot, in a downloader middleware, or still in the
+scheduler are not failed; they stay pending for resume. Pending requests do
+not count toward :setting:`CONCURRENT_REQUESTS` while paused.
+
+:meth:`~scrapy.crawler.Crawler.slot_request_status` accepts the original
+:attr:`~scrapy.Request.id` (or the request object) and reports whether the
+request started or remains pending.
+
+With :setting:`JOBDIR` enabled, slot order and request identities survive a
+clean stop and restart. After calling ``resume_slot()`` on the new crawler,
+supply replacement requests or callbacks by their original identity, then
+finish the supplementation window:
+
+.. code-block:: python
+
+    resumption = crawler.resume_slot("north")
+    resumption.supply_request(original_request_id, callback=new_callback)
+    resumption.finish_supplements()
+
+A pending identity that was not supplied is reported as missing when
+supplementation finishes; the remaining requests continue.
+
+.. versionadded:: VERSION
+
 .. _job-dir-spider-name:
 
 Deriving the job directory from the spider name

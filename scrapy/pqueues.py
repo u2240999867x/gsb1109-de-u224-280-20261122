@@ -314,7 +314,13 @@ class DownloaderInterface:
         self.downloader: Downloader = crawler.engine.downloader
 
     def stats(self, possible_slots: Iterable[str]) -> list[tuple[int, str]]:
-        return [(self._active_downloads(slot), slot) for slot in possible_slots]
+        pause_manager = getattr(self.downloader, "_slot_pause", None)
+        stats: list[tuple[int, str]] = []
+        for slot in possible_slots:
+            if pause_manager is not None and pause_manager.blocks_scheduling(slot):
+                continue
+            stats.append((self._active_downloads(slot), slot))
+        return stats
 
     def get_slot_key(self, request: Request) -> str:
         return self.downloader.get_slot_key(request)

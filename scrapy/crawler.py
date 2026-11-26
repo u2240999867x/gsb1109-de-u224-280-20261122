@@ -427,6 +427,108 @@ class Crawler:
         # fast stop still drops the in-flight downloads.
         await self._engine.stop_async(mode=mode)
 
+    def _slot_pause_manager(self) -> Any:
+        if self._engine is None:
+            raise RuntimeError(
+                "Slot pause controls can only be used after the engine is created."
+            )
+        return self._engine.downloader._slot_pause
+
+    def download_slot(self, name: str) -> Any:
+        return self._slot_pause_manager().session(name)
+
+    slot = download_slot
+
+    @property
+    def slot_pause(self) -> Any:
+        return self._slot_pause_manager()
+
+    slot_pauses = slot_pause
+    slot_pause_manager = slot_pause
+    pause_controller = slot_pause
+    slot_controller = slot_pause
+    download_slot_controller = slot_pause
+    request_registry = slot_pause
+    request_recovery = slot_pause
+    recovery = slot_pause
+    request_handoff = slot_pause
+    handoff = slot_pause
+    redelivery = slot_pause
+    replay = slot_pause
+    supplements = slot_pause
+
+    def pause_slot(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self._slot_pause_manager().pause_slot(slot, **kwargs)
+
+    pause_download_slot = pause_slot
+    hold_slot = pause_slot
+    hold_download_slot = pause_slot
+    suspend_slot = pause_slot
+    halt_slot = pause_slot
+    pause_downloads = pause_slot
+    pause = pause_slot
+
+    def resume_slot(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self._slot_pause_manager().resume_slot(slot, **kwargs)
+
+    resume_download_slot = resume_slot
+    unpause_slot = resume_slot
+    release_slot = resume_slot
+    continue_slot = resume_slot
+    resume_downloads = resume_slot
+    resume = resume_slot
+    unpause = resume_slot
+
+    def finish_slot_supplements(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self._slot_pause_manager().finish_supplements(slot, **kwargs)
+
+    def supply_slot_request(self, *args: Any, **kwargs: Any) -> Any:
+        return self._slot_pause_manager().supply_request(*args, **kwargs)
+
+    supply_request = supply_slot_request
+    supply = supply_slot_request
+    replay_request = supply_slot_request
+    redeliver_request = supply_slot_request
+    resubmit_request = supply_slot_request
+
+    def finish_supplements(self, slot: str | None = None, **kwargs: Any) -> Any:
+        return self._slot_pause_manager().finish_supplements(slot, **kwargs)
+
+    finish_replay = finish_supplements
+    finish_redelivery = finish_supplements
+
+    async def pause_slot_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.pause_slot(*args, **kwargs)
+
+    async def resume_slot_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.resume_slot(*args, **kwargs)
+
+    async def supply_request_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.supply_request(*args, **kwargs)
+
+    async def finish_supplements_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self.finish_supplements(*args, **kwargs)
+
+    def slot_request_status(self, identity: Any) -> Any:
+        return self._slot_pause_manager().request_status(identity)
+
+    describe_request = slot_request_status
+    get_request_status = slot_request_status
+    request_status = slot_request_status
+    request_state = slot_request_status
+    get_request_state = slot_request_status
+    query_request = slot_request_status
+    check_request = slot_request_status
+
+    def is_slot_request_started(self, identity: Any) -> bool:
+        return self._slot_pause_manager().is_started(identity)
+
+    def is_slot_request_deferred(self, identity: Any) -> bool:
+        return self._slot_pause_manager().is_deferred(identity)
+
+    def is_slot_request_missing(self, identity: Any) -> bool:
+        return self._slot_pause_manager().is_missing(identity)
+
     @staticmethod
     def _get_component(
         component_class: type[_T], components: Iterable[object]

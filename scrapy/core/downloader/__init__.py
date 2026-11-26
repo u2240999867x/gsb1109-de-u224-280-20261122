@@ -9,12 +9,17 @@ from dataclasses import dataclass, field
 from functools import partial
 from logging import getLogger
 from time import monotonic, perf_counter, time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 
 from scrapy import Request, Spider, signals
 from scrapy.core.downloader._middleware import DownloaderMiddlewareManager
+from scrapy.core.downloader._slotpause import RequestStatus as RequestStatus
+from scrapy.core.downloader._slotpause import SlotPause as SlotPause
+from scrapy.core.downloader._slotpause import SlotPauseControl as SlotPauseControl
+from scrapy.core.downloader._slotpause import SlotPauseController as SlotPauseController
+from scrapy.core.downloader._slotpause import SlotPauseManager, SlotPauseSession
 from scrapy.core.downloader.handlers import DownloadHandlers
 from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
 from scrapy.resolver import dnscache
@@ -100,6 +105,9 @@ class Slot:
     # Number of requests in queue not sent with
     # ExecutionEngine.download_async().
     _scheduled_queued: int = field(default=0, init=False, repr=False)
+    paused: bool = field(default=False, init=False, repr=False)
+    name: str | None = field(default=None, init=False, repr=False)
+    _pause_manager: Any = field(default=None, init=False, repr=False)
 
     # Hand-written to accept the deprecated randomize_delay parameter, which
     # means it also has to initialize the fields above.
@@ -132,6 +140,21 @@ class Slot:
         self.lastseen = 0
         self.latercall = None
         self._scheduled_queued = 0
+        self.paused = False
+        self.name = None
+        self._pause_manager = None
+
+    def pause(self) -> Any:
+        if self._pause_manager is not None and self.name is not None:
+            return self._pause_manager.pause_slot(self.name)
+        self.paused = True
+        return None
+
+    def resume(self, *args: Any, **kwargs: Any) -> Any:
+        if self._pause_manager is not None and self.name is not None:
+            return self._pause_manager.resume_slot(self.name, *args, **kwargs)
+        self.paused = False
+        return None
 
     @property
     def randomize_delay(self) -> bool:
@@ -236,6 +259,18 @@ class Downloader:
         self.signals: SignalManager = crawler.signals
         self.slots: dict[str, Slot] = {}
         self.active: set[Request] = set()
+        self._handler_entered: set[int] = set()
+        self._slot_pause = SlotPauseManager(crawler, self)
+        self.slot_pause = self._slot_pause
+        self.pause_manager = self._slot_pause
+        self.slot_pause_manager = self._slot_pause
+        self.pause_controller = self._slot_pause
+        self.pause_control = self._slot_pause
+        self.slot_controller = self._slot_pause
+        self.request_registry = self._slot_pause
+        self.request_recovery = self._slot_pause
+        self.redelivery = self._slot_pause
+        self.replay = self._slot_pause
         self.handlers: DownloadHandlers = DownloadHandlers(crawler)
         self.total_concurrency: int = self.settings.getint("CONCURRENT_REQUESTS")
         self.domain_concurrency: int = self.settings.getint(
@@ -316,7 +351,7 @@ class Downloader:
             )
             return result
         finally:
-            self.active.remove(request)
+            self.active.discard(request)
             self.middleware._discount_rough_size(request)
 
     def _record_backout(self, reason: str | None) -> None:
@@ -437,6 +472,9 @@ class Downloader:
             )
             delay = slot_settings.get("delay", self._delay)
             new_slot = Slot(conc, delay, _slot_jitter(slot_settings, self._jitter))
+            new_slot.name = key
+            new_slot._pause_manager = self._slot_pause
+            self._slot_pause.slot_created(key, new_slot)
             self.slots[key] = new_slot
             self._start_slot_gc()
 
@@ -454,6 +492,89 @@ class Downloader:
             key = dnscache.get(key, key)
 
         return key
+
+    def pause_slot(self, slot: str | None = None, **kwargs: Any) -> SlotPauseSession:
+        return self._slot_pause.pause_slot(slot, **kwargs)
+
+    pause_download_slot = pause_slot
+    hold_slot = pause_slot
+    hold_download_slot = pause_slot
+    suspend_slot = pause_slot
+    suspend_download_slot = pause_slot
+    halt_slot = pause_slot
+    pause = pause_slot
+
+    def resume_slot(self, slot: str | None = None, **kwargs: Any) -> SlotPauseSession:
+        return self._slot_pause.resume_slot(slot, **kwargs)
+
+    resume_download_slot = resume_slot
+    unpause_slot = resume_slot
+    release_slot = resume_slot
+    continue_slot = resume_slot
+    unblock_slot = resume_slot
+    resume = resume_slot
+    unpause = resume_slot
+
+    def begin_slot_supplements(
+        self, slot: str | None = None, **kwargs: Any
+    ) -> SlotPauseSession:
+        return self._slot_pause.begin_supplements(slot, **kwargs)
+
+    def finish_slot_supplements(
+        self, slot: str | None = None, **kwargs: Any
+    ) -> SlotPauseSession:
+        return self._slot_pause.finish_supplements(slot, **kwargs)
+
+    def supply_slot_request(self, *args: Any, **kwargs: Any) -> SlotPauseSession:
+        return self._slot_pause.supply_request(*args, **kwargs)
+
+    supply_request = supply_slot_request
+    replay_request = supply_slot_request
+    redeliver_request = supply_slot_request
+
+    def finish_supplements(
+        self, slot: str | None = None, **kwargs: Any
+    ) -> SlotPauseSession:
+        return self.finish_slot_supplements(slot, **kwargs)
+
+    def slot_request_status(self, identity: Any) -> Any:
+        return self._slot_pause.request_status(identity)
+
+    def request_pause_status(self, identity: Any) -> Any:
+        return self._slot_pause.request_status(identity)
+
+    describe_request = slot_request_status
+    request_status = slot_request_status
+    get_request_status = slot_request_status
+    request_state = slot_request_status
+    get_request_state = slot_request_status
+    check_request = slot_request_status
+
+    def is_slot_request_started(self, identity: Any) -> bool:
+        return self._slot_pause.is_started(identity)
+
+    def is_slot_request_deferred(self, identity: Any) -> bool:
+        return self._slot_pause.is_deferred(identity)
+
+    def is_slot_request_missing(self, identity: Any) -> bool:
+        return self._slot_pause.is_missing(identity)
+
+    async def prepare_graceful_stop(self) -> None:
+        self._slot_pause.prepare_stop()
+
+    async def pause_slot_async(self, *args: Any, **kwargs: Any) -> SlotPauseSession:
+        return self.pause_slot(*args, **kwargs)
+
+    async def resume_slot_async(self, *args: Any, **kwargs: Any) -> SlotPauseSession:
+        return self.resume_slot(*args, **kwargs)
+
+    async def finish_supplements_async(
+        self, *args: Any, **kwargs: Any
+    ) -> SlotPauseSession:
+        return self.finish_supplements(*args, **kwargs)
+
+    async def supply_request_async(self, *args: Any, **kwargs: Any) -> SlotPauseSession:
+        return self.supply_request(*args, **kwargs)
 
     async def _delay_request(self, request: Request) -> None:
         """Hold *request* until the deadline of its ``delay`` meta key.
@@ -492,6 +613,13 @@ class Downloader:
         if previous is None or previous == request.meta.get(_STAMPED_SLOT_META_KEY):
             request.meta[_STAMPED_SLOT_META_KEY] = key
         request.meta[self.DOWNLOAD_SLOT] = key
+        if self._slot_pause.blocks_enqueue(key):
+            disposition = await maybe_deferred_to_future(
+                self._slot_pause.wait_for_resume(request, key)
+            )
+            if disposition == "requeue":
+                request.dont_filter = True
+                return cast("Response", request)
         slot.active.add(request)
         self.signals.send_catch_log(
             signal=signals.request_reached_downloader,
@@ -509,6 +637,8 @@ class Downloader:
             slot.active.remove(request)
 
     def _process_queue(self, slot: Slot) -> None:
+        if slot.paused:
+            return
         if slot.latercall:
             # block processing until slot.latercall is called
             return
@@ -529,6 +659,7 @@ class Downloader:
                 break
             request, queue_dfd = slot.queue[index]
             del slot.queue[index]
+            self.active.add(request)
             slot.lastseen = now
             # Do this immediately so that following free_transfer_slots() calls
             # account for this request.
@@ -577,6 +708,8 @@ class Downloader:
         # The order is very important for the following logic. Do not change!
         try:
             # 1. Download the response
+            self._handler_entered.add(request.id)
+            self._slot_pause.mark_started(request)
             response: Response = await self.handlers.download_request_async(request)
             # Counted before _end_transfer() resumes queued requests, so that
             # _next_transfer_index() accounts for it.
