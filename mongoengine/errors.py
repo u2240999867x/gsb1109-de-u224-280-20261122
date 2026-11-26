@@ -13,6 +13,8 @@ __all__ = (
     "FieldDoesNotExist",
     "ValidationError",
     "SaveConditionError",
+    "CannotPromoteError",
+    "PromotionNotApplicableError",
     "DeprecatedError",
 )
 
@@ -59,6 +61,16 @@ class BulkWriteError(OperationError):
 
 class SaveConditionError(OperationError):
     pass
+
+
+class CannotPromoteError(OperationError):
+    """Raised when a staged document cannot be promoted to its formal model."""
+
+
+class PromotionNotApplicableError(SaveConditionError):
+    """Raised when a save on a staged document was already promoted and the
+    correction no longer applies to the formal document.
+    """
 
 
 class FieldDoesNotExist(MongoEngineException):

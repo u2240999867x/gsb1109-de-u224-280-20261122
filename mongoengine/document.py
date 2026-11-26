@@ -568,6 +568,8 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         object_id = doc["_id"]
         created = False
 
+        update_doc = self._get_update_doc()
+
         select_dict = {}
         if save_condition is not None:
             select_dict = transform.query(self.__class__, **save_condition)
@@ -576,13 +578,27 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         select_dict = self._integrate_shard_key(doc, select_dict)
 
-        update_doc = self._get_update_doc()
         if update_doc:
+            from mongoengine.base.promotion import promotion_save_update
+
             upsert = save_condition is None
             with set_write_concern(collection, write_concern) as wc_collection:
-                last_error = wc_collection.update_one(
-                    select_dict, update_doc, upsert=upsert, session=_get_session()
-                ).raw_result
+                last_error = promotion_save_update(
+                    wc_collection,
+                    self,
+                    save_condition,
+                    update_doc,
+                    select_dict,
+                    upsert,
+                    session=_get_session(),
+                )
+                if last_error is None:
+                    last_error = wc_collection.update_one(
+                        select_dict,
+                        update_doc,
+                        upsert=upsert,
+                        session=_get_session(),
+                    ).raw_result
             if not upsert and last_error["n"] == 0:
                 raise SaveConditionError(
                     "Race condition preventing document update detected"

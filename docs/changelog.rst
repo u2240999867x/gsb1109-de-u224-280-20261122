@@ -7,6 +7,9 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add opt-in promotion of a staged document to its formal subclass through
+  ``QuerySet.upsert_one`` (see :ref:`promotion`). Documents that do not enable
+  the feature keep the previous ``upsert_one``/``save_condition`` behaviour.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

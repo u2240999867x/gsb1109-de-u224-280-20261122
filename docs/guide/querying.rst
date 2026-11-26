@@ -667,6 +667,60 @@ modifier comes before the field, not after it::
     In version 0.5 the :meth:`~mongoengine.Document.save` runs atomic updates
     on changed documents by tracking changes to that document.
 
+.. _promotion:
+
+Promoting a staged document
+---------------------------
+Some workflows store a *staged* document first and only turn it into its
+*formal* counterpart once an external artefact (for example a reconciliation
+voucher) arrives.  Both models live in the same collection and are subclasses
+of a shared base, and the waybill number (``wb``) is unique across the whole
+collection.
+
+This behaviour is opt-in per model.  Enable it on the shared base class (or on
+the formal model) with a ``promotion`` entry in ``meta``; the staging and
+formal roles are inferred from the ``received``/``declared`` database field
+mapping, or can be declared explicitly with ``meta = {"promotion_role":
+"staging"}`` / ``{"promotion_role": "formal"}``::
+
+    class Waybill(Document):
+        wb = StringField(unique=True)
+        meta = {"allow_inheritance": True, "promotion": True}
+
+    class StagedWaybill(Waybill):
+        received = IntField(db_field="a")
+        declared = IntField(db_field="b")
+        collection_note = StringField(db_field="c")
+
+    class FormalWaybill(Waybill):
+        received = IntField(db_field="b")
+        declared = IntField(db_field="a")
+        voucher = StringField(db_field="c")
+
+``upsert_one`` on the shared base (or on the formal model) then promotes the
+staged row when it exists and its ``received`` quantity is at least ``80``::
+
+    formal = Waybill.objects(wb="W7").upsert_one(set__voucher="R7")
+
+Promotion keeps the original primary key, carries over ``received`` and
+``declared``, replaces the staged-only ``c`` field with the supplied voucher
+and leaves undeclared database keys (for example audit tags) untouched.  If no
+row exists for the waybill number, the complete formal document is created
+from the supplied update data.  An existing formal document, a row of another
+category, or a staged document below the threshold raises ``CannotPromoteError``
+and leaves the row unchanged.
+
+A ``save(save_condition=...)`` issued on a staged document that has been
+promoted in the meantime is translated to the formal field layout: conditions
+and changes referring to ``received``/``declared`` are mapped to the formal
+fields.  If the condition no longer matches (for example because ``declared``
+was corrected after promotion) a ``SaveConditionError`` is raised.  A change
+to a field that only exists on the staged model (such as the collection note)
+raises ``PromotionNotApplicableError`` instead of applying a partial save.
+
+Documents that do not opt into promotion keep the historical ``upsert_one``
+and ``save_condition`` semantics.
+
 The positional operator allows you to update list items without knowing the
 index position, therefore making the update a single atomic operation.  As we
 cannot use the `$` syntax in keyword arguments it has been mapped to `S`::

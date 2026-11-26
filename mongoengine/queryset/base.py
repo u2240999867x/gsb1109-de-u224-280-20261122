@@ -644,6 +644,17 @@ class BaseQuerySet:
         :returns the new or overwritten document
         """
 
+        from mongoengine.base.promotion import promotion_upsert
+
+        handled, document = promotion_upsert(
+            self,
+            update,
+            write_concern=write_concern,
+            read_concern=read_concern,
+        )
+        if handled:
+            return document
+
         atomic_update = self.update(
             multi=False,
             upsert=True,
