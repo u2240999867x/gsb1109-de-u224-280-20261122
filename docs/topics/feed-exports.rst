@@ -451,6 +451,33 @@ apply to the item itself. The number of exported entries is reported per
 storage class, as the ``feedexport/item_count/<storage class>`` stat.
 
 
+.. _page-ordering:
+
+Page ordering
+=============
+
+Set the ``page_ordered`` :ref:`feed option <feed-options>` to ``True`` to
+write complete source pages in their original order instead of writing items
+in pipeline completion order.
+
+.. versionadded:: VERSION
+
+Items yielded by one callback keep their yield order even when item pipelines
+finish out of order. Scrapy assigns page numbers from request scheduling order;
+set the ``page_index`` request meta key to use an explicit manifest order.
+
+The ``max_pending_pages`` option bounds the page window. Scrapy applies
+backpressure when faster pages get more than that many pages ahead, which keeps
+their completed items from accumulating without limit.
+
+A page whose rows are all :ref:`filtered <item-filter>` completes normally and
+writes no rows. If its callback raises an exception, Scrapy discards rows
+buffered for that page, logs the failure, and advances the page window so that
+later complete pages can still be written. The
+``feedexport/page_count/empty`` and ``feedexport/page_count/failed`` stats
+report those outcomes.
+
+
 .. _post-processing:
 
 Post-Processing
@@ -611,6 +638,12 @@ as a fallback value if that key is not provided for a specific feed definition:
     .. versionadded:: 2.20.0
 
     If undefined, items are exported as scraped.
+
+-   ``page_ordered``: write completed pages in their original order. See
+    :ref:`page-ordering`.
+
+-   ``max_pending_pages``: maximum number of pages in the ordered delivery
+    window, including the page currently waiting for earlier rows.
 
 -   ``indent``: falls back to :setting:`FEED_EXPORT_INDENT`.
 

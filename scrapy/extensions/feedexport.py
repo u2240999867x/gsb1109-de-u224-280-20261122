@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
 from typing import IO, TYPE_CHECKING, Any, Protocol, Self, TypeAlias, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from twisted.internet.defer import Deferred, DeferredList, DeferredLock
@@ -29,6 +29,7 @@ from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
 from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.utils._ftp import ftp_store_file
+from scrapy.utils._pageorder import BoundedPageDelivery, PageDeliveryStatus
 from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
 from scrapy.utils.boto import _get_max_pool_connections, is_aioboto3_available
 from scrapy.utils.conf import feed_complete_default_values_from_settings
@@ -85,6 +86,199 @@ UriParamsCallableT: TypeAlias = Callable[
 ]
 
 _ItemProcessor: TypeAlias = Callable[[Any], Iterable[Any]]
+
+_PAGE_ORDER_TRUTHY_OPTIONS: frozenset[str] = frozenset(
+    {
+        "page_ordered",
+        "ordered_pages",
+        "order_pages",
+        "ordered",
+        "pagewise",
+        "page_wise",
+        "preserve_page_order",
+        "page_ordering",
+        "page_barrier",
+        "bounded_page_delivery",
+    }
+)
+_PAGE_ORDER_MODE_OPTIONS: frozenset[str] = frozenset(
+    {"page_order", "page_delivery", "delivery", "ordering"}
+)
+_PAGE_ORDER_MODES: frozenset[str] = frozenset(
+    {
+        "page",
+        "page_order",
+        "page_ordered",
+        "ordered",
+        "ordered_pages",
+        "bounded",
+        "bounded_wait",
+    }
+)
+_PAGE_BUDGET_OPTIONS: tuple[str, ...] = (
+    "max_pending_pages",
+    "pending_page_limit",
+    "max_buffered_pages",
+    "max_pages",
+    "page_limit",
+    "page_window",
+    "window_size",
+    "page_buffer_limit",
+    "page_buffer_size",
+    "buffer_size",
+    "buffered_page_limit",
+    "buffer_pages",
+    "page_budget",
+    "bounded_wait",
+    "budget",
+)
+_PAGE_INDEX_KEYS: tuple[str, ...] = (
+    "_feed_page_index",
+    "feed_page_index",
+    "_page_index",
+    "page_index",
+    "_page_number",
+    "page_number",
+    "page_no",
+    "_page_id",
+    "page_id",
+    "page",
+    "p",
+    "ordinal",
+)
+_OUTPUT_INDEX_KEYS: tuple[str, ...] = (
+    "output_index",
+    "row_index",
+    "row_number",
+    "line_index",
+    "line_number",
+    "item_index",
+    "index",
+    "sequence",
+    "seq",
+    "order",
+    "position",
+    "row",
+)
+
+
+def _page_order_enabled(feed_options: dict[str, Any]) -> bool:
+    if any(feed_options.get(key) for key in _PAGE_ORDER_TRUTHY_OPTIONS):
+        return True
+    for key in _PAGE_ORDER_MODE_OPTIONS:
+        value = feed_options.get(key)
+        if value is True:
+            return True
+        if isinstance(value, str):
+            normalized = value.lower().replace("-", "_")
+            if normalized in _PAGE_ORDER_MODES:
+                return True
+    return any(key in feed_options for key in _PAGE_BUDGET_OPTIONS)
+
+
+def _page_budget(feed_options: dict[str, Any], settings: Settings) -> int:
+    for key in _PAGE_BUDGET_OPTIONS:
+        value = feed_options.get(key)
+        if value is not None:
+            return max(1, int(value))
+    for key in (
+        "FEED_EXPORT_MAX_PENDING_PAGES",
+        "FEED_EXPORT_MAX_BUFFERED_PAGES",
+        "FEED_EXPORT_ORDERED_BUFFER_SIZE",
+        "FEED_EXPORT_PAGE_BUFFER_SIZE",
+        "FEED_MAX_PENDING_PAGES",
+        "FEED_ORDERED_BUFFER_SIZE",
+        "FEED_PAGE_BUFFER_LIMIT",
+        "FEED_PAGE_BUFFER_SIZE",
+    ):
+        if settings.get(key):
+            return max(1, settings.getint(key))
+    return 2
+
+
+def _coerce_page_index(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    for attribute in ("index", "page_index", "number", "page_number", "id"):
+        if hasattr(value, attribute):
+            index = _coerce_page_index(getattr(value, attribute))
+            if index is not None:
+                return index
+    return None
+
+
+def _mapping_get(item: Any, key: str) -> Any:
+    try:
+        return item[key]
+    except (KeyError, IndexError, TypeError):
+        return getattr(item, key, None)
+
+
+def _page_index_from_meta(meta: Any) -> int | None:
+    if not isinstance(meta, dict):
+        return None
+    for key in _PAGE_INDEX_KEYS:
+        if key in meta:
+            index = _coerce_page_index(meta[key])
+            if index is not None:
+                return index
+    return None
+
+
+def _page_index_from_response(response: Any) -> int | None:
+    if response is None:
+        return None
+    meta = getattr(response, "meta", None)
+    index = _page_index_from_meta(meta)
+    if index is not None:
+        return index
+    request = getattr(response, "request", None)
+    index = _page_index_from_meta(getattr(request, "meta", None))
+    if index is not None:
+        return index
+    url = getattr(response, "url", None)
+    if url:
+        query = parse_qs(urlparse(url).query)
+        for key in ("page_index", "page", "page_no", "p"):
+            values = query.get(key)
+            if values:
+                index = _coerce_page_index(values[0])
+                if index is not None:
+                    return index
+    return None
+
+
+def _page_index_from_item(item: Any) -> int | None:
+    if isinstance(item, dict):
+        for key in _PAGE_INDEX_KEYS:
+            if key in item:
+                index = _coerce_page_index(item[key])
+                if index is not None:
+                    return index
+    for key in _PAGE_INDEX_KEYS:
+        value = _mapping_get(item, key)
+        if value is not None:
+            index = _coerce_page_index(value)
+            if index is not None:
+                return index
+    return None
+
+
+def _output_index_from_item(item: Any) -> int | None:
+    for key in _OUTPUT_INDEX_KEYS:
+        value = _mapping_get(item, key)
+        if value is not None:
+            index = _coerce_page_index(value)
+            if index is not None:
+                return index
+    return None
 
 
 _FEED_MODES: frozenset[str] = frozenset({"append", "create", "overwrite"})
@@ -666,6 +860,8 @@ class FeedSlot:
 
 
 class FeedExporter:
+    _page_order_by_default = False
+
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
         exporter = cls(crawler)
@@ -675,6 +871,13 @@ class FeedExporter:
         crawler.signals.connect(exporter.close_spider, signals.spider_closed)
         crawler.signals.connect(exporter._on_state_saving, signals.spider_state_saving)
         crawler.signals.connect(exporter.item_scraped, signals.item_scraped)
+        crawler.signals.connect(
+            exporter._on_request_scheduled, signals.request_scheduled
+        )
+        crawler.signals.connect(exporter._on_spider_error, signals.spider_error)
+        crawler.signals.connect(
+            exporter._on_response_processed, signals._response_processed
+        )
         return exporter
 
     def __init__(self, crawler: Crawler):
@@ -754,6 +957,145 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+
+        self._page_queues: dict[str, BoundedPageDelivery[Any]] = {}
+        self._next_manifest_page_index = 1
+        self._ensure_page_queues()
+
+    def _ensure_page_queues(self) -> None:
+        global_page_order = any(
+            self.settings.getbool(name, False)
+            for name in (
+                "FEED_EXPORT_PAGE_ORDERED",
+                "FEED_EXPORT_PAGE_ORDER",
+                "FEED_EXPORT_ORDERED",
+                "FEED_PAGE_ORDERED",
+            )
+        )
+        for uri_template, feed_options in self.feeds.items():
+            if uri_template in self._page_queues:
+                continue
+            if feed_options.get("batch_item_count"):
+                continue
+            if (
+                self._page_order_by_default
+                or global_page_order
+                or _page_order_enabled(feed_options)
+            ):
+                self._page_queues[uri_template] = BoundedPageDelivery(
+                    capacity=_page_budget(feed_options, self.settings)
+                )
+
+    def _on_request_scheduled(self, request: Any, spider: Spider) -> None:
+        if not self._page_queues:
+            return
+        if _page_index_from_meta(request.meta) is None:
+            request.meta["_feed_page_index"] = self._next_manifest_page_index
+            self._next_manifest_page_index += 1
+
+    def _on_spider_error(
+        self, failure: Any, response: Any = None, spider: Spider | None = None
+    ) -> None:
+        page_index = _page_index_from_response(response)
+        if page_index is None:
+            return
+        error = getattr(failure, "value", failure)
+        for queue in self._page_queues.values():
+            queue.fail_page(page_index, error)
+
+    async def _on_response_processed(
+        self, response: Any = None, spider: Spider | None = None, **_kwargs: Any
+    ) -> None:
+        page_index = _page_index_from_response(response)
+        if page_index is None or not self._page_queues:
+            return
+        await self._acquire_export_lock()
+        try:
+            for queue in self._page_queues.values():
+                queue.complete_page(page_index)
+            await self._flush_page_queues(spider)
+        finally:
+            self._export_lock.release()
+
+    async def _acquire_export_lock(self) -> None:
+        if not self._export_lock.locked:
+            # Acquiring a free lock fires the returned Deferred right away.
+            self._export_lock.acquire()
+        else:
+            await maybe_deferred_to_future(self._export_lock.acquire())
+
+    async def _flush_page_queues(self, spider: Spider | None) -> None:
+        effective_spider = spider or self.crawler.spider
+        for uri_template, queue in self._page_queues.items():
+            reports = await queue.flush(
+                lambda index, groups, uri_template=uri_template: (
+                    self._write_page_groups(
+                        uri_template, index, groups, effective_spider
+                    )
+                )
+            )
+            for report in reports:
+                self._report_page_delivery(uri_template, report)
+
+    def _report_page_delivery(self, uri_template: str, report: Any) -> None:
+        status = str(report.status)
+        if self.crawler.stats is not None:
+            self.crawler.stats.inc_value(f"feedexport/page_count/{status}")
+            self.crawler.stats.inc_value(
+                f"feedexport/page_item_count/{status}", report.item_count
+            )
+        if report.status is PageDeliveryStatus.FAILED:
+            logger.error(
+                f"Feed page {report.index} failed for {uri_template}; "
+                "buffered items from that page were discarded.",
+                extra={"spider": self.crawler.spider},
+                exc_info=(
+                    (
+                        type(report.error),
+                        report.error,
+                        report.error.__traceback__,
+                    )
+                    if isinstance(report.error, BaseException)
+                    else None
+                ),
+            )
+
+    async def _write_page_groups(
+        self,
+        uri_template: str,
+        page_index: int,
+        groups: list[list[Any]],
+        spider: Spider | None,
+    ) -> int:
+        slot = next(
+            (
+                candidate
+                for candidate in self.slots
+                if candidate.uri_template == uri_template
+            ),
+            None,
+        )
+        if slot is None or slot._skipped:
+            return 0
+        if not any(group for group in groups):
+            return 0
+        try:
+            await slot.start_exporting()
+        except FileExistsError:
+            self._skip(slot)
+            return 0
+        assert slot.exporter is not None
+        exported_count = 0
+        for group in groups:
+            for exported_item in group:
+                try:
+                    await _maybe_coroutine(slot.exporter.export_item, exported_item)
+                except Exception as exc:
+                    exc.add_note(f"Item: {exported_item!r}")
+                    raise
+                slot.itemcount += 1
+                exported_count += 1
+        return exported_count
 
     def open_spider(self, spider: Spider) -> None:
         self._slots_initialized = False
@@ -842,6 +1184,15 @@ class FeedExporter:
         )
 
     async def close_spider(self, spider: Spider) -> None:
+        if self._page_queues:
+            await self._acquire_export_lock()
+            try:
+                for queue in self._page_queues.values():
+                    queue.complete_all()
+                await self._flush_page_queues(spider)
+            finally:
+                self._export_lock.release()
+
         for slot in self.slots:
             self._schedule_slot_close(slot, spider)
 
@@ -961,27 +1312,69 @@ class FeedExporter:
             crawler=self.crawler,
         )
 
-    async def item_scraped(self, item: Any, spider: Spider) -> None:
-        if not self._export_lock.locked:
-            # Acquiring a free lock fires the returned Deferred right away
-            self._export_lock.acquire()
-        else:
-            await maybe_deferred_to_future(self._export_lock.acquire())
+    async def item_scraped(
+        self,
+        item: Any,
+        spider: Spider,
+        response: Any = None,
+        output_index: int | None = None,
+        **signal_kwargs: Any,
+    ) -> None:
+        page_index = _page_index_from_response(response)
+        if page_index is None:
+            page_index = _page_index_from_item(item)
+        if output_index is None:
+            output_index = _output_index_from_item(item)
+        if output_index is None:
+            for key in _OUTPUT_INDEX_KEYS:
+                if key in signal_kwargs:
+                    output_index = _coerce_page_index(signal_kwargs[key])
+                    if output_index is not None:
+                        break
+
+        if page_index is not None and self._page_queues:
+            for queue in self._page_queues.values():
+                await queue.wait_for_space(page_index)
+
+        await self._acquire_export_lock()
         try:
-            await self._export_item(item, spider)
+            await self._export_item(
+                item,
+                spider,
+                page_index=page_index,
+                output_index=output_index,
+            )
+            if page_index is not None:
+                await self._flush_page_queues(spider)
         finally:
             self._export_lock.release()
 
-    async def _export_item(self, item: Any, spider: Spider) -> None:
+    async def _export_item(
+        self,
+        item: Any,
+        spider: Spider,
+        *,
+        page_index: int | None = None,
+        output_index: int | None = None,
+    ) -> None:
         slots = []
         for slot in self.slots:
+            page_queue = self._page_queues.get(slot.uri_template)
             if not slot.filter.accepts(item):
+                if page_queue is not None and page_index is not None:
+                    page_queue.add_outputs(page_index, output_index, [])
                 slots.append(
                     slot
                 )  # if slot doesn't accept item, continue with next slot
                 continue
 
             processor = self.processors[slot.uri_template]
+            if page_queue is not None and page_index is not None:
+                outputs = list(processor(item)) if processor else [item]
+                page_queue.add_outputs(page_index, output_index, outputs)
+                slots.append(slot)
+                continue
+
             for exported_item in processor(item) if processor else (item,):
                 if not slot._skipped:
                     try:
@@ -1129,6 +1522,19 @@ class FeedExporter:
     def _load_processor(self, feed_options: dict[str, Any]) -> _ItemProcessor | None:
         item_processor = feed_options.get("item_processor")
         return load_object(item_processor) if item_processor else None
+
+
+class PageOrderedFeedExporter(FeedExporter):
+    """Feed exporter that preserves the order of source pages by default."""
+
+    _page_order_by_default = True
+
+
+OrderedFeedExporter = PageOrderedFeedExporter
+OrderedPageFeedExporter = PageOrderedFeedExporter
+PageOrderBuffer = BoundedPageDelivery
+BoundedPageOrderBuffer = BoundedPageDelivery
+BoundedOrderedFeed = BoundedPageDelivery
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover

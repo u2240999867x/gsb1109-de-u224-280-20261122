@@ -268,6 +268,13 @@ class Scraper:
                     self._handle_spider_error(spider_exc, request, result)
                 else:
                     await self.handle_spider_output_async(output, request, result)
+                finally:
+                    await self.signals.send_catch_log_async(
+                        signals._response_processed,
+                        response=result,
+                        request=request,
+                        spider=self.crawler.spider,
+                    )
                 return
 
             if result.check(CloseSpider):
@@ -456,32 +463,71 @@ class Scraper:
             )
             result = _as_async_generator(result)
         it = _aiter_errback(result, self._handle_spider_error, request, response)
+
+        async def enumerate_outputs() -> AsyncIterator[tuple[int, Any]]:
+            output_index = 0
+            async for output in it:
+                yield output_index, output
+                output_index += 1
+
+        indexed_output = enumerate_outputs()
         if is_asyncio_available():
             await _parallel_asyncio(
-                it, self.concurrent_items, self._process_spidermw_output_async, response
+                indexed_output,
+                self.concurrent_items,
+                self._process_indexed_spidermw_output_async,
+                response,
             )
             return
         await maybe_deferred_to_future(
             _parallel_async(
-                it,
+                indexed_output,
                 self.concurrent_items,
-                self._process_spidermw_output,
+                self._process_indexed_spidermw_output,
                 response,
             )
         )
 
+    def _process_indexed_spidermw_output(
+        self, indexed_output: tuple[int, Any], response: Response | Failure
+    ) -> Deferred[None]:
+        output_index, output = indexed_output
+        return self._process_spidermw_output(
+            output, response, output_index=output_index
+        )
+
+    async def _process_indexed_spidermw_output_async(
+        self, indexed_output: tuple[int, Any], response: Response | Failure
+    ) -> None:
+        output_index, output = indexed_output
+        await self._process_spidermw_output_async(
+            output, response, output_index=output_index
+        )
+
     def _process_spidermw_output(
-        self, output: Any, response: Response | Failure
+        self,
+        output: Any,
+        response: Response | Failure,
+        *,
+        output_index: int | None = None,
     ) -> Deferred[None]:
         """Process each Request/Item (given in the output parameter) returned
         from the spider.
 
         Items are sent to the item pipelines, requests are scheduled.
         """
-        return deferred_from_coro(self._process_spidermw_output_async(output, response))
+        return deferred_from_coro(
+            self._process_spidermw_output_async(
+                output, response, output_index=output_index
+            )
+        )
 
     async def _process_spidermw_output_async(
-        self, output: Any, response: Response | Failure
+        self,
+        output: Any,
+        response: Response | Failure,
+        *,
+        output_index: int | None = None,
     ) -> None:
         """Process each Request/Item (given in the output parameter) returned
         from the spider.
@@ -492,7 +538,9 @@ class Scraper:
             self.crawler.engine.crawl(request=output)
             return
         if output is not None:
-            await self.start_itemproc_async(output, response=response)
+            await self.start_itemproc_async(
+                output, response=response, output_index=output_index
+            )
 
     def start_itemproc(
         self, item: Any, *, response: Response | Failure | None
@@ -517,7 +565,11 @@ class Scraper:
         await self.start_itemproc_async(item, response=None)
 
     async def start_itemproc_async(
-        self, item: Any, *, response: Response | Failure | None
+        self,
+        item: Any,
+        *,
+        response: Response | Failure | None,
+        output_index: int | None = None,
     ) -> None:
         """Send *item* to the item pipelines for processing.
 
@@ -578,6 +630,7 @@ class Scraper:
                 item=output,
                 response=response,
                 spider=self.crawler.spider,
+                output_index=output_index,
             )
         finally:
             self.slot.itemproc_size -= 1
