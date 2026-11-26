@@ -37,6 +37,7 @@ from pandera.api.dataframe.model_components import (
     parser,
 )
 from pandera.api.hypotheses import Hypothesis
+from pandera.api.grouped import GroupedCheck
 from pandera.api.pandas.array import SeriesSchema
 from pandera.api.pandas.components import (
     Column,
@@ -139,6 +140,7 @@ __all__ = [
     "pandas_version",
     # checks
     "Check",
+    "GroupedCheck",
     # parsers
     "Parser",
     # decorators

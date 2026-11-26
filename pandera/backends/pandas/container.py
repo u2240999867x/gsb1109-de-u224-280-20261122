@@ -40,6 +40,16 @@ T = TypeVar("T")
 class DataFrameSchemaBackend(PandasSchemaBackend):
     """Backend for pandas DataFrameSchema."""
 
+    def validate_grouped(self, check_obj: pd.DataFrame, schema):
+        """Run grouped admission checks on a pandas DataFrame."""
+        from pandera.backends.grouped_adapters import (
+            validate_grouped_pandas,
+        )
+
+        if not is_table(check_obj):
+            raise TypeError(f"expected pd.DataFrame, got {type(check_obj)}")
+        return validate_grouped_pandas(check_obj, schema)
+
     def preprocess(self, check_obj: pd.DataFrame, inplace: bool = False):
         """Preprocesses a check object before applying check functions."""
         if not inplace:

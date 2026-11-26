@@ -8,6 +8,7 @@ from pandera.api.dataframe.model_components import (
     check,
     dataframe_check,
 )
+from pandera.api.grouped import GroupedCheck
 from pandera.api.pyarrow.components import Column
 from pandera.api.pyarrow.container import DataFrameSchema
 from pandera.api.pyarrow.model import DataFrameModel
@@ -29,6 +30,7 @@ __all__ = [
     "DataFrameSchema",
     "errors",
     "Field",
+    "GroupedCheck",
     "PyArrowData",
     "set_config",
     "typing",

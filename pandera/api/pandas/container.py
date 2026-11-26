@@ -45,6 +45,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
         description=None,
         metadata=None,
         drop_invalid_rows: bool = False,
+        grouped_checks=None,
     ) -> None:
         super().__init__(
             columns=columns,
@@ -66,6 +67,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
             description=description,
             metadata=metadata,
             drop_invalid_rows=drop_invalid_rows,
+            grouped_checks=grouped_checks,
         )
         if not self.columns and isinstance(
             self.dtype, pandas_engine.PydanticModel
@@ -152,6 +154,9 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
             together with ``strict="filter"`` is deprecated and raises a
             ``FutureWarning``, since column filtering does not mutate the
             input object in place; use the returned ``DataFrame`` instead.
+        :param grouped_checks: optional grouped admission checks applied by
+            :meth:`validate_grouped`. See
+            :class:`~pandera.api.grouped.GroupedCheck`.
         :returns: validated ``DataFrame``
 
         :raises SchemaError: when ``DataFrame`` violates built-in or custom

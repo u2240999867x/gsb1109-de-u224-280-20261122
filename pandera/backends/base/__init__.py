@@ -92,6 +92,10 @@ class BaseSchemaBackend(ABC):
         """
         raise NotImplementedError
 
+    def validate_grouped(self, check_obj, schema):
+        """Run grouped checks and return accepted rows plus rejections."""
+        raise NotImplementedError
+
     def coerce_dtype(
         self,
         check_obj,

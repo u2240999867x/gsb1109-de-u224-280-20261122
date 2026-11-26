@@ -122,6 +122,25 @@ def _to_frame_kind_nw(lf: nw.LazyFrame, return_type: type):
 
 
 class DataFrameSchemaBackend(NarwhalsSchemaBackend):
+    def validate_grouped(self, check_obj, schema):
+        """Run grouped checks on an eager pandas-like or pyarrow frame."""
+        import pyarrow as pa
+
+        from pandera.backends.grouped_adapters import (
+            validate_grouped_pandas,
+            validate_grouped_pyarrow,
+        )
+
+        native = _to_native(check_obj)
+        if isinstance(native, pa.Table):
+            return validate_grouped_pyarrow(native, schema)
+        if _native_is_pandas_like(native):
+            return validate_grouped_pandas(native, schema)
+        raise NotImplementedError(
+            "grouped checks require an eager pandas-like frame or a "
+            "pyarrow.Table under the narwhals backend."
+        )
+
     def validate(
         self,
         check_obj,

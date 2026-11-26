@@ -163,6 +163,62 @@ df = (
 schema.validate(df)
 ```
 
+(grouped-admission-checks)=
+
+## Grouped Admission Checks
+
+`DataFrameSchema` accepts an optional list of `GroupedCheck` rules through the
+`grouped_checks` argument. Unlike column check groups, these rules do not raise
+when a group fails. Instead, `validate_grouped` removes failing rows round after
+round and returns the table of accepted rows in original input order plus a
+per-row rejection list.
+
+Each rule declares its own grouping column(s) and a callback that receives the
+records of one group in original row order as `GroupRecords`. The callback
+returns either one boolean for the whole group or one boolean per row, and the
+same callback works for pandas `DataFrame`s and pyarrow `Table`s.
+
+Every rule in a round is evaluated against the rows that survived the previous
+round, so a rule can become unsatisfiable only after another rule removes rows.
+A group whose membership is unchanged keeps its previous verdict and is not
+called again; a group that has become empty is never called.
+
+```python
+import pandas as pd
+import pandera.pandas as pa
+
+df = pd.DataFrame(
+    {
+        "region": [None, "None", "None", None, "west", "west", None],
+        "device": ["X", "X", "Y", "W", "M", "N", "Z"],
+        "traffic": [4, 2, 5, 5, 5, 5, 5],
+        "delay": [12, 8, 8, 8, 8, 8, 8],
+    }
+)
+# Rows 3 and 4 intentionally share a duplicate display index.
+df.index = [0, 1, 2, 2, 3, 4, 5]
+
+schema = pa.DataFrameSchema(
+    grouped_checks=[
+        pa.GroupedCheck(lambda g: g["delay"] <= 10, "region", name="delay"),
+        pa.GroupedCheck(lambda g: g["traffic"].sum() >= 5, "device", name="device"),
+        pa.GroupedCheck(lambda g: g["device"].nunique() == 2, "region", name="dual"),
+    ]
+)
+
+result = schema.validate_grouped(df)
+result.table
+
+for rejection in result.rejections:
+    print(rejection.position, rejection.round, rejection.rules, rejection.group_keys)
+```
+
+Group keys distinguish genuinely null values from the text `"None"`. Duplicate
+pandas display indexes and pyarrow chunk boundaries do not affect which group a
+row belongs to: rows are tracked by their physical position. The
+`n_failure_cases` diagnostic cap limits sampling only; it never changes which
+rows are removed.
+
 ## Wide Checks
 
 `pandera` is primarily designed to operate on long-form data (commonly known

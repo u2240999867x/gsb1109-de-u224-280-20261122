@@ -180,6 +180,79 @@ df = (
 schema.validate(df)
 ```
 
+(grouped-admission-checks)=
+
+## Grouped Admission Checks
+
+`DataFrameSchema` accepts an optional list of
+{class}`~pandera.api.grouped.GroupedCheck` rules through the
+`grouped_checks` argument. Unlike the column check groups above, these rules
+do not raise when a group fails. Instead,
+{meth}`~pandera.api.dataframe.container.DataFrameSchema.validate_grouped`
+removes failing rows round after round and returns two things: the table of
+accepted rows in original input order, and a per-row rejection list.
+
+Each rule declares its own grouping column(s) and a callback that receives the
+records of one group in original row order as
+{class}`~pandera.api.grouped.GroupRecords`. The callback returns either a
+single boolean verdict for the whole group or one boolean per row. The same
+callback works for pandas `DataFrame`s and pyarrow `Table`s.
+
+Every rule in a round is evaluated against the rows that survived the
+previous round, so a rule can become unsatisfiable only after another rule
+removes rows. A group whose membership is unchanged keeps its previous verdict
+and is not called again; a group that has become empty is never called.
+
+```{code-cell} python
+import pandas as pd
+import pandera.pandas as pa
+
+df = pd.DataFrame(
+    {
+        "region": [None, "None", "None", None, "west", "west", None],
+        "device": ["X", "X", "Y", "W", "M", "N", "Z"],
+        "traffic": [4, 2, 5, 5, 5, 5, 5],
+        "delay": [12, 8, 8, 8, 8, 8, 8],
+    }
+)
+# Rows 3 and 4 intentionally share a duplicate display index.
+df.index = [0, 1, 2, 2, 3, 4, 5]
+
+schema = pa.DataFrameSchema(
+    grouped_checks=[
+        pa.GroupedCheck(
+            lambda group: group["delay"] <= 10,
+            groupby="region",
+            name="delay",
+        ),
+        pa.GroupedCheck(
+            lambda group: group["traffic"].sum() >= 5,
+            groupby="device",
+            name="device",
+        ),
+        pa.GroupedCheck(
+            lambda group: group["device"].nunique() == 2,
+            groupby="region",
+            name="dual",
+        ),
+    ]
+)
+
+result = schema.validate_grouped(df)
+result.table
+```
+
+```{code-cell} python
+for rejection in result.rejections:
+    print(rejection.position, rejection.round, rejection.rules, rejection.group_keys)
+```
+
+Group keys distinguish genuinely null values from the text `"None"`. Duplicate
+pandas display indexes and pyarrow chunk boundaries do not affect which group
+a row belongs to: rows are tracked by their physical position. The
+`n_failure_cases` diagnostic cap on a rule limits sampling only; it never
+changes which rows are removed.
+
 (wide-checks)=
 
 ## Wide Checks

@@ -19,11 +19,14 @@ from pandera import errors
 from pandera.api.base.schema import BaseSchema
 from pandera.api.base.types import CheckList, ParserList, StrictType
 from pandera.api.checks import Check
+from pandera.api.grouped import GroupedCheck
 from pandera.api.hypotheses import Hypothesis
 from pandera.api.parsers import Parser
 from pandera.constants import ON_MISSING_ACTIONS
 from pandera.dtypes import DataType, UniqueSettings
 from pandera.engines import PYDANTIC_V2
+
+GroupedCheckList = Union["GroupedCheck", list["GroupedCheck"]]
 
 # if python version is < 3.11, import Self from typing_extensions
 if sys.version_info < (3, 11):
@@ -64,6 +67,7 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         description: str | None = None,
         metadata: dict | None = None,
         drop_invalid_rows: bool = False,
+        grouped_checks: GroupedCheckList | None = None,
     ) -> None:
         """Library-agnostic base class for DataFrameSchema definitions.
 
@@ -108,6 +112,10 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
         :param description: An arbitrary textual description of the schema.
         :param metadata: An optional key-value data.
         :param drop_invalid_rows: if True, drop invalid rows on validation.
+        :param grouped_checks: optional grouped admission checks. Each
+            :class:`~pandera.api.grouped.GroupedCheck` declares its own
+            grouping column(s) and a callback that receives a group's records
+            in original row order. See :meth:`validate_grouped`.
 
         :raises SchemaInitError: if impossible to build schema from parameters
 
@@ -158,6 +166,12 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
             parsers = []
         if isinstance(parsers, Parser):
             parsers = [parsers]
+
+        if grouped_checks is None:
+            grouped_checks = []
+        if isinstance(grouped_checks, GroupedCheck):
+            grouped_checks = [grouped_checks]
+        self.grouped_checks: list[GroupedCheck] = list(grouped_checks)
 
         self.parser_source = parser_source
 
@@ -225,6 +239,28 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
             _pkg = self.__class__.__module__.rsplit(".", 1)[0]
             col_cls = importlib.import_module(f"{_pkg}.components").Column
         return [col_cls(self.dtype, name=str(name)) for name in column_names]
+
+    def validate_grouped(
+        self,
+        check_obj: TDataObject,
+    ) -> Any:
+        """Apply :attr:`grouped_checks` iteratively and return accepted rows.
+
+        Each round evaluates every grouped check over the records that
+        survived the previous round.  A rule whose group membership is
+        unchanged reuses its still-valid verdict; a group that has become empty
+        is skipped entirely.  Rows that fail any rule in a round are removed
+        together at the end of that round and never participate again.
+
+        :param check_obj: the dataframe or table to validate.
+        :returns: a :class:`~pandera.api.grouped.GroupedValidationResult`
+            holding the accepted rows in original input order and a per-row
+            rejection list.
+        :raises GroupedCheckLengthError: if a callback returns the wrong number
+            of per-row verdicts.  No partial admission result is returned.
+        """
+        backend = self.get_backend(check_obj)
+        return backend.validate_grouped(check_obj, schema=self)
 
     @property
     def dtype(
@@ -372,7 +408,8 @@ class DataFrameSchema(Generic[TDataObject], BaseSchema):
             f"title={self.title}, "
             f"description={self.description}, "
             f"metadata={self.metadata}, "
-            f"drop_invalid_rows={self.drop_invalid_rows}"
+            f"drop_invalid_rows={self.drop_invalid_rows}, "
+            f"grouped_checks={self.grouped_checks}"
             ")>"
         )
 
