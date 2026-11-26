@@ -6,6 +6,7 @@ import doctest
 import json
 import pickle
 import re
+import sqlite3
 import tempfile
 import unittest
 from decimal import Decimal
@@ -19,7 +20,7 @@ from openpyxl.reader.excel import load_workbook
 
 import tablib
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import TablibWorkOrderError, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -2144,3 +2145,280 @@ class SQLFormatTests(unittest.TestCase):
         expected = ("INSERT INTO schema_name.custom_table (col1,col2)"
                     " VALUES (1, 'test');\nCOMMIT;\n")
         self.assertEqual(sql, expected)
+
+
+WORK_ORDER_HEADERS = ['工单号', '前单号', '站点', '原读数', '新读数']
+STATION_ORDER = ["O'Reilly", '乙', '丙']
+
+
+def _work_order_rows():
+    """Four work orders: the first two stations alternate, 丙 is always confirmed."""
+    return [
+        ['W1', '起点', "O'Reilly", 8, 9],
+        ['W1', '起点', '乙', None, 3],
+        ['W1', '起点', '丙', 10, 10],
+        ['W2', 'W1', "O'Reilly", 9, 8],
+        ['W2', 'W1', '乙', 3, None],
+        ['W2', 'W1', '丙', 10, 10],
+        ['W3', 'W2', "O'Reilly", 8, 9],
+        ['W3', 'W2', '乙', None, 3],
+        ['W3', 'W2', '丙', 10, 10],
+        ['W4', 'W3', "O'Reilly", 9, 8],
+        ['W4', 'W3', '乙', 3, None],
+        ['W4', 'W3', '丙', 10, 10],
+    ]
+
+
+def _work_order_dataset(rows=None):
+    return tablib.Dataset(*(rows if rows is not None else _work_order_rows()),
+                          headers=WORK_ORDER_HEADERS)
+
+
+class SQLWorkOrderFormatTests(unittest.TestCase):
+    """SQLite work-order (工单) export."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(':memory:')
+        self.con.execute('CREATE TABLE "测站 A" (站点 TEXT PRIMARY KEY, 读数 INTEGER)')
+        self.con.executemany(
+            'INSERT INTO "测站 A" VALUES (?,?)',
+            [("O'Reilly", 8), ('乙', None), ('丙', 10)],
+        )
+        self.con.execute(
+            'CREATE TABLE 工单回执 (工单号 TEXT PRIMARY KEY, 前单号 TEXT, 内容 TEXT)'
+        )
+        self.con.execute(
+            'CREATE TABLE 审计 (id INTEGER PRIMARY KEY AUTOINCREMENT, '
+            '站点 TEXT, 旧值 INTEGER, 新值 INTEGER)'
+        )
+        self.con.execute(
+            'CREATE TRIGGER trg_audit AFTER UPDATE ON "测站 A" '
+            'BEGIN INSERT INTO 审计(站点,旧值,新值) '
+            'VALUES (OLD.站点, OLD.读数, NEW.读数); END;'
+        )
+        self.con.commit()
+
+    def tearDown(self):
+        self.con.close()
+
+    def _readings(self):
+        current = dict(self.con.execute('SELECT 站点,读数 FROM "测站 A"').fetchall())
+        return [current[station] for station in STATION_ORDER]
+
+    def _audit(self):
+        return self.con.execute(
+            'SELECT 站点,旧值,新值 FROM 审计 ORDER BY id'
+        ).fetchall()
+
+    def _receipts(self):
+        return self.con.execute(
+            'SELECT 工单号,前单号 FROM 工单回执 ORDER BY 工单号'
+        ).fetchall()
+
+    def _execute(self, script):
+        """Statement-by-statement executor that stops at the first SQL error."""
+        buffer = ''
+        for line in script.splitlines():
+            buffer += line + '\n'
+            if sqlite3.complete_statement(buffer):
+                statement = buffer.strip()
+                buffer = ''
+                if statement:
+                    self.con.execute(statement)
+
+    def _add_legacy_trigger(self):
+        self.con.execute(
+            'CREATE TRIGGER trg_legacy AFTER UPDATE OF 读数 ON "测站 A" '
+            "WHEN NEW.站点='乙' "
+            'BEGIN UPDATE "测站 A" SET 读数 = CASE '
+            'WHEN NEW.读数 IS 3 THEN 11 WHEN NEW.读数 IS NULL THEN 10 END '
+            "WHERE 站点='丙'; END;"
+        )
+        self.con.commit()
+
+    def test_work_order_full_narrative(self):
+        full = _work_order_dataset().export('sql', work_order=True)
+
+        # First file only carries work order one.
+        self._execute(_work_order_dataset(_work_order_rows()[:3]).export('sql', work_order=True))
+        self.assertEqual(self._readings(), [9, 3, 10])
+        self.assertEqual(self._receipts(), [('W1', '起点')])
+        audit_before = self._audit()
+        self.assertEqual(audit_before, [("O'Reilly", 8, 9), ('乙', None, 3)])
+
+        # An old trigger corrupts 丙; the rerun must fail at work order three.
+        self._add_legacy_trigger()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '工单 W3 站点 丙 原值核对失约'):
+            self._execute(full)
+        self.assertEqual(self._readings(), [9, 3, 10])
+        self.assertEqual(self._receipts(), [('W1', '起点')])
+        self.assertEqual(self._audit(), audit_before)
+        self.assertFalse(self.con.in_transaction)
+
+        # After disabling the trigger, retrying on the same connection succeeds.
+        self.con.execute('DROP TRIGGER trg_legacy')
+        self.con.commit()
+        self._execute(full)
+        self.assertEqual(self._readings(), [8, None, 10])
+        self.assertEqual(self._receipts(), [
+            ('W1', '起点'), ('W2', 'W1'), ('W3', 'W2'), ('W4', 'W3'),
+        ])
+        # Orders two, three and four each actually changed the first two stations.
+        self.assertEqual(self._audit(), [
+            ("O'Reilly", 8, 9), ('乙', None, 3),
+            ("O'Reilly", 9, 8), ('乙', 3, None),
+            ("O'Reilly", 8, 9), ('乙', None, 3),
+            ("O'Reilly", 9, 8), ('乙', 3, None),
+        ])
+
+        # Re-executing the identical file writes nothing new.
+        audit_after = self._audit()
+        self._execute(full)
+        self.assertEqual(self._readings(), [8, None, 10])
+        self.assertEqual(self._audit(), audit_after)
+        self.assertEqual(self.con.execute('SELECT count(*) FROM 工单回执').fetchone()[0], 4)
+
+    def test_work_order_with_executescript_runner(self):
+        full = _work_order_dataset().export('sql', work_order=True)
+        self.con.executescript(
+            _work_order_dataset(_work_order_rows()[:3]).export('sql', work_order=True)
+        )
+        self._add_legacy_trigger()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '工单 W3 站点 丙 原值核对失约'):
+            self.con.executescript(full)
+        self.assertEqual(self._readings(), [9, 3, 10])
+        self.assertEqual(self._receipts(), [('W1', '起点')])
+
+        self.con.execute('DROP TRIGGER trg_legacy')
+        self.con.commit()
+        self.con.executescript(full)
+        self.assertEqual(self._readings(), [8, None, 10])
+        self.assertEqual(self.con.execute('SELECT count(*) FROM 工单回执').fetchone()[0], 4)
+
+    def test_work_order_files_can_be_split(self):
+        rows = _work_order_rows()
+        self._execute(_work_order_dataset(rows[:3]).export('sql', work_order=True))
+        self.assertEqual(self._readings(), [9, 3, 10])
+        # The second file starts from the last receipt on site.
+        self._execute(_work_order_dataset(rows[3:6]).export('sql', work_order=True))
+        self.assertEqual(self._readings(), [8, None, 10])
+        self.assertEqual(self._receipts(), [('W1', '起点'), ('W2', 'W1')])
+
+    def test_work_order_chain_break_is_rejected_and_rolled_back(self):
+        rows = _work_order_rows()
+        self._execute(_work_order_dataset(rows[:3]).export('sql', work_order=True))
+        # W4 delivered while W2/W3 are missing: its predecessor is not the live tail.
+        gap = _work_order_dataset(rows[9:]).export('sql', work_order=True)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '工单 W4 断签'):
+            self._execute(gap)
+        self.assertEqual(self._receipts(), [('W1', '起点')])
+        self.assertFalse(self.con.in_transaction)
+
+    def test_work_order_changed_predecessor_is_rejected(self):
+        rows = _work_order_rows()
+        self._execute(_work_order_dataset(rows[:3]).export('sql', work_order=True))
+        altered = [list(row) for row in rows[:3]]
+        for row in altered:
+            row[1] = '别的起点'
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '回执前单号或更正内容'):
+            self._execute(_work_order_dataset(altered).export('sql', work_order=True))
+        self.assertEqual(self._receipts(), [('W1', '起点')])
+
+    def test_work_order_changed_content_is_rejected(self):
+        rows = _work_order_rows()
+        self._execute(_work_order_dataset(rows[:3]).export('sql', work_order=True))
+        altered = [list(row) for row in rows[:3]]
+        altered[0][4] = 7  # same work order number, different correction
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '回执前单号或更正内容'):
+            self._execute(_work_order_dataset(altered).export('sql', work_order=True))
+        self.assertEqual(self._readings(), [9, 3, 10])
+
+    def test_work_order_wrong_original_reading_rolls_back(self):
+        rows = _work_order_rows()
+        self._execute(_work_order_dataset(rows[:6]).export('sql', work_order=True))
+        self.assertEqual(self._receipts(), [('W1', '起点'), ('W2', 'W1')])
+        # W3 expects O'Reilly to read 8, claim 55 instead; the whole file rolls back.
+        bad = [list(row) for row in rows[6:9]]
+        bad[0][3] = 55
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '工单 W3 站点 O\'Reilly 原值核对失约'):
+            self._execute(_work_order_dataset(bad).export('sql', work_order=True))
+        self.assertEqual(self._receipts(), [('W1', '起点'), ('W2', 'W1')])
+        self.assertFalse(self.con.in_transaction)
+        # The same connection stays usable.
+        self.assertEqual(self.con.execute('SELECT 1').fetchone(), (1,))
+
+    def test_work_order_missing_station_rolls_back(self):
+        missing = [['W1', '起点', '丁', 1, 2]]
+        with self.assertRaisesRegex(sqlite3.IntegrityError, '工单 W1 站点 丁 不存在'):
+            self._execute(_work_order_dataset(missing).export('sql', work_order=True))
+        self.assertEqual(self.con.execute('SELECT count(*) FROM 工单回执').fetchone()[0], 0)
+
+    def test_patrol_confirmation_never_updates(self):
+        rows = [
+            ['W1', '起点', "O'Reilly", 8, 9],
+            ['W1', '起点', '乙', None, 3],
+            ['W1', '起点', '丙', 10, 10],  # old == new: patrol confirmation
+        ]
+        self._execute(_work_order_dataset(rows).export('sql', work_order=True))
+        # Only the two real corrections appear in the audit trigger log.
+        self.assertEqual(self._audit(), [("O'Reilly", 8, 9), ('乙', None, 3)])
+        self.assertEqual(self._readings(), [9, 3, 10])
+
+    def test_work_order_uses_custom_table_and_start_names(self):
+        self.con.execute('CREATE TABLE custom_stations (站点 TEXT PRIMARY KEY, 读数 INTEGER)')
+        self.con.execute("INSERT INTO custom_stations VALUES ('S1', 1)")
+        self.con.execute('CREATE TABLE custom_receipts (工单号 TEXT PRIMARY KEY, 前单号 TEXT, 内容 TEXT)')
+        self.con.commit()
+        data = _work_order_dataset([['W1', 'ROOT', 'S1', 1, 2]])
+        script = data.export(
+            'sql', work_order=True,
+            station_table='custom_stations', receipt_table='custom_receipts',
+            start='ROOT',
+        )
+        self._execute(script)
+        self.assertEqual(
+            self.con.execute('SELECT 读数 FROM custom_stations').fetchone(), (2,)
+        )
+        self.assertEqual(
+            self.con.execute('SELECT 工单号,前单号 FROM custom_receipts').fetchone(),
+            ('W1', 'ROOT'),
+        )
+
+    def test_work_order_requires_five_named_columns(self):
+        with self.assertRaises(TablibWorkOrderError):
+            tablib.Dataset(['a', 'b', 'c', 'd', 'e'],
+                           headers=['a', 'b', 'c', 'd', 'e']).export('sql', work_order=True)
+
+    def test_work_order_requires_a_row(self):
+        with self.assertRaises(TablibWorkOrderError):
+            tablib.Dataset(headers=WORK_ORDER_HEADERS).export('sql', work_order=True)
+
+    def test_work_order_rejects_duplicate_station_in_one_order(self):
+        data = _work_order_dataset([
+            ['W1', '起点', 'S', 1, 2],
+            ['W1', '起点', 'S', 2, 3],
+        ])
+        with self.assertRaisesRegex(TablibWorkOrderError, '站点 S 出现了多次'):
+            data.export('sql', work_order=True)
+
+    def test_work_order_rejects_inconsistent_predecessor(self):
+        data = _work_order_dataset([
+            ['W1', '起点', 'S', 1, 2],
+            ['W1', '别的', 'T', 2, 3],
+        ])
+        with self.assertRaisesRegex(TablibWorkOrderError, '前单号不一致'):
+            data.export('sql', work_order=True)
+
+    def test_work_order_accepts_headerless_dataset(self):
+        data = tablib.Dataset(['W1', '起点', 'S', 1, 2])
+        script = data.export('sql', work_order=True)
+        self.assertIn('SAVEPOINT tablib_wo;', script)
+
+    def test_regular_insert_export_is_unchanged(self):
+        data = tablib.Dataset(title='t')
+        data.headers = ['i', 's']
+        data.append([1, "O'Reilly"])
+        self.assertEqual(
+            data.export('sql'),
+            "INSERT INTO t (i,s) VALUES (1, 'O''Reilly');\n",
+        )

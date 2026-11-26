@@ -20,3 +20,7 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class TablibWorkOrderError(TablibException, ValueError):
+    """A Dataset cannot be exported as SQLite work orders."""

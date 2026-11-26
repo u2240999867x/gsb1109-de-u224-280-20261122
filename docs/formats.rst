@@ -345,3 +345,53 @@ Output::
 
     INSERT INTO "User_Updates" (id,username,update_date) VALUES (1, 'Alice', DATE '2021-01-01');
     COMMIT;
+
+SQLite work orders (``work_order=True``)
+----------------------------------------
+
+Passing ``work_order=True`` no longer emits plain INSERTs. Instead the Dataset is
+interpreted as a sequence of station work orders and exported as an idempotent SQLite
+script that an operator can replay against a database they cannot otherwise reach.
+
+The Dataset must have the columns ``工单号,前单号,站点,原读数,新读数`` (a headerless
+Dataset of the same width is accepted). Rows are grouped into work orders by ``工单号``
+in issuing order; a station appears at most once per work order but may be corrected
+across consecutive orders. The first order's predecessor is the marker ``起点`` by
+default (configurable with ``start``).
+
+The target database is expected to already contain:
+
+- a station table keyed by ``站点`` with a nullable ``读数`` column (default ``测站 A``),
+- an empty receipt table ``工单回执 (工单号 PRIMARY KEY, 前单号, 内容)``.
+
+The generated script:
+
+- recognises already-booked prefixes by receipt, so replaying a file performs no new
+  writes, and rejects a reused work order number whose predecessor or correction
+  content changed;
+- requires every not-yet-booked order to continue from the last receipt on site;
+- checks each station's original reading at execution time, applies the correction,
+  then re-checks the new reading after site triggers have run;
+- treats equal original and new readings as a patrol confirmation: the row must exist
+  and match, but is never updated;
+- wraps the whole file in a savepoint and rolls back every change and receipt of the
+  failed run, reporting the offending work order and station; the connection stays
+  usable for a retry on the same connection.
+
+The script relies only on standard SQLite features, works whether the executor runs the
+whole file as one script or statement by statement, and does not require a transaction
+to be open beforehand. Table names can be overridden with ``station_table`` and
+``receipt_table``.
+
+Example::
+
+    data = tablib.Dataset(headers=['工单号', '前单号', '站点', '原读数', '新读数'])
+    data.append(['W1', '起点', "O'Reilly", 8, 9])
+    data.append(['W1', '起点', '乙', None, 3])
+    data.append(['W1', '起点', '丙', 10, 10])  # patrol confirmation, no update
+
+    print(data.export('sql', work_order=True))
+
+Replaying the same file after all orders are booked succeeds without writing anything,
+while a file that reuses a work order number with different content fails at the first
+SQL error.
