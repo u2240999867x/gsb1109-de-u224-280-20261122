@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `_done` callback now runs only after stdout/stderr are fully drained, so it observes the final output instead of an empty or stale tail
+- Added `RunningCommand.completion`, `.delivered`, and `.delivery_error` as the delivery join point, distinct from the fast, exit-only `is_alive()` probe
+- `RunningCommand.wait(timeout=...)` now waits for full delivery; a timeout bounds that wait without consuming it, so it can be re-awaited
+- Done callback failures (for example, a manifest write failure) are retained and re-raised for every waiter, including `await`, instead of being absorbed
+- `await` on a `RunningCommand` now shares the same delivered outcome (output drain, done callback, and its errors) as `wait()`
+
 ## 2.4.0 - 7/25/26
 
 - Dropped support for Python < 3.10

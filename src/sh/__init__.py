@@ -344,6 +344,249 @@ class TimeoutException(Exception):
         super(Exception, self).__init__()
 
 
+class _Completion:
+    """the single, delivered result of a command.
+
+    there are two distinct milestones in a command's life:
+
+    * the child process exits, making an exit code available, and
+    * everything it wrote to stdout/stderr has been read, handed to the output
+      handlers, and the ``_done`` callback has finished.
+
+    ``is_alive()`` is intentionally only concerned with the first milestone: it
+    is a fast, side-effecting probe.  This object represents the second one.  It
+    is produced exactly once, by the thread that drains the output, and every
+    wait entry point (blocking, timed, and asyncio) observes the same result.
+
+    If the done callback raises (for example, because writing the handoff
+    manifest to disk failed), the failure is retained here, along with the
+    command outcome and final output, and is re-raised for every waiter.  No
+    waiter can absorb the failure and make a later waiter believe the command
+    delivered successfully.
+    """
+
+    def __init__(self, command):
+        self._command = command
+        self._cond = threading.Condition()
+        self._delivered = False
+        self._in_progress = False
+        # the thread currently running finalization, if any.  a done callback
+        # that calls wait() on its own command is running on this thread, and
+        # must not wait on itself.
+        self._finalizing_thread_id = None
+
+        self._exit_code = None
+        self._stdout = b""
+        self._stderr = b""
+        self._command_success = None
+        self._success = None
+        self._command_error = None
+        self._callback_error = None
+        self._output_error = None
+        self._error = None
+        self._reason = "process is still running"
+        self._aio_waiters = []
+
+    def __repr__(self):
+        return (
+            f"<_Completion delivered={self._delivered} exit_code={self._exit_code} "
+            f"success={self._success}>"
+        )
+
+    @property
+    def delivered(self):
+        """whether the complete result (output and done callback) is available"""
+        with self._cond:
+            return self._delivered
+
+    # an explicit alias, so asking "is it complete?" doesn't accidentally read
+    # like the fast process-liveness check
+    complete = delivered
+
+    @property
+    def exit_code(self):
+        """the reaped exit code, available as soon as the process exits.
+
+        This can be non-``None`` while :attr:`delivered` is still ``False``.
+        """
+        with self._cond:
+            return self._exit_code
+
+    @property
+    def stdout(self):
+        with self._cond:
+            return self._stdout
+
+    @property
+    def stderr(self):
+        with self._cond:
+            return self._stderr
+
+    @property
+    def command_success(self):
+        """whether the process's exit code was acceptable, once delivered"""
+        with self._cond:
+            return self._command_success
+
+    @property
+    def success(self):
+        """whether the command *and* its delivery completed successfully"""
+        with self._cond:
+            return self._success
+
+    @property
+    def command_error(self):
+        """the exception implied by the exit code, if any"""
+        with self._cond:
+            return self._command_error
+
+    @property
+    def callback_error(self):
+        """the exception raised by the ``_done`` callback, if any"""
+        with self._cond:
+            return self._callback_error
+
+    @property
+    def output_error(self):
+        with self._cond:
+            return self._output_error
+
+    @property
+    def manifest_error(self):
+        """why the handoff manifest could not be written, if it could not"""
+        with self._cond:
+            return self._callback_error or self._output_error
+
+    # more explicit aliases
+    delivery_error = manifest_error
+
+    @property
+    def error(self):
+        """the exception that waiters should raise, if any"""
+        with self._cond:
+            return self._error
+
+    @property
+    def reason(self):
+        """a human-readable explanation of the current delivery state"""
+        with self._cond:
+            return self._reason
+
+    def set_exit_code(self, exit_code):
+        """record the *exit fact* without claiming that delivery is complete"""
+        with self._cond:
+            self._exit_code = exit_code
+            if not self._delivered and not self._in_progress:
+                self._reason = (
+                    f"process exited with code {exit_code}, but its output has "
+                    "not been completely drained"
+                )
+
+    def wait(self, timeout=None):
+        """wait for complete delivery.  returns ``True`` if delivered.
+
+        returning ``False`` (rather than mutating any state) is what makes a
+        short wait re-waitable later.
+        """
+        with self._cond:
+            if self._delivered:
+                return True
+
+            if timeout is None:
+                while not self._delivered:
+                    if self._finalizing_thread_id == threading.get_ident():
+                        # a done callback waiting on its own delivery would join
+                        # itself.  delivery is in progress; do not wait.
+                        return False
+                    self._cond.wait()
+                return True
+
+            deadline = time.monotonic() + timeout
+            while not self._delivered:
+                if self._finalizing_thread_id == threading.get_ident():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+    async def wait_async(self):
+        """asyncio-friendly wait for complete delivery"""
+        loop = asyncio.get_running_loop()
+        with self._cond:
+            if self._delivered:
+                return
+            event = asyncio.Event()
+            waiter = (loop, event)
+            self._aio_waiters.append(waiter)
+
+        try:
+            await event.wait()
+        finally:
+            with self._cond:
+                try:
+                    self._aio_waiters.remove(waiter)
+                except ValueError:
+                    pass
+
+    def finish(
+        self,
+        *,
+        exit_code,
+        stdout,
+        stderr,
+        command_success,
+        command_error,
+        callback_error,
+        output_error,
+    ):
+        """publish the one and only delivered outcome.
+
+        Any internal error wins over the command's own error, because an
+        incomplete handoff must never be reported as a successful delivery.
+        """
+        with self._cond:
+            if self._delivered or self._in_progress:
+                return False
+            self._in_progress = True
+
+        error = callback_error or output_error or command_error
+        if callback_error is not None:
+            reason = f"done callback failed; manifest not written: {callback_error!r}"
+        elif output_error is not None:
+            reason = f"output collection failed; manifest not written: {output_error!r}"
+        elif command_error is not None:
+            reason = f"command exited with code {exit_code}"
+        else:
+            reason = None
+
+        with self._cond:
+            self._exit_code = exit_code
+            self._stdout = stdout
+            self._stderr = stderr
+            self._command_success = command_success
+            self._command_error = command_error
+            self._callback_error = callback_error
+            self._output_error = output_error
+            self._error = error
+            self._success = command_success and error is None
+            self._reason = reason
+            self._in_progress = False
+            self._delivered = True
+            waiters = self._aio_waiters
+            self._aio_waiters = []
+            self._cond.notify_all()
+
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # the waiting loop was closed; there is nobody to notify
+                pass
+        return True
+
+
 SIGNALS_THAT_SHOULD_THROW_EXCEPTION = {
     signal.SIGABRT,
     signal.SIGBUS,
@@ -631,8 +874,14 @@ class RunningCommand:
 
         self.process = None
         self._waited_until_completion = False
+
+        # the one-shot delivered outcome of this command.  the process exiting
+        # only produces an exit *fact*; this object becomes delivered once the
+        # output has been drained and the done callback has run.
+        self._completion = _Completion(self)
         should_wait = True
         spawn_process = True
+
 
         # if we're using an async for loop on this object, we need to put the underlying
         # iterable in no-block mode. however, we will only know if we're using an async
@@ -730,6 +979,26 @@ class RunningCommand:
             if should_wait:
                 self.wait()
 
+    @property
+    def completion(self):
+        """the :class:`_Completion` join point for this command.
+
+        Unlike :meth:`is_alive`, this is about *delivery*: the exit code, the
+        fully-drained stdout/stderr, and the ``_done`` callback.  It is produced
+        exactly once and shared by every waiter.
+        """
+        return self._completion
+
+    @property
+    def delivered(self):
+        """whether the full result has been delivered (not merely exited)"""
+        return self._completion.delivered
+
+    @property
+    def delivery_error(self):
+        """why the delivered manifest could not be produced, if it could not"""
+        return self._completion.manifest_error
+
     def wait(self, timeout=None):
         """waits for the running command to finish.  this is called on all
         running commands, eventually, except for ones that run in the background
@@ -739,72 +1008,78 @@ class RunningCommand:
 
         this function can raise a TimeoutException, either because of a `_timeout` on
         the command itself as it was
-        launched, or because of a timeout passed into this method.
+        launched, or because a timeout passed into this method elapsed before the
+        command's output and done callback had been completely delivered.
+
+        A timeout passed into this method bounds this *particular* wait.  It is
+        not a terminal state: if it elapses, the caller may call ``wait()``
+        again later and observe the same delivered outcome as any other waiter.
         """
-        if not self._waited_until_completion:
-            # if we've been given a timeout, we need to poll is_alive()
-            if timeout is not None:
-                waited_for = 0
-                sleep_amt = 0.1
-                alive = False
-                exit_code = None
-                if timeout < 0:
-                    raise RuntimeError("timeout cannot be negative")
+        if timeout is not None and timeout < 0:
+            raise RuntimeError("timeout cannot be negative")
 
-                # while we still have time to wait, run this loop
-                # notice that alive and exit_code are only defined in this loop, but
-                # the loop is also guaranteed to run, defining them, given the
-                # constraints that timeout is non-negative
-                while waited_for <= timeout:
-                    alive, exit_code = self.process.is_alive()
+        # a done callback is allowed to inspect its own command (for example,
+        # cmd.exit_code or cmd.stdout).  if it calls wait() from within the
+        # callback, there is nothing to wait for: re-entering the blocking
+        # delivery path from the delivering thread would join itself.  the
+        # output is already drained and the exit code is already known at
+        # callback time, so return immediately.
+        if self.process and self.process._is_finalizing_thread():
+            return self
 
-                    # if we're alive, we need to wait some more, but let's sleep
-                    # before we poll again
-                    if alive:
-                        time.sleep(sleep_amt)
-                        waited_for += sleep_amt
+        if timeout is not None:
+            # this waits for full delivery, not just for process exit.  a
+            # process that has exited but whose output has not been drained is
+            # not a complete result.
+            delivered = self._completion.wait(timeout)
+            if not delivered:
+                raise TimeoutException(None, self.ran)
+        else:
+            # blocking wait: reap the process (a no-op if is_alive() already
+            # did) and join the output/finalizer threads, which is what
+            # produces delivery.
+            self.process.wait()
+            self._completion.wait()
 
-                    # but if we're not alive, we're done waiting
-                    else:
-                        break
+        # now that delivery has been published, make sure the process's own
+        # cleanup (thread joins, fd closes) has run as well.  this is a no-op
+        # if the blocking path above did it.
+        self.process.wait()
+        self._waited_until_completion = True
 
-                # if we've made it this far, and we're still alive, then it means we
-                # timed out waiting
-                if alive:
-                    raise TimeoutException(None, self.ran)
+        exit_code = self._completion.exit_code
 
-                # if we didn't time out, we fall through and let the rest of the code
-                # handle exit_code. notice that we set _waited_until_completion here,
-                # only if we didn't time out. this allows us to re-wait again on
-                # timeout, if we catch the TimeoutException in the parent frame
-                self._waited_until_completion = True
+        if self.process.timed_out:
+            # if we timed out, our exit code represents a signal, which is
+            # negative, so let's make it positive to store in our
+            # TimeoutException
+            raise TimeoutException(-exit_code, self.ran)
 
-            else:
-                exit_code = self.process.wait()
-                self._waited_until_completion = True
+        # every waiter sees the same delivered error, including a done callback
+        # that failed to write the handoff manifest.  absorbing it on one wait
+        # must never make a later wait look like a normal completion.
+        if self._completion.error is not None:
+            raise self._completion.error
 
-            if self.process.timed_out:
-                # if we timed out, our exit code represents a signal, which is
-                # negative, so let's make it positive to store in our
-                # TimeoutException
-                raise TimeoutException(-exit_code, self.ran)
+        # if an iterable command is using an instance of OProc for its stdin,
+        # wait on it.  the process is probably set to "piped", which means it
+        # won't be waited on, which means exceptions won't propagate up to the
+        # main thread.  this allows them to bubble up
+        if self.process._stdin_process:
+            self.process._stdin_process.command.wait()
 
-            else:
-                self.handle_command_exit_code(exit_code)
-
-                # if an iterable command is using an instance of OProc for its stdin,
-                # wait on it.  the process is probably set to "piped", which means it
-                # won't be waited on, which means exceptions won't propagate up to the
-                # main thread.  this allows them to bubble up
-                if self.process._stdin_process:
-                    self.process._stdin_process.command.wait()
-
-            self.log.debug("process completed")
+        self.log.debug("process completed")
         return self
 
     def is_alive(self):
         """returns whether or not we're still alive. this call has side-effects on
-        OProc"""
+        OProc.
+
+        This is the fast, exit-only probe.  It may reap the process and make an
+        exit code available, but it never waits for output to drain and never
+        runs the done callback.  Use :attr:`completion` (or :meth:`wait`) for a
+        complete delivery.
+        """
         return self.process.is_alive()[0]
 
     def handle_command_exit_code(self, code):
@@ -821,17 +1096,24 @@ class RunningCommand:
 
     @property
     def stdout(self):
-        self.wait()
+        # once the delivery manifest exists, this is plain data access.  an
+        # earlier waiter may already have absorbed (raised) the outcome, and
+        # that must not make this access fail again.  before delivery, waiting
+        # is what produces the data.
+        if not self._completion.delivered:
+            self.wait()
         return self.process.stdout
 
     @property
     def stderr(self):
-        self.wait()
+        if not self._completion.delivered:
+            self.wait()
         return self.process.stderr
 
     @property
     def exit_code(self):
-        self.wait()
+        if not self._completion.delivered:
+            self.wait()
         return self.process.exit_code
 
     def __len__(self):
@@ -885,11 +1167,17 @@ class RunningCommand:
 
     def __await__(self):
         async def wait_for_completion():
-            await self.aio_output_complete.wait()
+            # wait for the same delivered outcome that blocking and timed waits
+            # observe, not merely for the output stream to hit EOF.  the done
+            # callback (and any failure it produced) is part of that outcome.
+            await self._completion.wait_async()
+
+            # join the process's threads and re-raise the shared outcome.  this
+            # raises a failed done callback or a bad exit code exactly as a
+            # blocking wait would.
+            self.wait()
+
             if self.call_args["return_cmd"]:
-                # We know the command has completed already,
-                # but need to catch exceptions
-                self.wait()
                 return self
             else:
                 return str(self)
@@ -1882,6 +2170,22 @@ class OProc:
         self.command = command
         self.call_args = call_args
 
+        # the shared, one-shot delivery state.  process exit and output
+        # delivery are separate milestones; this is the second one.
+        self._completion = command._completion
+        self._finalize_lock = threading.Lock()
+        self._finalize_started = False
+        self._finalizing_thread_id = None
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_done = False
+        self._just_ended_lock = threading.Lock()
+        self._just_ended_done = False
+
+        # held by RunningCommand while it assigns itself to command.process.
+        # the finalizer takes it before running the done callback, so a callback
+        # that inspects cmd.exit_code/cmd.process never sees a missing process.
+        self._process_assign_lock = process_assign_lock
+
         # convenience
         ca = self.call_args
 
@@ -2469,6 +2773,9 @@ class OProc:
                 def output_complete():
                     loop.call_soon_threadsafe(self.command.aio_output_complete.set)
 
+            def finalize(output_error=None):
+                self._finalize_delivery(output_error=output_error)
+
             self._output_thread_exc_queue = Queue(1)
             thread_name = f"STDOUT/ERR thread for pid {self.pid}"
             self._output_thread = _start_daemon_thread(
@@ -2483,10 +2790,16 @@ class OProc:
                 self._quit_threads,
                 self._stop_output_event,
                 output_complete,
+                finalize,
             )
 
     def __repr__(self):
         return f"<Process {self.pid} {self.cmd[:500]!r}>"
+
+    @property
+    def completion(self):
+        """the shared delivery join point (same object as the command's)"""
+        return self._completion
 
     def change_in_bufsize(self, buf):
         self._stdin_stream.stream_bufferer.change_buffering(buf)
@@ -2576,6 +2889,11 @@ class OProc:
                 self.exit_code = handle_process_exit_code(exit_code)
                 witnessed_end = True
 
+                # seeing the exit is not the same as having delivered the
+                # output.  publish the exit fact so a fast probe can report
+                # it, but leave delivery to the finalizer.
+                self._completion.set_exit_code(self.exit_code)
+
                 return False, self.exit_code
 
         # no child process
@@ -2589,13 +2907,21 @@ class OProc:
                 self._process_just_ended()
 
     def _process_just_ended(self):
+        # this can be reached from is_alive() and wait(), potentially from more
+        # than one thread.  only the first one may act.
+        with self._just_ended_lock:
+            if self._just_ended_done:
+                return
+            self._just_ended_done = True
+
         if self._timeout_timer:
             self._timeout_timer.cancel()
 
-        done_callback = self.call_args["done"]
-        if done_callback:
-            success = self.exit_code in self.call_args["ok_code"]
-            done_callback(success, self.exit_code)
+        # NOTE: the done callback is NOT run here.  seeing the process exit
+        # only yields an exit *fact*; output may still be sitting in a pipe or
+        # in a handler that has been paused.  The callback runs exactly once,
+        # from the finalizer, after the output has been completely drained.
+        # See _finalize_delivery().
 
         # this can only be closed at the end of the process, because it might be
         # the CTTY, and closing it prematurely will send a SIGHUP.  we also
@@ -2603,9 +2929,110 @@ class OProc:
         # is in charge of closing it also
         if self._stdin_parent_fd and not self._stdin_stream:
             os.close(self._stdin_parent_fd)
+            self._stdin_parent_fd = None
+
+        # if output draining has already finished (for example, the child
+        # closed its stdout before exiting, or the output thread raced ahead of
+        # the reaper), the output is complete and we are the first to see the
+        # exit, so publish delivery here.  otherwise the output thread will
+        # finalize itself once it has drained.  this is what lets a command
+        # whose exit is only ever observed via is_alive() still produce its
+        # manifest exactly once.
+        output_thread = getattr(self, "_output_thread", None)
+        if output_thread is not None and not output_thread.is_alive():
+            self._finalize_delivery()
+
+    def _is_finalizing_thread(self):
+        return self._finalizing_thread_id is not None and (
+            threading.get_ident() == self._finalizing_thread_id
+        )
+
+    def _finalize_delivery(self, output_error=None):
+        """drain-complete handoff: aggregate output, run done callback once.
+
+        This is the single place where delivery is published.  It may be
+        reached by the normal cleanup path or, if the process is reaped without
+        a blocking wait, by the output thread.  The finalize lock plus the
+        guard in :meth:`_Completion.finish` guarantee exactly one delivery.
+        """
+        with self._finalize_lock:
+            if self._finalize_started or self._completion.delivered:
+                return
+            self._finalize_started = True
+            ident = threading.get_ident()
+            self._finalizing_thread_id = ident
+            self._completion._finalizing_thread_id = ident
+
+        try:
+            exit_code = self.exit_code
+            if exit_code is None:
+                # the process has not been reaped, so there is no delivery to
+                # make yet.  the blocking wait path will call us back.
+                with self._finalize_lock:
+                    self._finalize_started = False
+                return
+
+            stdout = self.stdout
+            stderr = self.stderr
+
+            command_success = exit_code in self.call_args["ok_code"]
+
+            # the exception implied by the exit code, if any.  this mirrors
+            # RunningCommand.handle_command_exit_code(), but is captured rather
+            # than raised here, so the exit fact and the delivery outcome can be
+            # distinguished.
+            command_error = None
+            exc_class = get_exc_exit_code_would_raise(
+                exit_code, self.call_args["ok_code"], self.call_args["piped"]
+            )
+            if exc_class:
+                command_error = exc_class(
+                    self.command.ran, stdout, stderr, self.call_args["truncate_exc"]
+                )
+
+            callback_error = None
+            done_callback = self.call_args["done"]
+            if done_callback and output_error is None:
+                try:
+                    # a done callback is allowed to inspect its own command
+                    # (for example, cmd.exit_code or cmd.stdout).  the assign
+                    # lock guarantees self.command.process is populated by the
+                    # time the callback runs, even if it is fired from our
+                    # output thread before RunningCommand.__init__ returns.
+                    with self._process_assign_lock:
+                        done_callback(command_success, exit_code)
+                except BaseException as e:
+                    # a failure to write the handoff manifest must be retained,
+                    # not swallowed, so every waiter can explain it
+                    callback_error = e
+
+            self._completion.finish(
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                command_success=command_success,
+                command_error=command_error,
+                callback_error=callback_error,
+                output_error=output_error,
+            )
+        finally:
+            with self._finalize_lock:
+                self._finalizing_thread_id = None
+                self._completion._finalizing_thread_id = None
 
     def wait(self):
-        """waits for the process to complete, handles the exit code"""
+        """waits for the process to complete and produce the delivery manifest.
+
+        This blocks until the process has exited AND its output has been
+        drained AND the done callback has produced the delivery outcome.
+        """
+
+        # if the done callback itself is trying to wait on its own process, do
+        # not re-enter the blocking delivery path: it would join the very thread
+        # that is running the callback.  delivery is already in progress and the
+        # exit code is known, so return it directly.
+        if self._is_finalizing_thread():
+            return self.exit_code
 
         self.log.debug("acquiring wait lock to wait for completion")
         # using the lock in a with-context blocks, which is what we want if
@@ -2624,32 +3051,50 @@ class OProc:
                 self.log.debug(
                     "exit code already set (%d), no need to wait", self.exit_code
                 )
+
+            # publish the exit fact, even though delivery isn't complete yet
+            self._completion.set_exit_code(self.exit_code)
+
         self._process_exit_cleanup(witnessed_end=witnessed_end)
         return self.exit_code
 
     def _process_exit_cleanup(self, witnessed_end):
-        self._quit_threads.set()
+        # multiple waiters may reach cleanup.  joining threads is idempotent,
+        # but we still serialize the whole procedure so the output thread is
+        # joined exactly once and delivery is published once.
+        with self._cleanup_lock:
+            if self._cleanup_done:
+                return
+            self._cleanup_done = True
 
-        # we may not have a thread for stdin, if the pipe has been connected
-        # via _piped="direct"
-        if self._input_thread:
-            self._input_thread.join()
+            self._quit_threads.set()
 
-        # wait, then signal to our output thread that the child process is
-        # done, and we should have finished reading all the stdout/stderr
-        # data that we can by now
-        timer = threading.Timer(2.0, self._stop_output_event.set)
-        timer.start()
+            # we may not have a thread for stdin, if the pipe has been connected
+            # via _piped="direct"
+            if self._input_thread:
+                self._input_thread.join()
 
-        # wait for our stdout and stderr streamreaders to finish reading and
-        # aggregating the process output
-        self._output_thread.join()
-        timer.cancel()
+            # wait, then signal to our output thread that the child process is
+            # done, and we should have finished reading all the stdout/stderr
+            # data that we can by now
+            timer = threading.Timer(2.0, self._stop_output_event.set)
+            timer.start()
 
-        self._background_thread.join()
+            # wait for our stdout and stderr streamreaders to finish reading and
+            # aggregating the process output.  this is what makes output complete
+            # before delivery.
+            self._output_thread.join()
+            timer.cancel()
+
+            self._background_thread.join()
 
         if witnessed_end:
             self._process_just_ended()
+
+        # now that our own threads have stopped and output is drained, publish
+        # the one and only delivery outcome.  the output thread itself also
+        # finalizes (for un-waited commands); finalization is idempotent.
+        self._finalize_delivery()
 
 
 def input_thread(log, stdin, is_alive, quit_thread, close_before_term):
@@ -2729,6 +3174,7 @@ def output_thread(
     quit_thread,
     stop_output_event,
     output_complete,
+    finalize,
 ):
     """this function is run in a separate thread.  it reads from the
     process's stdout stream (a streamreader), and waits for it to claim that
@@ -2740,45 +3186,62 @@ def output_thread(
     if stderr is not None:
         poller.register_read(stderr)
 
-    # this is our poll loop for polling stdout or stderr that is ready to
-    # be read and processed.  if one of those streamreaders indicate that it
-    # is done altogether being read from, we remove it from our list of
-    # things to poll.  when no more things are left to poll, we leave this
-    # loop and clean up
-    while poller:
-        changed = no_interrupt(poller.poll, 0.1)
-        for f, events in changed:
-            if events & (POLLER_EVENT_READ | POLLER_EVENT_HUP):
-                log.debug("%r ready to be read from", f)
-                done = f.read()
-                if done:
-                    poller.unregister(f)
-            elif events & POLLER_EVENT_ERROR:
-                # for some reason, we have to just ignore streams that have had an
-                # error.  i'm not exactly sure why, but don't remove this until we
-                # figure that out, and create a test for it
-                pass
+    output_error = None
+    try:
+        # this is our poll loop for polling stdout or stderr that is ready to
+        # be read and processed.  if one of those streamreaders indicate that it
+        # is done altogether being read from, we remove it from our list of
+        # things to poll.  when no more things are left to poll, we leave this
+        # loop and clean up
+        while poller:
+            changed = no_interrupt(poller.poll, 0.1)
+            for f, events in changed:
+                if events & (POLLER_EVENT_READ | POLLER_EVENT_HUP):
+                    log.debug("%r ready to be read from", f)
+                    done = f.read()
+                    if done:
+                        poller.unregister(f)
+                elif events & POLLER_EVENT_ERROR:
+                    # for some reason, we have to just ignore streams that have had an
+                    # error.  i'm not exactly sure why, but don't remove this until we
+                    # figure that out, and create a test for it
+                    pass
 
-        if timeout_event and timeout_event.is_set():
-            break
+            if timeout_event and timeout_event.is_set():
+                break
 
-        if stop_output_event.is_set():
-            break
+            if stop_output_event.is_set():
+                break
 
-    # we need to wait until the process is guaranteed dead before closing our
-    # outputs, otherwise SIGPIPE
-    alive, _ = is_alive()
-    while alive:
-        quit_thread.wait(1)
+        # we need to wait until the process is guaranteed dead before closing our
+        # outputs, otherwise SIGPIPE
         alive, _ = is_alive()
+        while alive:
+            quit_thread.wait(1)
+            alive, _ = is_alive()
 
-    if stdout:
-        stdout.close()
+        if stdout:
+            stdout.close()
 
-    if stderr:
-        stderr.close()
+        if stderr:
+            stderr.close()
+    except BaseException as e:
+        # a failure while draining output means the handoff manifest cannot be
+        # trusted.  retain it rather than letting the daemon thread die silently.
+        output_error = e
+        log.exception("error while draining process output")
+        raise
+    finally:
+        output_complete()
 
-    output_complete()
+        # publish delivery from this thread as well.  this is what lets an
+        # un-waited background command, whose exit was only observed via
+        # is_alive(), produce its manifest exactly once.
+        if finalize is not None:
+            try:
+                finalize(output_error)
+            except BaseException:
+                log.exception("error while finalizing command delivery")
 
 
 class DoneReadingForever(Exception):

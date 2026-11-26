@@ -436,6 +436,52 @@ class DoneReadingForever(Exception): ...
 class NotYetReadyToRead(Exception): ...
 
 @type_check_only
+class _Completion:
+    """The single, delivered outcome of a command.
+
+    The command's exit and its *delivery* (drained output plus the done
+    callback) are distinct milestones.  This object is produced exactly once
+    and shared by every waiter, including blocking, timed, and asyncio waits.
+    """
+
+    @property
+    def delivered(self) -> bool: ...
+    @property
+    def complete(self) -> bool: ...
+    @property
+    def exit_code(self) -> int | None:
+        """Available as soon as the process exits, before delivery."""
+        ...
+    @property
+    def stdout(self) -> bytes: ...
+    @property
+    def stderr(self) -> bytes: ...
+    @property
+    def command_success(self) -> bool | None: ...
+    @property
+    def success(self) -> bool | None:
+        """Whether the command *and* its delivery succeeded."""
+        ...
+    @property
+    def command_error(self) -> BaseException | None: ...
+    @property
+    def callback_error(self) -> BaseException | None: ...
+    @property
+    def output_error(self) -> BaseException | None: ...
+    @property
+    def manifest_error(self) -> BaseException | None:
+        """Why the handoff manifest could not be written, if it could not."""
+        ...
+    @property
+    def delivery_error(self) -> BaseException | None: ...
+    @property
+    def error(self) -> BaseException | None: ...
+    @property
+    def reason(self) -> str: ...
+    def wait(self, timeout: float | None = ...) -> bool: ...
+    async def wait_async(self) -> None: ...
+
+@type_check_only
 class OProc:
     """Manages fork/exec and I/O wiring for a child process (Open Process).
 
@@ -501,10 +547,22 @@ class OProc:
 
         Returns ``(alive, exit_code)``.  ``exit_code`` is ``None`` while the
         process is still running.
+
+        This is the fast, exit-only probe.  Seeing ``(False, code)`` only means
+        the process exited; it does not mean output has been drained or the
+        done callback has run.  Use :attr:`completion` for that.
         """
         ...
     def wait(self) -> int:
-        """Block until the process exits and return its exit code."""
+        """Block until the process exits *and* delivery completes.
+
+        Returns the exit code after the output has been drained and the done
+        callback has run.
+        """
+        ...
+    @property
+    def completion(self) -> _Completion:
+        """The shared, one-shot delivery join point."""
         ...
 
     # -- buffering controls --
@@ -547,6 +605,18 @@ class RunningCommand(str):
     def stderr(self) -> bytes: ...
     @property
     def exit_code(self) -> int: ...
+    @property
+    def completion(self) -> _Completion:
+        """The shared, one-shot delivery join point."""
+        ...
+    @property
+    def delivered(self) -> bool:
+        """Whether the full result (output plus done callback) is available."""
+        ...
+    @property
+    def delivery_error(self) -> BaseException | None:
+        """Why the delivered manifest could not be produced, if it could not."""
+        ...
 
     #
     def __init__(

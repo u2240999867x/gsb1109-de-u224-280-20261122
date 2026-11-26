@@ -3033,6 +3033,303 @@ time.sleep(0.5)
         else:
             self.fail("command should've thrown an exception")
 
+    def test_done_callback_waits_for_output(self):
+        """`is_alive()` seeing the exit must not run the done callback while
+        output is still in flight; a paused output handler proves the gap."""
+        import threading
+
+        py = create_tmp_test(
+            """
+import sys
+import time
+
+sys.stdout.write("first\\n")
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("LAST\\n")
+sys.stdout.flush()
+"""
+        )
+
+        release = threading.Event()
+
+        class PausedHandler:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, chunk):
+                if b"LAST" in chunk:
+                    # hold the final chunk inside the handler, as a blocking
+                    # log handler flush would
+                    release.wait(10)
+                self.data += chunk
+
+            def flush(self):
+                pass
+
+        handler = PausedHandler()
+        calls = []
+
+        def done(cmd, success, exit_code):
+            calls.append((success, exit_code))
+
+        p = python("-u", py.name, _out=handler, _done=done, _bg=True)
+
+        # a watcher observes process exit while the handler is still blocked
+        for _ in range(500):
+            if not p.is_alive():
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(p.process.exit_code)  # exit fact is available
+        self.assertFalse(p.delivered)  # but delivery is not
+        self.assertEqual(calls, [])
+
+        release.set()
+        p.wait()
+
+        self.assertTrue(p.delivered)
+        self.assertEqual(calls, [(True, 0)])
+        self.assertIn(b"LAST", handler.data)
+
+    def test_done_callback_runs_once_and_rewaits(self):
+        """a wait that times out first must not prevent a later wait from
+        observing the same single delivered outcome."""
+        import threading
+
+        py = create_tmp_test(
+            """
+import sys
+import time
+
+sys.stdout.write("first\\n")
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("LAST\\n")
+sys.stdout.flush()
+"""
+        )
+
+        release = threading.Event()
+
+        class PausedHandler:
+            def write(self, chunk):
+                if b"LAST" in chunk:
+                    release.wait(10)
+
+            def flush(self):
+                pass
+
+        calls = []
+
+        def done(cmd, success, exit_code):
+            calls.append((success, exit_code))
+
+        p = python("-u", py.name, _out=PausedHandler(), _done=done, _bg=True)
+
+        for _ in range(500):
+            if not p.is_alive():
+                break
+            time.sleep(0.01)
+
+        # a personal wait bound elapses while the manifest is still incomplete
+        self.assertRaises(sh.TimeoutException, p.wait, 0.2)
+        self.assertEqual(calls, [])
+        self.assertFalse(p.delivered)
+
+        release.set()
+
+        # the same waiter, or any other, can come back and finish the wait
+        p.wait()
+        self.assertEqual(calls, [(True, 0)])
+
+        # a second full wait sees the same delivered result, without re-running
+        # the callback or raising an absorbed error
+        p.wait()
+        self.assertEqual(calls, [(True, 0)])
+
+    def test_done_callback_manifest_failure_is_sticky(self):
+        """a done callback that fails to write its handoff manifest must not be
+        reported as success, by any waiter, ever."""
+        py = create_tmp_test("pass")
+
+        calls = []
+
+        def done(cmd, success, exit_code):
+            calls.append(exit_code)
+            raise OSError("manifest disk full")
+
+        p = python(py.name, _done=done, _bg=True)
+
+        for _ in range(3):
+            try:
+                p.wait()
+            except OSError as e:
+                self.assertIn("manifest disk full", str(e))
+            else:
+                self.fail("a failed manifest must not look like success")
+
+        self.assertEqual(calls, [0])
+        self.assertTrue(p.delivered)
+        self.assertFalse(p.completion.success)
+        self.assertIsNotNone(p.delivery_error)
+
+    def test_done_callback_can_wait_on_own_command(self):
+        """a callback inspecting its own command must not deadlock or re-raise
+        the command's own exit-code exception."""
+        py = create_tmp_test(
+            """
+import sys
+sys.stdout.write("done!")
+"""
+        )
+
+        seen = {}
+
+        def done(cmd, success, exit_code):
+            # these would deadlock or raise if the callback re-entered the
+            # blocking delivery path
+            cmd.wait()
+            cmd.process.wait()
+            cmd.completion.wait()
+            cmd.completion.wait(timeout=0.1)
+            seen["exit_code"] = cmd.exit_code
+            seen["stdout"] = cmd.stdout
+
+        p = python(py.name, _done=done, _bg=True)
+        p.wait()
+
+        self.assertEqual(seen["exit_code"], 0)
+        self.assertEqual(seen["stdout"], b"done!")
+
+    def test_bg_exit_fact_without_delivery(self):
+        """`is_alive()` may publish an exit code without claiming success."""
+        import threading
+
+        py = create_tmp_test(
+            """
+import sys
+import time
+
+sys.stdout.write("first\\n")
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("LAST\\n")
+sys.stdout.flush()
+"""
+        )
+
+        release = threading.Event()
+
+        class PausedHandler:
+            def write(self, chunk):
+                if b"LAST" in chunk:
+                    release.wait(10)
+
+            def flush(self):
+                pass
+
+        delivered = []
+
+        def done(cmd, success, exit_code):
+            delivered.append((success, exit_code))
+
+        p = python("-u", py.name, _out=PausedHandler(), _done=done, _bg=True)
+
+        for _ in range(500):
+            if not p.is_alive():
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(p.completion.exit_code, 0)
+        self.assertFalse(p.completion.delivered)
+        self.assertEqual(p.completion.reason, p.completion.reason)  # stable
+        self.assertIn("not been completely drained", p.completion.reason)
+        self.assertIsNone(p.completion.success)
+        self.assertEqual(delivered, [])
+
+        release.set()
+        p.wait()
+
+        self.assertTrue(p.completion.delivered)
+        self.assertTrue(p.completion.success)
+
+    def test_delivery_without_wait(self):
+        """a command whose exit is only observed via is_alive() still delivers
+        its manifest exactly once once output is drained."""
+        py = create_tmp_test(
+            """
+import os
+import sys
+import time
+
+sys.stdout.write("bye\\n")
+sys.stdout.flush()
+# close stdout early so the output thread finishes before the exit
+os.close(1)
+time.sleep(0.3)
+"""
+        )
+
+        calls = []
+
+        def done(cmd, success, exit_code):
+            calls.append((success, exit_code))
+
+        p = python(py.name, _done=done, _bg=True)
+
+        for _ in range(500):
+            if not p.is_alive():
+                break
+            time.sleep(0.01)
+
+        for _ in range(500):
+            if p.delivered:
+                break
+            time.sleep(0.01)
+
+        self.assertTrue(p.delivered)
+        self.assertEqual(calls, [(True, 0)])
+
+        # a later wait must not re-run the callback
+        p.wait()
+        self.assertEqual(calls, [(True, 0)])
+
+    def test_async_await_shares_delivered_outcome(self):
+        """awaiting a command observes the same done callback outcome as wait."""
+        py = create_tmp_test(
+            """
+import sys
+sys.stdout.write("async output")
+"""
+        )
+
+        calls = []
+
+        def done(cmd, success, exit_code):
+            calls.append((success, exit_code))
+
+        async def main():
+            p = python(py.name, _done=done, _async=True, _return_cmd=False)
+            return await p
+
+        output = asyncio.run(main())
+
+        self.assertEqual(output, "async output")
+        self.assertEqual(calls, [(True, 0)])
+
+    def test_async_await_manifest_failure(self):
+        """await must raise a failed manifest, just like wait."""
+        py = create_tmp_test("pass")
+
+        def done(cmd, success, exit_code):
+            raise OSError("no manifest for you")
+
+        async def main():
+            return await python(py.name, _done=done, _async=True)
+
+        self.assertRaisesRegex(OSError, "no manifest", asyncio.run, main())
+
     def test_callable_stdin(self):
         py = create_tmp_test(
             """

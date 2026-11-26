@@ -391,6 +391,17 @@ A callback that is *always* called when the command completes, even if it
 completes with an exit code that would raise an exception.  After the callback
 is run, any exception that would be raised is raised.
 
+The callback runs after the process's output has been completely drained and
+handed to its handlers, so it observes the final output.  It runs exactly once
+per command, from the delivering thread.  Seeing the process exit (for example,
+via :meth:`RunningCommand.is_alive`) is *not* completion: a callback may still
+be pending while output is draining.
+
+If the callback raises -- for example, because it could not write a handoff
+manifest to disk -- that failure is retained and raised by every waiter
+(:meth:`RunningCommand.wait`, ``wait(timeout=...)``, or ``await``), and the
+command is never reported as a successful delivery.
+
 The callback is passed the :ref:`RunningCommand <running_command>` instance, a
 boolean indicating success, and the exit code.
 

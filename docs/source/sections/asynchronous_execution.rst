@@ -75,7 +75,10 @@ long-running command, you can put it in the background with the :ref:`_bg=True
 	print("...and 3 seconds later")
 
 You'll notice that you need to call :meth:`RunningCommand.wait` in order to exit
-after your command exits.
+after your command exits.  ``wait()`` waits for *delivery* -- process exit, a
+complete drain of stdout/stderr, and the :ref:`_done <done>` callback -- not
+merely for the process to exit.  ``await`` a command waits for the same
+delivered outcome, including a :ref:`_done <done>` callback failure.
 
 Commands launched in the background ignore ``SIGHUP``, meaning that when their
 controlling process (the session leader, if there is a controlling terminal)

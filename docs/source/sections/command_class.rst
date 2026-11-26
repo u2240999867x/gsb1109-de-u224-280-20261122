@@ -109,10 +109,24 @@ this class. It is only returned if ``_return_cmd=True`` when you execute a comma
     If the exit code represents a failure, we raise the appropriate exception.
     See :ref:`exceptions <exceptions>`.
 
+    "Finishing" here means *delivery*, not merely process exit: the process
+    must have exited, everything it wrote to STDOUT/ERR must have been read and
+    handed to the output handlers, and the :ref:`_done <done>` callback must
+    have run.  This is what makes the output and callback result trustworthy.
+
+    A ``timeout`` passed into this method bounds *this particular* wait.  If it
+    elapses before delivery completes, we raise :ref:`timeout_exc`, but nothing
+    is consumed or finalized.  The caller may call ``wait()`` again later and
+    observe the same delivered outcome as any other waiter.
+
     .. note::
-        
-        Calling this method multiple times only yields an exception on the first
-        call.
+
+        An error produced during delivery -- for example, a :ref:`_done <done>`
+        callback that failed to write its handoff manifest to disk -- is
+        *sticky*.  It is raised by every waiter, including ones that arrive
+        after a different waiter has already re-raised it.  No waiter can
+        absorb the failure and make a later wait look like a normal completion.
+        The command's own exit-code exception is reported the same way.
 
     This is called automatically by sh unless your command is being executed
     :ref:`asynchronously <async>`, in which case, you may want to call this
@@ -121,6 +135,25 @@ this class. It is only returned if ``_return_cmd=True`` when you execute a comma
     If an instance of :ref:`Command <command_class>` is being used as the stdin
     argument (see :ref:`piping <piping>`), :meth:`wait` is also called on that
     instance, and any exceptions resulting from that process are propagated up.
+
+.. py:attribute:: RunningCommand.completion
+
+    The shared :class:`_Completion` join point.  It represents the *delivered*
+    outcome, which is distinct from the process merely having exited.  Use it
+    when you want to wait for, or inspect, the complete handoff without
+    preferring one of the convenience methods above.
+
+.. py:attribute:: RunningCommand.delivered
+
+    ``True`` once the output has been completely drained and the :ref:`_done
+    <done>` callback has run.  This can be ``False`` while
+    :attr:`RunningCommand.is_alive` already reports the process as exited.
+
+.. py:attribute:: RunningCommand.delivery_error
+
+    If delivery could not produce a trustworthy manifest -- for example, the
+    :ref:`_done <done>` callback raised -- this holds the exception and explains
+    why.  ``None`` when delivery completed cleanly.
 
 .. py:attribute:: RunningCommand.process
 
@@ -188,6 +221,12 @@ this class. It is only returned if ``_return_cmd=True`` when you execute a comma
 .. py:method:: RunningCommand.is_alive()
 
     Returns whether or not the process is still alive.
+
+    This is the fast, exit-only probe.  When it returns ``False`` the process
+    has exited and an exit code is available, but output may still be draining
+    and the :ref:`_done <done>` callback may not have run yet.  Do not treat
+    ``is_alive() == False`` as a completed delivery; use
+    :attr:`RunningCommand.completion` or :meth:`RunningCommand.wait` for that.
 
     :rtype: bool
 

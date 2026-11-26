@@ -108,13 +108,56 @@ The exit code is obtained from the reaped process.  If the process ended from a
 signal, the exit code is the negative value of that signal.  For example,
 SIGKILL would result in an exit code -9.
 
+.. _arch_delivery:
+
+Exit Fact vs. Delivery
+----------------------
+
+Seeing the process exit and having a complete, trustworthy result are two
+different milestones:
+
+* **Exit fact** -- :meth:`OProc.is_alive` / :attr:`OProc.exit_code` reap the
+  process and produce an exit code.  This is a fast probe, because callers such
+  as a monitor thread poll it frequently.  It deliberately does *not* wait for
+  output or run the done callback.
+* **Delivery** -- everything the process wrote has been read, buffered (or
+  handed to ``_out``/``_err``), the output handlers have flushed, and the
+  :ref:`done` callback has run.  Only when this completes is there a manifest
+  that the caller can trust.
+
+A single :class:`_Completion` object represents delivery.  It is produced
+exactly once, by the finalizer: either the blocking cleanup path or, for a
+command that was never waited on, the STDOUT/ERR thread itself.  Finalization
+is guarded so that no matter how many waiters race to it, the callback fires
+once.
+
+All wait entry points share that one object:
+
+* :meth:`RunningCommand.wait` blocks on it.
+* :meth:`RunningCommand.wait(timeout=...)` bounds a *single* wait and raises
+  :ref:`timeout_exc` if it elapses.  It does not consume anything, so the same
+  caller (or another) may wait again and observe the same outcome.
+* ``await`` ing a :ref:`RunningCommand <running_command>` waits on the same
+  object.
+
+If delivery fails -- for example, a done callback cannot write its manifest to
+disk -- the failure is stored on the completion along with the command outcome
+and final output, and is raised by *every* waiter.  A waiter that catches the
+error does not clear it, so no later wait can mistake an incomplete handoff for
+a normal completion.
+
+The done callback runs on the finalizing thread.  It may safely inspect its own
+command (``cmd.exit_code``, ``cmd.stdout``, ``cmd.process``) or even call
+``cmd.wait()``; that re-entrant wait is a no-op rather than a self-join.
+
 Done Callback
 -------------
 
 If specified, the :ref:`done` callback is executed with the :ref:`RunningCommand
 <running_command>` instance, a boolean indicating success, and the adjusted exit
-code.  After the callback returns, error processing continues.  In other words,
-the done callback is called regardless of success or failure, and there's
-nothing it can do to prevent the :ref:`ErrorReturnCode <error_return_code>`
-exceptions from being raised after it completes.
+code.  It runs only after the output has been completely drained, so the output
+it observes is the final output.  After the callback returns, error processing
+continues.  In other words, the done callback is called regardless of success or
+failure, and there's nothing it can do to prevent the :ref:`ErrorReturnCode
+<error_return_code>` exceptions from being raised after it completes.
 
