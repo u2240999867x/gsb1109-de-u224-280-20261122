@@ -15,8 +15,38 @@ from .core import (  # noqa: F401
     Dataset,
     InvalidDatasetType,
     InvalidDimensions,
+    ReviewSummary,
     UnsupportedFormat,
     detect_format,
     import_book,
     import_set,
 )
+from .review import (  # noqa: F401
+    Approval,
+    ApprovalConflictError,
+    ApprovalDocument,
+    ApprovalInbox,
+    ApprovalIncompleteError,
+    BandCapacityError,
+    BandedReview,
+    MissingApprovalError,
+    Release,
+    ReleaseRecord,
+    ReviewInbox,
+    ReviewLedger,
+    ReviewPacket,
+    ReviewStatus,
+    ReviewWorkflow,
+    Sample,
+    SummaryReport,
+)
+
+
+def __getattr__(name):
+    from . import core as _core
+    from . import review as _review
+
+    for module in (_review, _core):
+        if hasattr(module, name):
+            return getattr(module, name)
+    raise AttributeError(f"module 'tablib' has no attribute {name!r}")

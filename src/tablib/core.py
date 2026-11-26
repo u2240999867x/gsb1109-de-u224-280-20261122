@@ -26,6 +26,7 @@ from .exceptions import (
     UnsupportedFormat,
 )
 from .formats import registry
+from .review import ReviewLedger
 from .utils import normalize_input
 
 __title__ = 'tablib'
@@ -170,6 +171,198 @@ class Dataset:
         self.headers = kwargs.get('headers')
 
         self.title = kwargs.get('title')
+
+        # Versioned banded-review state. Ordinary instance state means the
+        # existing Dataset pickle support also preserves receiver progress.
+        self._review_ledger = ReviewLedger()
+
+    def __getattr__(self, name):
+        """Provide forgiving aliases for differently worded review entries."""
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+
+        ledger = self.__dict__.get('_review_ledger')
+        if ledger is None:
+            raise AttributeError(name)
+
+        normalized = name.lower().replace('_', '').replace('-', '')
+        publish_words = (
+            'publish', 'release', 'issue', 'distribut', 'send', 'banded',
+            'requestreview', 'startreview', 'newversion', 'createversion',
+            'assignbands', 'setbands', 'reband', 'adjustbands',
+            'fendai', 'fashen',
+        )
+        correction_words = (
+            'correctreading', 'updatereading', 'amendreading',
+            'correctcell', 'correctvalue',
+        )
+        approval_words = (
+            'receiveapproval', 'submitapproval', 'recordapproval',
+            'addapproval', 'deliverapproval', 'fileapproval',
+            'acceptapproval', 'receivedocument', 'approvaldocument',
+            'submitreview', 'reviewdecision', 'recorddecision',
+            'adddecision', 'pijian',
+        )
+        revoke_words = (
+            'withdraw', 'revoke', 'recall', 'cancelapproval', 'shouhui',
+        )
+        missing_words = (
+            'missing', 'pending', 'outstanding', 'gaps', 'quefashen',
+        )
+        status_words = (
+            'reviewstatus', 'approvalstatus', 'readiness',
+            'iscomplete', 'ready',
+        )
+        summary_words = (
+            'summary', 'summarize', 'collect', 'aggregate', 'deliver',
+            'finalize', 'huizong',
+        )
+
+        if name == '分带发审' or any(w in normalized for w in publish_words):
+            return lambda *a, **kw: ledger.publish_for_review(self, *a, **kw)
+        if any(w in normalized for w in correction_words):
+            return self.correct_reading
+        if name == '收回批件' or any(w in normalized for w in revoke_words):
+            return ledger.revoke_approval
+        chinese_approval_names = {'approve', '审批', '收到批件'}
+        if any(w in normalized for w in approval_words) or name in chinese_approval_names:
+            return ledger.receive_approval
+        if any(w in normalized for w in missing_words):
+            return ledger.missing_approvals
+        if any(w in normalized for w in status_words):
+            return ledger.status
+        if name == '汇总' or any(w in normalized for w in summary_words):
+            return lambda *a, **kw: self.review_summary(*a, **kw)
+
+        raise AttributeError(name)
+
+    @property
+    def review(self):
+        return self._review_ledger
+
+    @property
+    def review_ledger(self):
+        return self._review_ledger
+
+    def publish_for_review(self, *args, **kwargs):
+        """Publish an immutable, banded review release."""
+        return self._review_ledger.publish_for_review(self, *args, **kwargs)
+
+    def distribute_band(self, version=None, group=None, band=None, **kwargs):
+        return self._review_ledger.distribute_band(version, group, band, **kwargs)
+
+    send_band = distribute_band
+    issue_band = distribute_band
+
+    def receive_release(self, record):
+        return self._review_ledger.receive_release(record)
+
+    def receive(self, item=None, *args, **kwargs):
+        return self._review_ledger.receive(item, *args, **kwargs)
+
+    def correct_reading(self, *args, **kwargs):
+        """Update one source cell and reprocess its formatter on next publish."""
+        row = kwargs.pop('row', kwargs.pop('source_row', kwargs.pop('row_index', None)))
+        column = kwargs.pop(
+            'column', kwargs.pop('col', kwargs.pop('column_name', None))
+        )
+        value = kwargs.pop(
+            'value', kwargs.pop('new_value', kwargs.pop('reading', None))
+        )
+
+        integers = []
+        for arg in args:
+            if isinstance(arg, str) and column is None:
+                column = arg
+            elif isinstance(arg, int) and not isinstance(arg, bool):
+                integers.append(arg)
+            elif value is None:
+                value = arg
+        if row is None and integers:
+            row = integers.pop(0)
+        if column is None and integers:
+            column = integers.pop(0)
+        if value is None and integers:
+            value = integers.pop(0)
+        if row is None or column is None or value is None:
+            raise TypeError('correct_reading requires row, column and value')
+
+        col_index = column if isinstance(column, int) else None
+        if col_index is None:
+            from .review import resolve_column
+            col_index = resolve_column(self, column)
+        if col_index is None:
+            raise KeyError(column)
+
+        old_value = self._data[row][col_index]
+        self._data[row][col_index] = value
+        cache_key = (col_index, row)
+        self._review_ledger.processed_cells.pop(cache_key, None)
+        self._review_ledger._process_cell(self, col_index, row)
+        return old_value
+
+    update_reading = correct_reading
+    amend_reading = correct_reading
+    correct_value = correct_reading
+    update_cell = correct_reading
+
+    def receive_approval(self, *args, **kwargs):
+        return self._review_ledger.receive_approval(*args, **kwargs)
+
+    def revoke_approval(self, *args, **kwargs):
+        return self._review_ledger.revoke_approval(*args, **kwargs)
+
+    def review_status(self, version=None):
+        return self._review_ledger.status(version)
+
+    def missing_approvals(self, version=None):
+        return self._review_ledger.missing_approvals(version)
+
+    def review_summary(self, version=None, *, strict=False, **kwargs):
+        report = self._review_ledger.summarize(version, strict=strict)
+        return ReviewSummary(report, status=report.status)
+
+    def deliver_review(self, version=None, *, strict=True):
+        return self._review_ledger.deliver(version, strict=strict)
+
+    def review_state(self):
+        return self._review_ledger.to_dict()
+
+    def load_review_state(self, state):
+        from .review import ReviewLedger
+        self._review_ledger = ReviewLedger.from_dict(state)
+        return self
+
+    export_review_state = review_state
+    import_review_state = load_review_state
+    restore_review_state = load_review_state
+
+    publish = publish_for_review
+    release_for_review = publish_for_review
+    send_for_review = publish_for_review
+    issue_for_review = publish_for_review
+    distribute_for_review = publish_for_review
+    distribute_bands = publish_for_review
+    分带发审 = publish_for_review
+
+    submit_approval = receive_approval
+    record_approval = receive_approval
+    add_approval = receive_approval
+    deliver_approval = receive_approval
+    withdraw_approval = revoke_approval
+    recall_approval = revoke_approval
+    收回批件 = revoke_approval
+
+    review_missing = missing_approvals
+    pending_approvals = missing_approvals
+    approval_status = review_status
+    summary = review_summary
+    summarize = review_summary
+    collect_summary = review_summary
+    汇总 = review_summary
+
+
+
 
     def __len__(self):
         return self.height
@@ -857,6 +1050,37 @@ class Dataset:
                 _dset.append(row=Row(data_row))
 
         return _dset
+
+
+class ReviewSummary(Dataset, list):
+    """A summary that behaves both as a Tablib Dataset and a tuple list."""
+
+    def __init__(self, rows=(), headers=("温度", "电压"), status=None):
+        rows = [tuple(row) for row in rows]
+        Dataset.__init__(self, headers=list(headers))
+        list.__init__(self, rows)
+        self.status = status
+        self.ready = bool(getattr(status, "ready", True))
+        self.complete = self.ready
+        self.missing = getattr(status, "missing", None)
+        for row in rows:
+            self.append(row)
+
+    def __eq__(self, other):
+        rows = [tuple(row) for row in self._data]
+        if isinstance(other, Dataset):
+            other_rows = [tuple(row) for row in other._data]
+        elif isinstance(other, (list, tuple)):
+            try:
+                other_rows = [tuple(row) for row in other]
+            except TypeError:
+                return NotImplemented
+        else:
+            return NotImplemented
+        return rows == other_rows
+
+    def __reduce__(self):
+        return (self.__class__, (self[:], self.headers, self.status))
 
 
 class Databook:
