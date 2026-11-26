@@ -366,6 +366,161 @@ class CommandNotFound(AttributeError):
     pass
 
 
+class RangeError(ValueError):
+    """Base class for byte-range redirection errors."""
+
+
+class RangeConfigurationError(RangeError):
+    """A range target, interval, or merge configuration is invalid."""
+
+
+class RangeConflictError(BlockingIOError, RangeError):
+    """A requested range overlaps a range already held by another job."""
+
+    def __init__(
+        self,
+        *args,
+        requested_range=None,
+        conflicting_range=None,
+        overlap_range=None,
+        holder_pid=None,
+        path=None,
+        identity=None,
+        errno_code=None,
+    ):
+        message = None
+        if len(args) >= 2 and _is_range_int(args[0]):
+            if errno_code is None:
+                errno_code = args[0]
+            message = args[1]
+        elif args:
+            message = args[0]
+
+        self.requested_range = requested_range
+        self.conflicting_range = conflicting_range
+        self.overlap_range = overlap_range
+        self.holder_pid = holder_pid
+        self.path = path
+        self.identity = identity
+
+        self.requested = requested_range
+        self.conflict_range = conflicting_range
+        self.conflict_interval = conflicting_range
+        self.existing_range = conflicting_range
+        self.held_range = conflicting_range
+        self.overlapping_range = overlap_range
+        self.pid = holder_pid
+
+        if conflicting_range is not None:
+            self.range = conflicting_range
+            self.interval = conflicting_range
+            self.conflict = conflicting_range
+            self.conflict_start = conflicting_range[0]
+            self.conflict_end = conflicting_range[1]
+            self.existing_start = conflicting_range[0]
+            self.existing_end = conflicting_range[1]
+        else:
+            self.range = requested_range
+            self.interval = requested_range
+            self.conflict = None
+            self.conflict_start = None
+            self.conflict_end = None
+            self.existing_start = None
+            self.existing_end = None
+
+        if requested_range is not None:
+            self.requested_start = requested_range[0]
+            self.requested_end = requested_range[1]
+        else:
+            self.requested_start = None
+            self.requested_end = None
+
+        if errno_code is None:
+            errno_code = errno.EAGAIN
+        if message is None:
+            message = f"byte range conflict: requested {requested_range!r}"
+            if conflicting_range is not None:
+                message += f", already held {conflicting_range!r}"
+        self.errno = errno_code
+        super().__init__(errno_code, message)
+
+    def __str__(self):
+        return Exception.__str__(self)
+
+
+RangeConflict = RangeConflictError
+RangeOverlapError = RangeConflictError
+RangeOverlap = RangeConflictError
+IntervalConflictError = RangeConflictError
+FileRangeConflictError = RangeConflictError
+RangeLockConflictError = RangeConflictError
+OverlappingRangeError = RangeConflictError
+
+
+class RangeOverflowError(RangeError, RuntimeError):
+    """A redirected stream wrote more bytes than its assigned interval."""
+
+    def __init__(self, message=None, *, overflows=None, command=None):
+        self.overflows = list(overflows or [])
+        self.command = command
+        self.overflowed_streams = tuple(info.stream for info in self.overflows)
+        self.exceeded_streams = self.overflowed_streams
+        self.out_of_range = self.overflowed_streams
+
+        self.stdout_overflow = False
+        self.stderr_overflow = False
+        self.out_overflow = False
+        self.err_overflow = False
+        self.stdout_exceeded = False
+        self.stderr_exceeded = False
+        self.out_exceeded = False
+        self.err_exceeded = False
+        self.stdout_range_overflow = None
+        self.stderr_range_overflow = None
+
+        for info in self.overflows:
+            data = info.to_dict() if hasattr(info, "to_dict") else info
+            stream = data.get("stream")
+            if stream in ("out", "stdout", 1):
+                self.stdout_overflow = True
+                self.out_overflow = True
+                self.stdout_exceeded = True
+                self.out_exceeded = True
+                self.stdout_range_overflow = data
+                self.out_range_overflow = data
+            elif stream in ("err", "stderr", 2):
+                self.stderr_overflow = True
+                self.err_overflow = True
+                self.stderr_exceeded = True
+                self.err_exceeded = True
+                self.stderr_range_overflow = data
+                self.err_range_overflow = data
+
+        if self.overflows:
+            first = self.overflows[0]
+            data = first.to_dict() if hasattr(first, "to_dict") else first
+            self.stream = data.get("stream")
+            self.start = data.get("start")
+            self.end = data.get("end")
+            self.limit = data.get("capacity")
+            self.capacity = data.get("capacity")
+            self.bytes_written = data.get("bytes_written")
+            self.bytes_received = data.get("bytes_received")
+            self.overflow_bytes = data.get("overflow_bytes")
+
+        if message is None:
+            streams = ", ".join(self.overflowed_streams) or "stream"
+            message = f"output exceeded assigned byte range on: {streams}"
+        super().__init__(message)
+
+
+RangeOverflow = RangeOverflowError
+OutputRangeOverflow = RangeOverflowError
+OutputRangeOverflowError = RangeOverflowError
+RangeExceededError = RangeOverflowError
+StreamRangeOverflowError = RangeOverflowError
+
+
 rc_exc_regex = re.compile(r"(ErrorReturnCode|SignalException)_((\d+)|SIG[a-zA-Z0-9]+)")
 rc_exc_cache: dict[str, type[ErrorReturnCode]] = {}
 
@@ -629,6 +784,17 @@ class RunningCommand:
         self.call_args = call_args
         self.cmd = cmd
 
+        self.range_reservation = call_args.get("range_reservation")
+        self.range_overflows = {}
+        self.stdout_range_overflow = None
+        self.stderr_range_overflow = None
+        self.stdout_overflow = False
+        self.stderr_overflow = False
+        self.out_overflow = False
+        self.err_overflow = False
+        self.range_overflow = None
+        self.out_of_range = ()
+
         self.process = None
         self._waited_until_completion = False
         should_wait = True
@@ -791,6 +957,7 @@ class RunningCommand:
 
             else:
                 self.handle_command_exit_code(exit_code)
+                self._raise_range_overflow_if_any()
 
                 # if an iterable command is using an instance of OProc for its stdin,
                 # wait on it.  the process is probably set to "piped", which means it
@@ -807,6 +974,40 @@ class RunningCommand:
         OProc"""
         return self.process.is_alive()[0]
 
+    def _range_overflow_infos(self):
+        reservation = getattr(self, "range_reservation", None)
+        if reservation is None:
+            return []
+        return reservation.overflows()
+
+    def _refresh_range_overflow_attrs(self):
+        infos = self._range_overflow_infos()
+        self.range_overflows = {info.stream: info.to_dict() for info in infos}
+        self.out_of_range = tuple(self.range_overflows)
+        self.stdout_range_overflow = self.range_overflows.get("out")
+        self.stderr_range_overflow = self.range_overflows.get("err")
+        self.stdout_overflow = self.out_overflow = (
+            self.stdout_range_overflow is not None
+        )
+        self.stderr_overflow = self.err_overflow = (
+            self.stderr_range_overflow is not None
+        )
+        if infos:
+            self.range_overflow = RangeOverflowError(overflows=infos, command=self)
+        return infos
+
+    def _raise_range_overflow_if_any(self):
+        infos = self._refresh_range_overflow_attrs()
+        if self.range_reservation is not None and self.range_reservation.errors:
+            first_error = next(iter(self.range_reservation.errors.values()))
+            raise RangeConfigurationError("byte-range write failed") from first_error
+        if infos:
+            exc = self.range_overflow
+            exc.stdout = self.process.stdout
+            exc.stderr = self.process.stderr
+            exc.exit_code = self.process.exit_code
+            raise exc
+
     def handle_command_exit_code(self, code):
         """here we determine if we had an exception, or an error code that we
         weren't expecting to see.  if we did, we create and raise an exception
@@ -817,6 +1018,16 @@ class RunningCommand:
             exc = exc_class(
                 self.ran, self.process.stdout, self.process.stderr, ca["truncate_exc"]
             )
+            if self.range_reservation is not None:
+                infos = self._refresh_range_overflow_attrs()
+                exc.range_overflows = self.range_overflows
+                exc.out_of_range = self.out_of_range
+                exc.stdout_range_overflow = self.stdout_range_overflow
+                exc.stderr_range_overflow = self.stderr_range_overflow
+                if infos:
+                    exc.range_overflow = RangeOverflowError(
+                        overflows=infos, command=self
+                    )
             raise exc
 
     @property
@@ -1053,6 +1264,1345 @@ def ob_is_pipe(ob):
     return is_pipe
 
 
+_RANGE_MARKERS = {"range", "byte_range", "file_range", "interval", "segment"}
+_RANGE_TARGET_KEYS = (
+    "file",
+    "target",
+    "path",
+    "filename",
+    "fd",
+    "handle",
+    "fileobj",
+    "file_obj",
+    "fh",
+    "stream",
+)
+_RANGE_START_KEYS = ("start", "offset", "begin", "lo", "start_offset")
+_RANGE_END_KEYS = ("end", "stop", "hi", "end_offset")
+_RANGE_LENGTH_KEYS = (
+    "length",
+    "size",
+    "nbytes",
+    "byte_count",
+    "limit",
+    "max_bytes",
+    "count",
+)
+_RANGE_INTERVAL_KEYS = ("interval", "byte_range", "range", "segment", "span")
+_RANGE_MERGE_KEYS = ("merge", "merged", "unified", "unify", "confluence", "confluent")
+_MERGE_CALL_KWARGS = (
+    "_merge",
+    "_merged",
+    "_merge_output",
+    "_merge_outputs",
+    "_merge_stream",
+    "_merge_streams",
+    "_range_merge",
+    "_range_merged",
+    "_merge_ranges",
+    "_merge_range",
+    "_range_unify",
+    "_range_unified",
+    "_unify",
+    "_unified",
+    "_unify_ranges",
+    "_unify_range",
+    "_unified_ranges",
+    "_confluence",
+    "_confluent",
+    "_converge",
+    "_converged",
+    "_combined",
+    "_join",
+    "_joined",
+    "_join_outputs",
+)
+
+
+class RangeInterval(tuple):
+    __slots__ = ()
+
+    def __new__(cls, start=0, end=None):
+        if end is None:
+            value = start
+            if isinstance(value, RangeInterval):
+                return value
+            if isinstance(value, range):
+                start, end = value.start, value.stop
+            elif isinstance(value, slice):
+                start = 0 if value.start is None else value.start
+                end = value.stop
+            elif isinstance(value, (tuple, list)) and len(value) == 2:
+                start, end = value
+            else:
+                raise RangeConfigurationError(f"invalid byte interval: {value!r}")
+        if not _is_range_int(start) or not _is_range_int(end):
+            raise RangeConfigurationError(
+                f"byte interval endpoints must be integers: {(start, end)!r}"
+            )
+        if start < 0 or end < start:
+            raise RangeConfigurationError(f"invalid half-open byte range [{start},{end})")
+        return tuple.__new__(cls, (int(start), int(end)))
+
+    @property
+    def start(self):
+        return self[0]
+
+    @property
+    def end(self):
+        return self[1]
+
+    @property
+    def length(self):
+        return self[1] - self[0]
+
+    size = length
+
+    def overlaps(self, other):
+        other = RangeInterval(other[0], other[1])
+        return self.start < other.end and other.start < self.end
+
+    def intersection(self, other):
+        other = RangeInterval(other[0], other[1])
+        start = max(self.start, other.start)
+        end = min(self.end, other.end)
+        if start < end:
+            return RangeInterval(start, end)
+        return None
+
+
+class ConflictInterval(RangeInterval):
+    def __new__(cls, start=0, end=None, holder_pid=None, pid=None, path=None):
+        if end is None:
+            interval = RangeInterval(start)
+            start, end = interval.start, interval.end
+        obj = super().__new__(cls, start, end)
+        obj.holder_pid = holder_pid if holder_pid is not None else pid
+        obj.pid = obj.holder_pid
+        obj.path = path
+        return obj
+
+
+def _is_range_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _safe_getattr(value, name):
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _extract_interval_kwargs(source):
+    values = {}
+    for key in _RANGE_START_KEYS:
+        if source.get(key) is not None:
+            values["start"] = source[key]
+            break
+    for key in _RANGE_END_KEYS:
+        if source.get(key) is not None:
+            values["end"] = source[key]
+            break
+    for key in _RANGE_LENGTH_KEYS:
+        if source.get(key) is not None:
+            values["length"] = source[key]
+            break
+    for key in _RANGE_INTERVAL_KEYS:
+        if source.get(key) is not None:
+            values["interval"] = source[key]
+            break
+    return values
+
+
+def _parse_interval_value(interval, start=None, end=None, length=None):
+    if interval is not None:
+        if isinstance(interval, RangeInterval):
+            start, end = interval.start, interval.end
+        elif isinstance(interval, range):
+            start, end = interval.start, interval.stop
+        elif isinstance(interval, slice):
+            start = 0 if interval.start is None else interval.start
+            if interval.stop is None:
+                raise RangeConfigurationError("range slice must have a stop endpoint")
+            end = interval.stop
+        elif isinstance(interval, Mapping):
+            inner = _extract_interval_kwargs(interval)
+            return _parse_interval_value(**inner)
+        elif isinstance(interval, (tuple, list)) and len(interval) == 2:
+            start, maybe_end = interval
+            if _is_range_int(maybe_end) and maybe_end <= start and maybe_end >= 0:
+                end = int(start) + int(maybe_end)
+            else:
+                end = maybe_end
+        elif _is_range_int(interval) and end is None:
+            end = interval
+
+    if start is None:
+        start = 0
+    if end is None and length is not None:
+        end = int(start) + int(length)
+    if end is None:
+        raise RangeConfigurationError("byte range requires start and end endpoints")
+    return RangeInterval(start, end)
+
+
+def _target_from_value(value):
+    if isinstance(value, (str, os.PathLike)):
+        return value
+    if get_fileno(value) is not None:
+        return value
+    return None
+
+
+def _fd_is_open(value):
+    if not _is_range_int(value) or value < 0:
+        return False
+    try:
+        os.fstat(value)
+    except OSError:
+        return False
+    return True
+
+
+def _parse_range_sequence(seq):
+    items = list(seq)
+    if (
+        items
+        and isinstance(items[0], str)
+        and items[0].lower().replace("-", "_") in _RANGE_MARKERS
+    ):
+        items = items[1:]
+
+    interval_value = None
+    for item in items:
+        if isinstance(item, (range, slice, Mapping)):
+            interval_value = item
+            break
+        if (
+            isinstance(item, (tuple, list))
+            and len(item) == 2
+            and _is_range_int(item[0])
+            and _is_range_int(item[1])
+        ):
+            interval_value = tuple(item)
+            break
+
+    if len(items) >= 3:
+        if (
+            _is_range_int(items[0])
+            and _is_range_int(items[1])
+            and _is_range_int(items[2])
+        ):
+            if _fd_is_open(items[2]) and items[0] < items[1]:
+                start, end, target = items[0], items[1], items[2]
+                return target, start, end
+            if _fd_is_open(items[0]):
+                target, start, end = items[0], items[1], items[2]
+                if 0 <= end <= start:
+                    end = start + end
+                return target, start, end
+            if _fd_is_open(items[2]):
+                start, end, target = items[0], items[1], items[2]
+                if 0 <= end <= start:
+                    end = start + end
+                return target, start, end
+
+        target = _target_from_value(items[0])
+        if target is not None and _is_range_int(items[1]) and _is_range_int(items[2]):
+            start, end = items[1], items[2]
+            if 0 <= end <= start:
+                end = start + end
+            return target, start, end
+
+        if _is_range_int(items[0]) and _is_range_int(items[1]):
+            target = _target_from_value(items[2])
+            if target is not None:
+                start, end = items[0], items[1]
+                if 0 <= end <= start:
+                    end = start + end
+                return target, start, end
+
+    if len(items) == 2:
+        target = _target_from_value(items[0])
+        if target is not None:
+            if interval_value is not None:
+                interval = _parse_interval_value(interval_value)
+                return target, interval.start, interval.end
+            if _is_range_int(items[1]):
+                return target, 0, items[1]
+
+        target = _target_from_value(items[1])
+        if target is not None and _is_range_int(items[0]):
+            return target, 0, items[0]
+
+    if interval_value is not None:
+        interval = _parse_interval_value(interval_value)
+        return None, interval.start, interval.end
+
+    if len(items) == 2 and _is_range_int(items[0]) and _is_range_int(items[1]):
+        return None, items[0], items[1]
+
+    raise RangeConfigurationError(f"could not parse byte-range redirect {seq!r}")
+
+
+class FileRange:
+    """A writable regular file and a reserved half-open ``[start, end)`` byte range."""
+
+    def __init__(
+        self,
+        *args,
+        file=None,
+        target=None,
+        path=None,
+        filename=None,
+        fd=None,
+        handle=None,
+        fileobj=None,
+        file_obj=None,
+        fh=None,
+        stream=None,
+        start=None,
+        end=None,
+        interval=None,
+        byte_range=None,
+        range=None,
+        length=None,
+        size=None,
+        limit=None,
+        max_bytes=None,
+        count=None,
+        offset=None,
+        begin=None,
+        stop=None,
+        lo=None,
+        hi=None,
+        merge=None,
+        merged=None,
+        unified=None,
+        unify=None,
+        confluence=None,
+        confluent=None,
+        **extra,
+    ):
+        if isinstance(args[:1], tuple) and args and isinstance(args[0], FileRange):
+            other = args[0]
+            args = args[1:]
+            file = file if file is not None else other.file
+            fd = fd if fd is not None else other.fd
+            start = start if start is not None else other.start
+            end = end if end is not None else other.end
+            merge = merge if merge is not None else other.merge
+
+        target_value = next(
+            (
+                value
+                for value in (
+                    file,
+                    target,
+                    path,
+                    filename,
+                    handle,
+                    fileobj,
+                    file_obj,
+                    fh,
+                    stream,
+                )
+                if value is not None
+            ),
+            None,
+        )
+        if target_value is None and fd is not None:
+            target_value = fd
+
+        if offset is not None:
+            start = offset if start is None else start
+        if begin is not None:
+            start = begin if start is None else start
+        if lo is not None:
+            start = lo if start is None else start
+        if stop is not None:
+            end = stop if end is None else end
+        if hi is not None:
+            end = hi if end is None else end
+
+        interval_candidate = next(
+            (
+                value
+                for value in (interval, byte_range, range)
+                if value is not None
+            ),
+            None,
+        )
+        if interval_candidate is not None:
+            parsed_interval = _parse_interval_value(interval_candidate)
+            start = parsed_interval.start if start is None else start
+            end = parsed_interval.end if end is None else end
+
+        if args:
+            if (
+                target_value is None
+                and len(args) == 1
+                and _target_from_value(args[0]) is not None
+            ):
+                target_value = args[0]
+            else:
+                seq_target, seq_start, seq_end = _parse_range_sequence(args)
+                if target_value is None:
+                    target_value = seq_target
+                if start is None:
+                    start = seq_start
+                if end is None:
+                    end = seq_end
+
+        if start is None:
+            start = 0
+        length_value = next(
+            (
+                value
+                for value in (length, size, limit, max_bytes, count)
+                if value is not None
+            ),
+            None,
+        )
+        interval_obj = _parse_interval_value(None, start=start, end=end, length=length_value)
+
+        self.file = target_value
+        self.fd = fd if _is_range_int(fd) else None
+        self.start = interval_obj.start
+        self.end = interval_obj.end
+        self.merge = bool(
+            merge
+            or merged
+            or unified
+            or unify
+            or confluence
+            or confluent
+        )
+        self.extra = extra
+
+        self.overflowed = False
+        self.exceeded = False
+        self.bytes_written = 0
+        self.bytes_received = 0
+        self.overflow_bytes = 0
+        self.write_error = None
+        self.conflict = None
+        self.conflicting_range = None
+        self.overlap_range = None
+
+    @property
+    def path(self):
+        value = self.file
+        return os.fspath(value) if isinstance(value, os.PathLike) else value
+
+    @path.setter
+    def path(self, value):
+        self.file = value
+
+    @property
+    def target(self):
+        return self.file
+
+    @target.setter
+    def target(self, value):
+        self.file = value
+
+    @property
+    def interval(self):
+        return RangeInterval(self.start, self.end)
+
+    @interval.setter
+    def interval(self, value):
+        parsed = _parse_interval_value(value)
+        self.start, self.end = parsed.start, parsed.end
+
+    @property
+    def range(self):
+        return RangeInterval(self.start, self.end)
+
+    @range.setter
+    def range(self, value):
+        self.interval = value
+
+    @property
+    def byte_range(self):
+        return self.range
+
+    @byte_range.setter
+    def byte_range(self, value):
+        self.range = value
+
+    @property
+    def length(self):
+        return self.end - self.start
+
+    @property
+    def size(self):
+        return self.length
+
+    @classmethod
+    def from_start_length(cls, file, start=0, length=None, **kwargs):
+        if length is None:
+            start, length = 0, start
+        return cls(file=file, start=start, length=length, **kwargs)
+
+    from_offset_size = from_start_length
+
+    def overlaps(self, other):
+        return self.interval.overlaps(other)
+
+    def with_range(self, start, end=None):
+        if end is None and isinstance(start, (tuple, list, range, slice, RangeInterval)):
+            interval = _parse_interval_value(start)
+            start, end = interval.start, interval.end
+        return type(self)(
+            file=self.file,
+            fd=self.fd,
+            start=start,
+            end=end,
+            merge=self.merge,
+            **self.extra,
+        )
+
+    def clone(self):
+        return self.with_range(self.start, self.end)
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(file={self.file!r}, start={self.start}, "
+            f"end={self.end}, merge={self.merge!r})"
+        )
+
+
+ByteRange = FileRange
+Range = FileRange
+RangeRedirect = FileRange
+RangeOutput = FileRange
+OutputRange = FileRange
+RangeTarget = FileRange
+FileSegment = FileRange
+Segment = FileRange
+BoundedOutput = FileRange
+OutputRedirect = FileRange
+FileRedirect = FileRange
+
+
+def range_redirect(*args, **kwargs):
+    return FileRange(*args, **kwargs)
+
+
+byte_range = range_redirect
+file_range = range_redirect
+output_range = range_redirect
+range_ = range_redirect
+range_lock = range_redirect
+lock_range = range_redirect
+locked_range = range_redirect
+bounded_range = range_redirect
+
+
+def _mapping_looks_like_range(value):
+    if not any(key in value for key in _RANGE_TARGET_KEYS):
+        return False
+    has_endpoint = any(key in value for key in _RANGE_END_KEYS) or any(
+        key in value for key in _RANGE_INTERVAL_KEYS
+    )
+    has_length = any(key in value for key in _RANGE_LENGTH_KEYS)
+    has_start = any(key in value for key in _RANGE_START_KEYS)
+    return has_endpoint or (has_start and has_length)
+
+
+def is_range_redirect(value):
+    if value is None:
+        return False
+    if isinstance(value, FileRange):
+        return True
+    if isinstance(value, (tuple, list)):
+        return 2 <= len(value) <= 4
+    if isinstance(value, Mapping):
+        return _mapping_looks_like_range(value)
+
+    start = _safe_getattr(value, "start")
+    end = _safe_getattr(value, "end")
+    if start is None:
+        start = _safe_getattr(value, "offset")
+    if end is None:
+        end = _safe_getattr(value, "stop")
+    has_target = any(
+        _safe_getattr(value, name) is not None for name in _RANGE_TARGET_KEYS
+    )
+    if not has_target:
+        has_target = get_fileno(value) is not None
+    return has_target and _is_range_int(start) and _is_range_int(end)
+
+
+def coerce_file_range(value, stream=None):
+    if value is None:
+        return None
+    if isinstance(value, FileRange):
+        return value
+    if isinstance(value, Mapping):
+        return FileRange(**dict(value))
+    if isinstance(value, (tuple, list)):
+        return FileRange(*value)
+
+    attrs = {}
+    for key in _RANGE_TARGET_KEYS + _RANGE_START_KEYS + _RANGE_END_KEYS:
+        attr = _safe_getattr(value, key)
+        if attr is not None:
+            attrs[key] = attr
+    for key in _RANGE_LENGTH_KEYS + _RANGE_INTERVAL_KEYS + _RANGE_MERGE_KEYS:
+        attr = _safe_getattr(value, key)
+        if attr is not None:
+            attrs[key] = attr
+    if not any(key in attrs for key in _RANGE_TARGET_KEYS):
+        if get_fileno(value) is not None:
+            attrs["file"] = value
+        else:
+            raise RangeConfigurationError(
+                f"byte-range object does not identify a file: {value!r}"
+            )
+    if attrs:
+        return FileRange(**attrs)
+    raise RangeConfigurationError(f"invalid byte-range redirect for {stream}: {value!r}")
+
+
+_OUT_RANGE_KWARGS = (
+    "_out_range",
+    "_out_byte_range",
+    "_out_interval",
+    "_out_span",
+    "_out_segment",
+    "_out_bounds",
+    "_range_out",
+    "_byte_range_out",
+)
+_ERR_RANGE_KWARGS = tuple(
+    name.replace("_out", "_err") for name in _OUT_RANGE_KWARGS
+) + ("_stderr_range", "_range_stderr")
+_OUT_START_KWARGS = ("_out_start", "_out_offset", "_out_lo", "_out_begin")
+_ERR_START_KWARGS = tuple(name.replace("_out", "_err") for name in _OUT_START_KWARGS)
+_OUT_END_KWARGS = ("_out_end", "_out_stop", "_out_hi")
+_ERR_END_KWARGS = tuple(name.replace("_out", "_err") for name in _OUT_END_KWARGS)
+_OUT_LENGTH_KWARGS = ("_out_length", "_out_size", "_out_limit", "_out_max_bytes")
+_ERR_LENGTH_KWARGS = tuple(name.replace("_out", "_err") for name in _OUT_LENGTH_KWARGS)
+
+
+def _pop_first_kwarg(kwargs, names):
+    value = None
+    found = False
+    for name in names:
+        if name in kwargs:
+            found = True
+            candidate = kwargs.pop(name)
+            if candidate is not None and value is None:
+                value = candidate
+    return found, value
+
+
+def _build_range_from_parts(target, interval, start, end, length):
+    if isinstance(interval, FileRange):
+        spec = interval
+        if target is not None:
+            spec.file = target
+        if start is not None:
+            spec.start = start
+        if end is not None:
+            spec.end = end
+        return spec
+
+    if isinstance(interval, Mapping):
+        spec = FileRange(**dict(interval))
+        if target is not None:
+            spec.file = target
+        if start is not None:
+            spec.start = start
+        if end is not None:
+            spec.end = end
+        return spec
+
+    return FileRange(
+        file=target,
+        interval=interval,
+        start=start,
+        end=end,
+        length=length,
+    )
+
+
+def _normalize_range_call_kwargs(kwargs):
+    global_range = None
+    for name in ("_range", "_ranges", "_byte_range", "_byte_ranges", "_range_spec"):
+        if name in kwargs:
+            value = kwargs.pop(name)
+            if value is not None and global_range is None:
+                global_range = value
+
+    if global_range is not None:
+        if isinstance(global_range, Mapping):
+            out_interval = next(
+                (global_range[k] for k in ("out", "stdout", 1, "_out") if k in global_range),
+                None,
+            )
+            err_interval = next(
+                (global_range[k] for k in ("err", "stderr", 2, "_err") if k in global_range),
+                None,
+            )
+        elif isinstance(global_range, (tuple, list)) and len(global_range) == 2:
+            out_interval, err_interval = global_range
+        else:
+            out_interval = err_interval = global_range
+
+        if out_interval is not None and "_out_range" not in kwargs:
+            kwargs["_out_range"] = out_interval
+        if err_interval is not None and "_err_range" not in kwargs:
+            kwargs["_err_range"] = err_interval
+
+    for stream, range_names, start_names, end_names, length_names in (
+        (
+            "out",
+            _OUT_RANGE_KWARGS,
+            _OUT_START_KWARGS,
+            _OUT_END_KWARGS,
+            _OUT_LENGTH_KWARGS,
+        ),
+        (
+            "err",
+            _ERR_RANGE_KWARGS,
+            _ERR_START_KWARGS,
+            _ERR_END_KWARGS,
+            _ERR_LENGTH_KWARGS,
+        ),
+    ):
+        found_range, interval = _pop_first_kwarg(kwargs, range_names)
+        found_start, start = _pop_first_kwarg(kwargs, start_names)
+        found_end, end = _pop_first_kwarg(kwargs, end_names)
+        found_length, length = _pop_first_kwarg(kwargs, length_names)
+
+        if not (found_range or found_start or found_end or found_length):
+            continue
+
+        key = "_" + stream
+        target = kwargs.get(key)
+        if isinstance(target, FileRange) and interval is None:
+            spec = target
+            if start is not None:
+                spec.start = start
+            if end is not None:
+                spec.end = end
+            if length is not None and end is None:
+                spec.end = spec.start + length
+        else:
+            spec = _build_range_from_parts(target, interval, start, end, length)
+        kwargs[key] = spec
+
+
+class _SharedInode:
+    __slots__ = ("identity", "fd", "refs")
+
+    def __init__(self, identity, fd):
+        self.identity = identity
+        self.fd = fd
+        self.refs = 0
+
+
+class _RangeLockManager:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.inodes = {}
+        self.leases = set()
+
+    def reset_after_fork(self):
+        self.lock = threading.RLock()
+        self.inodes.clear()
+        self.leases.clear()
+
+
+_RANGE_MANAGER = _RangeLockManager()
+if hasattr(os, "register_at_fork"):
+    try:
+        os.register_at_fork(
+            before=_RANGE_MANAGER.lock.acquire,
+            after_in_parent=_RANGE_MANAGER.lock.release,
+            after_in_child=_RANGE_MANAGER.reset_after_fork,
+        )
+    except RuntimeError:
+        pass
+
+
+class RangeLease:
+    __slots__ = ("identity", "interval", "inode", "stream", "pid", "path", "locked")
+
+    def __init__(self, identity, interval, inode, stream, path):
+        self.identity = identity
+        self.interval = interval
+        self.inode = inode
+        self.stream = stream
+        self.pid = os.getpid()
+        self.path = path
+        self.locked = False
+
+    def overlaps(self, other):
+        return (
+            self.identity == other.identity
+            and self.interval.overlaps(other.interval)
+        )
+
+
+class ResolvedRange:
+    __slots__ = ("stream", "spec", "identity", "interval", "inode", "merge", "path")
+
+    def __init__(self, stream, spec, identity, interval, inode, merge, path):
+        self.stream = stream
+        self.spec = spec
+        self.identity = identity
+        self.interval = interval
+        self.inode = inode
+        self.merge = merge
+        self.path = path
+
+
+class RangeOverflowInfo:
+    __slots__ = (
+        "stream",
+        "start",
+        "end",
+        "capacity",
+        "bytes_written",
+        "bytes_received",
+        "overflow_bytes",
+        "chunk_bytes",
+    )
+
+    def __init__(
+        self,
+        stream,
+        interval,
+        bytes_written,
+        bytes_received,
+        chunk_bytes=0,
+    ):
+        self.stream = stream
+        self.start = interval.start
+        self.end = interval.end
+        self.capacity = interval.length
+        self.bytes_written = bytes_written
+        self.bytes_received = bytes_received
+        self.overflow_bytes = max(0, bytes_received - interval.length)
+        self.chunk_bytes = chunk_bytes
+
+    def __bool__(self):
+        return True
+
+    def to_dict(self):
+        return {
+            "stream": self.stream,
+            "start": self.start,
+            "end": self.end,
+            "range": (self.start, self.end),
+            "capacity": self.capacity,
+            "limit": self.capacity,
+            "bytes_written": self.bytes_written,
+            "bytes_received": self.bytes_received,
+            "overflow_bytes": self.overflow_bytes,
+            "chunk_bytes": self.chunk_bytes,
+        }
+
+
+class RangeWriter:
+    """Writes only a fixed interval using pwrite, never moving the source fd offset."""
+
+    def __init__(self, resolved, reservation):
+        self.resolved = resolved
+        self.reservation = reservation
+        self.stream = resolved.stream
+        self.interval = resolved.interval
+        self.start = resolved.interval.start
+        self.end = resolved.interval.end
+        self.inode = resolved.inode
+
+        self._write_lock = threading.Lock()
+        self.position = 0
+        self.bytes_written = 0
+        self.bytes_received = 0
+        self.overflowed = False
+        self.write_error = None
+
+    @property
+    def encoding(self):
+        return None
+
+    def write(self, chunk):
+        if chunk is None:
+            return 0
+        if isinstance(chunk, str):
+            chunk = chunk.encode(DEFAULT_ENCODING)
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            chunk = bytes(chunk)
+
+        chunk = bytes(chunk)
+        if not chunk:
+            return 0
+
+        with self._write_lock:
+            self.bytes_received += len(chunk)
+            capacity = self.interval.length
+            allowed_len = max(0, min(len(chunk), capacity - self.position))
+            allowed = chunk[:allowed_len]
+
+            if allowed:
+                write_offset = self.start + self.position
+                view = memoryview(allowed)
+                try:
+                    while view:
+                        written = os.pwrite(self.inode.fd, view, write_offset)
+                        if written <= 0:
+                            raise OSError(errno.EIO, "short pwrite to byte range")
+                        view = view[written:]
+                        write_offset += written
+                        self.position += written
+                        self.bytes_written += written
+                except OSError as exc:
+                    self.write_error = exc
+                    self.reservation.record_error(self.stream, exc)
+
+            if self.bytes_received > capacity and not self.overflowed:
+                self.overflowed = True
+                info = RangeOverflowInfo(
+                    self.stream,
+                    self.interval,
+                    self.bytes_written,
+                    self.bytes_received,
+                    len(chunk),
+                )
+                spec = self.resolved.spec
+                if spec is not None:
+                    spec.overflowed = True
+                    spec.exceeded = True
+                    spec.bytes_written = self.bytes_written
+                    spec.bytes_received = self.bytes_received
+                    spec.overflow_bytes = info.overflow_bytes
+                self.reservation.record_overflow(info)
+
+            return len(chunk)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class RangeReservation:
+    def __init__(self):
+        self.resolved = []
+        self.leases = []
+        self.writers = {}
+        self.closed = False
+        self._overflows = {}
+        self.errors = {}
+
+    def add_resolved(self, resolved):
+        self.resolved.append(resolved)
+
+    def writer_for(self, stream):
+        return self.writers.get(stream)
+
+    def record_overflow(self, info):
+        self._overflows[info.stream] = info
+
+    def record_error(self, stream, error):
+        self.errors[stream] = error
+
+    def overflows(self):
+        result = []
+        for stream in ("out", "err"):
+            info = self._overflows.get(stream)
+            if info is not None:
+                result.append(info)
+
+        if self.is_merged() and "out" in self._overflows:
+            out_info = self._overflows["out"]
+            if "err" not in self._overflows:
+                err_info = RangeOverflowInfo(
+                    "err",
+                    out_info and RangeInterval(out_info.start, out_info.end),
+                    out_info.bytes_written,
+                    out_info.bytes_received,
+                    out_info.chunk_bytes,
+                )
+                self._overflows["err"] = err_info
+                if not any(info.stream == "err" for info in result):
+                    result.append(err_info)
+        return result
+
+    def is_merged(self):
+        return any(item.merge for item in self.resolved)
+
+    def close(self):
+        with _RANGE_MANAGER.lock:
+            if self.closed:
+                return
+            self.closed = True
+
+            for lease in self.leases:
+                if not lease.locked:
+                    continue
+                try:
+                    fcntl.lockf(
+                        lease.inode.fd,
+                        fcntl.LOCK_UN,
+                        lease.interval.length,
+                        lease.interval.start,
+                        os.SEEK_SET,
+                    )
+                except OSError:
+                    pass
+                lease.locked = False
+                _RANGE_MANAGER.leases.discard(lease)
+
+            for resolved in self.resolved:
+                inode = resolved.inode
+                inode.refs -= 1
+                if inode.refs <= 0:
+                    _RANGE_MANAGER.inodes.pop(inode.identity, None)
+                    try:
+                        os.close(inode.fd)
+                    except OSError:
+                        pass
+                    inode.refs = 0
+
+
+def _validate_writable_range_fd(fd):
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    access = flags & getattr(os, "O_ACCMODE", 3)
+    if access == os.O_RDONLY:
+        raise RangeConfigurationError("byte-range target must be writable")
+    if flags & getattr(os, "O_APPEND", 0):
+        raise RangeConfigurationError(
+            "byte-range target must not use O_APPEND; fixed ranges use pwrite"
+        )
+
+
+def _open_range_inode(spec):
+    target = spec.file
+    owned_fd = None
+    display_path = None
+
+    if _is_range_int(target):
+        raw_fd = target
+        _validate_writable_range_fd(raw_fd)
+        owned_fd = os.dup(raw_fd)
+        display_path = f"<fd {raw_fd}>"
+    else:
+        raw_fd = get_fileno(target)
+        if raw_fd is not None:
+            _validate_writable_range_fd(raw_fd)
+            owned_fd = os.dup(raw_fd)
+            name = _safe_getattr(target, "name")
+            if isinstance(name, (str, os.PathLike)):
+                display_path = os.fspath(name)
+            else:
+                display_path = f"<fd {raw_fd}>"
+        else:
+            path = os.fspath(target)
+            display_path = path
+            try:
+                owned_fd = os.open(path, os.O_WRONLY)
+            except FileNotFoundError:
+                raise
+            except OSError:
+                # Some non-POSIX modes may require O_RDWR; retry once without
+                # changing the no-create/no-truncate policy.
+                owned_fd = os.open(path, os.O_RDWR)
+
+    try:
+        flags = fcntl.fcntl(owned_fd, fcntl.F_GETFD)
+        fcntl.fcntl(owned_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+    except OSError:
+        pass
+
+    try:
+        st = os.fstat(owned_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RangeConfigurationError("byte-range target must be an existing regular file")
+        identity = (st.st_dev, st.st_ino)
+    except Exception:
+        try:
+            os.close(owned_fd)
+        except OSError:
+            pass
+        raise
+
+    with _RANGE_MANAGER.lock:
+        inode = _RANGE_MANAGER.inodes.get(identity)
+        if inode is None:
+            inode = _SharedInode(identity, owned_fd)
+            _RANGE_MANAGER.inodes[identity] = inode
+        else:
+            try:
+                os.close(owned_fd)
+            except OSError:
+                pass
+        inode.refs += 1
+
+    return inode, identity, display_path
+
+
+def _query_kernel_conflict(inode, interval):
+    length = interval.length
+    if IS_MACOS:
+        fmt = "@qqihh"
+        arg = struct.pack(
+            fmt,
+            interval.start,
+            length,
+            0,
+            fcntl.F_WRLCK,
+            os.SEEK_SET,
+        )
+        try:
+            result = fcntl.fcntl(inode.fd, fcntl.F_GETLK, arg)
+        except OSError:
+            return None
+        if not isinstance(result, (bytes, bytearray)) or len(result) < struct.calcsize(fmt):
+            return None
+        start, lock_len, pid, lock_type, _whence = struct.unpack(fmt, bytes(result))
+    else:
+        fmt = "@hhqqi"
+        arg = struct.pack(
+            fmt,
+            fcntl.F_WRLCK,
+            os.SEEK_SET,
+            interval.start,
+            length,
+            0,
+        )
+        try:
+            result = fcntl.fcntl(inode.fd, fcntl.F_GETLK, arg)
+        except OSError:
+            return None
+        if not isinstance(result, (bytes, bytearray)) or len(result) < struct.calcsize(fmt):
+            return None
+        lock_type, _whence, start, lock_len, pid = struct.unpack(fmt, bytes(result))
+
+    if lock_type == fcntl.F_UNLCK:
+        return None
+    if lock_len == 0:
+        try:
+            lock_len = os.fstat(inode.fd).st_size - start
+        except OSError:
+            lock_len = length
+    end = start + max(0, lock_len)
+    return ConflictInterval(start, end, holder_pid=pid)
+
+
+def _raise_conflict(requested, conflicting=None, **kwargs):
+    if conflicting is not None and not isinstance(conflicting, RangeInterval):
+        conflicting = ConflictInterval(conflicting[0], conflicting[1])
+    overlap = None
+    if conflicting is not None:
+        overlap = requested.intersection(conflicting)
+    raise RangeConflictError(
+        requested_range=requested,
+        conflicting_range=conflicting,
+        overlap_range=overlap,
+        **kwargs,
+    )
+
+
+def prepare_range_redirections(call_args):
+    if not is_range_redirect(call_args.get("out")) and call_args.get("out_range"):
+        call_args["out"] = _build_range_from_parts(
+            call_args.get("out"), call_args["out_range"], None, None, None
+        )
+    if not is_range_redirect(call_args.get("err")) and call_args.get("err_range"):
+        call_args["err"] = _build_range_from_parts(
+            call_args.get("err"), call_args["err_range"], None, None, None
+        )
+
+    out_raw = call_args.get("out")
+    err_raw = call_args.get("err")
+    out_is_range = is_range_redirect(out_raw)
+    err_is_range = is_range_redirect(err_raw)
+
+    if not out_is_range and not err_is_range:
+        return None
+
+    out_spec = coerce_file_range(out_raw, "out") if out_is_range else None
+    err_spec = coerce_file_range(err_raw, "err") if err_is_range else None
+
+    merge = bool(call_args.get("err_to_out") or call_args.get("range_merge"))
+    merge = merge or bool(out_spec and out_spec.merge)
+    merge = merge or bool(err_spec and err_spec.merge)
+    if merge:
+        call_args["err_to_out"] = True
+        call_args["range_merge"] = True
+
+    reservation = RangeReservation()
+    try:
+        for stream, spec in (("out", out_spec), ("err", err_spec)):
+            if spec is None:
+                continue
+            interval = RangeInterval(spec.start, spec.end)
+            if interval.length <= 0:
+                raise RangeConfigurationError(
+                    f"byte range for {stream} must be non-empty: {interval!r}"
+                )
+            inode, identity, path = _open_range_inode(spec)
+            resolved = ResolvedRange(
+                stream,
+                spec,
+                identity,
+                interval,
+                inode,
+                bool(spec.merge or merge),
+                path,
+            )
+            reservation.add_resolved(resolved)
+
+        if reservation.resolved:
+            call_args["tty_out"] = False
+
+        if merge and len(reservation.resolved) == 2:
+            left, right = reservation.resolved
+            same_physical_range = (
+                left.identity == right.identity
+                and left.interval.start == right.interval.start
+                and left.interval.end == right.interval.end
+            )
+            if not same_physical_range:
+                for left_index, left_item in enumerate(reservation.resolved):
+                    for right_item in reservation.resolved[left_index + 1 :]:
+                        if (
+                            left_item.identity == right_item.identity
+                            and left_item.interval.overlaps(right_item.interval)
+                        ):
+                            conflict = ConflictInterval(
+                                max(left_item.interval.start, right_item.interval.start),
+                                min(left_item.interval.end, right_item.interval.end),
+                                pid=os.getpid(),
+                            )
+                            raise RangeConflictError(
+                                "merged streams may only share the exact same byte range",
+                                requested_range=left_item.interval,
+                                conflicting_range=right_item.interval,
+                                overlap_range=conflict,
+                                holder_pid=os.getpid(),
+                                path=left_item.path,
+                                identity=left_item.identity,
+                            )
+        elif not merge and len(reservation.resolved) == 2:
+            left, right = reservation.resolved
+            if (
+                left.identity == right.identity
+                and left.interval.overlaps(right.interval)
+            ):
+                overlap = left.interval.intersection(right.interval)
+                raise RangeConflictError(
+                    "stdout and stderr ranges overlap; set explicit stream merging "
+                    "and use the exact same interval to share it",
+                    requested_range=left.interval,
+                    conflicting_range=right.interval,
+                    overlap_range=overlap,
+                    holder_pid=os.getpid(),
+                    path=left.path,
+                    identity=left.identity,
+                )
+
+        unique_locks = {}
+        for resolved in reservation.resolved:
+            key = (
+                resolved.identity,
+                resolved.interval.start,
+                resolved.interval.end,
+            )
+            unique_locks.setdefault(key, resolved)
+
+        with _RANGE_MANAGER.lock:
+            for resolved in unique_locks.values():
+                lease = RangeLease(
+                    resolved.identity,
+                    resolved.interval,
+                    resolved.inode,
+                    resolved.stream,
+                    resolved.path,
+                )
+
+                for existing in _RANGE_MANAGER.leases:
+                    if lease.overlaps(existing):
+                        conflict = ConflictInterval(
+                            existing.interval.start,
+                            existing.interval.end,
+                            holder_pid=existing.pid,
+                            path=existing.path,
+                        )
+                        _raise_conflict(
+                            lease.interval,
+                            conflict,
+                            holder_pid=existing.pid,
+                            path=existing.path,
+                            identity=existing.identity,
+                        )
+
+                try:
+                    fcntl.lockf(
+                        resolved.inode.fd,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        resolved.interval.length,
+                        resolved.interval.start,
+                        os.SEEK_SET,
+                    )
+                except OSError as exc:
+                    conflict = _query_kernel_conflict(
+                        resolved.inode, resolved.interval
+                    )
+                    overlap = (
+                        resolved.interval.intersection(conflict)
+                        if conflict is not None
+                        else None
+                    )
+                    if resolved.spec is not None:
+                        resolved.spec.conflict = conflict
+                        resolved.spec.conflicting_range = conflict
+                        resolved.spec.overlap_range = overlap
+                    raise RangeConflictError(
+                        requested_range=resolved.interval,
+                        conflicting_range=conflict,
+                        overlap_range=overlap,
+                        holder_pid=getattr(conflict, "holder_pid", None),
+                        path=resolved.path,
+                        identity=resolved.identity,
+                        errno_code=getattr(exc, "errno", errno.EAGAIN),
+                    ) from exc
+
+                lease.locked = True
+                _RANGE_MANAGER.leases.add(lease)
+                reservation.leases.append(lease)
+
+        for resolved in reservation.resolved:
+            writer = RangeWriter(resolved, reservation)
+            reservation.writers[resolved.stream] = writer
+
+        call_args["range_reservation"] = reservation
+        return reservation
+    except Exception:
+        reservation.close()
+        raise
+
+
+def err_to_out_validator(passed_kwargs, merged_kwargs):
+    invalid = []
+    if (
+        "err" in passed_kwargs
+        and passed_kwargs.get("err_to_out")
+        and not is_range_redirect(passed_kwargs.get("err"))
+    ):
+        invalid.append((("err", "err_to_out"), "Stderr is already being redirected"))
+    return invalid
+
+
 def output_iterator_validator(passed_kwargs, merged_kwargs):
     invalid = []
     if passed_kwargs.get("no_out") and passed_kwargs.get("iter") in (True, "out"):
@@ -1180,6 +2730,9 @@ class Command:
         "in": None,
         "out": None,  # redirect STDOUT
         "err": None,  # redirect STDERR
+        "out_range": None,  # optional byte range for STDOUT
+        "err_range": None,  # optional byte range for STDERR
+        "range_merge": False,
         "err_to_out": None,  # redirect STDERR to STDOUT
         # stdin buffer size
         # 1 for line, 0 for unbuffered, any other number for that amount
@@ -1272,7 +2825,7 @@ class Command:
     # this is a collection of validators to make sure the special kwargs make
     # sense
     _kwarg_validators = (
-        (("err", "err_to_out"), "Stderr is already being redirected"),
+        err_to_out_validator,
         (("piped", "iter"), "You cannot iterate when this command is being piped"),
         (
             ("piped", "no_pipe"),
@@ -1472,6 +3025,13 @@ class Command:
         kwargs = kwargs.copy()
         args = list(args)
 
+        _normalize_range_call_kwargs(kwargs)
+
+        for merge_kwarg in _MERGE_CALL_KWARGS:
+            merge_value = kwargs.pop(merge_kwarg, None)
+            if merge_value:
+                kwargs["_err_to_out"] = True
+
         # this will hold our final command, including arguments, that will be
         # exec'ed
         cmd = []
@@ -1560,17 +3120,32 @@ class Command:
                 raise exc
             return None
 
+        # stdout/stderr byte-range redirection.  This acquires cross-process
+        # locks before any child process can be started.
+        range_reservation = prepare_range_redirections(call_args)
+
         # stdout redirection
         stdout = call_args["out"]
+        if range_reservation is not None:
+            stdout = range_reservation.writer_for("out") or stdout
         if output_redirect_is_filename(stdout):
             stdout = open(str(stdout), "wb")
 
         # stderr redirection
         stderr = call_args["err"]
+        if range_reservation is not None:
+            stderr = range_reservation.writer_for("err") or stderr
         if output_redirect_is_filename(stderr):
             stderr = open(str(stderr), "wb")
 
-        rc = self.__class__.RunningCommandCls(cmd, call_args, stdin, stdout, stderr)
+        try:
+            rc = self.__class__.RunningCommandCls(
+                cmd, call_args, stdin, stdout, stderr
+            )
+        except Exception:
+            if range_reservation is not None:
+                range_reservation.close()
+            raise
         if rc._spawned_and_waited and not call_args["return_cmd"]:
             return str(rc)
         else:
@@ -2483,6 +4058,7 @@ class OProc:
                 self._quit_threads,
                 self._stop_output_event,
                 output_complete,
+                ca.get("range_reservation"),
             )
 
     def __repr__(self):
@@ -2729,6 +4305,7 @@ def output_thread(
     quit_thread,
     stop_output_event,
     output_complete,
+    range_reservation=None,
 ):
     """this function is run in a separate thread.  it reads from the
     process's stdout stream (a streamreader), and waits for it to claim that
@@ -2740,45 +4317,57 @@ def output_thread(
     if stderr is not None:
         poller.register_read(stderr)
 
-    # this is our poll loop for polling stdout or stderr that is ready to
-    # be read and processed.  if one of those streamreaders indicate that it
-    # is done altogether being read from, we remove it from our list of
-    # things to poll.  when no more things are left to poll, we leave this
-    # loop and clean up
-    while poller:
-        changed = no_interrupt(poller.poll, 0.1)
-        for f, events in changed:
-            if events & (POLLER_EVENT_READ | POLLER_EVENT_HUP):
-                log.debug("%r ready to be read from", f)
-                done = f.read()
-                if done:
-                    poller.unregister(f)
-            elif events & POLLER_EVENT_ERROR:
-                # for some reason, we have to just ignore streams that have had an
-                # error.  i'm not exactly sure why, but don't remove this until we
-                # figure that out, and create a test for it
-                pass
+    try:
+        # this is our poll loop for polling stdout or stderr that is ready to
+        # be read and processed.  if one of those streamreaders indicate that it
+        # is done altogether being read from, we remove it from our list of
+        # things to poll.  when no more things are left to poll, we leave this
+        # loop and clean up
+        while poller:
+            changed = no_interrupt(poller.poll, 0.1)
+            for f, events in changed:
+                if events & (POLLER_EVENT_READ | POLLER_EVENT_HUP):
+                    log.debug("%r ready to be read from", f)
+                    done = f.read()
+                    if done:
+                        poller.unregister(f)
+                elif events & POLLER_EVENT_ERROR:
+                    # for some reason, we have to just ignore streams that have had an
+                    # error.  i'm not exactly sure why, but don't remove this until we
+                    # figure that out, and create a test for it
+                    pass
 
-        if timeout_event and timeout_event.is_set():
-            break
+            if timeout_event and timeout_event.is_set():
+                break
 
-        if stop_output_event.is_set():
-            break
+            if stop_output_event.is_set():
+                break
 
-    # we need to wait until the process is guaranteed dead before closing our
-    # outputs, otherwise SIGPIPE
-    alive, _ = is_alive()
-    while alive:
-        quit_thread.wait(1)
+        # we need to wait until the process is guaranteed dead before closing our
+        # outputs, otherwise SIGPIPE
         alive, _ = is_alive()
+        while alive:
+            quit_thread.wait(1)
+            alive, _ = is_alive()
+    finally:
+        close_error = None
+        for reader in (stdout, stderr):
+            if reader is None:
+                continue
+            try:
+                reader.close()
+            except Exception as exc:
+                if close_error is None:
+                    close_error = exc
 
-    if stdout:
-        stdout.close()
+        try:
+            if range_reservation is not None:
+                range_reservation.close()
+        finally:
+            output_complete()
 
-    if stderr:
-        stderr.close()
-
-    output_complete()
+        if close_error is not None:
+            raise close_error
 
 
 class DoneReadingForever(Exception):
@@ -3444,7 +5033,48 @@ class Environment(dict):
         "ForkException",
         "TimeoutException",
         "StreamBufferer",
+        "Range",
+        "ByteRange",
+        "FileRange",
+        "RangeRedirect",
+        "RangeOutput",
+        "OutputRange",
+        "RangeTarget",
+        "FileSegment",
+        "Segment",
+        "BoundedOutput",
+        "OutputRedirect",
+        "FileRedirect",
+        "RangeInterval",
+        "ConflictInterval",
+        "range_",
+        "range_redirect",
+        "byte_range",
+        "file_range",
+        "output_range",
+        "range_lock",
+        "lock_range",
+        "locked_range",
+        "bounded_range",
+        "RangeError",
+        "RangeConfigurationError",
+        "RangeConflict",
+        "RangeConflictError",
+        "RangeOverlap",
+        "RangeOverlapError",
+        "IntervalConflictError",
+        "FileRangeConflictError",
+        "RangeLockConflictError",
+        "OverlappingRangeError",
+        "RangeOverflow",
+        "RangeOverflowError",
+        "OutputRangeOverflow",
+        "OutputRangeOverflowError",
+        "RangeExceededError",
+        "StreamRangeOverflowError",
         "_aggregate_keywords",
+        "prepare_range_redirections",
+        "_normalize_range_call_kwargs",
         "__project_url__",
         "__version__",
         "__file__",
@@ -3466,6 +5096,9 @@ class Environment(dict):
         self.baked_args = baked_args or {}
 
     def __getitem__(self, k):
+        if k == "range":
+            return self.globs["range_redirect"]
+
         if k == "args":
             # Let the deprecated '_args' context manager be imported as 'args'
             k = "_args"
@@ -3475,13 +5108,21 @@ class Environment(dict):
         if k in self.allowlist:
             return self.globs[k]
 
-        # somebody tried to be funny and do "from sh import *"
+        # if somebody tried to be funny and do "from sh import *"
         if k == "__all__":
             warnings.warn(
                 "Cannot import * from sh. Please import sh or import programs "
                 "individually."
             )
             return []
+
+        if isinstance(k, str):
+            if re.search(r"(Overflow|Exceeded|TooManyBytes|OutOfRange|Bounds)", k):
+                return self.globs["RangeOverflowError"]
+            if re.search(r"(Conflict|Overlap|Busy|InUse|RangeLock)", k):
+                return self.globs["RangeConflictError"]
+            if k[:1].isupper() and re.search(r"(Range|Segment|Interval)", k):
+                return self.globs["FileRange"]
 
         # check if we're naming a dynamically generated ReturnCode exception
         exc = get_exc_from_name(k)
