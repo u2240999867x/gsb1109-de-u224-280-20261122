@@ -167,6 +167,7 @@ Joins
 .. autofunction:: petl.transform.hashjoins.hashlookupjoin
 .. autofunction:: petl.transform.hashjoins.hashrightjoin
 .. autofunction:: petl.transform.hashjoins.hashantijoin
+.. autofunction:: petl.transform.reconcile.ReconcileSpec
 
 
 .. module:: petl.transform.setops

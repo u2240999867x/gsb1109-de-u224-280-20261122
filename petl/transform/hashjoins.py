@@ -10,7 +10,8 @@ from petl.util.lookups import lookup, lookupone
 
 
 def hashjoin(left, right, key=None, lkey=None, rkey=None, cache=True,
-             lprefix=None, rprefix=None, missing=None):
+             lprefix=None, rprefix=None, missing=None, reconcile=None,
+             **kwargs):
     """Alternative implementation of :func:`petl.transform.joins.join`, where
     the join is executed by constructing an in-memory lookup for the right
     hand table, then iterating over rows from the left hand table.
@@ -24,13 +25,26 @@ def hashjoin(left, right, key=None, lkey=None, rkey=None, cache=True,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    If `reconcile` is true (or a :class:`ReconcileSpec`), rows are matched by
+    site and device number, with a serial-number fallback for unmatched
+    readings. See :mod:`petl.transform.reconcile` for the rules. Without this
+    argument the ordinary join behaviour is preserved.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up and rows will be filled with the value if `missing` keyword
         argument before joining to ensure correct results.
 
     """
-    
+
+    from petl.transform.reconcile import make_reconcile_spec, ReconcileView
+    rspec = make_reconcile_spec(key=key, lkey=lkey, rkey=rkey,
+                                reconcile=reconcile, options=kwargs,
+                                missing=missing)
+    if rspec is not None:
+        return ReconcileView(left, right, rspec, leftouter=False,
+                             use_hash=True, cache=cache, lprefix=lprefix,
+                             rprefix=rprefix)
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return HashJoinView(left, right, lkey=lkey, rkey=rkey, cache=cache,
                         lprefix=lprefix, rprefix=rprefix, missing=missing)
@@ -109,7 +123,8 @@ def iterhashjoin(left, right, lkey, rkey, rlookup, lprefix, rprefix):
         
         
 def hashleftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
-                 cache=True, lprefix=None, rprefix=None):
+                 cache=True, lprefix=None, rprefix=None, reconcile=None,
+                 **kwargs):
     """Alternative implementation of :func:`petl.transform.joins.leftjoin`,
     where the join is executed by constructing an in-memory lookup for the
     right hand table, then iterating over rows from the left hand table.
@@ -123,12 +138,25 @@ def hashleftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    If `reconcile` is true (or a :class:`ReconcileSpec`), rows are matched by
+    site and device number, with a serial-number fallback for unmatched
+    readings. See :mod:`petl.transform.reconcile` for the rules. Without this
+    argument the ordinary join behaviour is preserved.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
 
     """
 
+    from petl.transform.reconcile import make_reconcile_spec, ReconcileView
+    rspec = make_reconcile_spec(key=key, lkey=lkey, rkey=rkey,
+                                reconcile=reconcile, options=kwargs,
+                                missing=missing)
+    if rspec is not None:
+        return ReconcileView(left, right, rspec, leftouter=True,
+                             use_hash=True, cache=cache, lprefix=lprefix,
+                             rprefix=rprefix)
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return HashLeftJoinView(left, right, lkey, rkey, missing=missing,
                             cache=cache, lprefix=lprefix, rprefix=rprefix)

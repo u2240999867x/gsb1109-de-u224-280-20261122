@@ -1563,3 +1563,236 @@ def test_joins_negative_key_indices():
     for join_impl in (join, leftjoin, rightjoin, outerjoin, hashjoin,
                       hashleftjoin, hashrightjoin, lookupjoin, hashlookupjoin):
         ieq(expected, join_impl(left, right, lkey=-1, rkey=-1))
+
+
+# ---------------------------------------------------------------------------
+# Device reconciliation ("stale device claim") rules
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal
+
+import pytest
+
+from petl.transform.reconcile import ReconcileSpec
+
+
+# The catalogue is in serial-then-device order so that the short R6 row can
+# carry its site and serial while the device and record number are absent.
+_NORTH_CATALOG = (
+    ('site', 'serial', 'device', 'record'),
+    ('north', 'Y', Decimal('9007199254740992.00'), 'R0'),
+    ('north', 'Y', Decimal('9007199254740993.00'), 'R1'),
+    ('north', 'Y', Decimal('9007199254740993.00'), 'R2'),
+    ('north', 'X', 7, 'R3'),
+    ('north', 'X', 7, 'R4'),
+    ('north', 'X', None, 'R5'),
+    ('north', 'X'),  # R6: short row, serial present, device absent
+)
+
+_NORTH_READINGS = (
+    ('site', 'serial', 'device'),
+    ('north', 'Y', 9007199254740992),
+    ('north', 'X', 9007199254740993),
+    ('north', 'Y', None),
+    ('north', 'X', 99),
+    ('north', 'X'),  # short row: serial present, device absent
+)
+
+
+def _reconciled(fn, left=_NORTH_READINGS, right=_NORTH_CATALOG, **kwargs):
+    return list(fn(left, right, reconcile=True, **kwargs))
+
+
+def _records(result):
+    return [row[-1] for row in list(result)[1:]]
+
+
+@pytest.mark.parametrize('fn', [join, hashjoin])
+def test_reconcile_exact_and_serial_fallback(fn):
+    result = _reconciled(fn)
+    # int and finite Decimal agree by exact numeric value
+    assert result[1] == ('north', 'Y', 9007199254740992, 'Y', 'R0')
+    assert [row[-1] for row in result[2:4]] == ['R1', 'R2']
+    assert [row[2] for row in result[2:4]] == [9007199254740993] * 2
+    # unknown device and short row both fall back; each catalogue row kept
+    assert [row[-1] for row in result[4:]] == ['R3', 'R4', 'R3', 'R4']
+    # the explicit None reading is unclaimed for an inner join
+    assert len(result) == 8
+
+
+def test_reconcile_exact_match_wins_over_serial():
+    catalog = (
+        ('site', 'device', 'serial', 'record'),
+        ('north', 1, 'S', 'A'),
+        ('north', 2, 'S', 'B'),
+    )
+    readings = (('site', 'serial', 'device'),
+                ('north', 'S', 1))
+    assert _records(join(readings, catalog, reconcile=True)) == ['A']
+
+
+def test_reconcile_ambiguous_serial_unclaimed():
+    catalog = (
+        ('site', 'device', 'serial', 'record'),
+        ('north', 1, 'S', 'A'),
+        ('north', 2, 'S', 'B'),
+    )
+    readings = (('site', 'serial', 'device'),
+                ('north', 'S'))
+    assert _records(join(readings, catalog, reconcile=True)) == []
+    left = _reconciled(leftjoin, readings, catalog)
+    assert len(left) == 2 and left[1][-1] is None
+
+
+def test_reconcile_catalog_missing_and_none_not_claimed_by_serial():
+    catalog = (
+        ('site', 'serial', 'device', 'record'),
+        ('north', 'S', None, 'A'),
+        ('north', 'S'),  # missing device number
+        ('north', 'S', 3, 'B'),
+    )
+    readings = (('site', 'serial', 'device'),
+                ('north', 'S'))
+    # only device 3 is an eligible serial claim; None/missing rows are not
+    assert _records(join(readings, catalog, reconcile=True)) == ['B']
+
+
+def test_reconcile_short_y_reading_unclaimed():
+    readings = (('site', 'serial', 'device'),
+                ('north', 'Y'))
+    assert _records(join(readings, _NORTH_CATALOG, reconcile=True)) == []
+    left = list(leftjoin(readings, _NORTH_CATALOG, reconcile=True))
+    assert left[1:] == [('north', 'Y', None, None, None)]
+
+
+def test_reconcile_none_device_only_when_none_matching():
+    result = _reconciled(hashjoin)
+    assert all(row[-1] != 'R5' for row in result)
+
+    result = _reconciled(hashleftjoin, match_none=True)
+    explicit_none = [row for row in result[1:] if row[2] is None]
+    # the explicit None reading claims R5; the short reading falls back
+    assert explicit_none == [('north', 'Y', None, 'X', 'R5'),
+                             ('north', 'X', None, 'X', 'R3'),
+                             ('north', 'X', None, 'X', 'R4')]
+
+
+@pytest.mark.parametrize('fn', [join, leftjoin, hashjoin, hashleftjoin])
+def test_reconcile_left_and_inner_shape(fn):
+    result = _reconciled(fn)
+    assert result[0] == ('site', 'serial', 'device', 'serial', 'record')
+    inner = fn is join or fn is hashjoin
+    if inner:
+        assert len(result) == 8
+    else:
+        # every unclaimed reading is kept exactly once
+        assert len(result) == 9
+        unclaimed = [row for row in result[1:] if row[-1] is None]
+        assert unclaimed == [('north', 'Y', None, None, None)]
+    # left device value keeps its original Python type
+    assert type(result[1][2]) is int
+
+
+def test_reconcile_reordered_catalog_and_value_types():
+    catalog = (
+        ('record', 'serial', 'device', 'site'),
+        ('R3', 'X', 7, 'north'),
+        ('R4', 'X', 7, 'north'),
+        ('R5', 'X', None, 'north'),
+    )
+    readings = (('site', 'serial', 'device'),
+                ('north', 'X'))
+    result = list(hashjoin(readings, catalog, reconcile=True))
+    assert result[0] == ('site', 'serial', 'device', 'record', 'serial')
+    assert [row[3] for row in result[1:]] == ['R3', 'R4']
+
+
+def test_reconcile_booleans_and_strings_distinct():
+    catalog = (
+        ('site', 'device', 'serial', 'record'),
+        ('north', True, 'S', 'B'),
+        ('north', 1, 'S', 'N'),
+        ('north', '1', 'S', 'T'),
+    )
+    readings = (('site', 'serial', 'device'),
+                ('north', 'S', True))
+    assert _records(join(readings, catalog, reconcile=True)) == ['B']
+
+
+def test_reconcile_explicit_spec():
+    spec = ReconcileSpec(lsite='site', rsite='site', ldevice='device',
+                         rdevice='device', lserial='serial',
+                         rserial='serial', rrecord='record')
+    catalog = (('site', 'device', 'serial', 'record'),
+               ('north', 7, 'S', 'A'))
+    readings = (('site', 'serial', 'device'),
+                ('north', 'S'))
+    result = list(join(readings, catalog, reconcile=spec))
+    assert result[1][-1] == 'A'
+
+
+class _BatchCatalog(object):
+    def __init__(self, batches):
+        self.batches = batches
+        self.opens = 0
+
+    def __iter__(self):
+        batch = self.batches[min(self.opens, len(self.batches) - 1)]
+        self.opens += 1
+        return iter(batch)
+
+
+class _Readings(object):
+    def __init__(self, rows):
+        self.rows = rows
+        self.opens = 0
+
+    def __iter__(self):
+        self.opens += 1
+        return iter(self.rows)
+
+
+@pytest.mark.parametrize('fn', [join, leftjoin, hashjoin, hashleftjoin])
+@pytest.mark.parametrize('buffersize', [None, 1])
+def test_reconcile_two_catalog_batches_uncached(fn, buffersize):
+    catalog = _BatchCatalog([
+        (
+            ('site', 'device', 'serial', 'record'),
+            ('north', 7, 'X', 'R3'),
+            ('north', 7, 'X', 'R4'),
+        ),
+        (
+            ('device', 'record', 'serial', 'site'),
+            (7, 'R7', 'X', 'north'),
+        ),
+    ])
+    readings = _Readings((('site', 'serial', 'device'),
+                          ('north', 'X')))
+
+    view = fn(readings, catalog, reconcile=True, cache=False,
+              buffersize=buffersize)
+    a = iter(view)
+    header_a = next(a)
+    assert header_a == ('site', 'serial', 'device', 'serial', 'record')
+
+    b = iter(view)
+    header_b = next(b)
+    assert header_b == ('site', 'serial', 'device', 'record', 'serial')
+    rows_b = list(b)
+    assert rows_b == [('north', 'X', None, 'R7', 'X')]
+
+    rows_a = list(a)
+    assert rows_a == [('north', 'X', None, 'X', 'R3'),
+                      ('north', 'X', None, 'X', 'R4')]
+    assert catalog.opens == 2
+    assert readings.opens == 2
+
+
+def test_reconcile_legacy_join_unchanged():
+    table1 = (('site', 'device'), ('north', 1))
+    table2 = (('site', 'device', 'record'), ('north', 1, 'R'))
+    # without the reconciliation rules the ordinary join applies
+    assert list(join(table1, table2)) == [
+        ('site', 'device', 'record'), ('north', 1, 'R')]
+    assert list(hashjoin(table1, table2)) == [
+        ('site', 'device', 'record'), ('north', 1, 'R')]

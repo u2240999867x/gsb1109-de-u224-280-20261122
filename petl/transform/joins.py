@@ -54,7 +54,8 @@ def _nonkey_indices(hdr, indices):
 
 
 def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
-         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None):
+         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None,
+         reconcile=None, **kwargs):
     """
     Perform an equi-join on the given tables. E.g.::
 
@@ -141,6 +142,11 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    If `reconcile` is true (or a :class:`ReconcileSpec`), rows are matched by
+    site and device number, with a serial-number fallback for unmatched
+    readings. See :mod:`petl.transform.reconcile` for the rules. Without this
+    argument the ordinary join behaviour is preserved.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
@@ -148,6 +154,14 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     """
 
     # TODO don't read data twice (occurs if using natural key)
+    from petl.transform.reconcile import make_reconcile_spec, ReconcileView
+    rspec = make_reconcile_spec(key=key, lkey=lkey, rkey=rkey,
+                                reconcile=reconcile, options=kwargs)
+    if rspec is not None:
+        return ReconcileView(left, right, rspec, leftouter=False,
+                             use_hash=False, buffersize=buffersize,
+                             tempdir=tempdir, cache=cache, lprefix=lprefix,
+                             rprefix=rprefix)
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, buffersize=buffersize, tempdir=tempdir,
@@ -187,7 +201,7 @@ class JoinView(Table):
 
 def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
              presorted=False, buffersize=None, tempdir=None, cache=True,
-             lprefix=None, rprefix=None):
+             lprefix=None, rprefix=None, reconcile=None, **kwargs):
     """
     Perform a left outer join on the given tables. E.g.::
 
@@ -221,6 +235,11 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    If `reconcile` is true (or a :class:`ReconcileSpec`), rows are matched by
+    site and device number, with a serial-number fallback for unmatched
+    readings. See :mod:`petl.transform.reconcile` for the rules. Without this
+    argument the ordinary join behaviour is preserved.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
@@ -228,6 +247,15 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     """
 
     # TODO don't read data twice (occurs if using natural key)
+    from petl.transform.reconcile import make_reconcile_spec, ReconcileView
+    rspec = make_reconcile_spec(key=key, lkey=lkey, rkey=rkey,
+                                reconcile=reconcile, options=kwargs,
+                                missing=missing)
+    if rspec is not None:
+        return ReconcileView(left, right, rspec, leftouter=True,
+                             use_hash=False, buffersize=buffersize,
+                             tempdir=tempdir, cache=cache, lprefix=lprefix,
+                             rprefix=rprefix)
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=False,

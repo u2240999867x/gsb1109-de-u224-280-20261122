@@ -25,6 +25,9 @@ from petl.transform.selects import select, selectop, selectcontains, \
 from petl.transform.joins import join, leftjoin, rightjoin, outerjoin, \
     crossjoin, antijoin, lookupjoin, unjoin
 
+from petl.transform.reconcile import ReconcileSpec, make_reconcile_spec, \
+    reconcile_spec
+
 from petl.transform.hashjoins import hashjoin, hashleftjoin, hashrightjoin, \
     hashantijoin, hashlookupjoin
 
