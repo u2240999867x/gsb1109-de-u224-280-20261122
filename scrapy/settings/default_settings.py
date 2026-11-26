@@ -89,6 +89,7 @@ __all__ = [
     "DUPEFILTER_CLASS",
     "DUPEFILTER_DEBUG",
     "EDITOR",
+    "ENTRY_SHARING_ENABLED",
     "EVENT_LOOP_LAG_THRESHOLD",
     "EXTENSIONS",
     "EXTENSIONS_BASE",
@@ -374,6 +375,7 @@ DOWNLOADER_MIDDLEWARES_BASE = {
     "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware": 590,
     "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": 600,
     "scrapy.downloadermiddlewares.cookies.CookiesMiddleware": 700,
+    "scrapy.entrymode.EntrySharingMiddleware": 710,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
     "scrapy.downloadermiddlewares.stats.DownloaderStats": 850,
     "scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware": 900,
@@ -385,6 +387,8 @@ DOWNLOADER_STATS = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.RFPDupeFilter"
 DUPEFILTER_DEBUG = False
+
+ENTRY_SHARING_ENABLED = False
 
 EDITOR = "vi"
 if sys.platform == "win32":

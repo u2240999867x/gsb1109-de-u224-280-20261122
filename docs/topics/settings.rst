@@ -1039,6 +1039,7 @@ Default:
         "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware": 590,
         "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": 600,
         "scrapy.downloadermiddlewares.cookies.CookiesMiddleware": 700,
+        "scrapy.entrymode.EntrySharingMiddleware": 710,
         "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
         "scrapy.downloadermiddlewares.stats.DownloaderStats": 850,
         "scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware": 900,
