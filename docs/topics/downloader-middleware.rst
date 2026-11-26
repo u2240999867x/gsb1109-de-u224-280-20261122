@@ -744,6 +744,24 @@ Default: ``False``
 If enabled, will compress all cached data with gzip.
 This setting is specific to the Filesystem backend.
 
+.. setting:: HTTPCACHE_RANGE_REQUESTS
+
+HTTPCACHE_RANGE_REQUESTS
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Default: ``False``
+
+.. versionadded:: VERSION
+
+If enabled, single-range ``GET`` requests can reuse the bytes already cached
+for the same URL and version, downloading only the missing intervals from the
+origin server.
+
+This setting is specific to the Filesystem backend. It only applies to
+resources without content compression, without a ``Vary`` header, and with a
+strong ``ETag``. A regular ``GET`` request only hits the cache this way when
+the cached bytes of one version are complete.
+
 .. setting:: HTTPCACHE_ALWAYS_STORE
 
 HTTPCACHE_ALWAYS_STORE
