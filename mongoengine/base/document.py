@@ -12,6 +12,7 @@ from mongoengine.base.datastructures import (
     BaseList,
     EmbeddedDocumentList,
     StrictDict,
+    _propagate_change,
 )
 from mongoengine.base.fields import ComplexBaseField
 from mongoengine.common import _import_class
@@ -40,6 +41,7 @@ class BaseDocument:
         "_dynamic_fields",
         "_auto_id_field",
         "_db_field_map",
+        "_owner_links",
         "__weakref__",
     )
 
@@ -559,6 +561,16 @@ class BaseDocument:
         if not key:
             return
 
+        self._note_unset_path(key)
+        # A nested value may be shared by several documents. Notify every
+        # document that currently contains it so each one persists its own
+        # update.
+        _propagate_change(self, key, unset=True)
+
+    def _note_unset_path(self, key):
+        if not key:
+            return
+
         key = self._resolve_key(key)
         # An exact or ancestor unset already removes this path.
         if key in self._unset_fields or any(
@@ -574,6 +586,17 @@ class BaseDocument:
     def _mark_as_changed(self, key):
         """Mark a key as explicitly changed by the user."""
         if not self._has_change_tracking_baseline:
+            return
+
+        self._note_changed_path(key)
+        # A nested value may be shared by several documents. Notify every
+        # document that currently contains it so each one persists its own
+        # update.
+        _propagate_change(self, key, unset=False)
+
+    def _note_changed_path(self, key):
+        """Record a changed path without notifying containing documents."""
+        if not key or not self._has_change_tracking_baseline:
             return
 
         self._unmark_as_unset(key)
@@ -692,6 +715,8 @@ class BaseDocument:
     @staticmethod
     def _get_disjoint_updated_fields(changed_fields, unset_fields):
         """Remove ancestor and descendant conflicts from updated field paths."""
+        changed_fields = list(dict.fromkeys(changed_fields))
+        unset_fields = list(dict.fromkeys(unset_fields))
         unset_fields = [
             field
             for field in unset_fields

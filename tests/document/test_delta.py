@@ -1346,6 +1346,140 @@ class TestDelta(MongoDBTestCase):
         raw_doc = get_as_pymongo(mydoc)
         assert raw_doc == {"_id": mydoc.id, "dico": {"": 3, "a": {"b": 0}}}
 
+    def test_nested_value_shared_by_two_documents__each_document_saves_its_own_change(
+        self,
+    ):
+        class Config(EmbeddedDocument):
+            params = DictField()
+
+        class Sheet(Document):
+            dq = ListField(EmbeddedDocumentField(Config))
+            rl = ListField(EmbeddedDocumentField(Config))
+
+        def make_config():
+            return Config(params={"gain": 4, "offset": 1})
+
+        first = Sheet(dq=[make_config(), make_config(), make_config()]).save()
+        second = Sheet(rl=[make_config()]).save()
+
+        first = Sheet.objects.get(id=first.id)
+        second = Sheet.objects.get(id=second.id)
+
+        # Two parameter panels are open on the pending list.
+        second_panel = first.dq[1].params
+        third_panel = first.dq[2].params
+
+        # Move the same config object into both sheets' release lists.
+        config = first.dq[1]
+        first.dq.pop(1)
+        first.rl.insert(0, config)
+        second.rl.insert(1, config)
+
+        # Replace the old pending slot and drop the third one.
+        first.dq.insert(1, make_config())
+        first.dq.pop(2)
+
+        first.save()
+        second.save()
+
+        second_panel["gain"] = 7
+        del second_panel["offset"]
+        third_panel["gain"] = 99
+
+        first.save()
+
+        assert get_as_pymongo(first)["rl"] == [{"params": {"gain": 7}}]
+        assert get_as_pymongo(first)["dq"] == [
+            {"params": {"gain": 4, "offset": 1}},
+            {"params": {"gain": 4, "offset": 1}},
+        ]
+        assert get_as_pymongo(second)["rl"] == [
+            {"params": {"gain": 4, "offset": 1}},
+            {"params": {"gain": 4, "offset": 1}},
+        ]
+
+        # Detach the config from the first sheet and edit the old panel again.
+        first.rl.pop(0)
+        first.save()
+
+        assert first._delta() == ({}, {})
+
+        second_panel["gain"] = 9
+        assert first._delta() == ({}, {})
+
+        first.save()
+        assert get_as_pymongo(first)["rl"] == []
+
+        second.save()
+        assert get_as_pymongo(second)["rl"] == [
+            {"params": {"gain": 4, "offset": 1}},
+            {"params": {"gain": 9}},
+        ]
+
+    def test_nested_value_shared_by_two_documents__delta_targets_current_position(
+        self,
+    ):
+        class Config(EmbeddedDocument):
+            params = DictField()
+
+        class Sheet(Document):
+            dq = ListField(EmbeddedDocumentField(Config))
+            rl = ListField(EmbeddedDocumentField(Config))
+
+        def make_config():
+            return Config(params={"gain": 4, "offset": 1})
+
+        first = Sheet(dq=[make_config(), make_config(), make_config()]).save()
+        second = Sheet(rl=[make_config()]).save()
+
+        first = Sheet.objects.get(id=first.id)
+        second = Sheet.objects.get(id=second.id)
+
+        panel = first.dq[1].params
+        config = first.dq[1]
+        first.dq.pop(1)
+        first.rl.insert(0, config)
+        second.rl.insert(1, config)
+        first.dq.insert(1, make_config())
+        first.dq.pop(2)
+        first.save()
+        second.save()
+
+        panel["gain"] = 7
+        del panel["offset"]
+
+        assert first._delta() == (
+            {"rl.0.params.gain": 7},
+            {"rl.0.params.offset": 1},
+        )
+        first.save()
+
+        first.rl.pop(0)
+        first.save()
+        panel["gain"] = 9
+
+        assert first._delta() == ({}, {})
+        assert second._delta() == (
+            {"rl.1.params.gain": 9},
+            {"rl.1.params.offset": 1},
+        )
+
+    def test_nested_value_unmoved__editing_one_param_only_sets_that_param(self):
+        class Config(EmbeddedDocument):
+            params = DictField()
+
+        class Sheet(Document):
+            dq = ListField(EmbeddedDocumentField(Config))
+
+        sheet = Sheet(dq=[Config(params={"gain": 4, "offset": 1})]).save()
+        sheet = Sheet.objects.get(id=sheet.id)
+
+        sheet.dq[0].params["gain"] = 7
+
+        assert sheet._delta() == ({"dq.0.params.gain": 7}, {})
+        sheet.save()
+        assert get_as_pymongo(sheet)["dq"] == [{"params": {"gain": 7, "offset": 1}}]
+
 
 if __name__ == "__main__":
     unittest.main()

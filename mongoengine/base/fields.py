@@ -11,6 +11,7 @@ from mongoengine.base.datastructures import (
     BaseDict,
     BaseList,
     EmbeddedDocumentList,
+    _add_owner,
 )
 from mongoengine.common import _import_class
 from mongoengine.errors import DeprecatedError, ValidationError
@@ -202,10 +203,12 @@ class BaseField:
         EmbeddedDocument = _import_class("EmbeddedDocument")
         if isinstance(value, EmbeddedDocument):
             value._instance = weakref.proxy(instance)
+            _add_owner(value, instance)
         elif isinstance(value, (list, tuple)):
             for v in value:
                 if isinstance(v, EmbeddedDocument):
                     v._instance = weakref.proxy(instance)
+                    _add_owner(v, instance)
 
         instance._data[self.name] = value
 

@@ -14,39 +14,292 @@ __all__ = (
 )
 
 
-def mark_as_changed_wrapper(parent_method):
-    """Decorator that ensures _mark_as_changed method gets called."""
-
-    def wrapper(self, *args, **kwargs):
-        # Can't use super() in the decorator.
-        result = parent_method(self, *args, **kwargs)
-        self._mark_as_changed()
-        return result
-
-    return wrapper
+def _make_owner_ref(owner):
+    """Return a weak reference to ``owner`` when possible."""
+    if isinstance(owner, weakref.ProxyTypes):
+        return owner
+    try:
+        return weakref.ref(owner)
+    except TypeError:
+        return owner
 
 
-def mark_key_as_changed_wrapper(parent_method):
-    """Decorator that ensures _mark_as_changed method gets called with the key argument"""
+def _owner_links(holder, create=False):
+    try:
+        links = getattr(holder, "_owner_links", None)
+    except ReferenceError:
+        return None
+    if links is None and create:
+        links = {}
+        try:
+            holder._owner_links = links
+        except (AttributeError, ReferenceError):
+            return None
+    return links
 
-    def wrapper(self, key, *args, **kwargs):
-        # Can't use super() in the decorator.
-        if not args or key not in self or self[key] != args[0]:
-            self._mark_as_changed(key)
-        return parent_method(self, key, *args, **kwargs)
 
-    return wrapper
+def _add_owner(child, owner):
+    """Record that ``child`` is currently contained by ``owner``."""
+    if child is None or owner is None:
+        return
+
+    links = _owner_links(child, create=True)
+    if links is not None:
+        links[id(owner)] = _make_owner_ref(owner)
 
 
-def mark_key_as_unset_wrapper(parent_method):
-    """Decorator that ensures _mark_as_unset gets called after deleting a key."""
+def _remove_owner(child, owner):
+    links = _owner_links(child)
+    if links is not None and owner is not None:
+        links.pop(id(owner), None)
 
-    def wrapper(self, key, *args, **kwargs):
-        result = parent_method(self, key, *args, **kwargs)
-        self._mark_as_unset(key)
-        return result
 
-    return wrapper
+def _iter_owners(child):
+    """Yield the live objects that currently contain ``child``."""
+    try:
+        links = _owner_links(child)
+    except ReferenceError:
+        return
+    if not links:
+        return
+
+    dead = []
+    for owner_id, owner_ref in list(links.items()):
+        try:
+            owner = (
+                owner_ref()
+                if isinstance(owner_ref, weakref.ReferenceType)
+                else owner_ref
+            )
+        except ReferenceError:
+            owner = None
+
+        if owner is None:
+            dead.append(owner_id)
+        else:
+            yield owner
+
+    for owner_id in dead:
+        links.pop(owner_id, None)
+
+
+def _child_positions(owner, child):
+    """Return every list index or dict key where ``owner`` contains ``child``."""
+    positions = []
+    if isinstance(owner, BaseList):
+        for index, value in enumerate(list.__iter__(owner)):
+            if value is child:
+                positions.append(index)
+    elif isinstance(owner, BaseDict):
+        for key, value in dict.items(owner):
+            if value is child:
+                positions.append(key)
+    return positions
+
+
+def _locate_identities(value, child, path, ancestors, matches):
+    """Collect every path from ``value`` down to ``child``."""
+    if value is child:
+        matches.append(path)
+        return
+
+    object_id = id(value)
+    if object_id in ancestors:
+        return
+    ancestors.add(object_id)
+    try:
+        if isinstance(value, BaseList):
+            for index, item in enumerate(list.__iter__(value)):
+                _locate_identities(item, child, [*path, str(index)], ancestors, matches)
+        elif isinstance(value, BaseDict):
+            for key, item in dict.items(value):
+                _locate_identities(item, child, [*path, str(key)], ancestors, matches)
+        elif not getattr(value, "_is_document", False):
+            data = getattr(value, "_data", None)
+            if data is not None:
+                db_field_map = getattr(value, "_db_field_map", {})
+                for field_name, item in dict.items(data):
+                    path_part = db_field_map.get(field_name, field_name)
+                    _locate_identities(
+                        item, child, [*path, path_part], ancestors, matches
+                    )
+    finally:
+        ancestors.discard(object_id)
+
+
+def _paths_within(owner, child):
+    """Return every dotted path from ``owner``'s fields down to ``child``."""
+    data = getattr(owner, "_data", None)
+    if data is None:
+        return []
+
+    matches = []
+    for field_name, value in dict.items(data):
+        _locate_identities(value, child, [field_name], {id(owner)}, matches)
+    return [".".join(match) for match in matches]
+
+
+def _first_field_name(owner, child):
+    """Return the document field that directly holds ``child``."""
+    data = getattr(owner, "_data", None)
+    if data is None:
+        return None
+
+    for field_name, value in dict.items(data):
+        if value is child:
+            return field_name
+    return None
+
+
+def _resolve_relative_key(child, key):
+    """Translate a path relative to ``child`` into database field names."""
+    if key is None:
+        return None
+
+    resolved = []
+    current = child
+    for part in str(key).split("."):
+        data = getattr(current, "_data", None)
+        if data is not None:
+            db_field_map = getattr(current, "_db_field_map", {})
+            resolved.append(db_field_map.get(part, part))
+            current = data.get(part)
+        elif isinstance(current, (BaseList, list)) and part.isdigit():
+            resolved.append(part)
+            index = int(part)
+            current = current[index] if index < len(current) else None
+        elif isinstance(current, (BaseDict, dict)) and part in current:
+            resolved.append(part)
+            current = dict.__getitem__(current, part)
+        else:
+            resolved.append(part)
+            current = None
+
+    return ".".join(resolved)
+
+
+def _owner_path(owner, child, key):
+    """Resolve absolute paths for a change to ``child`` inside ``owner``."""
+    relative_key = _resolve_relative_key(child, key)
+    paths = _paths_within(owner, child)
+    if not paths:
+        return None
+    return [_join_path(path, relative_key) for path in paths]
+
+
+def _join_path(base, key):
+    base = "" if base is None else str(base)
+    key = "" if key is None else str(key)
+    if not base:
+        return key
+    if not key:
+        return base
+    return f"{base}.{key}"
+
+
+def _record_change(owner, path, unset):
+    """Record a path on ``owner`` without triggering another propagation."""
+    try:
+        note_name = "_note_unset_path" if unset else "_note_changed_path"
+        note = getattr(owner, note_name, None)
+        if note is not None:
+            note(path)
+            return
+
+        method_name = "_mark_as_unset" if unset else "_mark_as_changed"
+        method = getattr(owner, method_name, None)
+        if method is not None:
+            method(path)
+    except ReferenceError:
+        pass
+
+
+def _propagate_change(holder, key=None, unset=False):
+    """Propagate a change to every document currently containing ``holder``."""
+    _propagate_change_from(holder, key, unset, set())
+
+
+def _propagate_change_from(holder, key, unset, seen):
+    branch = (id(holder), key)
+    if branch in seen:
+        return
+    seen.add(branch)
+
+    EmbeddedDocument = _import_class("EmbeddedDocument")
+    owners = list(_iter_owners(holder))
+    if not owners:
+        # Containers created without an owning document keep the historical
+        # single-instance behaviour. Containers that are (or were) attached to
+        # a document must not write through a stale ``_instance``.
+        if isinstance(holder, (BaseDict, BaseList)) and _owner_links(holder) is None:
+            _legacy_mark(holder, key, unset)
+        return
+
+    for owner in owners:
+        if isinstance(owner, (BaseList, BaseDict)):
+            positions = _child_positions(owner, holder)
+            if not positions:
+                # The value has been removed from this container.
+                _remove_owner(holder, owner)
+                continue
+            for position in positions:
+                _propagate_change_from(owner, _join_path(position, key), unset, seen)
+            continue
+
+        paths = _owner_path(owner, holder, key)
+        if paths is None:
+            field_name = _first_field_name(owner, holder)
+            if field_name is None:
+                _remove_owner(holder, owner)
+                continue
+            paths = [_join_path(field_name, key)]
+
+        for path in paths:
+            _record_change(owner, path, unset)
+        if isinstance(owner, EmbeddedDocument):
+            # Every document currently containing this embedded document keeps
+            # its own absolute path too, so one document saving doesn't clear
+            # the tracking of another document that shares the same value.
+            for path in paths:
+                _propagate_change_from(owner, path, unset, seen)
+
+
+def _legacy_mark(holder, key, unset):
+    """Notify the single instance historically stored on a container."""
+    try:
+        instance = holder._instance
+    except (AttributeError, ReferenceError):
+        return
+
+    if instance is None:
+        return
+
+    if key is None:
+        path = holder._name
+    else:
+        path = _join_path(holder._name, key)
+    _record_change(instance, path, unset)
+
+
+def _bind_value(container, value):
+    """Register ``value`` as currently contained by ``container``."""
+    EmbeddedDocument = _import_class("EmbeddedDocument")
+    if isinstance(value, (BaseDict, BaseList, EmbeddedDocument)):
+        _add_owner(value, container)
+
+
+def _bind_values(container, values):
+    for value in values:
+        _bind_value(container, value)
+
+
+def _wrap_value(value):
+    """Convert plain nested containers to their tracked equivalents."""
+    if isinstance(value, dict) and not isinstance(value, BaseDict):
+        return BaseDict(value, None, None)
+    if isinstance(value, list) and not isinstance(value, BaseList):
+        return BaseList(value, None, None)
+    return value
 
 
 class BaseDict(dict):
@@ -61,8 +314,10 @@ class BaseDict(dict):
 
         if isinstance(instance, BaseDocument):
             self._instance = weakref.proxy(instance)
+            _add_owner(self, instance)
         self._name = name
         super().__init__(dict_items)
+        _bind_values(self, dict.values(self))
 
     def get(self, key, default=None):
         # get does not use __getitem__ by default so we must override it as well
@@ -75,17 +330,68 @@ class BaseDict(dict):
         value = super().__getitem__(key)
 
         EmbeddedDocument = _import_class("EmbeddedDocument")
-        if isinstance(value, EmbeddedDocument) and value._instance is None:
-            value._instance = self._instance
+        if isinstance(value, EmbeddedDocument):
+            if value._instance is None:
+                value._instance = self._instance
+            _bind_value(self, value)
         elif isinstance(value, dict) and not isinstance(value, BaseDict):
             value = BaseDict(value, None, f"{self._name}.{key}")
             super().__setitem__(key, value)
             value._instance = self._instance
+            _bind_value(self, value)
         elif isinstance(value, list) and not isinstance(value, BaseList):
             value = BaseList(value, None, f"{self._name}.{key}")
             super().__setitem__(key, value)
             value._instance = self._instance
+            _bind_value(self, value)
+        elif isinstance(value, (BaseDict, BaseList)):
+            _bind_value(self, value)
         return value
+
+    def __setitem__(self, key, value):
+        if key not in self or self[key] != value:
+            self._mark_as_changed(key)
+
+        value = _wrap_value(value)
+        result = super().__setitem__(key, value)
+        _bind_value(self, value)
+        return result
+
+    def __delitem__(self, key):
+        result = super().__delitem__(key)
+        self._mark_as_unset(key)
+        return result
+
+    def pop(self, *args, **kwargs):
+        result = super().pop(*args, **kwargs)
+        self._mark_as_changed()
+        return result
+
+    def clear(self):
+        result = super().clear()
+        self._mark_as_changed()
+        return result
+
+    def update(self, *args, **kwargs):
+        result = super().update(*args, **kwargs)
+        _bind_values(self, dict.values(self))
+        self._mark_as_changed()
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        self._mark_as_changed()
+        return result
+
+    def setdefault(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            value = _wrap_value(default)
+            result = super().__setitem__(key, value)
+            _bind_value(self, value)
+            self._mark_as_changed()
+            return result
 
     def __getstate__(self):
         self.instance = None
@@ -96,24 +402,11 @@ class BaseDict(dict):
         self = state
         return self
 
-    __setitem__ = mark_key_as_changed_wrapper(dict.__setitem__)
-    __delitem__ = mark_key_as_unset_wrapper(dict.__delitem__)
-    pop = mark_as_changed_wrapper(dict.pop)
-    clear = mark_as_changed_wrapper(dict.clear)
-    update = mark_as_changed_wrapper(dict.update)
-    popitem = mark_as_changed_wrapper(dict.popitem)
-    setdefault = mark_as_changed_wrapper(dict.setdefault)
-
     def _mark_as_changed(self, key=None):
-        if hasattr(self._instance, "_mark_as_changed"):
-            if key:
-                self._instance._mark_as_changed(f"{self._name}.{key}")
-            else:
-                self._instance._mark_as_changed(self._name)
+        _propagate_change(self, key)
 
     def _mark_as_unset(self, key):
-        if hasattr(self._instance, "_mark_as_unset"):
-            self._instance._mark_as_unset(f"{self._name}.{key}")
+        _propagate_change(self, key, unset=True)
 
 
 class BaseList(list):
@@ -131,9 +424,11 @@ class BaseList(list):
                 self._instance = instance
             else:
                 self._instance = weakref.proxy(instance)
+            _add_owner(self, instance)
 
         self._name = name
         super().__init__(list_items)
+        _bind_values(self, list.__iter__(self))
 
     def __getitem__(self, key):
         # change index to positive value because MongoDB does not support negative one
@@ -147,18 +442,24 @@ class BaseList(list):
             return value
 
         EmbeddedDocument = _import_class("EmbeddedDocument")
-        if isinstance(value, EmbeddedDocument) and value._instance is None:
-            value._instance = self._instance
+        if isinstance(value, EmbeddedDocument):
+            if value._instance is None:
+                value._instance = self._instance
+            _bind_value(self, value)
         elif isinstance(value, dict) and not isinstance(value, BaseDict):
             # Replace dict by BaseDict
             value = BaseDict(value, None, f"{self._name}.{key}")
             super().__setitem__(key, value)
             value._instance = self._instance
+            _bind_value(self, value)
         elif isinstance(value, list) and not isinstance(value, BaseList):
             # Replace list by BaseList
             value = BaseList(value, None, f"{self._name}.{key}")
             super().__setitem__(key, value)
             value._instance = self._instance
+            _bind_value(self, value)
+        elif isinstance(value, (BaseDict, BaseList)):
+            _bind_value(self, value)
         return value
 
     def __iter__(self):
@@ -176,32 +477,90 @@ class BaseList(list):
     def __setitem__(self, key, value):
         changed_key = key
         if isinstance(key, slice):
-            # In case of slice, we don't bother to identify the exact elements being updated
-            # instead, we simply marks the whole list as changed
+            # In case of slice, we don't bother to identify the exact elements
+            # being updated; instead, we simply mark the whole list as changed.
             changed_key = None
-
-        result = super().__setitem__(key, value)
+            values = [_wrap_value(v) for v in value]
+            result = super().__setitem__(key, values)
+            _bind_values(self, values)
+        else:
+            value = _wrap_value(value)
+            result = super().__setitem__(key, value)
+            _bind_value(self, value)
+        if isinstance(changed_key, int) and changed_key < 0:
+            changed_key %= len(self)
         self._mark_as_changed(changed_key)
         return result
 
-    append = mark_as_changed_wrapper(list.append)
-    extend = mark_as_changed_wrapper(list.extend)
-    insert = mark_as_changed_wrapper(list.insert)
-    pop = mark_as_changed_wrapper(list.pop)
-    remove = mark_as_changed_wrapper(list.remove)
-    reverse = mark_as_changed_wrapper(list.reverse)
-    sort = mark_as_changed_wrapper(list.sort)
-    clear = mark_as_changed_wrapper(list.clear)
-    __delitem__ = mark_as_changed_wrapper(list.__delitem__)
-    __iadd__ = mark_as_changed_wrapper(list.__iadd__)
-    __imul__ = mark_as_changed_wrapper(list.__imul__)
+    def append(self, value):
+        value = _wrap_value(value)
+        result = super().append(value)
+        _bind_value(self, value)
+        self._mark_as_changed()
+        return result
+
+    def extend(self, values):
+        values = [_wrap_value(v) for v in values]
+        result = super().extend(values)
+        _bind_values(self, values)
+        self._mark_as_changed()
+        return result
+
+    def insert(self, index, value):
+        value = _wrap_value(value)
+        result = super().insert(index, value)
+        _bind_value(self, value)
+        self._mark_as_changed()
+        return result
+
+    def __iadd__(self, values):
+        values = [_wrap_value(v) for v in values]
+        result = super().__iadd__(values)
+        _bind_values(self, values)
+        self._mark_as_changed()
+        return result
+
+    def __imul__(self, count):
+        result = super().__imul__(count)
+        _bind_values(self, list.__iter__(self))
+        self._mark_as_changed()
+        return result
+
+    def pop(self, *args, **kwargs):
+        result = super().pop(*args, **kwargs)
+        self._mark_as_changed()
+        return result
+
+    def remove(self, value):
+        result = super().remove(value)
+        self._mark_as_changed()
+        return result
+
+    def reverse(self):
+        result = super().reverse()
+        self._mark_as_changed()
+        return result
+
+    def sort(self, *args, **kwargs):
+        result = super().sort(*args, **kwargs)
+        self._mark_as_changed()
+        return result
+
+    def clear(self):
+        result = super().clear()
+        self._mark_as_changed()
+        return result
+
+    def __delitem__(self, key):
+        result = super().__delitem__(key)
+        self._mark_as_changed()
+        return result
 
     def _mark_as_changed(self, key=None):
-        if hasattr(self._instance, "_mark_as_changed"):
-            if key is not None:
-                self._instance._mark_as_changed(f"{self._name}.{key % len(self)}")
-            else:
-                self._instance._mark_as_changed(self._name)
+        _propagate_change(self, key)
+
+    def _mark_as_unset(self, key):
+        _propagate_change(self, key, unset=True)
 
 
 class EmbeddedDocumentList(BaseList):
