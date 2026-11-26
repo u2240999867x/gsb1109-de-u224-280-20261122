@@ -124,6 +124,16 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
 
+    A cached sort view is bound to the current input when a reader first
+    requests the header; requesting only the header does not read any data
+    rows. All readers which bind to the same input share one source read and
+    sort, regardless of which reader first asks for data. Call
+    ``clearcache()`` after pointing the source at a different input, so that
+    new readers bind to the new input. Readers which have already started
+    keep reading the input and cached rows they bound to. Temporary sort files
+    stay available until the last reader bound to their input has finished or
+    closed.
+
     """
 
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
@@ -236,6 +246,65 @@ def _mergesorted(key=None, reverse=False, *iterables):
         return _heapqmergesorted(key, *iterables)
 
 
+class _SortCache(object):
+    """State shared by all readers of one batch of a :class:`SortView`.
+
+    A cache is bound to a particular source iterator (and therefore to a
+    particular batch) when its header is read. Data is sorted lazily on the
+    first request for a data row, but the same sorted result is then shared by
+    every reader of the batch.
+    """
+
+    def __init__(self, hdr, getkey, source_it, no_output=False):
+        self.hdr = hdr
+        self.getkey = getkey
+        self.source_it = source_it
+        self.no_output = no_output
+        self.rows = None
+        self.files = None
+        self.error = None
+        self.complete = False
+
+    def store_mem(self, rows):
+        self.rows = rows
+        self.source_it = None
+        self.complete = True
+
+    def store_files(self, files):
+        self.files = files
+        self.source_it = None
+        self.complete = True
+
+    def store_error(self, error):
+        self.source_it = None
+        self.error = error
+
+    def iterrows(self, reverse):
+        if self.error is not None:
+            raise self.error
+        if self.rows is not None:
+            for row in self.rows:
+                yield tuple(row)
+        else:
+            # Keep a local reference to the files for the lifetime of this
+            # iterator, so they are not deleted while they are being read.
+            filecache = self.files
+            filenames = list(map(operator.attrgetter('name'), filecache))
+            debug('iterate from file cache: %r', filenames)
+            chunkiters = [_iterchunk(fn) for fn in filenames]
+            rows = _mergesorted(self.getkey, reverse, *chunkiters)
+            try:
+                for row in rows:
+                    yield tuple(row)
+            finally:
+                # N.B., need to ensure that any open files are closed
+                # **before** temporary files are deleted, as deletion will
+                # fail on Windows if a file is still in use.
+                del chunkiters
+                del rows
+                del filecache
+
+
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
                  tempdir=None, cache=True):
@@ -248,6 +317,7 @@ class SortView(Table):
             self.buffersize = buffersize
         self.tempdir = tempdir
         self._cache = cache
+        self._batchcache = None
         self._hdrcache = None
         self._memcache = None
         self._filecache = None
@@ -255,71 +325,116 @@ class SortView(Table):
 
     def clearcache(self):
         debug('clear cache')
+        # Readers which are already iterating keep their own reference to the
+        # cache they bound to, so clearing here only detaches the view from
+        # the current batch.
+        self._batchcache = None
         self._hdrcache = None
         self._memcache = None
         self._filecache = None
         self._getkey = None
 
     def __iter__(self):
-        source = self.source
-        key = self.key
-        reverse = self.reverse
-        if self._cache and self._memcache is not None:
-            return self._iterfrommemcache()
-        elif self._cache and self._filecache is not None:
-            return self._iterfromfilecache()
+        if self._cache:
+            return self._itercached()
         else:
-            return self._iternocache(source, key, reverse)
+            return self._iteruncached()
 
-    def _iterfrommemcache(self):
-        debug('iterate from memory cache')
-        yield tuple(self._hdrcache)
-        for row in self._memcache:
-            yield tuple(row)
-
-    def _iterfromfilecache(self):
-        # create a reference to the filecache here, so cleanup happens in the
-        # correct order
-        filecache = self._filecache
-        filenames = list(map(operator.attrgetter('name'), filecache))
-        debug('iterate from file cache: %r', filenames)
-        yield tuple(self._hdrcache)
-        chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+    def _itercached(self):
+        # Bind to a batch when the header is first requested. From this point
+        # on this iterator only ever sees this cache, even if the view is
+        # pointed at another batch and clearcache() is called.
+        cache = self._batchcache
+        if cache is None:
+            cache = self._newcache()
+            if cache.no_output:
+                return
+        yield tuple(cache.hdr)
         try:
-            for row in rows:
-                yield tuple(row)
-        finally:
-            debug('attempt cleanup from generator')
-            # N.B., need to ensure that any open files are closed **before**
-            # temporary files are deleted, as deletion will fail on Windows
-            # if file is in use (i.e., still open)
-            del chunkiters
-            del rows
-            del filecache
-            debug('exiting generator')
+            if cache.error is not None:
+                raise cache.error
+            if cache.complete:
+                for row in cache.iterrows(self.reverse):
+                    yield row
+            elif cache.source_it is None:
+                # Another reader already failed to build this batch.
+                raise RuntimeError('sort cache is not available')
+            else:
+                for row in self._iternocache(cache.source_it, cache.getkey,
+                                             self.reverse, cache):
+                    yield row
+        except Exception as e:
+            if not cache.complete:
+                # Do not retain a partially built batch; readers which are
+                # already bound to it see the same failure, while a later pass
+                # through the view can start again.
+                cache.store_error(e)
+                if self._batchcache is cache:
+                    self.clearcache()
+            raise
 
-    def _iternocache(self, source, key, reverse):
-        debug('iterate without cache')
-        self.clearcache()
-        it = iter(source)
-
+    def _newcache(self):
+        debug('create cache for current batch')
+        it = iter(self.source)
         try:
             hdr = next(it)
         except StopIteration:
-            if key is None:
-                return  # nothing to do on a table without headers
+            if self.key is None:
+                # nothing to do on a table without headers
+                return _SortCache(None, None, None, no_output=True)
             hdr = []
-        yield tuple(hdr)
 
-        if key is not None:
+        if self.key is not None:
             # convert field selection into field indices
-            indices = asindices(hdr, key)
+            indices = asindices(hdr, self.key)
         else:
             indices = range(len(hdr))
         # now use field indices to construct a _getkey function
         getkey = comparable_itemgetter(*indices)
 
+        cache = _SortCache(hdr, getkey, it)
+        self._batchcache = cache
+        self._hdrcache = hdr
+        self._memcache = None
+        self._filecache = None
+        self._getkey = getkey
+        return cache
+
+    def _cache_updated(self, cache):
+        # The compatibility attributes on the view always describe the
+        # current batch. A retired batch may finish sorting while the view is
+        # serving a newer batch, and must not overwrite them.
+        if self._batchcache is cache:
+            self._hdrcache = cache.hdr
+            self._getkey = cache.getkey
+            self._memcache = cache.rows
+            self._filecache = cache.files
+
+    def _iteruncached(self):
+        debug('iterate without cache')
+        it = iter(self.source)
+
+        try:
+            hdr = next(it)
+        except StopIteration:
+            if self.key is None:
+                return  # nothing to do on a table without headers
+            hdr = []
+        yield tuple(hdr)
+
+        if self.key is not None:
+            # convert field selection into field indices
+            indices = asindices(hdr, self.key)
+        else:
+            indices = range(len(hdr))
+        # now use field indices to construct a _getkey function
+        getkey = comparable_itemgetter(*indices)
+
+        for row in self._iternocache(it, getkey, self.reverse):
+            yield row
+
+    def _iternocache(self, it, getkey, reverse, cache=None):
+        debug('sorting rows')
         # TODO support native comparison
 
         # initialise the first chunk
@@ -330,12 +445,10 @@ class SortView(Table):
         if self.buffersize is None or len(rows) < self.buffersize:
             # yes, table fits within sort buffer
 
-            if self._cache:
+            if cache is not None:
                 debug('caching mem')
-                self._hdrcache = hdr
-                self._memcache = rows
-                # actually not needed to iterate from memcache
-                self._getkey = getkey
+                cache.store_mem(rows)
+                self._cache_updated(cache)
 
             for row in rows:
                 yield tuple(row)
@@ -345,36 +458,45 @@ class SortView(Table):
 
             chunkfiles = []
 
-            while rows:
+            try:
+                while rows:
 
-                # dump the chunk
-                with NamedTemporaryFile(dir=self.tempdir, delete=False,
-                                        mode='wb') as f:
-                    # N.B., we **don't** want the file to be deleted on close,
-                    # but we **do** want the file to be deleted when self
-                    # is garbage collected, or when the program exits. When
-                    # all references to the wrapper are gone, the file should
-                    # get deleted.
-                    wrapper = _NamedTempFileDeleteOnGC(f.name)
-                    debug('created temporary chunk file %s' % f.name)
-                    for row in rows:
-                        pickle.dump(row, f, protocol=-1)
-                    f.flush()
-                    chunkfiles.append(wrapper)
+                    # dump the chunk
+                    with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                            mode='wb') as f:
+                        # N.B., we **don't** want the file to be deleted on
+                        # close, but we **do** want the file to be deleted
+                        # when all references to the wrapper are gone, or
+                        # when the program exits.
+                        wrapper = _NamedTempFileDeleteOnGC(f.name)
+                        debug('created temporary chunk file %s' % f.name)
+                        for row in rows:
+                            pickle.dump(row, f, protocol=-1)
+                        f.flush()
+                        chunkfiles.append(wrapper)
 
-                # grab the next chunk
-                rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+                    # grab the next chunk
+                    rows = list(itertools.islice(it, 0, self.buffersize))
+                    rows.sort(key=getkey, reverse=reverse)
+            except Exception:
+                # Release any chunks written before the failure.
+                chunkfiles = None
+                wrapper = None
+                raise
 
-            if self._cache:
+            if cache is not None:
                 debug('caching files')
-                self._hdrcache = hdr
-                self._filecache = chunkfiles
-                self._getkey = getkey
+                cache.store_files(chunkfiles)
+                self._cache_updated(cache)
 
             chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
-                yield tuple(row)
+            rows = _mergesorted(getkey, reverse, *chunkiters)
+            try:
+                for row in rows:
+                    yield tuple(row)
+            finally:
+                del chunkiters
+                del rows
 
 
 class _NamedTempFileDeleteOnGC(object):

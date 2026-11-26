@@ -4,6 +4,13 @@ Changes
 Version 1.8.0
 -------------
 
+* Keep each ``sort()`` reader bound to the batch it started on. A reader
+  binds to the current input when it reads the header, so switching the
+  source and calling ``clearcache()`` no longer leaks rows between batches.
+  Readers of the same batch share one source read and sort, even when the
+  first reader only reads the header, and temporary sort files are released
+  when the last reader of a retired batch closes.
+
 * Keep added column values aligned with their header when input rows are short
   or long in ``addcolumn()``.
 
