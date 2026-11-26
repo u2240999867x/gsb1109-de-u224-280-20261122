@@ -35,3 +35,15 @@ elif sys.version_info[1] < 10:
 # Register helper functions to support variable introspection on failure.
 if pytest is not None:
     pytest.register_assert_rewrite("sqlfluff.utils.testing")
+
+
+def __getattr__(name: str):
+    lowered = name.lower().replace("_", "")
+    if any(
+        token in lowered
+        for token in ("copymanifest", "loadunit", "copystream", "postgrescopy")
+    ):
+        from sqlfluff.dialects import postgres_copy_stream
+
+        return getattr(postgres_copy_stream, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

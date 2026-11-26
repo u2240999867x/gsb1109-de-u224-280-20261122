@@ -1,5 +1,7 @@
 """The PostgreSQL dialect."""
 
+from typing import Any, Optional
+
 from sqlfluff.core.dialects import load_raw_dialect
 from sqlfluff.core.parser import (
     AnyNumberOf,
@@ -8573,6 +8575,40 @@ class PostgresCopyStdinDataStatementSegment(BaseSegment):
     match_grammar = Sequence(
         Ref("PostgresCopyStdinDataSegment"),
     )
+
+    @property
+    def copy_manifest(self) -> Optional[Any]:
+        """Streaming manifest for this lexed COPY data block."""
+        from sqlfluff.dialects.postgres_copy_stream import (
+            PostgresCopyManifestReader,
+        )
+
+        result = PostgresCopyManifestReader().finish(self.raw.encode("utf-8"))
+        return result.manifests[0] if result.manifests else None
+
+    def get_copy_manifest(self) -> Optional[Any]:
+        """Return :attr:`copy_manifest` for method-style callers."""
+        return self.copy_manifest
+
+    @property
+    def payload_byte_range(self) -> Optional[tuple[int, int]]:
+        manifest = self.copy_manifest
+        return None if manifest is None else manifest.payload_range
+
+    @property
+    def payload_digest(self) -> Optional[str]:
+        manifest = self.copy_manifest
+        return None if manifest is None else manifest.digest
+
+    @property
+    def payload_sha256(self) -> Optional[str]:
+        manifest = self.copy_manifest
+        return None if manifest is None else manifest.sha256
+
+    @property
+    def copy_row_count(self) -> Optional[int]:
+        manifest = self.copy_manifest
+        return None if manifest is None else manifest.row_count
 
 
 class DropForeignTableStatement(BaseSegment):
