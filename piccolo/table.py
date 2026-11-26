@@ -1362,6 +1362,7 @@ class Table(metaclass=TableMetaclass):
         values: Optional[dict[Union[Column, str], Any]] = None,
         force: bool = False,
         use_auto_update: bool = True,
+        skip_unchanged: bool = False,
         **kwargs,
     ) -> Update:
         """
@@ -1398,6 +1399,16 @@ class Table(metaclass=TableMetaclass):
             the ``auto_update`` argument on
             :class:`Column <piccolo.columns.base.Column>` for more information.
 
+        :param skip_unchanged:
+            If ``True``, rows where every new value is identical to the
+            existing value (including ``NULL`` compared with ``NULL``) are
+            skipped, rather than being written again. This means no
+            ``UPDATE`` triggers fire for those rows, and ``auto_update``
+            columns keep their existing values. Each value expression is only
+            evaluated once per row, with the same result used for the
+            comparison and the assignment. Supported by SQLite, Postgres and
+            Cockroach.
+
         """
         if values is None:
             values = {}
@@ -1406,7 +1417,9 @@ class Table(metaclass=TableMetaclass):
         if use_auto_update and cls._meta.auto_update_columns:
             values.update(cls._meta.get_auto_update_values())  # type: ignore
 
-        return Update(table=cls, force=force).values(values)
+        return Update(
+            table=cls, force=force, skip_unchanged=skip_unchanged
+        ).values(values)
 
     @classmethod
     def indexes(cls) -> Indexes:

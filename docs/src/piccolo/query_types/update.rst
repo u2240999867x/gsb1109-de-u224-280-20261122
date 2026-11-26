@@ -37,6 +37,48 @@ overwriting the data in a table.
 
 -------------------------------------------------------------------------------
 
+skip_unchanged
+--------------
+
+By default every row matched by the ``where`` clause is written, even if the
+new values are identical to the existing ones. Passing ``skip_unchanged=True``
+changes this, so a row is only written when at least one value actually
+changes:
+
+.. code-block:: python
+
+    await Band.update(
+        {Band.popularity: Band.popularity + 0},
+        skip_unchanged=True
+    ).where(
+        Band.manager == 1
+    )
+
+Rows where every guarded value is unchanged are skipped. The comparison is
+null-aware, so a ``NULL`` value compared with another ``NULL`` counts as
+unchanged, whereas ``NULL`` compared with an empty string counts as a change.
+
+This is useful when the table has ``UPDATE`` triggers, or ``auto_update``
+columns (such as a ``modified_on`` timestamp), because they only fire for the
+rows which genuinely changed. Each value expression is evaluated once per row,
+and the same result is used for both the comparison and the assignment - so a
+non-deterministic expression produces a single value.
+
+The same option is available as a query clause:
+
+.. code-block:: python
+
+    await Band.update(
+        {Band.popularity: 1000}
+    ).where(
+        Band.manager == 1
+    ).skip_unchanged_rows()
+
+It's supported by SQLite, Postgres and Cockroach. When the option isn't
+enabled the existing behaviour is unchanged.
+
+-------------------------------------------------------------------------------
+
 Modifying values
 ----------------
 
