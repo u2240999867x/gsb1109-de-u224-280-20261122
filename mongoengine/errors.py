@@ -13,6 +13,10 @@ __all__ = (
     "FieldDoesNotExist",
     "ValidationError",
     "SaveConditionError",
+    "SavePositionConflictError",
+    "SaveGenerationConflictError",
+    "SaveCountConflictError",
+    "SaveLocationNotUniqueError",
     "DeprecatedError",
 )
 
@@ -59,6 +63,51 @@ class BulkWriteError(OperationError):
 
 class SaveConditionError(OperationError):
     pass
+
+
+class SavePositionConflictError(OperationError):
+    """Raised by a positional :meth:`~mongoengine.Document.save` when an
+    embedded document can no longer be updated through the identity that was
+    observed when the document was loaded.
+
+    The document is never written when this error is raised, so any unsaved
+    edits are kept on the in-memory document.
+
+    :ivar location: business key of the embedded document (e.g. a location
+        code) as observed when the document was loaded.
+    """
+
+    def __init__(self, message="", location=None):
+        super().__init__(message)
+        self.location = location
+
+
+class SaveGenerationConflictError(SavePositionConflictError):
+    """Raised when the embedded document identified by ``location`` no longer
+    carries the generation that was observed when the document was loaded."""
+
+    def __init__(self, message="", location=None, expected_generation=None,
+                 actual_generation=None):
+        super().__init__(message, location=location)
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+
+
+class SaveCountConflictError(SavePositionConflictError):
+    """Raised when the counted value of the embedded document identified by
+    ``location`` changed in the database before the save."""
+
+    def __init__(self, message="", location=None, expected_count=None,
+                 actual_count=None):
+        super().__init__(message, location=location)
+        self.expected_count = expected_count
+        self.actual_count = actual_count
+
+
+class SaveLocationNotUniqueError(SavePositionConflictError):
+    """Raised when the database contains several embedded documents sharing
+    the same location key, so the target row can no longer be identified
+    unambiguously."""
 
 
 class FieldDoesNotExist(MongoEngineException):

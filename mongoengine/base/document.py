@@ -40,6 +40,8 @@ class BaseDocument:
         "_dynamic_fields",
         "_auto_id_field",
         "_db_field_map",
+        "_only_loaded_fields",
+        "_only_loaded_snapshot",
         "__weakref__",
     )
 
@@ -69,6 +71,14 @@ class BaseDocument:
         self._changed_fields = []
         self._unset_fields = []
         self._has_change_tracking_baseline = False
+        # When the document is loaded through QuerySet.only(), holds the set
+        # of database field paths that were actually projected. ``None``
+        # means the whole document was loaded.
+        self._only_loaded_fields = None
+        # Raw projected document as read from the database, kept so that an
+        # identity based save can target the embedded rows that were actually
+        # seen even after the in-memory values have been edited.
+        self._only_loaded_snapshot = None
 
         if args:
             raise TypeError(
@@ -219,6 +229,8 @@ class BaseDocument:
             "_created",
             "_dynamic_fields",
             "_fields_ordered",
+            "_only_loaded_fields",
+            "_only_loaded_snapshot",
         ):
             if hasattr(self, k):
                 data[k] = getattr(self, k)
@@ -231,6 +243,8 @@ class BaseDocument:
         # these tracking fields so it's important that we set them to maintain backward compatibility.
         self._changed_fields = []
         self._unset_fields = []
+        self._only_loaded_fields = None
+        self._only_loaded_snapshot = None
         self._has_change_tracking_baseline = (
             not self._is_document or "_changed_fields" in data
         )
@@ -244,6 +258,8 @@ class BaseDocument:
             "_created",
             "_data",
             "_dynamic_fields",
+            "_only_loaded_fields",
+            "_only_loaded_snapshot",
         ):
             if k in data:
                 setattr(self, k, data[k])

@@ -191,7 +191,7 @@ class BaseQuerySet:
         elif isinstance(key, int):
             if queryset._scalar:
                 return queryset._get_scalar(
-                    queryset._document._from_son(
+                    queryset._from_son_with_projection(
                         queryset._cursor[key],
                         _auto_dereference=self._auto_dereference,
                     )
@@ -200,7 +200,7 @@ class BaseQuerySet:
             if queryset._as_pymongo:
                 return queryset._cursor[key]
 
-            return queryset._document._from_son(
+            return queryset._from_son_with_projection(
                 queryset._cursor[key],
                 _auto_dereference=self._auto_dereference,
             )
@@ -760,7 +760,7 @@ class BaseQuerySet:
             raise OperationError("Update failed (%s)" % err)
 
         if result is not None:
-            result = self._document._from_son(result)
+            result = self._from_son_with_projection(result)
 
         return result
 
@@ -797,7 +797,7 @@ class BaseQuerySet:
                 doc_map[doc["_id"]] = doc
         else:
             for doc in docs:
-                doc_map[doc["_id"]] = self._document._from_son(
+                doc_map[doc["_id"]] = self._from_son_with_projection(
                     doc,
                     _auto_dereference=self._auto_dereference,
                 )
@@ -1678,6 +1678,18 @@ class BaseQuerySet:
 
     # Iterator helpers
 
+    def _from_son_with_projection(self, son, **kwargs):
+        """Build a document from a raw SON and remember the projection (if
+        any) it was loaded with, so positional saves can target the rows the
+        caller actually saw instead of relying on list indexes.
+        """
+        doc = self._document._from_son(son, **kwargs)
+        loaded_fields = self._loaded_fields
+        if loaded_fields and loaded_fields.value == QueryFieldList.ONLY:
+            doc._only_loaded_fields = frozenset(loaded_fields.fields)
+            doc._only_loaded_snapshot = copy.deepcopy(son)
+        return doc
+
     def __next__(self):
         """Wrap the result in a :class:`~mongoengine.Document` object."""
         if self._none or self._empty:
@@ -1688,7 +1700,7 @@ class BaseQuerySet:
         if self._as_pymongo:
             return raw_doc
 
-        doc = self._document._from_son(
+        doc = self._from_son_with_projection(
             raw_doc,
             _auto_dereference=self._auto_dereference,
         )

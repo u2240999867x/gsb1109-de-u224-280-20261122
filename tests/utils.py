@@ -48,6 +48,10 @@ def requires_mongodb_lt_42(func):
     return _decorated_with_ver_requirement(func, (4, 2), oper=operator.lt)
 
 
+def requires_mongodb_gte_36(func):
+    return _decorated_with_ver_requirement(func, (3, 6), oper=operator.ge)
+
+
 def requires_mongodb_gte_40(func):
     return _decorated_with_ver_requirement(func, (4, 0), oper=operator.ge)
 

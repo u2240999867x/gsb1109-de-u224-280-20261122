@@ -30,6 +30,9 @@ from mongoengine.errors import (
     InvalidDocumentError,
     InvalidQueryError,
     SaveConditionError,
+    SaveCountConflictError,
+    SaveGenerationConflictError,
+    SaveLocationNotUniqueError,
 )
 from mongoengine.pymongo_support import list_collection_names
 from mongoengine.queryset import (
@@ -370,6 +373,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         _refs=None,
         save_condition=None,
         signal_kwargs=None,
+        positional=None,
         **kwargs,
     ):
         """Save the :class:`~mongoengine.Document` to the database. If the
@@ -399,6 +403,22 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             Raises :class:`OperationError` if the conditions are not satisfied
         :param signal_kwargs: (optional) kwargs dictionary to be passed to
             the signal calls.
+        :param positional: explicitly enable identity based saves for embedded
+            list rows edited from a :meth:`~mongoengine.queryset.QuerySet.only`
+            projection. Pass a mapping of an
+            :class:`~mongoengine.fields.EmbeddedDocumentListField` attribute
+            name to a ``(location_field, generation_field, value_field)``
+            tuple of embedded attribute names. Edited rows are then saved by
+            the location and generation that were read, rather than by their
+            list index, so backend reordering cannot make an edit hit the
+            wrong row. The projected location, generation and counted values
+            are checked against the database inside the same write; a changed
+            generation, a changed counted value or a duplicated location
+            raises a :class:`~mongoengine.errors.SaveGenerationConflictError`,
+            :class:`~mongoengine.errors.SaveCountConflictError` or
+            :class:`~mongoengine.errors.SaveLocationNotUniqueError` without
+            writing anything and without discarding the in-memory edits.
+            ``None`` (the default) keeps the historical positional behaviour.
 
         .. versionchanged:: 0.5
             In existing documents it only saves changed fields using
@@ -454,6 +474,13 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             if created:
                 object_id = self._save_create(
                     doc=doc, force_insert=force_insert, write_concern=write_concern
+                )
+            elif positional:
+                object_id, created = self._save_positional_update(
+                    doc=doc,
+                    save_condition=save_condition,
+                    write_concern=write_concern,
+                    positional=positional,
                 )
             else:
                 object_id, created = self._save_update(
@@ -596,6 +623,410 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
                     # https://github.com/MongoEngine/mongoengine/issues/564
 
         return object_id, created
+
+    def _resolve_positional_spec(self, positional):
+        """Validate the ``positional`` mapping of save() and translate it to
+        database field names.
+        """
+        EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+
+        resolved = {}
+        for list_name, field_names in positional.items():
+            if list_name not in self._fields:
+                raise InvalidDocumentError(
+                    "positional save references unknown field '%s'" % list_name
+                )
+            list_field = self._fields[list_name]
+            if not isinstance(list_field, EmbeddedDocumentListField):
+                raise InvalidDocumentError(
+                    "positional save field '%s' must be an "
+                    "EmbeddedDocumentListField" % list_name
+                )
+
+            if (
+                not isinstance(field_names, (list, tuple))
+                or len(field_names) != 3
+                or not all(isinstance(name, str) for name in field_names)
+            ):
+                raise InvalidDocumentError(
+                    "positional save entry for '%s' must be a "
+                    "(location_field, generation_field, value_field) tuple"
+                    % list_name
+                )
+
+            embedded_cls = list_field.field.document_type
+            location_name, generation_name, value_name = field_names
+            for name in field_names:
+                if name not in embedded_cls._fields:
+                    raise InvalidDocumentError(
+                        "embedded document '%s' has no field '%s'"
+                        % (embedded_cls.__name__, name)
+                    )
+
+            resolved[list_name] = {
+                "list_db_field": list_field.db_field,
+                "location_db_field": embedded_cls._fields[location_name].db_field,
+                "generation_db_field": embedded_cls._fields[generation_name].db_field,
+                "value_db_field": embedded_cls._fields[value_name].db_field,
+            }
+        return resolved
+
+    def _positional_projected_paths(self, spec):
+        """Return the database paths that must have been projected for the
+        given positional list specification.
+        """
+        list_db_field = spec["list_db_field"]
+        return {
+            "%s.%s" % (list_db_field, spec["location_db_field"]),
+            "%s.%s" % (list_db_field, spec["generation_db_field"]),
+            "%s.%s" % (list_db_field, spec["value_db_field"]),
+        }
+
+    def _build_positional_update(self, resolved_specs):
+        """Build the filter, update document and array filters of an identity
+        based embedded-list save from the projected document.
+
+        Returns ``(select_extra, update_doc, array_filters, edited_refs)``
+        where ``select_extra`` holds the snapshot and uniqueness clauses that
+        get merged into the document level filter, and ``edited_refs`` lists
+        the embedded rows that were written so the in-memory snapshot can be
+        refreshed after a successful write.
+        """
+        if self._only_loaded_snapshot is None or self._only_loaded_fields is None:
+            raise InvalidDocumentError(
+                "positional save requires the document to be loaded with "
+                "QuerySet.only()"
+            )
+
+        set_updates, unset_updates = self._delta()
+        snapshot = self._only_loaded_snapshot
+
+        select_extra = {}
+        array_filters = []
+        update_set = {}
+        update_unset = {}
+        uniqueness_clauses = []
+        edited_refs = []
+        for list_name, spec in resolved_specs.items():
+            list_db_field = spec["list_db_field"]
+            location_db_field = spec["location_db_field"]
+            generation_db_field = spec["generation_db_field"]
+            value_db_field = spec["value_db_field"]
+
+            projected_paths = self._positional_projected_paths(spec)
+            bare_list_loaded = list_db_field in self._only_loaded_fields
+            if not bare_list_loaded and not projected_paths.issubset(
+                self._only_loaded_fields
+            ):
+                required = projected_paths | {list_db_field}
+                raise InvalidDocumentError(
+                    "positional save on '%s' requires %s to be loaded by only()"
+                    % (list_name, sorted(required))
+                )
+
+            prefix = list_db_field + "."
+            # A whole-list replacement cannot be expressed as row identity
+            # updates; the caller must reload before such a save.
+            if list_db_field in set_updates or list_db_field in unset_updates:
+                raise InvalidDocumentError(
+                    "positional save cannot replace the whole '%s' list; "
+                    "reload the document before adding, removing or reordering "
+                    "rows" % list_name
+                )
+
+            embedded_docs = self._data.get(list_name) or []
+            snapshot_rows = snapshot.get(list_db_field)
+            if not isinstance(snapshot_rows, list) or len(snapshot_rows) != len(
+                embedded_docs
+            ):
+                raise InvalidDocumentError(
+                    "positional save only supports in-place edits of the rows "
+                    "loaded by only(); reload '%s' before structural changes"
+                    % list_name
+                )
+
+            expected_rows = []
+            edited_locations = []
+            for index, embedded_doc in enumerate(embedded_docs):
+                changed_fields, unset_fields = embedded_doc._get_updated_fields()
+                if not changed_fields and not unset_fields:
+                    continue
+
+                snapshot_row = snapshot_rows[index]
+                location_value = snapshot_row[location_db_field]
+                generation_value = snapshot_row[generation_db_field]
+                value_value = snapshot_row[value_db_field]
+
+                identifier = "pos_%s" % index
+                array_filters.append(
+                    {
+                        "%s.%s" % (identifier, location_db_field): location_value,
+                        "%s.%s" % (identifier, generation_db_field): generation_value,
+                    }
+                )
+
+                expected_rows.append(
+                    {
+                        "$elemMatch": {
+                            location_db_field: location_value,
+                            generation_db_field: generation_value,
+                            value_db_field: value_value,
+                        }
+                    }
+                )
+                edited_locations.append(location_value)
+
+                embedded_mongo = embedded_doc.to_mongo()
+                for changed_path in changed_fields:
+                    value = self._walk_mongo_path(embedded_mongo, changed_path)
+                    update_set[prefix + "$[%s].%s" % (identifier, changed_path)] = (
+                        value
+                    )
+                for unset_path in unset_fields:
+                    unset_key = prefix + "$[%s].%s" % (identifier, unset_path)
+                    update_unset[unset_key] = ""
+
+                edited_refs.append((list_db_field, index, embedded_mongo))
+
+            if expected_rows:
+                select_extra[list_db_field] = {"$all": expected_rows}
+
+            for location_value in set(edited_locations):
+                uniqueness_clauses.append(
+                    self._positional_uniqueness_expr(
+                        list_db_field, location_db_field, location_value
+                    )
+                )
+
+            # Positional paths are handled above; keep all other changes.
+            set_updates = {
+                path: value
+                for path, value in set_updates.items()
+                if not path.startswith(prefix)
+            }
+            unset_updates = {
+                path: value
+                for path, value in unset_updates.items()
+                if not path.startswith(prefix)
+            }
+
+        if uniqueness_clauses:
+            select_extra["$and"] = [
+                {"$expr": clause} for clause in uniqueness_clauses
+            ]
+
+        update_set.update(set_updates)
+        update_unset.update(unset_updates)
+
+        update_doc = {}
+        if update_set:
+            update_doc["$set"] = update_set
+        if update_unset:
+            update_doc["$unset"] = update_unset
+
+        return select_extra, update_doc, array_filters, edited_refs
+
+    @staticmethod
+    def _merge_select_clauses(select_dict, select_extra):
+        """Merge positional snapshot clauses into the document filter without
+        dropping an ``$and`` clause already produced by save_condition.
+        """
+        extra_and = select_extra.pop("$and", None)
+        select_dict.update(select_extra)
+        if not extra_and:
+            return
+        existing_and = select_dict.get("$and")
+        if existing_and is None:
+            select_dict["$and"] = extra_and
+        else:
+            select_dict["$and"] = list(existing_and) + extra_and
+
+    def _refresh_positional_snapshot(self, edited_refs, doc):
+        """Advance the projected snapshot with the values just written, so a
+        later save on the same in-memory document validates against the new
+        state instead of the original read.
+        """
+        snapshot = self._only_loaded_snapshot
+        for db_field, value in doc.items():
+            if db_field in snapshot and not isinstance(value, (list, dict)):
+                snapshot[db_field] = value
+
+        for list_db_field, index, embedded_mongo in edited_refs:
+            snapshot_row = snapshot[list_db_field][index]
+            for key, value in embedded_mongo.items():
+                if key in snapshot_row:
+                    snapshot_row[key] = value
+
+    @staticmethod
+    def _walk_mongo_path(mongo_doc, path):
+        data = mongo_doc
+        for part in path.split("."):
+            if isinstance(data, list) and part.isdigit():
+                data = data[int(part)]
+            else:
+                data = data[part]
+        return data
+
+    @staticmethod
+    def _positional_uniqueness_expr(list_db_field, location_db_field, location_value):
+        return {
+            "$eq": [
+                {
+                    "$size": {
+                        "$filter": {
+                            "input": "$%s" % list_db_field,
+                            "as": "row",
+                            "cond": {
+                                "$eq": [
+                                    "$$row.%s" % location_db_field,
+                                    location_value,
+                                ]
+                            },
+                        }
+                    }
+                },
+                1,
+            ]
+        }
+
+    def _diagnose_positional_failure(
+        self, resolved_specs, save_condition, object_id
+    ):
+        """Inspect the current database state to explain a failed positional
+        save with a specific exception. Nothing is written by this method.
+        """
+        collection = self._get_collection()
+        current_doc = collection.find_one({"_id": object_id}, session=_get_session())
+        if current_doc is None:
+            raise SaveConditionError(
+                "Race condition preventing document update detected"
+            )
+
+        if save_condition is not None:
+            condition_query = transform.query(self.__class__, **save_condition)
+            condition_query["_id"] = object_id
+            if collection.count_documents(condition_query, session=_get_session()) == 0:
+                raise SaveConditionError(
+                    "Race condition preventing document update detected"
+                )
+
+        snapshot = self._only_loaded_snapshot
+        for list_name, spec in resolved_specs.items():
+            list_db_field = spec["list_db_field"]
+            location_db_field = spec["location_db_field"]
+            generation_db_field = spec["generation_db_field"]
+            value_db_field = spec["value_db_field"]
+
+            embedded_docs = self._data.get(list_name) or []
+            snapshot_rows = snapshot.get(list_db_field, [])
+            current_rows = current_doc.get(list_db_field, [])
+
+            for index, embedded_doc in enumerate(embedded_docs):
+                changed_fields, unset_fields = embedded_doc._get_updated_fields()
+                if not changed_fields and not unset_fields:
+                    continue
+
+                snapshot_row = snapshot_rows[index]
+                location_value = snapshot_row[location_db_field]
+                matching_rows = [
+                    row
+                    for row in current_rows
+                    if row.get(location_db_field) == location_value
+                ]
+
+                if len(matching_rows) > 1:
+                    raise SaveLocationNotUniqueError(
+                        "Location '%s' is no longer unique in '%s'"
+                        % (location_value, list_name),
+                        location=location_value,
+                    )
+                if len(matching_rows) == 0:
+                    raise SaveGenerationConflictError(
+                        "Location '%s' no longer exists in '%s'"
+                        % (location_value, list_name),
+                        location=location_value,
+                        expected_generation=snapshot_row[generation_db_field],
+                        actual_generation=None,
+                    )
+
+                current_row = matching_rows[0]
+                expected_generation = snapshot_row[generation_db_field]
+                actual_generation = current_row.get(generation_db_field)
+                if actual_generation != expected_generation:
+                    raise SaveGenerationConflictError(
+                        "Location '%s' generation changed from %s to %s"
+                        % (
+                            location_value,
+                            expected_generation,
+                            actual_generation,
+                        ),
+                        location=location_value,
+                        expected_generation=expected_generation,
+                        actual_generation=actual_generation,
+                    )
+
+                expected_value = snapshot_row[value_db_field]
+                actual_value = current_row.get(value_db_field)
+                if actual_value != expected_value:
+                    raise SaveCountConflictError(
+                        "Counted value for location '%s' changed from %s to %s"
+                        % (location_value, expected_value, actual_value),
+                        location=location_value,
+                        expected_count=expected_value,
+                        actual_count=actual_value,
+                    )
+
+        raise SaveConditionError(
+            "Race condition preventing document update detected"
+        )
+
+    def _save_positional_update(
+        self, doc, save_condition, write_concern, positional
+    ):
+        """Update an existing document by embedded-row identity instead of
+        list indexes.
+
+        Helper method, should only be used inside save().
+        """
+        collection = self._get_collection()
+        object_id = doc["_id"]
+
+        select_dict = {}
+        if save_condition is not None:
+            select_dict = transform.query(self.__class__, **save_condition)
+        select_dict["_id"] = object_id
+        select_dict = self._integrate_shard_key(doc, select_dict)
+
+        resolved_specs = self._resolve_positional_spec(positional)
+        (
+            select_extra,
+            update_doc,
+            array_filters,
+            edited_refs,
+        ) = self._build_positional_update(resolved_specs)
+        self._merge_select_clauses(select_dict, select_extra)
+
+        if not update_doc:
+            return object_id, False
+
+        with set_write_concern(collection, write_concern) as wc_collection:
+            last_error = wc_collection.update_one(
+                select_dict,
+                update_doc,
+                upsert=False,
+                array_filters=array_filters,
+                session=_get_session(),
+            ).raw_result
+
+        if last_error["n"] == 0:
+            self._diagnose_positional_failure(
+                resolved_specs=resolved_specs,
+                save_condition=save_condition,
+                object_id=object_id,
+            )
+
+        self._refresh_positional_snapshot(edited_refs, doc)
+        return object_id, False
 
     def cascade_save(self, **kwargs):
         """Recursively save any references and generic references on the

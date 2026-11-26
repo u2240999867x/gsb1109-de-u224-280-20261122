@@ -8,6 +8,13 @@ Development
 ===========
 - (Fill this out as you fix issues and develop your features).
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
+- Add an opt-in ``positional`` argument to ``Document.save()`` so embedded list rows
+  edited from a ``QuerySet.only()`` projection are updated by their business identity
+  (location + generation) with array filters instead of by list index. A changed
+  generation, a changed counted value or a duplicated location raises the new
+  ``SaveGenerationConflictError``, ``SaveCountConflictError`` or
+  ``SaveLocationNotUniqueError`` without writing anything, while ``save_condition``
+  keeps being applied.
 
 Changes in 1.0.0
 ================
