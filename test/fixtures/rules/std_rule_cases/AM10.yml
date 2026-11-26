@@ -1,0 +1,70 @@
+rule: AM10
+
+test_fail_receipt_join_amplifies_rows:
+  fail_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+        JOIN receipt AS r ON r.record_no = e.record_no
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      ambiguous.row_pick_determinism:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+            receipt:
+              primary_key: receipt_no
+          relationships:
+            - name: receipts_per_record
+              left: receipt
+              right: event
+              left_columns: [record_no]
+              right_columns: [record_no]
+              cardinality: many_to_one
+
+test_pass_full_key_ordering:
+  pass_str: |
+    SELECT picked.site_id, picked.event_time
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      ambiguous.row_pick_determinism:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+
+test_pass_no_catalog_stays_silent:
+  pass_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC
+               ) AS rn
+        FROM event AS e
+    ) AS picked
+    WHERE picked.rn = 1

@@ -29,6 +29,13 @@ COMMA_SEPARATED_PATH_KEYS = (
     "loader_search_path",
     "exclude_macros_from_path",
 )
+# Catalog paths may legitimately be empty when the inline ``catalog`` value is
+# used instead, so they need a gentler resolution than the other ``*_path``
+# keys (which assert that the value is a string).
+OPTIONAL_PATH_KEYS = (
+    "catalog_path",
+    "row_pick_catalog_path",
+)
 RESOLVE_PATH_SUFFIXES = ("_path", "_dir")
 # Values in this section are arbitrary user data for templating, so the path
 # heuristics below must not be applied to them.
@@ -82,8 +89,17 @@ def _resolve_paths_in_config(
                     logging_reference=logging_reference,
                     key_path=key_path + (key.lower(),),
                 )
+        # A catalog can be supplied inline; an empty optional path is fine.
+        if key.lower() in OPTIONAL_PATH_KEYS:
+            if val in (None, ""):
+                continue
+            assert isinstance(val, str), (
+                f"Value for {key} in {log_filename} must be a string not {type(val)}."
+            )
+            resolved_paths = _resolve_path(filepath, val)
+            config[key] = resolved_paths[0] if resolved_paths else val
         # If it's a potential multi-path, split, resolve and join
-        if key.lower() in COMMA_SEPARATED_PATH_KEYS:
+        elif key.lower() in COMMA_SEPARATED_PATH_KEYS:
             assert isinstance(val, str), (
                 f"Value for {key} in {log_filename} must be a string not {type(val)}."
             )

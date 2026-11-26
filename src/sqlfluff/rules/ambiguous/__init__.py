@@ -22,6 +22,26 @@ def get_configs_info() -> dict[str, ConfigInfo]:
                 "or implicit positional references."
             ),
         },
+        "catalog_path": {
+            "definition": (
+                "Path to a read-only YAML/JSON catalog declaring natural keys, "
+                "nullable key columns and relationship cardinality."
+            ),
+        },
+        "catalog": {
+            "definition": (
+                "Read-only table metadata (YAML/JSON mapping or inline text) "
+                "declaring natural keys, nullable key columns and relationship "
+                "cardinality for the deterministic row-pick rule."
+            ),
+        },
+        "report_insufficient_evidence": {
+            "validation": [True, False],
+            "definition": (
+                "Report row picks whose determinism cannot be proven from the "
+                "catalog as insufficient evidence. Defaults to True."
+            ),
+        },
     }
 
 
@@ -41,6 +61,7 @@ def get_rules() -> list[type[BaseRule]]:
     from sqlfluff.rules.ambiguous.AM07 import Rule_AM07
     from sqlfluff.rules.ambiguous.AM08 import Rule_AM08
     from sqlfluff.rules.ambiguous.AM09 import Rule_AM09
+    from sqlfluff.rules.ambiguous.AM10 import Rule_AM10
 
     return [
         Rule_AM01,
@@ -52,4 +73,5 @@ def get_rules() -> list[type[BaseRule]]:
         Rule_AM07,
         Rule_AM08,
         Rule_AM09,
+        Rule_AM10,
     ]

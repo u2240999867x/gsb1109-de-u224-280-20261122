@@ -1,0 +1,229 @@
+rule: ST13
+
+test_fail_equal_event_times_no_key_evidence:
+  # event_time can repeat; the ordering never reaches the event key tail.
+  fail_str: |
+    SELECT picked.site_id, picked.event_time
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC
+               ) AS rn
+        FROM event AS e
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+
+test_fail_receipt_join_amplifies_rows:
+  # Two receipts per record share the same event ordering.
+  fail_str: |
+    SELECT picked.site_id, picked.event_time
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+        JOIN receipt AS r ON r.record_no = e.record_no
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+            receipt:
+              primary_key: receipt_no
+          relationships:
+            - name: receipts_per_record
+              left: receipt
+              right: event
+              left_columns: [record_no]
+              right_columns: [record_no]
+              cardinality: many_to_one
+
+test_fail_outer_distinct_cannot_repair_window:
+  fail_str: |
+    SELECT DISTINCT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+        JOIN receipt AS r ON r.record_no = e.record_no
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+            receipt:
+              primary_key: receipt_no
+          relationships:
+            - name: receipts_per_record
+              left: receipt
+              right: event
+              left_columns: [record_no]
+              right_columns: [record_no]
+              cardinality: many_to_one
+
+test_fail_nullable_receipt_column:
+  fail_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no, r.note
+               ) AS rn
+        FROM event AS e
+        JOIN receipt AS r ON r.record_no = e.record_no
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+            receipt:
+              primary_key: receipt_no
+              columns:
+                note:
+                  nullable: true
+
+test_fail_insufficient_evidence_enabled:
+  fail_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        report_insufficient_evidence: true
+        catalog: |
+          tables:
+            event:
+              columns: [site_id, event_time, record_no]
+
+test_pass_catalog_one_per_site:
+  pass_str: |
+    SELECT picked.site_id, picked.event_time
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+        JOIN site_catalog AS c ON c.site_id = e.site_id
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+            site_catalog:
+              primary_key: site_id
+
+test_pass_named_window:
+  pass_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER latest AS rn
+        FROM event AS e
+        WINDOW latest AS (
+            PARTITION BY e.site_id
+            ORDER BY e.event_time DESC, e.record_no
+        )
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no]
+
+test_pass_fixed_key_tail_filter:
+  # Where fixes the extra key column, so the remaining key is complete.
+  pass_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               e.event_seq,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC, e.record_no
+               ) AS rn
+        FROM event AS e
+        WHERE e.event_seq = 7
+    ) AS picked
+    WHERE picked.rn = 1
+  configs:
+    rules:
+      structure.deterministic_row_pick:
+        catalog: |
+          tables:
+            event:
+              primary_key: [site_id, event_time, record_no, event_seq]
+
+test_pass_no_catalog_stays_silent:
+  # Enabling the rule is not evidence; without a catalog it stays silent.
+  pass_str: |
+    SELECT picked.site_id
+    FROM (
+        SELECT e.site_id,
+               e.event_time,
+               e.record_no,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.site_id
+                   ORDER BY e.event_time DESC
+               ) AS rn
+        FROM event AS e
+    ) AS picked
+    WHERE picked.rn = 1

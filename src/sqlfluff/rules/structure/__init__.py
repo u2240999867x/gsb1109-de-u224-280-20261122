@@ -19,6 +19,26 @@ def get_configs_info() -> dict[str, ConfigInfo]:
                 "Defaults to ``earlier``."
             ),
         },
+        "catalog": {
+            "definition": (
+                "Read-only table metadata (YAML/JSON mapping or inline text) "
+                "declaring natural keys, nullable key columns and relationship "
+                "cardinality for the deterministic row-pick rule."
+            ),
+        },
+        "catalog_path": {
+            "definition": (
+                "Path to a read-only YAML/JSON catalog declaring natural keys, "
+                "nullable key columns and relationship cardinality."
+            ),
+        },
+        "report_insufficient_evidence": {
+            "validation": [True, False],
+            "definition": (
+                "Report row picks whose determinism cannot be proven from the "
+                "catalog as insufficient evidence. Defaults to True."
+            ),
+        },
     }
 
 
@@ -41,6 +61,7 @@ def get_rules() -> list[type[BaseRule]]:
     from sqlfluff.rules.structure.ST10 import Rule_ST10
     from sqlfluff.rules.structure.ST11 import Rule_ST11
     from sqlfluff.rules.structure.ST12 import Rule_ST12
+    from sqlfluff.rules.structure.ST13 import Rule_ST13
 
     return [
         Rule_ST01,
@@ -55,4 +76,5 @@ def get_rules() -> list[type[BaseRule]]:
         Rule_ST10,
         Rule_ST11,
         Rule_ST12,
+        Rule_ST13,
     ]

@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover
     pytest = None  # type: ignore[assignment]
 
 # Expose the public API.
-from sqlfluff.api import fix, lint, list_dialects, list_rules, parse
+from sqlfluff.api import analyze_row_picks, fix, lint, list_dialects, list_rules, parse
 
 __all__ = (
     "lint",
@@ -17,6 +17,7 @@ __all__ = (
     "parse",
     "list_rules",
     "list_dialects",
+    "analyze_row_picks",
 )
 
 # Get the current version

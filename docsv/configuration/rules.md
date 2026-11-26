@@ -163,3 +163,93 @@ The `[sqlfluff:layout]` section of the config controls the
 treatment of spacing and line breaks across all rules. To understand
 more about this section, see the section of the docs dedicated to
 layout: [Layout Configuration](../configuration/layout).
+
+## Row-Pick Determinism Catalog
+
+The row-pick determinism rules,
+[`ST13`](../reference/rules/structure#st13) and
+[`AM10`](../reference/rules/ambiguous#am10), need table metadata to prove that a
+`ROW_NUMBER()` pick has a unique winner. Because SQLFluff has no database
+connection, that metadata comes from a user-supplied, read-only *catalog*.
+
+```ini
+[sqlfluff:rules:structure.deterministic_row_pick]
+catalog_path = catalog.yml
+```
+
+The catalog is YAML (or JSON), and declares tables, natural keys and
+relationships:
+
+```yaml
+tables:
+  site_catalog:
+    primary_key: site_id
+  event:
+    primary_key: [site_id, event_time, record_no]
+    nullable: [event_time]
+  receipt:
+    primary_key: receipt_no
+    columns:
+      record_no:
+        nullable: false
+
+relationships:
+  - name: catalog_per_site
+    left: site_catalog
+    right: event
+    left_columns: [site_id]
+    right_columns: [site_id]
+    cardinality: one_to_many
+  - name: receipts_per_record
+    left: receipt
+    right: event
+    left_columns: [record_no]
+    right_columns: [record_no]
+    cardinality: many_to_one
+```
+
+`primary_key`, `natural_key`, `business_key`, `unique_key` and `keys` are
+accepted for key declarations. `nullable`, `nullable_columns` and
+`nullable_keys` declare key columns which may be null. A relationship's
+`cardinality` can be written as `one_to_many`, `many_to_one`, `one_to_one` or
+`many_to_many`; `left_max_one`/`right_max_one` and `unique_side` are
+equivalent spellings.
+
+The analysis reports three outcomes:
+
+* **deterministic** when the partition, filters and ordering cover a declared
+  unique key, so every row in a partition has a distinct rank;
+* **not deterministic** when two rows can share a rank, for example because a
+  join can return more than one row per key, an ordering column is nullable, or
+  the ordering stops short of a declared key; and
+* **insufficient evidence** when the catalog does not declare the relevant
+  key or table. This is reported only when
+  `report_insufficient_evidence = True`, and never treated as a proof.
+
+An outer `DISTINCT` does not make a row pick deterministic: the window has
+already assigned the tied rows the same rank before the outer query can remove
+duplicates. A filter which pins part of a key (for example
+`WHERE event_seq = 7`) does contribute to the proof, because it removes the
+unfixed key column from the uniqueness check.
+
+Supply the catalog inline with `catalog` instead of `catalog_path` if it is
+small or generated, for example:
+
+```ini
+[sqlfluff:rules:ambiguous.row_pick_determinism]
+catalog = |
+  tables:
+    event:
+      primary_key: [site_id, event_time, record_no]
+```
+
+
+The same analysis is available programmatically:
+
+```python
+import sqlfluff
+
+results = sqlfluff.analyze_row_picks(sql, catalog="catalog.yml")
+for result in results:
+    print(result.status, result.order_by, result.message)
+```
