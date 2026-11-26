@@ -15,8 +15,45 @@ from .core import (  # noqa: F401
     Dataset,
     InvalidDatasetType,
     InvalidDimensions,
+    MaintainableDataset,
+    MaintainedDataset,
+    ManagedDataset,
     UnsupportedFormat,
     detect_format,
     import_book,
     import_set,
 )
+from .exceptions import (  # noqa: F401
+    CalculationCallbackError,
+    CalculationError,
+    CellCalculationError,
+    CircularDependency,
+    CircularDependencyError,
+    CircularReferenceError,
+    ConflictError,
+    CorrectionConflictError,
+    CycleError,
+    DependencyCycleError,
+    DerivedCellCalculationError,
+    MaintenanceError,
+    MergeConflict,
+    MergeConflictError,
+)
+from .maintenance import (  # noqa: F401
+    InputRegistry,
+    MaintainableColumn,
+    MaintainedCallableColumn,
+    MaintainedColumn,
+    MaintenanceManager,
+    ManagedColumn,
+    current_field,
+    current_item,
+    current_sku,
+    merge_datasets,
+    merge_maintenance,
+    register_input,
+)
+
+merge_copies = merge_datasets
+merge = merge_datasets
+reconcile = merge_datasets

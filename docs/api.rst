@@ -40,6 +40,14 @@ Functions
 .. autofunction:: import_set
 
 
+------------------
+Maintained Columns
+------------------
+
+.. automodule:: tablib.maintenance
+   :members: merge_datasets, register_input, current_sku
+
+
 ----------
 Exceptions
 ----------
