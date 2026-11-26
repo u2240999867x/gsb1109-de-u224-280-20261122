@@ -1,6 +1,8 @@
 v4.27.0
 =======
 
+* Add `jsonschema.audit_amount_contract`, an exact decimal auditing entry point for amount contracts.
+  Given a schema restricted to numeric bounds, ``multipleOf`` and ``allOf`` / ``anyOf`` / ``oneOf`` plus a finite audit window and a warehouse unit, it reports which amounts are genuinely admissible as queryable lattice segments, why each rejected amount fails (out of range, step mismatch or mutually exclusive ``oneOf`` overlap), and a precise counterexample whenever the contract accepts an amount the warehouse unit cannot register losslessly.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

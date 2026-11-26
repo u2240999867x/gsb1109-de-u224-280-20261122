@@ -24,6 +24,10 @@ indices
 ipv
 iterable
 iteratively
+lattice
+lattices
+counterexample
+losslessly
 Javascript
 jsonschema
 majorly

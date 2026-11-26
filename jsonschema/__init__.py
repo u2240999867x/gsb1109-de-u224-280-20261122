@@ -13,6 +13,13 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
+from jsonschema.amounts import (
+    AmountAdmission,
+    AmountContract,
+    AmountSegment,
+    AmountStatus,
+    audit_amount_contract,
+)
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import (
     Draft3Validator,
@@ -113,6 +120,10 @@ def __getattr__(name):
 
 
 __all__ = [
+    "AmountAdmission",
+    "AmountContract",
+    "AmountSegment",
+    "AmountStatus",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -123,5 +134,6 @@ __all__ = [
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "audit_amount_contract",
     "validate",
 ]
