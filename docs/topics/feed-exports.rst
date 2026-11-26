@@ -512,6 +512,57 @@ To pass a parameter to your plugin, use :ref:`feed options <feed-options>`. You
 can then access those parameters from the ``__init__`` method of your plugin.
 
 
+.. _delivery-receipts:
+
+Delivery receipts
+=================
+
+A feed that writes more than one entry per scraped item, or that filters items
+differently from other feeds, cannot be resumed safely from a batch number
+alone. The batch that failed may have written a file, while another feed of the
+same crawl stored the same source records successfully.
+
+Set the ``delivery_receipts`` :ref:`feed option <feed-options>` (or the
+:setting:`FEED_EXPORT_DELIVERY_RECEIPTS` setting) to track a feed per exported
+entry. Scrapy then writes :file:`feed_receipts.json` into the
+:setting:`JOBDIR` directory, with one receipt per entry after its storage
+succeeds. If a batch fails to store, none of its entries get a receipt.
+
+When the same source records are scraped again with the same :setting:`JOBDIR`,
+Scrapy skips the entries that already have a receipt and delivers only the
+missing ones, to new batch files. Previously stored files are neither
+rewritten nor appended to. The receipt records the source record, the entry
+index within the source record, the batch ID and the target URI, so a receipt
+can be located per feed and per entry even when one source record expands into
+several rows.
+
+:attr:`FeedExporter.delivery_receipts` lists the recorded receipts of the
+current run, and :attr:`FeedSlot.delivery_receipts` lists the receipts of the
+entries of a stored slot. A failed slot has no receipts and its
+:attr:`~FeedSlot.delivered` is ``False``.
+
+Changing ``batch_item_count`` between runs does not affect receipts: entries
+that were delivered keep their receipts, and batch numbering continues after
+the last batch that was stored or attempted.
+
+When a local feed uses receipts, Scrapy stages the output in a temporary file
+and renames it into place only on success, so a failed local write leaves no
+partial target file.
+
+.. setting:: FEED_EXPORT_DELIVERY_RECEIPTS
+
+FEED_EXPORT_DELIVERY_RECEIPTS
+-----------------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Whether feeds track delivery receipts per exported entry. Requires
+:setting:`JOBDIR`. Can be overridden with the ``delivery_receipts``
+:ref:`feed option <feed-options>`. See :ref:`delivery-receipts`.
+
+
 Settings
 ========
 
@@ -528,6 +579,7 @@ These are the settings used for configuring the feed exports:
 -   :setting:`FEED_STORAGE_S3_ACL`
 -   :setting:`FEED_EXPORTERS`
 -   :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`
+-   :setting:`FEED_EXPORT_DELIVERY_RECEIPTS`
 -   :setting:`UPLOAD_TIMEOUT`
 
 .. setting:: FEEDS
@@ -592,6 +644,20 @@ as a fallback value if that key is not provided for a specific feed definition:
 
 -   ``batch_item_count``: falls back to
     :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`.
+
+-   ``delivery_receipts``: falls back to
+    :setting:`FEED_EXPORT_DELIVERY_RECEIPTS`, and defaults to ``True`` when
+    :setting:`JOBDIR` is set and the feed declares an ``item_processor``,
+    ``item_filter`` or ``item_classes``. See :ref:`delivery-receipts`.
+
+    .. versionadded:: VERSION
+
+-   ``delivery_receipt_key``: a callable, or its import path, that returns the
+    identifier of the source record of an item. It takes precedence over the
+    ``id``, ``_id``, ``source_id`` and ``record_id`` fields, and over hashing
+    the item.
+
+    .. versionadded:: VERSION
 
 -   ``encoding``: falls back to :setting:`FEED_EXPORT_ENCODING`.
 

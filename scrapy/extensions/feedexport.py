@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
+import os
 import re
+import shutil
 import sys
+import threading
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
@@ -21,6 +27,7 @@ from typing import IO, TYPE_CHECKING, Any, Protocol, Self, TypeAlias, cast
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
+from itemadapter import ItemAdapter
 from twisted.internet.defer import Deferred, DeferredList, DeferredLock
 from w3lib.url import file_uri_to_path
 from zope.interface import Interface
@@ -31,7 +38,7 @@ from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.utils._ftp import ftp_store_file
 from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
 from scrapy.utils.boto import _get_max_pool_connections, is_aioboto3_available
-from scrapy.utils.conf import feed_complete_default_values_from_settings
+from scrapy.utils.conf import _job_dir, feed_complete_default_values_from_settings
 from scrapy.utils.defer import (
     _maybe_coroutine,
     deferred_from_coro,
@@ -85,7 +92,230 @@ UriParamsCallableT: TypeAlias = Callable[
 ]
 
 _ItemProcessor: TypeAlias = Callable[[Any], Iterable[Any]]
+_ItemReceiptKey: TypeAlias = Callable[[Any], Any]
 
+
+@dataclass(frozen=True)
+class FeedItemReceipt:
+    """A persisted confirmation that one exported entry of a feed reached its
+    storage.
+
+    *item_key* identifies the scraped item that the exported entry comes from,
+    and *entry_key* identifies that entry among the entries that the item
+    produces for the feed, e.g. the two rows that an item processor can
+    generate for one scraped item.
+    """
+
+    feed: str
+    item_key: str
+    entry_key: str
+    uri: str
+    batch_id: int
+    index: int
+
+
+_FEED_RECEIPTS_VERSION = 1
+_FEED_RECEIPTS_FILENAME = "feed_receipts.json"
+
+
+_RECEIPT_KEY_FIELDS = ("id", "_id", "source_id", "record_id")
+
+
+def _item_receipt_key(
+    item: Any,
+    receipt_key: Callable[[Any], Any] | None = None,
+) -> str:
+    """Return the key that identifies the source record of *item*.
+
+    A *receipt_key* callable takes precedence. Otherwise the first populated
+    field among :data:`_RECEIPT_KEY_FIELDS` is used, so that a replayed record
+    maps to the same key as in the run that first exported it. Items without
+    any of those fields fall back to a hash of their contents.
+    """
+    if receipt_key is not None:
+        value = receipt_key(item)
+        return value if isinstance(value, str) else str(value)
+    try:
+        adapter = ItemAdapter(item)
+        for field in _RECEIPT_KEY_FIELDS:
+            try:
+                value = adapter[field]
+            except KeyError:
+                continue
+            return value if isinstance(value, str) else str(value)
+        data = json.dumps(
+            adapter.asdict(), sort_keys=True, default=repr, ensure_ascii=False
+        ).encode()
+    except (TypeError, ValueError):
+        data = repr(item).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+class _FeedReceipts:
+    """Persist which entries of each feed reached storage.
+
+    A receipt is written only after :meth:`FeedSlot.store` succeeds, one per
+    exported entry, so that a later run can skip the entries that were already
+    delivered and retry the ones that were not, even when one feed succeeded
+    while another failed.
+    """
+
+    def __init__(self, path: Path):
+        self.path: Path = path
+        self._receipts: dict[str, dict[str, FeedItemReceipt]] = {}
+        self._batches: dict[str, set[int]] = {}
+        self._attempted: dict[str, set[int]] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            logger.warning(
+                f"Ignoring unreadable feed receipts file: {self.path}",
+                exc_info=True,
+            )
+            return
+        if not isinstance(data, dict) or data.get("version") != _FEED_RECEIPTS_VERSION:
+            return
+        for feed, batches in data.get("batches", {}).items():
+            if isinstance(batches, list):
+                self._batches[feed] = {
+                    int(batch_id)
+                    for batch_id in batches
+                    if isinstance(batch_id, int)
+                }
+        for feed, batches in data.get("attempted_batches", {}).items():
+            if isinstance(batches, list):
+                self._attempted[feed] = {
+                    int(batch_id)
+                    for batch_id in batches
+                    if isinstance(batch_id, int)
+                }
+        for feed, entries in data.get("feeds", {}).items():
+            if not isinstance(entries, dict):
+                continue
+            feed_receipts: dict[str, FeedItemReceipt] = {}
+            for receipt in entries.values():
+                if not isinstance(receipt, dict):
+                    continue
+                try:
+                    value = FeedItemReceipt(
+                        feed=receipt["feed"],
+                        item_key=receipt["item_key"],
+                        entry_key=receipt["entry_key"],
+                        uri=receipt["uri"],
+                        batch_id=int(receipt["batch_id"]),
+                        index=int(receipt["index"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                feed_receipts[value.entry_key] = value
+            self._receipts[feed] = feed_receipts
+
+    def _save(self) -> None:
+        data = {
+            "version": _FEED_RECEIPTS_VERSION,
+            "batches": {
+                feed: sorted(batches)
+                for feed, batches in self._batches.items()
+            },
+            "attempted_batches": {
+                feed: sorted(batches)
+                for feed, batches in self._attempted.items()
+            },
+            "feeds": {
+                feed: {
+                    entry_key: {
+                        "feed": receipt.feed,
+                        "item_key": receipt.item_key,
+                        "entry_key": receipt.entry_key,
+                        "uri": receipt.uri,
+                        "batch_id": receipt.batch_id,
+                        "index": receipt.index,
+                    }
+                    for entry_key, receipt in entries.items()
+                }
+                for feed, entries in self._receipts.items()
+            },
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as file:
+            file.write(json.dumps(data, indent=2, sort_keys=True))
+            file.flush()
+            os.fsync(file.fileno())
+        tmp_path.replace(self.path)
+
+    @staticmethod
+    def entry_key(uri_template: str, item_key: str, index: int) -> str:
+        return f"{uri_template}\0{item_key}\0{index}"
+
+    def delivered(self, feed: str, entry_key: str) -> bool:
+        with self._lock:
+            return entry_key in self._receipts.get(feed, {})
+
+    def add(
+        self, receipts: Iterable[FeedItemReceipt], batch: tuple[str, int] | None = None
+    ) -> None:
+        with self._lock:
+            changed = False
+            pending = list(receipts)
+            for receipt in pending:
+                entries = self._receipts.setdefault(receipt.feed, {})
+                if receipt.entry_key in entries:
+                    continue
+                entries[receipt.entry_key] = receipt
+                changed = True
+            if batch is not None:
+                feed, batch_id = batch
+                batches = self._batches.setdefault(feed, set())
+                if batch_id not in batches:
+                    batches.add(batch_id)
+                    changed = True
+            if changed:
+                self._save()
+
+    def all(self) -> list[FeedItemReceipt]:
+        with self._lock:
+            return sorted(
+                (
+                    receipt
+                    for entries in self._receipts.values()
+                    for receipt in entries.values()
+                ),
+                key=lambda receipt: (
+                    receipt.feed,
+                    receipt.item_key,
+                    receipt.entry_key,
+                ),
+            )
+
+    def mark_attempted(self, feed: str, batch_id: int) -> None:
+        """Record that *batch_id* of *feed* is about to be stored.
+
+        The batch is not a receipt. It is kept apart so that a retry does not
+        reuse the URI of a batch that may have left a partial file behind.
+        """
+        with self._lock:
+            batches = self._attempted.setdefault(feed, set())
+            if batch_id in batches:
+                return
+            batches.add(batch_id)
+            self._save()
+
+    def next_batch_id(self, feed: str) -> int:
+        """Return the batch ID to use for new entries of *feed*."""
+        with self._lock:
+            used = self._attempted.get(feed, set()) | self._batches.get(feed, set())
+            used.update(
+                receipt.batch_id
+                for receipt in self._receipts.get(feed, {}).values()
+            )
+            return max(used, default=0) + 1
 
 _FEED_MODES: frozenset[str] = frozenset({"append", "create", "overwrite"})
 
@@ -263,16 +493,74 @@ class FileFeedStorage:
         self.write_mode: OpenBinaryMode = _WRITE_MODES[
             _get_mode(self, feed_options, "append")
         ]
+        self._transactional: bool = bool(
+            (feed_options or {}).get("delivery_receipts")
+        )
+        self._temp_path: str | None = None
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
+        if self._transactional:
+            # Write next to the target, so that committing is a rename within
+            # one filesystem, and a failed store cannot leave a partial target
+            # that looks like delivered output.
+            temp = NamedTemporaryFile(
+                prefix=f".{Path(self.path).name}.", dir=dirname or ".", delete=False
+            )
+            self._temp_path = temp.name
+            return temp
         return Path(self.path).open(self.write_mode)
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
+        if self._transactional:
+            self._commit(file)
+            return None
         file.close()
         return None
+
+    def _commit(self, file: IO[bytes]) -> None:
+        assert self._temp_path is not None
+        try:
+            file.flush()
+            os.fsync(file.fileno())
+            file.close()
+            if self.write_mode == "ab":
+                # Append into a fresh file that starts with the current target,
+                # so that a failed append cannot leave the target half-written.
+                combined = NamedTemporaryFile(
+                    prefix=f".{Path(self.path).name}.",
+                    dir=Path(self.path).parent,
+                    delete=False,
+                )
+                try:
+                    with combined, Path(self._temp_path).open("rb") as temp:
+                        if Path(self.path).exists():
+                            with Path(self.path).open("rb") as target:
+                                shutil.copyfileobj(target, combined)
+                        shutil.copyfileobj(temp, combined)
+                        combined.flush()
+                        os.fsync(combined.fileno())
+                    Path(combined.name).replace(self.path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        Path(combined.name).unlink()
+                    raise
+                Path(self._temp_path).unlink()
+            else:
+                if self.write_mode == "xb" and Path(self.path).exists():
+                    raise FileExistsError(str(self.path))
+                Path(self._temp_path).replace(self.path)
+            self._temp_path = None
+        except BaseException:
+            with contextlib.suppress(OSError):
+                file.close()
+            if self._temp_path is not None:
+                with contextlib.suppress(OSError):
+                    Path(self._temp_path).unlink()
+                self._temp_path = None
+            raise
 
 
 class S3FeedStorage(BlockingFeedStorage):
@@ -623,6 +911,34 @@ class FeedSlot:
         self._skipped: bool = False
         self._exporting: bool = False
         self._fileloaded: bool = False
+        # Entries exported in this slot, and the receipts of the entries that
+        # reached storage. A failed store leaves both empty.
+        self._pending_receipts: list[FeedItemReceipt] = []
+        self._delivered_receipts: list[FeedItemReceipt] = []
+        self._pending_count: int = 0
+        self._delivered: bool = False
+
+    @property
+    def delivery_receipts(self) -> list[FeedItemReceipt]:
+        """The receipts of the entries of this slot that reached storage."""
+        return list(self._delivered_receipts)
+
+    @property
+    def delivered(self) -> bool:
+        """Whether this slot reached storage."""
+        return self._delivered
+
+    def add_receipt(self, item_key: str, index: int) -> None:
+        self._pending_receipts.append(
+            FeedItemReceipt(
+                feed=self.uri_template,
+                item_key=item_key,
+                entry_key=_FeedReceipts.entry_key(self.uri_template, item_key, index),
+                uri=self.uri,
+                batch_id=self.batch_id,
+                index=index,
+            )
+        )
 
     async def start_exporting(self) -> None:
         if not self._fileloaded:
@@ -685,6 +1001,8 @@ class FeedExporter:
         self.filters: dict[str, ItemFilter] = {}
         self.processors: dict[str, _ItemProcessor | None] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
+        self._receipts: _FeedReceipts | None = None
+        self._receipt_keys: dict[str, _ItemReceiptKey | None] = {}
         # Item export may await user-defined code (e.g. an async def
         # export_item() method), while item_scraped signals are sent
         # concurrently (see the CONCURRENT_ITEMS setting). This lock prevents
@@ -712,6 +1030,7 @@ class FeedExporter:
             )
             self.filters[uri] = self._load_filter(feed_options)
             self.processors[uri] = self._load_processor(feed_options)
+            self._receipt_keys[uri] = self._load_receipt_key(feed_options)
         # End: Backward compatibility for FEED_URI and FEED_FORMAT settings
 
         # 'FEEDS' setting takes precedence over 'FEED_URI'
@@ -727,6 +1046,9 @@ class FeedExporter:
             )
             self.filters[uri] = self._load_filter(feed_options)
             self.processors[uri] = self._load_processor(feed_options)
+            self._receipt_keys[uri] = self._load_receipt_key(feed_options)
+
+        self._init_receipts()
 
         self.storages: dict[str, type[FeedStorageProtocol]] = self._load_components(
             "FEED_STORAGES"
@@ -787,22 +1109,28 @@ class FeedExporter:
         opens its file lazily; no I/O has occurred yet.
         """
         feed_batch_ids: dict[str, int] = state.get("feed_batch_ids", {})
-        if feed_batch_ids:
-            spider = self.crawler.spider
-            assert spider is not None
-            for slot in self.slots:
-                saved_id = feed_batch_ids.get(slot.uri_template, 0)
-                if saved_id == 0:
-                    continue
-                batch_id = saved_id
-                uri_params = self._get_uri_params(
-                    spider, self.feeds[slot.uri_template]["uri_params"]
-                )
-                uri_params["batch_id"] = batch_id
-                uri = apply_uri_params(slot.uri_template, uri_params)
-                slot.batch_id = batch_id
-                slot.uri = uri
-                slot.storage = self._get_storage(uri, self.feeds[slot.uri_template])
+        spider = self.crawler.spider
+        assert spider is not None
+        for slot in self.slots:
+            batch_id = feed_batch_ids.get(slot.uri_template, 0)
+            if slot.feed_options["delivery_receipts"] and self._receipts is not None:
+                # A receipt journal records the batches that were stored and
+                # the ones that were merely attempted. Reusing an attempted
+                # batch would append to, or overwrite, a file that a failed
+                # store may have left behind.
+                saved_id = self._receipts.next_batch_id(slot.uri_template)
+                if saved_id > 1:
+                    batch_id = saved_id
+            if batch_id in {0, 1}:
+                continue
+            uri_params = self._get_uri_params(
+                spider, self.feeds[slot.uri_template]["uri_params"]
+            )
+            uri_params["batch_id"] = batch_id
+            uri = apply_uri_params(slot.uri_template, uri_params)
+            slot.batch_id = batch_id
+            slot.uri = uri
+            slot.storage = self._get_storage(uri, self.feeds[slot.uri_template])
         self._slots_initialized = True
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slots_initialized, slots=self.slots
@@ -823,7 +1151,16 @@ class FeedExporter:
         """
         feed_batch_ids = state.setdefault("feed_batch_ids", {})
         for slot in self.slots:
-            feed_batch_ids[slot.uri_template] = slot.batch_id
+            if slot.feed_options["delivery_receipts"]:
+                # The receipt journal, not spider.state, is the source of
+                # truth for receipt-enabled feeds: spider.state is not
+                # written during the crawl.
+                if self._receipts is not None:
+                    feed_batch_ids[slot.uri_template] = (
+                        self._receipts.next_batch_id(slot.uri_template)
+                    )
+            else:
+                feed_batch_ids[slot.uri_template] = slot.batch_id
 
     def _skip(self, slot: FeedSlot) -> None:
         """Report that the target of *slot* already exists, and mark *slot* so
@@ -884,9 +1221,36 @@ class FeedExporter:
     def _get_file(slot_: FeedSlot) -> IO[bytes]:
         assert slot_.file
         if isinstance(slot_.file, PostProcessingManager):
+            file = slot_.file.file
             slot_.file.close()
-            return slot_.file.file
+            return file
         return slot_.file
+
+    @staticmethod
+    def _reset_file(slot: FeedSlot) -> None:
+        """Forget the file of a slot whose storage failed, so that the slot
+        cannot be reused as if nothing had happened."""
+        if isinstance(slot.file, PostProcessingManager):
+            file = slot.file.file
+        else:
+            file = slot.file
+        with contextlib.suppress(Exception):
+            assert file is not None
+            file.close()
+        slot.file = None
+        slot.exporter = None
+        slot._fileloaded = False
+        slot._exporting = False
+        slot._pending_receipts.clear()
+        slot._pending_count = 0
+
+    async def _finish_slot(self, slot: FeedSlot) -> None:
+        try:
+            await slot.finish_exporting()
+        except Exception:
+            if self._receipts is not None and slot.feed_options["delivery_receipts"]:
+                self._receipts.mark_attempted(slot.uri_template, slot.batch_id)
+            raise
 
     async def _close_slot(self, slot: FeedSlot, spider: Spider) -> None:
         if slot._skipped:
@@ -894,13 +1258,14 @@ class FeedExporter:
 
         if slot.itemcount:
             # Normal case
-            await slot.finish_exporting()
+            await self._finish_slot(slot)
         elif slot.store_empty and slot.batch_id == 1:
             # Need to store the empty file
             await slot.start_exporting()
-            await slot.finish_exporting()
+            await self._finish_slot(slot)
         else:
-            # In this case, the file is not stored, so no processing is required.
+            # In this case, the file is not stored, so no processing is
+            # required.
             return
 
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
@@ -908,11 +1273,25 @@ class FeedExporter:
         self.crawler.stats.inc_value(
             f"feedexport/item_count/{slot_type}", slot.itemcount
         )
+        if (
+            slot.feed_options["delivery_receipts"]
+            and slot.itemcount
+            and not slot._pending_count
+        ):
+            # Every entry of this slot was already delivered by an earlier
+            # run, so writing a file now would duplicate them.
+            await self.crawler.signals.send_catch_log_async(
+                signals.feed_slot_closed, slot=slot
+            )
+            return
+        if self._receipts is not None and slot.feed_options["delivery_receipts"]:
+            self._receipts.mark_attempted(slot.uri_template, slot.batch_id)
         try:
             await ensure_awaitable(slot.storage.store(self._get_file(slot)))
         except FileExistsError:
             self._skip(slot)
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            self._reset_file(slot)
         except Exception:
             logger.exception(
                 "Error storing %s",
@@ -920,13 +1299,35 @@ class FeedExporter:
                 extra={"spider": spider},
             )
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            self._reset_file(slot)
+            if self._receipts is not None and slot.feed_options["delivery_receipts"]:
+                # The partial file may still be on disk. Move the retry to a
+                # different batch instead of appending to or overwriting it.
+                self._receipts.mark_attempted(slot.uri_template, slot.batch_id)
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+            if self._receipts is not None and slot.feed_options["delivery_receipts"]:
+                slot._delivered = True
+                slot._delivered_receipts = list(slot._pending_receipts)
+                self._receipts.add(
+                    slot._delivered_receipts,
+                    batch=(slot.uri_template, slot.batch_id),
+                )
 
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
         )
+
+    @property
+    def delivery_receipts(self) -> list[FeedItemReceipt]:
+        """The entries that have reached storage, across all feeds.
+
+        Only feeds with the ``delivery_receipts`` feed option are tracked.
+        """
+        if self._receipts is None:
+            return []
+        return self._receipts.all()
 
     def _start_new_batch(
         self,
@@ -972,7 +1373,45 @@ class FeedExporter:
         finally:
             self._export_lock.release()
 
+    def _needs_rotation(self, slot: FeedSlot) -> bool:
+        batch_count = self.feeds[slot.uri_template]["batch_item_count"]
+        if not batch_count:
+            return False
+        if slot.feed_options["delivery_receipts"]:
+            # Only the entries written and not skipped in this run count.
+            return bool(slot._pending_count >= batch_count)
+        return bool(slot.itemcount >= batch_count)
+
+    async def _export_entry(
+        self,
+        slot: FeedSlot,
+        item_key: str | None,
+        index: int,
+        exported_item: Any,
+    ) -> None:
+        if item_key is not None:
+            assert self._receipts is not None
+            entry_key = _FeedReceipts.entry_key(slot.uri_template, item_key, index)
+            if self._receipts.delivered(slot.uri_template, entry_key):
+                return
+        if not slot._skipped:
+            try:
+                await slot.start_exporting()
+            except FileExistsError:
+                self._skip(slot)
+        if not slot._skipped:
+            assert slot.exporter
+            try:
+                await _maybe_coroutine(slot.exporter.export_item, exported_item)
+            except Exception as e:
+                e.add_note(f"Item: {exported_item!r}")
+                raise
+            if item_key is not None:
+                slot.add_receipt(item_key, index)
+                slot._pending_count += 1
+
     async def _export_item(self, item: Any, spider: Spider) -> None:
+        item_key = None
         slots = []
         for slot in self.slots:
             if not slot.filter.accepts(item):
@@ -982,29 +1421,21 @@ class FeedExporter:
                 continue
 
             processor = self.processors[slot.uri_template]
-            for exported_item in processor(item) if processor else (item,):
-                if not slot._skipped:
-                    try:
-                        await slot.start_exporting()
-                    except FileExistsError:
-                        self._skip(slot)
-                if not slot._skipped:
-                    assert slot.exporter
-                    try:
-                        await _maybe_coroutine(slot.exporter.export_item, exported_item)
-                    except Exception as e:
-                        e.add_note(f"Item: {exported_item!r}")
-                        raise
+            exported_items = list(processor(item)) if processor else [item]
+            tracked = slot.feed_options["delivery_receipts"]
+            if tracked and item_key is None:
+                item_key = _item_receipt_key(
+                    item, self._receipt_keys[slot.uri_template]
+                )
+            for index, exported_item in enumerate(exported_items):
+                await self._export_entry(
+                    slot, item_key if tracked else None, index, exported_item
+                )
                 # Skipped items are counted, so that the following files of
                 # this feed still cover the same items as those of any other
                 # feed.
                 slot.itemcount += 1
-                # create new slot for each slot with itemcount == FEED_EXPORT_BATCH_ITEM_COUNT and close the old one
-                if (
-                    self.feeds[slot.uri_template]["batch_item_count"]
-                    and slot.itemcount
-                    >= self.feeds[slot.uri_template]["batch_item_count"]
-                ):
+                if self._needs_rotation(slot):
                     uri_params = self._get_uri_params(
                         spider, self.feeds[slot.uri_template]["uri_params"], slot
                     )
@@ -1129,6 +1560,41 @@ class FeedExporter:
     def _load_processor(self, feed_options: dict[str, Any]) -> _ItemProcessor | None:
         item_processor = feed_options.get("item_processor")
         return load_object(item_processor) if item_processor else None
+
+    def _load_receipt_key(
+        self, feed_options: dict[str, Any]
+    ) -> _ItemReceiptKey | None:
+        receipt_key = feed_options.get("delivery_receipt_key")
+        return load_object(receipt_key) if receipt_key else None
+
+    def _init_receipts(self) -> None:
+        jobdir = _job_dir(self.settings)
+        enabled_by_setting = self.settings.getbool(
+            "FEED_EXPORT_DELIVERY_RECEIPTS"
+        )
+        for feed_options in self.feeds.values():
+            enabled = feed_options.get("delivery_receipts")
+            if enabled is None:
+                # A feed that reshapes or filters items needs per-entry
+                # tracking to resume without duplicates or gaps. Plain batch
+                # feeds keep the legacy batch-ID rotation.
+                enabled = enabled_by_setting or (
+                    bool(jobdir)
+                    and bool(
+                        feed_options.get("item_processor")
+                        or feed_options.get("item_filter")
+                        or feed_options.get("item_classes")
+                    )
+                )
+            feed_options["delivery_receipts"] = bool(enabled)
+        if not any(
+            feed_options["delivery_receipts"]
+            for feed_options in self.feeds.values()
+        ):
+            return
+        if jobdir is None:
+            raise NotConfigured("Feed delivery receipts need a JOBDIR setting")
+        self._receipts = _FeedReceipts(Path(jobdir, _FEED_RECEIPTS_FILENAME))
 
 
 def __getattr__(name: str) -> Any:  # pragma: no cover

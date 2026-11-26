@@ -868,6 +868,16 @@ Deprecations
 New features
 ~~~~~~~~~~~~
 
+-   Added :ref:`feed delivery receipts <delivery-receipts>`, enabled per feed
+    with the ``delivery_receipts`` :ref:`feed option <feed-options>` or
+    globally with the :setting:`FEED_EXPORT_DELIVERY_RECEIPTS` setting, to
+    record in the :setting:`JOBDIR` directory which entries of each feed
+    reached storage. A resumed crawl skips the entries that were already
+    delivered and retries only the missing ones, even when different feeds
+    filter and expand the same scraped items differently, or when one feed
+    stored successfully after another failed.
+    (:gh:`5905`, :gh:`7911`)
+
 -   :class:`~scrapy.Request` objects can now be awaited, e.g. in a spider
     callback, to send them and get their response. See :ref:`inline-requests`.
     (:gh:`1144`, :gh:`8207`)
