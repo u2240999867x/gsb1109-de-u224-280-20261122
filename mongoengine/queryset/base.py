@@ -34,6 +34,10 @@ from mongoengine.pymongo_support import (
     count_documents,
 )
 from mongoengine.queryset import transform
+from mongoengine.queryset.evidence import (
+    compile_evidence_program,
+    _selection_query_from_rules,
+)
 from mongoengine.queryset.field_list import QueryFieldList
 from mongoengine.queryset.visitor import Q, QNode
 
@@ -71,6 +75,8 @@ class BaseQuerySet:
         self._as_pymongo = False
         self._search_text = None
         self._search_text_score = None
+        self._evidence_program = None
+        self._evidence_rules = None
 
         self.__dereference = False
         self.__auto_dereference = True
@@ -189,6 +195,11 @@ class BaseQuerySet:
 
         # Handle an index
         elif isinstance(key, int):
+            if queryset._evidence_program is not None:
+                return queryset._evidence_program.evaluate(
+                    queryset._cursor[key], queryset._collation
+                )
+
             if queryset._scalar:
                 return queryset._get_scalar(
                     queryset._document._from_son(
@@ -870,6 +881,8 @@ class BaseQuerySet:
             "_collation",
             "_search_text",
             "_search_text_score",
+            "_evidence_program",
+            "_evidence_rules",
             "_max_time_ms",
             "_comment",
             "_batch_size",
@@ -973,7 +986,9 @@ class BaseQuerySet:
         queryset._collation = collation
 
         if queryset._cursor_obj:
-            queryset._cursor_obj.collation(collation)
+            set_collation = getattr(queryset._cursor_obj, "collation", None)
+            if callable(set_collation):
+                set_collation(collation)
 
         return queryset
 
@@ -1295,6 +1310,70 @@ class BaseQuerySet:
             queryset = queryset.all_fields()
 
         return queryset
+
+    def evidence(self, rules=None, *additional_rules, combine="or"):
+        """Select documents with the current query and explain each rule.
+
+        This is an optional read mode.  It does not change how a regular read
+        of the same queryset projects fields or applies document defaults: the
+        evidence read works from the raw SON returned by its own cursor, while
+        a normal read keeps using the queryset's existing projection.
+
+        :param rules: A named rule (or a mapping/list of named rules) to
+            evaluate.  A rule is built with :class:`EvidenceRule` and may be
+            combined with other rules using ``&`` and ``|``.  When omitted,
+            the top-level OR branches of the current query are used as rules.
+        :param combine: How a list/mapping of rules is combined.  ``"or"``
+            (the default) or ``"and"``.
+
+        The returned queryset yields :class:`EvidenceResult` objects.  Each
+        result contains only the report number, the rule names, their boolean
+        result, and zero-based ``(group_index, reading_index)`` hit positions.
+        The original raw values (readings, tags, supplier identifiers) stay in
+        the database and are not part of ``to_dict()``.
+        """
+        if additional_rules:
+            if rules is None:
+                rules = list(additional_rules)
+            else:
+                rules = [rules, *additional_rules]
+
+        queryset = self.clone()
+        if rules is None:
+            rules = self._query_obj
+        elif not queryset._query_obj:
+            # Typical convenience call: Report.objects.evidence(rules=...).
+            # A queryset which was already filtered keeps its own selection.
+            queryset._query_obj = _selection_query_from_rules(
+                rules, combine, self._document
+            )
+            queryset._mongo_query = None
+        queryset._evidence_program = compile_evidence_program(
+            self._document, rules, combine=combine
+        )
+        queryset._evidence_rules = rules
+        # Evidence must be evaluated against the original document, not a
+        # projection which may have removed the fields that triggered a rule.
+        queryset._loaded_fields = QueryFieldList()
+        queryset._as_pymongo = False
+        queryset._scalar = []
+        queryset._cursor_obj = None
+        return queryset
+
+    def evidence_rules(self):
+        """Return the rules configured for an evidence read, if any."""
+        return self._evidence_rules
+
+    # Common aliases for the optional evidence read mode.
+    def with_evidence(self, rules=None, *additional_rules, combine="or"):
+        return self.evidence(
+            rules, *additional_rules, combine=combine
+        )
+
+    def match_evidence(self, rules=None, *additional_rules, combine="or"):
+        return self.evidence(
+            rules, *additional_rules, combine=combine
+        )
 
     def as_pymongo(self):
         """Instead of returning Document instances, return raw values from
@@ -1685,6 +1764,9 @@ class BaseQuerySet:
 
         raw_doc = next(self._cursor)
 
+        if self._evidence_program is not None:
+            return self._evidence_program.evaluate(raw_doc, self._collation)
+
         if self._as_pymongo:
             return raw_doc
 
@@ -1722,7 +1804,10 @@ class BaseQuerySet:
         if self._allow_disk_use:
             cursor_args["allow_disk_use"] = True
 
-        if self._loaded_fields:
+        if (
+            self._loaded_fields
+            and self._evidence_program is None
+        ):
             cursor_args[fields_name] = self._loaded_fields.as_dict()
 
         if self._search_text:
@@ -1785,7 +1870,9 @@ class BaseQuerySet:
             self._cursor_obj.hint(self._hint)
 
         if self._collation is not None:
-            self._cursor_obj.collation(self._collation)
+            set_collation = getattr(self._cursor_obj, "collation", None)
+            if callable(set_collation):
+                set_collation(self._collation)
 
         if self._batch_size is not None:
             self._cursor_obj.batch_size(self._batch_size)

@@ -7,6 +7,13 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add an optional ``QuerySet.evidence()`` read mode which returns each
+  document's report number together with per-rule truth values and zero-based
+  ``(group_index, reading_index)`` hit positions. Rules support ``cross_row``
+  and ``same_row`` conditions, AND/OR combinations, nested ``$elemMatch``
+  semantics and the query's collation. Evidence is evaluated from the same raw
+  SON that selected the document, so it cannot drift from the selection when a
+  document changes while a cursor is being consumed.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

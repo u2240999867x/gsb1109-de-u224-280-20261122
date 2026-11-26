@@ -1,4 +1,5 @@
 from mongoengine.errors import *
+from mongoengine.queryset.evidence import *
 from mongoengine.queryset.field_list import *
 from mongoengine.queryset.manager import *
 from mongoengine.queryset.queryset import *
@@ -10,6 +11,19 @@ __all__ = (
     "QuerySet",
     "QuerySetNoCache",
     "Q",
+    "Rule",
+    "RuleGroup",
+    "RuleCondition",
+    "EvidenceRule",
+    "EvidenceRuleGroup",
+    "EvidenceCondition",
+    "EvidenceResult",
+    "Evidence",
+    "RuleEvidence",
+    "RuleEvidenceCollection",
+    "ConditionEvidence",
+    "EvidenceHit",
+    "compile_evidence_program",
     "queryset_manager",
     "QuerySetManager",
     "QueryFieldList",

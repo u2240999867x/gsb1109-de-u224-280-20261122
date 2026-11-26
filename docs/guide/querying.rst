@@ -795,3 +795,69 @@ following example shows how the substitutions are made::
         return comments;
     }
     """)
+
+
+Evidence for audit rules
+========================
+:meth:`~mongoengine.queryset.QuerySet.evidence` is an optional read mode for
+queries whose results need an explanation.  It selects documents exactly like
+the queryset it is called on (including its ``collation``), but yields
+:class:`~mongoengine.queryset.EvidenceResult` objects instead of documents::
+
+    from mongoengine import EvidenceRule, Q
+
+    tag_is_hold = EvidenceRule(
+        "tag-hold",
+        Q(readings__tag="hold"),
+    )
+    zero_reading = EvidenceRule(
+        "zero-reading",
+        EvidenceRule.same_row(
+            "cold-chain-null",
+            Q(groups__kind="cold-chain")
+            & Q(groups__readings__tag="hold")
+            & Q(groups__readings__value=None),
+        ),
+    )
+
+    reports = Report.objects(...).collation({"locale": "en", "strength": 2})
+    for result in reports.evidence([tag_is_hold, zero_reading]):
+        print(result.report_number, result.matched)
+        for rule in result.rules:
+            print(rule.name, rule.matched, rule.positions)
+
+A rule has a name and either a :class:`Q` expression or explicit
+:class:`~mongoengine.queryset.EvidenceCondition` objects.  Conditions are
+evaluated in two scopes:
+
+* ``cross_row`` (the default) evaluates a condition over the whole report and
+  reports every matching ``(group_index, reading_index)`` position.
+* ``same_row`` requires all fields in the condition to match one group/reading
+  pair.  ``EvidenceRule.same_row(name, Q(...))`` and an explicit
+  ``Q(groups__readings__match={...})`` are the usual ways to express "the text
+  on *this* reading" rather than "somewhere in the report".  A conjunction of
+  dot-notation siblings such as ``Q(groups__kind="cold-chain") &
+  Q(groups__readings__tag="hold")`` also collapses to same-row when one field
+  path is a parent of another (here the group path contains the reading path).
+
+Rules may be combined with ``&`` and ``|``::
+
+    selection = rule_a | (rule_b & rule_c)
+    Report.objects(...).evidence(selection)
+
+When an evidence queryset is not already filtered, the rules themselves are
+also used as the selection query.  When it is already filtered, the existing
+``Q`` query remains the selection and the rules only explain its results.
+
+Evidence is calculated from the raw SON returned by the same cursor that
+selected the document.  It is never filled in later with a second query by
+primary key, so a document changed while a cursor is being consumed cannot
+produce a result whose selection and explanation describe different versions
+of the document.  A normal read of the same queryset keeps using its usual
+projection and document defaults; use ``as_pymongo()`` if the original values
+are needed for debugging.  For transmission, ``EvidenceResult.transmit()``
+(also available as ``to_payload()``) contains only the report number, rule
+names, booleans, positions and a ``null``/``missing`` category.  It
+deliberately omits raw readings, tags and supplier identifiers.  ``to_dict()``
+is a slightly richer debugging representation with the same omission of raw
+values.
