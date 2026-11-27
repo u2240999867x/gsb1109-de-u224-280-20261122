@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `RedirectSampling` for retaining a small, budgeted raw-byte sample of
+  each followed redirect body. Mandatory bodies are still read in full by
+  the response hooks while a stream tap retains the raw encoded bytes;
+  regular bodies are only pulled until the per-hop limit or the shared
+  per-fetch budget is reached, with per-hop records exposing the pulled byte
+  count, retained sample and stop reason.
 
 ## 0.28.1 (6th December, 2024)
 

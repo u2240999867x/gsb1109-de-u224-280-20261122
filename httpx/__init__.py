@@ -6,6 +6,7 @@ from ._config import *
 from ._content import *
 from ._exceptions import *
 from ._models import *
+from ._redirect_sampling import *
 from ._status_codes import *
 from ._transports import *
 from ._types import *
@@ -75,6 +76,10 @@ __all__ = [
     "QueryParams",
     "ReadError",
     "ReadTimeout",
+    "RedirectSample",
+    "RedirectSampleReason",
+    "RedirectSampleRule",
+    "RedirectSampling",
     "RemoteProtocolError",
     "request",
     "Request",

@@ -27,6 +27,10 @@ from ._exceptions import (
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._redirect_sampling import (
+    RedirectSample,
+    RedirectSampling,
+)
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -50,6 +54,8 @@ from ._utils import URLPattern, get_environment_proxies
 
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
+
+    from ._redirect_sampling import _Sampler as _RedirectSampler
 
 __all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
 
@@ -200,6 +206,7 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        redirect_sampling: RedirectSampling | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -218,6 +225,7 @@ class BaseClient:
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
+        self.redirect_sampling = redirect_sampling
         self._state = ClientState.UNOPENED
 
     @property
@@ -658,6 +666,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        redirect_sampling: RedirectSampling | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +680,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            redirect_sampling=redirect_sampling,
         )
 
         if http2:
@@ -911,19 +921,36 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
+        sampler = (
+            self.redirect_sampling.start()
+            if self.redirect_sampling is not None
+            else None
         )
+
+        try:
+            response = self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+                sampler=sampler,
+            )
+        except BaseException as exc:
+            if sampler is not None:
+                sampler.attach_error(exc)
+            raise
         try:
             if not stream:
                 response.read()
 
+            if sampler is not None:
+                response.redirect_sampler = sampler
+
             return response
 
         except BaseException as exc:
+            if sampler is not None:
+                sampler.attach_error(exc)
             response.close()
             raise exc
 
@@ -933,6 +960,7 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        sampler: _RedirectSampler | None = None,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +971,7 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    sampler=sampler,
                 )
                 try:
                     try:
@@ -950,10 +979,21 @@ class Client(BaseClient):
                     except StopIteration:
                         return response
 
-                    response.history = list(history)
+                    if sampler is not None:
+                        # Preserve the redirects observed within this auth
+                        # round, so the final history keeps every hop both
+                        # before and after the authentication retry.
+                        in_round_history = list(response.history)
+                        response.history = list(history) + in_round_history
+                    else:
+                        in_round_history = []
+                        response.history = list(history)
                     response.read()
                     request = next_request
-                    history.append(response)
+                    if sampler is not None:
+                        history = history + in_round_history + [response]
+                    else:
+                        history.append(response)
 
                 except BaseException as exc:
                     response.close()
@@ -966,6 +1006,7 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        sampler: _RedirectSampler | None = None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -977,7 +1018,15 @@ class Client(BaseClient):
                 hook(request)
 
             response = self._send_single_request(request)
+            record: RedirectSample | None = None
             try:
+                if (
+                    sampler is not None
+                    and follow_redirects
+                    and response.has_redirect_location
+                ):
+                    record = sampler.begin_hop(response)
+
                 for hook in self._event_hooks["response"]:
                     hook(response)
                 response.history = list(history)
@@ -989,12 +1038,29 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    response.read()
+                    if record is None:
+                        response.read()
+                    else:
+                        assert sampler is not None
+                        if record.mandatory:
+                            # Mandatory bodies are fully read and checked by
+                            # the existing response hooks. The stream tap
+                            # retains the raw encoded bytes as they pass
+                            # through.
+                            response.read()
+                            sampler.complete_mandatory(response)
+                        else:
+                            sampler.drain_sync(response)
                 else:
+                    # Sampling never reads redirect bodies on the caller's
+                    # behalf when redirect following is disabled.
                     response.next_request = request
                     return response
 
             except BaseException as exc:
+                if record is not None:
+                    assert sampler is not None
+                    sampler.mark_error(response, exc)
                 response.close()
                 raise exc
 
@@ -1372,6 +1438,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        redirect_sampling: RedirectSampling | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1452,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            redirect_sampling=redirect_sampling,
         )
 
         if http2:
@@ -1626,19 +1694,36 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = await self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
+        sampler = (
+            self.redirect_sampling.start()
+            if self.redirect_sampling is not None
+            else None
         )
+
+        try:
+            response = await self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+                sampler=sampler,
+            )
+        except BaseException as exc:
+            if sampler is not None:
+                sampler.attach_error(exc)
+            raise
         try:
             if not stream:
                 await response.aread()
 
+            if sampler is not None:
+                response.redirect_sampler = sampler
+
             return response
 
         except BaseException as exc:
+            if sampler is not None:
+                sampler.attach_error(exc)
             await response.aclose()
             raise exc
 
@@ -1648,6 +1733,7 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        sampler: _RedirectSampler | None = None,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1744,7 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    sampler=sampler,
                 )
                 try:
                     try:
@@ -1665,10 +1752,21 @@ class AsyncClient(BaseClient):
                     except StopAsyncIteration:
                         return response
 
-                    response.history = list(history)
+                    if sampler is not None:
+                        # Preserve the redirects observed within this auth
+                        # round, so the final history keeps every hop both
+                        # before and after the authentication retry.
+                        in_round_history = list(response.history)
+                        response.history = list(history) + in_round_history
+                    else:
+                        in_round_history = []
+                        response.history = list(history)
                     await response.aread()
                     request = next_request
-                    history.append(response)
+                    if sampler is not None:
+                        history = history + in_round_history + [response]
+                    else:
+                        history.append(response)
 
                 except BaseException as exc:
                     await response.aclose()
@@ -1681,6 +1779,7 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        sampler: _RedirectSampler | None = None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1692,7 +1791,15 @@ class AsyncClient(BaseClient):
                 await hook(request)
 
             response = await self._send_single_request(request)
+            record: RedirectSample | None = None
             try:
+                if (
+                    sampler is not None
+                    and follow_redirects
+                    and response.has_redirect_location
+                ):
+                    record = sampler.begin_hop(response)
+
                 for hook in self._event_hooks["response"]:
                     await hook(response)
 
@@ -1705,12 +1812,29 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    await response.aread()
+                    if record is None:
+                        await response.aread()
+                    else:
+                        assert sampler is not None
+                        if record.mandatory:
+                            # Mandatory bodies are fully read and checked by
+                            # the existing response hooks. The stream tap
+                            # retains the raw encoded bytes as they pass
+                            # through.
+                            await response.aread()
+                            sampler.complete_mandatory(response)
+                        else:
+                            await sampler.drain_async(response)
                 else:
+                    # Sampling never reads redirect bodies on the caller's
+                    # behalf when redirect following is disabled.
                     response.next_request = request
                     return response
 
             except BaseException as exc:
+                if record is not None:
+                    assert sampler is not None
+                    sampler.mark_error(response, exc)
                 await response.aclose()
                 raise exc
 

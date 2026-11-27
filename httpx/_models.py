@@ -48,6 +48,9 @@ from ._types import (
 from ._urls import URL
 from ._utils import to_bytes_or_str, to_str
 
+if typing.TYPE_CHECKING:
+    from ._redirect_sampling import RedirectSample, _Sampler
+
 __all__ = ["Cookies", "Headers", "Request", "Response"]
 
 SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
@@ -536,6 +539,12 @@ class Response:
         # When follow_redirects=False and a redirect is received,
         # the client will set `response.next_request`.
         self.next_request: Request | None = None
+
+        # Set when redirect body sampling is enabled. `redirect_sample` holds
+        # the per-hop record while following redirects, and `redirect_sampler`
+        # is attached to the final response (or to a raised exception).
+        self.redirect_sample: "RedirectSample | None" = None
+        self.redirect_sampler: "_Sampler | None" = None
 
         self.extensions = {} if extensions is None else dict(extensions)
         self.history = [] if history is None else list(history)
