@@ -582,6 +582,15 @@ class Machine(object):
 
         self.states = OrderedDict()
         self.events = OrderedDict()
+        # counts how many triggered events have not fully finished yet, keyed by model id;
+        # used to refuse a definition revision swap while a model is mid-event
+        self._active_events = defaultdict(int)
+        # named definition revisions; each value holds the (model-less) machine that owns the
+        # states/events/callbacks of that revision and its initial state name
+        self._definitions = OrderedDict()
+        # revision name currently effective per registered model
+        self._model_definitions = {}
+        self._latest_definition = None
         self.send_event = send_event
         self.auto_transitions = auto_transitions
         self.ignore_invalid_triggers = ignore_invalid_triggers
@@ -613,8 +622,19 @@ class Machine(object):
             self.add_model(model)
 
     def add_model(self, model, initial=None):
-        """Register a model with the state machine, initializing triggers and callbacks."""
+        """Register a model with the state machine, initializing triggers and callbacks.
+
+        When a definition revision has been published with :meth:`define_revision`, newly added
+        models are bound directly to the latest revision and start from that revision's initial
+        state. Models added before the first revision keep running on the base definition.
+        """
         models = listify(model)
+
+        target_machine = self
+        if self._latest_definition is not None:
+            target_machine = self._definitions[self._latest_definition]
+            if initial is None:
+                initial = target_machine.initial
 
         if initial is None:
             if self.initial is None:
@@ -625,15 +645,16 @@ class Machine(object):
             mod = self if mod is self.self_literal else mod
             if mod not in self.models:
                 self._checked_assignment(mod, 'trigger', partial(self._get_trigger, mod))
-                self._checked_assignment(mod, 'may_trigger', partial(self._can_trigger, mod))
+                self._checked_assignment(mod, 'may_trigger', partial(self._route_may_trigger, mod))
 
-                for trigger in self.events:
+                self._model_definitions[id(mod)] = self._latest_definition
+                for trigger in target_machine.events:
                     self._add_trigger_to_model(trigger, mod)
 
-                for state in self.states.values():
-                    self._add_model_to_state(state, mod)
+                for state in target_machine.states.values():
+                    target_machine._add_model_to_state(state, mod)
 
-                self.set_state(initial, model=mod)
+                target_machine.set_state(initial, model=mod)
                 self.models.append(mod)
 
     def remove_model(self, model):
@@ -644,6 +665,8 @@ class Machine(object):
 
         for mod in models:
             self.models.remove(mod)
+            self._model_definitions.pop(id(mod), None)
+            self._active_events.pop(id(mod), None)
         if len(self._transition_queue) > 0:
             # the first element of the list is currently executed. Keeping it for further Machine._process(ing)
             self._transition_queue = deque(
@@ -922,11 +945,67 @@ class Machine(object):
         return False
 
     def _add_may_transition_func_for_trigger(self, trigger, model):
-        self._checked_assignment(model, "may_%s" % trigger, partial(self._can_trigger, model, trigger))
+        self._checked_assignment(model, "may_%s" % trigger,
+                                 partial(self._route_may_trigger, model, trigger))
 
     def _add_trigger_to_model(self, trigger, model):
-        self._checked_assignment(model, trigger, partial(self.events[trigger].trigger, model))
+        self._checked_assignment(model, trigger, partial(self._route_trigger, model, trigger))
         self._add_may_transition_func_for_trigger(trigger, model)
+
+    def _revision_of(self, model):
+        return self._model_definitions.get(id(model))
+
+    def _definition_machine(self, model):
+        """Return the machine owning the definition revision currently bound to ``model``.
+
+        Models that have never been migrated keep running on the machine they were attached to
+        (``self``). Migrated models are routed to the isolated machine built by
+        :meth:`define_revision`.
+        """
+        revision = self._revision_of(model)
+        if revision is None:
+            return self
+        return self._definitions.get(revision, self)
+
+    def _enter_event(self, model):
+        self._active_events[id(model)] += 1
+
+    def _exit_event(self, model):
+        remaining = self._active_events[id(model)] - 1
+        if remaining > 0:
+            self._active_events[id(model)] = remaining
+        else:
+            self._active_events.pop(id(model), None)
+
+    def _is_model_busy(self, model):
+        """Whether ``model`` is currently inside an event that has not fully returned yet."""
+        return self._active_events.get(id(model), 0) > 0
+
+    def _route_trigger(self, model, trigger, *args, **kwargs):
+        """Bound trigger entry point. Resolves the model's active definition at call time so that
+        a trigger reference captured before a revision swap still executes the swapped definition."""
+        definition_machine = self._definition_machine(model)
+        revision = self._revision_of(model)
+        _LOGGER.debug("%s[revision] enter event '%s' on definition '%s' for model %s.",
+                      self.name, trigger, revision if revision is not None else "current", id(model))
+        return self._run_with_event_boundary(
+            model, lambda: definition_machine.events[trigger].trigger(model, *args, **kwargs))
+
+    def _run_with_event_boundary(self, model, invoke):
+        """Run ``invoke`` while marking the model busy for the whole event.
+
+        The marker is released only once the event has fully returned, so a definition migration
+        cannot be applied in the middle of an event. The async extension overrides this to keep the
+        marker until an awaitable event has completed.
+        """
+        self._enter_event(model)
+        try:
+            return invoke()
+        finally:
+            self._exit_event(model)
+
+    def _route_may_trigger(self, model, trigger, *args, **kwargs):
+        return self._definition_machine(model)._can_trigger(model, trigger, *args, **kwargs)
 
     def _get_trigger(self, model, trigger_name, *args, **kwargs):
         """Convenience function added to the model to trigger events by name.
@@ -938,16 +1017,17 @@ class Machine(object):
         Returns:
             bool: True if a transitions has been conducted or the trigger event has been queued.
         """
+        definition_machine = self._definition_machine(model)
         try:
-            event = self.events[trigger_name]
+            event = definition_machine.events[trigger_name]
         except KeyError:
-            state = self.get_model_state(model)
+            state = definition_machine.get_model_state(model)
             ignore = state.ignore_invalid_triggers if state.ignore_invalid_triggers is not None \
-                else self.ignore_invalid_triggers
+                else definition_machine.ignore_invalid_triggers
             if not ignore:
                 raise AttributeError("Do not know event named '%s'." % trigger_name)
             return False
-        return event.trigger(model, *args, **kwargs)
+        return self._run_with_event_boundary(model, lambda: event.trigger(model, *args, **kwargs))
 
     def get_triggers(self, *args):
         """Collects all triggers FROM certain states.
@@ -1170,6 +1250,246 @@ class Machine(object):
         """
         res = [getattr(model, trigger)(*args, **kwargs) for model in self.models]
         return all(res)
+
+    def define_revision(self, name, states=None, initial=None, transitions=None):
+        """Publish a new, immutable definition revision without touching already bound models.
+
+        The revision is built as an isolated machine seeded from the current base definition and
+        overridden with the passed states/transitions. Publishing a revision never restarts or
+        re-runs any model: models added afterwards are bound directly to the new revision while
+        existing models keep their current definition until explicitly migrated via
+        :meth:`migrate_definition`. No enter/exit callbacks are simulated by publishing.
+
+        Args:
+            name (str): Unique name of the revision.
+            states (optional[list]): State configurations overriding same-named base states or
+                adding new ones. ``None`` inherits the base states unchanged.
+            initial (optional[str]): Initial state of the revision. Defaults to the base initial.
+            transitions (optional[list]): Full transition configuration of the revision.
+                ``None`` inherits the base transitions unchanged.
+        Returns:
+            Machine: The isolated machine owning the new revision's states and events.
+        """
+        if name in self._definitions:
+            raise ValueError("Definition revision '%s' has already been published." % name)
+        self._check_revision_support()
+
+        definition_machine = self._build_definition_machine(states, initial, transitions)
+        self._definitions[name] = definition_machine
+        self._latest_definition = name
+        _LOGGER.info("%s[revision] commit definition '%s' with initial state '%s'.",
+                     self.name, name, definition_machine.initial)
+        return definition_machine
+
+    def _check_revision_support(self):
+        """Revisions rely on every model trigger being routed through ``_route_trigger`` so the
+        active definition can be resolved at call time. Machines that replace the trigger binding
+        (e.g. the hierarchical extension) cannot guarantee that and are rejected explicitly."""
+        if type(self)._add_trigger_to_model is not Machine._add_trigger_to_model:
+            raise MachineError(
+                "Definition revisions are not supported by %s because it overrides model trigger "
+                "binding instead of routing through Machine._route_trigger." % type(self).__name__)
+
+    def _build_definition_machine(self, states, initial, transitions):
+        """Construct the model-less machine that owns a revision's definition."""
+        state_configs = self._revision_state_configs(states)
+        # reconstructing the base set already carries every auto transition, so do not let the
+        # new machine generate them a second time
+        auto_transitions = self.auto_transitions if transitions is not None else False
+        transition_configs = self._revision_transition_configs(transitions)
+        clean_name = self.name[:-2] if self.name.endswith(": ") else self.name
+        return type(self)(
+            model=None,
+            states=state_configs,
+            initial=self.initial if initial is None else initial,
+            transitions=transition_configs,
+            send_event=self.send_event,
+            auto_transitions=auto_transitions,
+            ignore_invalid_triggers=self.ignore_invalid_triggers,
+            name=clean_name,
+            queued=self._queued,
+            prepare_event=list(self.prepare_event),
+            before_state_change=list(self.before_state_change),
+            after_state_change=list(self.after_state_change),
+            finalize_event=list(self.finalize_event),
+            model_attribute=self.model_attribute,
+            model_override=self.model_override,
+            on_exception=list(self.on_exception),
+            on_final=list(self.on_final),
+        )
+
+    def _revision_state_configs(self, states):
+        """Build the revision's state set.
+
+        Without an explicit ``states`` argument the base states are inherited verbatim. When a
+        list is given it is treated as the authoritative state set of the revision: same-named
+        states passed as bare names still inherit their base callbacks, while states absent from
+        the list (e.g. a renamed state) are dropped.
+        """
+        if states is None:
+            return [
+                {
+                    "name": state.name,
+                    "on_enter": list(state.on_enter),
+                    "on_exit": list(state.on_exit),
+                    "ignore_invalid_triggers": state.ignore_invalid_triggers,
+                    "final": state.final,
+                }
+                for state in self.states.values()
+            ]
+
+        configs = []
+        for config in listify(states):
+            if isinstance(config, dict) or isinstance(config, State):
+                configs.append(config)
+                continue
+
+            if isinstance(config, Enum):
+                state_name = config.name
+            else:
+                state_name = config
+
+            base = self.states.get(state_name)
+            if base is None:
+                configs.append({"name": state_name})
+            else:
+                configs.append({
+                    "name": state_name,
+                    "on_enter": list(base.on_enter),
+                    "on_exit": list(base.on_exit),
+                    "ignore_invalid_triggers": base.ignore_invalid_triggers,
+                    "final": base.final,
+                })
+        return configs
+
+    def _revision_transition_configs(self, transitions):
+        """Reconstruct transition configs from the base definition unless a full set is given."""
+        if transitions is not None:
+            return listify(transitions)
+        configs = []
+        for event in self.events.values():
+            for trans in itertools.chain.from_iterable(event.transitions.values()):
+                configs.append({
+                    "trigger": event.name,
+                    "source": trans.source,
+                    "dest": trans.dest,
+                    "prepare": list(trans.prepare),
+                    "before": list(trans.before),
+                    "after": list(trans.after),
+                    "conditions": [cond.func for cond in trans.conditions if cond.target],
+                    "unless": [cond.func for cond in trans.conditions if not cond.target],
+                })
+        return configs
+
+    def can_migrate_definition(self, model, revision, state_map=None):
+        """Whether ``model`` can be moved to ``revision`` right now using ``state_map``.
+
+        Migration is only possible when the model is not currently inside an event, the revision
+        exists and the model's present state has an entry in the caller-provided state map that
+        resolves to a registered state of the target revision.
+        """
+        try:
+            self._check_migration(model, revision, state_map)
+        except MachineError:
+            return False
+        return True
+
+    def migrate_definition(self, model, revision, state_map=None):
+        """Move an already bound model to a published definition revision.
+
+        The swap is atomic and only allowed at the boundary where the model's current event has
+        fully finished. ``state_map`` maps the model's present state to the state it should hold in
+        the new revision; a missing mapping aborts the migration without altering the model. No
+        historical enter/exit callbacks are simulated. On success the model's bound trigger entry
+        points follow the new definition while its runtime data state is remapped, not reset.
+
+        Args:
+            model (object): The bound model to migrate.
+            revision (str): Name of a revision previously created by :meth:`define_revision`.
+            state_map (dict): Mapping of current state name to the target revision state name.
+        """
+        target_state = self._check_migration(model, revision, state_map)
+        target_machine = self._definitions[revision]
+        source_machine = self._definition_machine(model)
+
+        # all validation succeeded above; commit the swap as the only mutating step
+        self._model_definitions[id(model)] = revision
+        target_machine.set_state(target_state, model=model)
+
+        self._reconcile_model_bindings(model, source_machine, target_machine)
+
+        _LOGGER.info("%s[revision] migrate model %s to definition '%s' (state '%s' -> '%s').",
+                     self.name, id(model), revision,
+                     getattr(model, self.model_attribute), target_state)
+
+    def _reconcile_model_bindings(self, model, source_machine, target_machine):
+        """Align the model's public entry points with the definition now in effect.
+
+        Trigger wrappers resolve the active revision at call time, so shared triggers need no
+        rebinding. Only triggers/states introduced by the new revision are added and ones removed
+        by it are dropped.
+        """
+        source_triggers = set(source_machine.events)
+        target_triggers = set(target_machine.events)
+        for trigger in target_triggers - source_triggers:
+            self._add_trigger_to_model(trigger, model)
+        for trigger in source_triggers - target_triggers:
+            self._remove_trigger_from_model(trigger, model)
+
+        source_states = set(source_machine.states)
+        target_states = set(target_machine.states)
+        for state_name in target_states - source_states:
+            target_machine._add_model_to_state(target_machine.states[state_name], model)
+        for state_name in source_states - target_states:
+            self._remove_state_from_model(state_name, model)
+
+    def _remove_trigger_from_model(self, trigger, model):
+        for name in (trigger, "may_%s" % trigger):
+            try:
+                delattr(model, name)
+            except AttributeError:
+                pass
+
+    def _remove_state_from_model(self, state_name, model):
+        if self.model_attribute == 'state':
+            name = 'is_%s' % state_name
+        else:
+            name = 'is_%s_%s' % (self.model_attribute, state_name)
+        try:
+            delattr(model, name)
+        except AttributeError:
+            pass
+
+    def _check_migration(self, model, revision, state_map):
+        """Validate a migration request and return the target state name, or raise MachineError."""
+        if model not in self.models:
+            raise MachineError("Model %s is not bound to this machine." % id(model))
+        if self._is_model_busy(model):
+            raise MachineError(
+                "Cannot migrate model %s to revision '%s' while an event is still in progress; "
+                "the swap is only allowed at a completed event boundary." % (id(model), revision))
+        if revision not in self._definitions:
+            raise MachineError("Definition revision '%s' has not been published." % revision)
+
+        current_state = getattr(model, self.model_attribute)
+        state_map = state_map or {}
+        if current_state not in state_map:
+            raise MachineError(
+                "No target state mapping for current state '%s' of model %s; revision '%s' "
+                "cannot be applied on this active path." % (current_state, id(model), revision))
+
+        target_state = state_map[current_state]
+        target_machine = self._definitions[revision]
+        try:
+            target_machine.get_state(target_state)
+        except ValueError:
+            raise MachineError(
+                "Mapped target state '%s' does not exist in revision '%s'." % (target_state, revision))
+        return target_state
+
+    def definition_of(self, model):
+        """Return the revision name currently effective for ``model`` (``None`` = base definition)."""
+        return self._model_definitions.get(id(model))
 
     def callbacks(self, funcs, event_data):
         """Triggers a list of callbacks"""

@@ -334,6 +334,19 @@ class AsyncMachine(Machine):
             for mod in listify(model):
                 self._transition_queue_dict[id(self) if mod is self.self_literal else id(mod)] = deque()
 
+    def _run_with_event_boundary(self, model, invoke):
+        """Keep the busy marker until the awaitable event has fully completed."""
+        self._enter_event(model)
+        awaitable = invoke()
+
+        async def _await_boundary():
+            try:
+                return await awaitable
+            finally:
+                self._exit_event(model)
+
+        return _await_boundary()
+
     async def dispatch(self, trigger, *args, **kwargs):
         """Trigger an event on all models assigned to the machine.
         Args:

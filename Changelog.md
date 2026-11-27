@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: `Machine.define_revision` publishes an isolated, versioned state/transition definition and `Machine.migrate_definition` moves an already bound model to it only at a completed event boundary, validated against a caller-provided state mapping; new models bind directly to the latest revision while unmapped models keep their data state and entry points on the previous definition (no historical enter/exit callbacks are simulated)
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
