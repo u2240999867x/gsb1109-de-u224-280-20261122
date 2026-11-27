@@ -679,6 +679,51 @@ print(outer_model.model_dump(polymorphic_serialization=True))  # (3)!
 `outer_model.model_dump()` serializes `user` as a `User` value, excluding the subclass' `password` field.
 With `polymorphic_serialization=True`, it serializes the full `UserLogin` value instead.
 
+### Exporting shared instances as references
+
+By default, a model instance that is reachable from several places is serialized in full at each
+occurrence. When the same instance is meant to represent a single shared "subject", you can ask the dump
+methods to emit it once and reference it everywhere else by passing `serialize_references=True`:
+
+```python
+from pydantic import BaseModel
+
+
+class Tray(BaseModel):
+    warehouse: str
+    code: str
+
+
+class Manifest(BaseModel):
+    code: str
+    review: Tray
+    handoff: Tray
+
+
+east = Tray(warehouse='east', code='P-17')
+
+manifest = Manifest(code='C-41', review=east, handoff=east)
+
+print(manifest.model_dump())
+#> {
+#>     'code': 'C-41',
+#>     'review': {'warehouse': 'east', 'code': 'P-17'},
+#>     'handoff': {'warehouse': 'east', 'code': 'P-17'},
+#> }
+print(manifest.model_dump(serialize_references=True))
+#> {
+#>     'code': 'C-41',
+#>     'review': {'warehouse': 'east', 'code': 'P-17', '$id': 'ref_0'},
+#>     'handoff': {'$ref': 'ref_0'},
+#> }
+```
+
+The first occurrence of a shared instance is emitted inline and annotated with an `$id` entry, while every
+later occurrence is replaced with a `{'$ref': <id>}` mapping. Instances that are only reachable once are
+left untouched, and distinct instances are never merged, even if they compare equal. The option is
+supported by both `model_dump()` and `model_dump_json()` and composes with the other serialization options
+(aliases, exclusions, polymorphic serialization, etc.).
+
 ## Serializing "as Any"
 
 A more extreme form of [polymorphic serialization](#polymorphic-serialization) is "any" serialization. In this

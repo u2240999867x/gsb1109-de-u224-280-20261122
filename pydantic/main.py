@@ -452,6 +452,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         fallback: Callable[[Any], Any] | None = None,
         serialize_as_any: bool = False,
         polymorphic_serialization: bool | None = None,
+        serialize_references: bool = False,
     ) -> dict[str, Any]:
         """!!! abstract "Usage Documentation"
             [`model_dump`](../concepts/serialization.md#python-mode)
@@ -479,11 +480,14 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
             serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
             polymorphic_serialization: Whether to use model and dataclass polymorphic serialization for this call.
+            serialize_references: Whether to export shared model instances only once and reference them
+                elsewhere. The first occurrence of a shared instance is emitted inline with an `'$id'` entry,
+                and later occurrences are replaced with `{'$ref': <id>}`.
 
         Returns:
             A dictionary representation of the model.
         """
-        return self.__pydantic_serializer__.to_python(
+        tree = self.__pydantic_serializer__.to_python(
             self,
             mode=mode,
             by_alias=by_alias,
@@ -500,6 +504,11 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             serialize_as_any=serialize_as_any,
             polymorphic_serialization=polymorphic_serialization,
         )
+        if serialize_references:
+            from ._internal import _references
+
+            tree = _references.share_references(tree, self, by_alias=bool(by_alias))
+        return tree
 
     def model_dump_json(
         self,
@@ -519,6 +528,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         fallback: Callable[[Any], Any] | None = None,
         serialize_as_any: bool = False,
         polymorphic_serialization: bool | None = None,
+        serialize_references: bool = False,
     ) -> str:
         """!!! abstract "Usage Documentation"
             [`model_dump_json`](../concepts/serialization.md#json-mode)
@@ -546,10 +556,39 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
             serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
             polymorphic_serialization: Whether to use model and dataclass polymorphic serialization for this call.
+            serialize_references: Whether to export shared model instances only once and reference them
+                elsewhere. The first occurrence of a shared instance is emitted inline with an `'$id'` entry,
+                and later occurrences are replaced with `{'$ref': <id>}`.
 
         Returns:
             A JSON string representation of the model.
         """
+        if serialize_references:
+            import json
+
+            from ._internal import _references
+
+            tree = self.__pydantic_serializer__.to_python(
+                self,
+                mode='json',
+                by_alias=by_alias,
+                include=include,
+                exclude=exclude,
+                context=context,
+                exclude_unset=exclude_unset,
+                exclude_defaults=exclude_defaults,
+                exclude_none=exclude_none,
+                exclude_computed_fields=exclude_computed_fields,
+                round_trip=round_trip,
+                warnings=warnings,
+                fallback=fallback,
+                serialize_as_any=serialize_as_any,
+                polymorphic_serialization=polymorphic_serialization,
+            )
+            tree = _references.share_references(tree, self, by_alias=bool(by_alias))
+            if indent is None:
+                return json.dumps(tree, ensure_ascii=ensure_ascii, separators=(',', ':'))
+            return json.dumps(tree, indent=indent, ensure_ascii=ensure_ascii)
         return self.__pydantic_serializer__.to_json(
             self,
             indent=indent,

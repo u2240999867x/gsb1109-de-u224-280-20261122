@@ -150,6 +150,7 @@ class RootModel(BaseModel, Generic[RootModelRootType], metaclass=_RootModelMetac
             fallback: Callable[[Any], Any] | None = None,
             serialize_as_any: bool = False,
             polymorphic_serialization: bool | None = None,
+            serialize_references: bool = False,
         ) -> Any:
             """!!! abstract "Usage Documentation"
                 [`model_dump`](../concepts/serialization.md#python-mode)
@@ -177,6 +178,9 @@ class RootModel(BaseModel, Generic[RootModelRootType], metaclass=_RootModelMetac
                     a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
                 serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
                 polymorphic_serialization: Whether to use model and dataclass polymorphic serialization for this call.
+                serialize_references: Whether to export shared model instances only once and reference them
+                    elsewhere. The first occurrence of a shared instance is emitted inline with an `'$id'` entry,
+                    and later occurrences are replaced with `{'$ref': <id>}`.
 
             Returns:
                 A dictionary representation of the model.
