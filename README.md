@@ -2108,6 +2108,49 @@ asyncio.gather(model1.event1(), model1.error(), model1.event3(), model2.event1()
 
 Note that queue modes must not be changed after machine construction.
 
+##### Event receipts for queued events
+
+A queued trigger returns as soon as the event has been accepted into the queue and therefore cannot tell
+whether the transition will ultimately be conducted. To keep the established boolean entry point while still
+exposing the real outcome, every queued trigger returns a `TransitionReceipt` instead of a plain boolean.
+A receipt is truthy while it is unresolved (matching the legacy `True` returned for an enqueued event) and,
+once processed, mirrors the actual boolean result. Its `status` distinguishes the concrete outcome and
+`wait()` returns an independent awaitable that resolves to the receipt:
+
+- `TransitionStatus.QUEUED`: the event is waiting in the model's queue.
+- `TransitionStatus.SUCCESS`: a transition was conducted (boolean result `True`).
+- `TransitionStatus.GUARD_REJECTED`: the event ran but none of its transitions passed its conditions.
+- `TransitionStatus.CALLBACK_ERROR`: a callback raised; the exception is kept on `receipt.error`.
+- `TransitionStatus.DISCARDED`: the event never ran because an earlier event in the same queue raised.
+- `TransitionStatus.MODEL_REMOVED`: the event was still queued when its model was removed from the machine.
+
+```python
+from transitions.extensions.asyncio import AsyncMachine, TransitionStatus
+
+machine = AsyncMachine(states=["idle", "done"], initial="idle", queued="model",
+                       transitions=[["finish", "idle", "done"]])
+receipt = await machine.finish()           # truthy while the event is queued or processed successfully
+assert receipt.status is TransitionStatus.SUCCESS
+resolved = await receipt.wait()            # independent awaitable; resolves to the receipt
+assert resolved.result is True
+```
+
+Each call to `wait()` produces its own future. Cancelling that future only ends this particular observation;
+the shared transition keeps running and other waiters still observe the real result.
+
+A callback that needs to schedule a follow-up event can use `machine.submit(trigger, model, *args, **kwargs)`.
+It enqueues the event and hands back a referenceable receipt immediately, so the callback never has to wait
+for the model's currently busy queue and cannot deadlock on itself:
+
+```python
+async def schedule_review(event_data):
+    review_receipt = await event_data.machine.submit("review", event_data.model)
+    # the receipt can be awaited later; the current callback returns without blocking the queue
+```
+
+Receipts always resolve to the receipt itself -- even when a callback raised. Inspect `status` and `error`
+rather than relying on an exception being propagated through `wait()`.
+
 #### <a name="state-features"></a>Adding features to states
 
 If your superheroes need some custom behaviour, you can throw in some extra functionality by decorating machine states:

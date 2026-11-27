@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: `AsyncMachine` queued triggers (`queued=True` and `queued='model'`) now return a `TransitionReceipt` in addition to the legacy boolean entry point; the receipt is resolved per trigger with the actual outcome (`TransitionStatus`: queued, success, guard rejected, callback error, discarded, model removed) and offers cancellable per-waiter `wait()` plus a non-blocking `Machine.submit(trigger, model, ...)` for follow-up events
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)

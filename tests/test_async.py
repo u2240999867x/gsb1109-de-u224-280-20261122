@@ -7,7 +7,7 @@ from transitions.extensions.states import add_state_features
 try:
     import asyncio
     from transitions.extensions.asyncio import AsyncMachine, HierarchicalAsyncMachine, AsyncEventData, \
-        AsyncTransition, AsyncTimeout
+        AsyncTransition, AsyncTimeout, TransitionReceipt, TransitionStatus
 
 except (ImportError, SyntaxError):
     asyncio = None  # type: ignore
@@ -343,6 +343,221 @@ class TestAsync(TestTransitions):
             self.assertTrue(m1.is_B())
             self.assertTrue(m2.is_C())
             m.remove_model(m2)
+        asyncio.run(run())
+
+    def test_receipt_statuses(self):
+        # type: () -> None
+        model_a = DummyModel()
+        model_b = DummyModel()
+        gate = asyncio.Event()
+        follow_ups = {}
+
+        async def await_gate(event_data):
+            # type: (AsyncEventData) -> bool
+            await gate.wait()
+            return True
+
+        def only_model_b(event_data):
+            return event_data.model is model_b
+
+        async def submit_follow_ups(event_data):
+            # type: (AsyncEventData) -> None
+            # referenceable receipts are returned immediately without waiting on model A's busy queue
+            follow_ups['explode'] = await event_data.machine.submit('explode', event_data.model)
+            follow_ups['cleanup'] = await event_data.machine.submit('cleanup', event_data.model)
+
+        async def raise_value_error(event_data):
+            # type: (AsyncEventData) -> None
+            raise ValueError("boom")
+
+        transitions = [
+            {'trigger': 'check', 'source': 'idle', 'dest': None,
+             'conditions': [await_gate], 'after': [submit_follow_ups]},
+            {'trigger': 'review', 'source': 'idle', 'dest': 'done', 'conditions': [only_model_b]},
+            {'trigger': 'explode', 'source': 'idle', 'dest': 'error', 'before': [raise_value_error]},
+            {'trigger': 'cleanup', 'source': 'idle', 'dest': 'done'},
+        ]  # type: Sequence[AsyncTransitionConfig]
+
+        async def run():
+            machine = self.machine_cls(model=[model_a, model_b], states=['idle', 'done', 'error'],
+                                       transitions=transitions, initial='idle', queued='model', send_event=True)
+            # item 1 of model A occupies the queue head and blocks on its guard
+            head_task = asyncio.ensure_future(model_a.check())
+            await asyncio.sleep(0)
+
+            # item 2 of model A shares its trigger name with model B's event but is merely queued
+            receipt_a = await model_a.review()
+            self.assertIsInstance(receipt_a, TransitionReceipt)
+            self.assertTrue(receipt_a)
+            self.assertEqual(receipt_a.status, TransitionStatus.QUEUED)
+            self.assertFalse(receipt_a.done)
+            self.assertEqual(receipt_a.event, 'review')
+
+            # two independent observers of the same receipt; one of them gives up waiting
+            waiter_cancelled = receipt_a.wait()
+            waiter_kept = receipt_a.wait()
+            waiter_cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter_cancelled
+
+            # model B processes the identically named event on its own queue and succeeds
+            receipt_b = await model_b.review()
+            self.assertEqual(receipt_b.status, TransitionStatus.SUCCESS)
+            self.assertTrue(receipt_b.result)
+            self.assertIsNone(receipt_b.error)
+            self.assertIsNot(receipt_a, receipt_b)
+
+            # releasing the guard drains model A's queue: callback then submits items 3 and 4
+            gate.set()
+            with self.assertRaises(ValueError):
+                await head_task
+
+            # the kept observer still observes the real outcome; the cancelled observer changed nothing
+            resolved = await waiter_kept
+            self.assertIs(resolved, receipt_a)
+            self.assertEqual(receipt_a.status, TransitionStatus.GUARD_REJECTED)
+            self.assertFalse(receipt_a.result)
+            self.assertIsNone(receipt_a.error)
+
+            # item 3 raised, item 4 was discarded when the queue got cleared
+            receipt_error = follow_ups['explode']
+            receipt_discarded = follow_ups['cleanup']
+            self.assertEqual(receipt_error.status, TransitionStatus.CALLBACK_ERROR)
+            self.assertIsInstance(receipt_error.error, ValueError)
+            self.assertFalse(receipt_error.result)
+            self.assertEqual(receipt_discarded.status, TransitionStatus.DISCARDED)
+            self.assertIsNone(receipt_discarded.error)
+            self.assertFalse(receipt_discarded.result)
+
+            # model B must not inherit model A's failure and model A never left its idle state
+            self.assertEqual(receipt_b.status, TransitionStatus.SUCCESS)
+            self.assertTrue(model_b.is_done())
+            self.assertTrue(model_a.is_idle())
+        asyncio.run(run())
+
+    def test_receipt_queued_success(self):
+        # type: () -> None
+        gate = asyncio.Event()
+
+        async def await_gate(event_data):
+            # type: (AsyncEventData) -> bool
+            await gate.wait()
+            return True
+
+        async def run():
+            machine = self.machine_cls(states=['A', 'B', 'C'], initial='A', queued='model', send_event=True,
+                                       transitions=[
+                                           {'trigger': 'head', 'source': 'A', 'dest': 'B',
+                                            'conditions': [await_gate]},
+                                           {'trigger': 'follow', 'source': 'B', 'dest': 'C'}])
+            head_task = asyncio.ensure_future(machine.head())
+            await asyncio.sleep(0)
+            receipt = await machine.follow()
+            self.assertEqual(receipt.status, TransitionStatus.QUEUED)
+            gate.set()
+            await head_task
+            resolved = await receipt.wait()
+            self.assertIs(resolved, receipt)
+            self.assertEqual(receipt.status, TransitionStatus.SUCCESS)
+            self.assertTrue(receipt.result)
+            self.assertTrue(machine.is_C())
+        asyncio.run(run())
+
+    def test_receipt_immediate_success(self):
+        # type: () -> None
+        async def run():
+            machine = self.machine_cls(states=['A', 'B'], initial='A', queued='model',
+                                       transitions=[['go', 'A', 'B']])
+            receipt = await machine.go()
+            self.assertIsInstance(receipt, TransitionReceipt)
+            self.assertTrue(receipt.done)
+            self.assertEqual(receipt.status, TransitionStatus.SUCCESS)
+            self.assertTrue(receipt.result)
+            self.assertIs(await receipt.wait(), receipt)
+        asyncio.run(run())
+
+    def test_receipt_model_removed(self):
+        # type: () -> None
+        gate = asyncio.Event()
+
+        async def await_gate(event_data):
+            # type: (AsyncEventData) -> bool
+            await gate.wait()
+            return True
+
+        async def run():
+            # 'model' uses a per-model queue with an explicit model; True uses the shared (self) queue
+            model = DummyModel()
+            for queued, target in (('model', model), (True, None)):
+                gate.clear()
+                if target is None:
+                    machine = self.machine_cls(states=['A', 'B'], initial='A', queued=queued,
+                                               send_event=True, transitions=[
+                                                   {'trigger': 'head', 'source': 'A', 'dest': None,
+                                                    'conditions': [await_gate]},
+                                                   {'trigger': 'later', 'source': 'A', 'dest': 'B'}])
+                    target = machine
+                else:
+                    machine = self.machine_cls(model=target, states=['A', 'B'], initial='A', queued=queued,
+                                               send_event=True, transitions=[
+                                                   {'trigger': 'head', 'source': 'A', 'dest': None,
+                                                    'conditions': [await_gate]},
+                                                   {'trigger': 'later', 'source': 'A', 'dest': 'B'}])
+                head_task = asyncio.ensure_future(target.head())
+                await asyncio.sleep(0)
+                receipt = await target.later()
+                self.assertEqual(receipt.status, TransitionStatus.QUEUED)
+                waiter = receipt.wait()
+
+                machine.remove_model(target)
+                resolved = await waiter
+                self.assertIs(resolved, receipt)
+                self.assertEqual(receipt.status, TransitionStatus.MODEL_REMOVED)
+                self.assertFalse(receipt.result)
+                self.assertIsNone(receipt.error)
+                self.assertTrue(receipt.done)
+
+                gate.set()
+                await head_task
+        asyncio.run(run())
+
+    def test_receipt_non_queued_keeps_boolean(self):
+        # type: () -> None
+        async def run():
+            machine = self.machine_cls(states=['A', 'B'], initial='A', queued=False,
+                                       transitions=[['go', 'A', 'B']])
+            result = await machine.go()
+            self.assertIs(result, True)
+            self.assertNotIsInstance(result, TransitionReceipt)
+            with self.assertRaises(MachineError):
+                await machine.submit('go', machine)
+        asyncio.run(run())
+
+    def test_receipt_bool_compatibility(self):
+        # type: () -> None
+        gate = asyncio.Event()
+
+        async def await_gate(event_data):
+            # type: (AsyncEventData) -> bool
+            await gate.wait()
+            return True
+
+        async def run():
+            machine = self.machine_cls(states=['A', 'B'], initial='A', queued='model', send_event=True,
+                                       transitions=[
+                                           {'trigger': 'head', 'source': 'A', 'dest': None,
+                                            'conditions': [await_gate]},
+                                           {'trigger': 'reject', 'source': 'A', 'dest': 'B',
+                                            'conditions': [lambda event_data: False]}])
+            head_task = asyncio.ensure_future(machine.head())
+            await asyncio.sleep(0)
+            queued = await machine.reject()
+            self.assertTrue(queued)  # an unresolved receipt keeps the legacy "queued -> True" behaviour
+            gate.set()
+            await head_task
+            rejected = await queued.wait()
+            self.assertFalse(rejected)  # a guard rejection stays falsy, just like the old boolean result
+            self.assertEqual(rejected.status, TransitionStatus.GUARD_REJECTED)
         asyncio.run(run())
 
     def test_async_timeout(self):

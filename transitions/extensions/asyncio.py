@@ -21,7 +21,9 @@ import inspect
 import sys
 import warnings
 from collections import deque
+from enum import Enum
 from functools import partial, reduce
+from typing import Any, List, Optional
 import copy
 
 from ..core import State, Condition, Transition, EventData, listify
@@ -35,6 +37,113 @@ _LOGGER.addHandler(logging.NullHandler())
 
 CANCELLED_MSG = "_transition"
 """A message passed to a cancelled task to indicate that the cancellation was caused by transitions."""
+
+
+_RECEIPT_ATTR = "_transitions_receipt"
+"""Attribute used to attach a :class:`TransitionReceipt` to the queued trigger partial."""
+
+
+class TransitionStatus(Enum):
+    """Terminal (and the initial ``QUEUED``) states an event can reach while being processed.
+
+    Members:
+        QUEUED: The event has been accepted and is waiting in the model's transition queue.
+        SUCCESS: The event was processed and a transition was conducted (the boolean result was True).
+        GUARD_REJECTED: The event ran but none of its transitions passed its conditions (boolean False).
+        CALLBACK_ERROR: A callback of the event raised an exception while the event was being processed.
+        DISCARDED: The event never ran because an earlier event in the same queue raised and cleared it.
+        MODEL_REMOVED: The event was still waiting in the queue when its model was removed from the machine.
+    """
+
+    QUEUED = "queued"
+    SUCCESS = "success"
+    GUARD_REJECTED = "guard_rejected"
+    CALLBACK_ERROR = "callback_error"
+    DISCARDED = "discarded"
+    MODEL_REMOVED = "model_removed"
+
+
+class TransitionReceipt:
+    """An independent completion receipt created for every triggered event.
+
+    A trigger keeps returning the plain boolean the library has always exposed (``True`` when an event was
+    conducted or merely queued). In addition, a ``TransitionReceipt`` is returned when the event is queued and
+    is resolved with the *actual* processing result once the event leaves the queue. This lets callers tell an
+    event that was only enqueued apart from one that passed its guards, raised, got discarded or whose model
+    was removed.
+
+    Several waiters may observe the same receipt through :meth:`wait`. Each call returns an independent
+    awaitable, so a single waiter can cancel its own observation without cancelling the shared transition or
+    disturbing the other observers; the receipt itself is still resolved with the real outcome by the machine.
+    """
+
+    def __init__(self, model, event, args, kwargs):
+        # type: (object, Optional[str], tuple, dict) -> None
+        self.model = model
+        self.event = event
+        self.args = args
+        self.kwargs = kwargs
+        self.status = TransitionStatus.QUEUED
+        self.result = None  # type: Optional[bool]
+        self.error = None  # type: Optional[BaseException]
+        self._future = asyncio.get_running_loop().create_future()  # type: asyncio.Future[Any]
+
+    @property
+    def done(self):
+        # type: () -> bool
+        """Return whether the event has been processed and the receipt has been resolved."""
+        return self._future.done()
+
+    def __bool__(self):
+        # type: () -> bool
+        """Preserve the legacy boolean entry point of triggers.
+
+        An unresolved receipt is truthy just like the ``True`` a trigger returned as soon as an event was
+        queued. Once resolved, the truth value mirrors the actual transition result (falsy when the event was
+        rejected, raised, got discarded or its model was removed).
+        """
+        if self.status is TransitionStatus.QUEUED:
+            return True
+        return bool(self.result)
+
+    def wait(self):
+        # type: () -> asyncio.Future[TransitionReceipt]
+        """Return an independent awaitable that resolves to this receipt when the event has been processed.
+
+        Every caller receives its own future. Cancelling that future only ends this particular observation;
+        the queued event keeps running and other waiters as well as the receipt's own resolution are untouched.
+        A processed event always resolves to its receipt -- even when a callback raised. Inspect
+        :attr:`status` and :attr:`error` to distinguish the concrete outcome instead of relying on exceptions.
+        """
+        waiter = asyncio.get_running_loop().create_future()  # type: asyncio.Future[TransitionReceipt]
+
+        def _propagate(_):
+            # type: (Any) -> None
+            if waiter.done():
+                return
+            if self._future.cancelled():
+                waiter.cancel()
+                return
+            waiter.set_result(self)
+
+        # registering the callback keeps both the closure and the per-caller waiter alive until resolution
+        self._future.add_done_callback(_propagate)
+        if self._future.done():
+            _propagate(self._future)
+        return waiter
+
+    def _resolve(self, status, result=None, error=None):
+        # type: (TransitionStatus, Optional[bool], Optional[BaseException]) -> None
+        if self._future.done():
+            return
+        self.status = status
+        self.result = result
+        self.error = error
+        self._future.set_result(result)
+
+    def __repr__(self):
+        # type: () -> str
+        return "<{0}({1}, {2})@{3}>".format(type(self).__name__, self.event, self.status.name, id(self))
 
 
 class AsyncState(State):
@@ -184,7 +293,8 @@ class AsyncEvent(Event):
                 be passed onto the EventData object, enabling arbitrary state
                 information to be passed on to downstream triggered functions.
         Returns: boolean indicating whether or not a transition was
-            successfully executed (True if successful, False if not).
+            successfully executed (True if successful, False if not). When the event is queued, a
+            :class:`TransitionReceipt` is returned instead which behaves truthy while it is unresolved.
         """
         func = partial(self._trigger, EventData(None, self, self.machine, model, args=args, kwargs=kwargs))
         return await self.machine.process_context(func, model)
@@ -332,7 +442,8 @@ class AsyncMachine(Machine):
         super().add_model(model, initial)
         if self.has_queue == 'model':
             for mod in listify(model):
-                self._transition_queue_dict[id(self) if mod is self.self_literal else id(mod)] = deque()
+                key = id(self) if mod is self.self_literal else id(mod)
+                self._transition_queue_dict[key] = deque()
 
     async def dispatch(self, trigger, *args, **kwargs):
         """Trigger an event on all models assigned to the machine.
@@ -415,7 +526,8 @@ class AsyncMachine(Machine):
             model (object): The currently processed model
 
         Returns:
-            bool: returns the success state of the triggered event
+            bool or TransitionReceipt: returns the success state of the triggered event. When the event is
+                queued, its :class:`TransitionReceipt` is returned instead.
         """
         if self.current_context.get() is None:
             token = self.current_context.set(asyncio.current_task())
@@ -441,13 +553,75 @@ class AsyncMachine(Machine):
             res = await self._process_async(func, model)
         return res
 
+    def _receipt_of(self, trigger):
+        # type: (Any) -> Optional[TransitionReceipt]
+        return getattr(trigger, _RECEIPT_ATTR, None)
+
+    def _attach_receipt(self, trigger, receipt):
+        # type: (Any, TransitionReceipt) -> None
+        setattr(trigger, _RECEIPT_ATTR, receipt)
+
+    @staticmethod
+    def _event_name(trigger):
+        # type: (Any) -> Optional[str]
+        args = trigger.args
+        if not args:
+            return None
+        name = getattr(getattr(args[0], "event", None), "name", None)
+        if name is not None:
+            return name
+        # HierarchicalAsyncMachine.trigger_event binds partial(self._trigger_event, event_data, trigger_name)
+        if len(args) > 1 and isinstance(args[1], str):
+            return args[1]
+        return None
+
+    async def submit(self, trigger, model, *args, **kwargs):
+        # type: (str, object, Any, Any) -> TransitionReceipt
+        """Enqueue an event without waiting for the model's queue to be consumed and return a receipt.
+
+        This is intended for callbacks that schedule a follow-up event while another event of the same model
+        is still being processed. A :class:`TransitionReceipt` is returned immediately, so the calling
+        callback does not have to await the same model's queue and cannot deadlock on itself. The receipt is
+        resolved with the actual outcome once the enqueued event is processed.
+
+        Args:
+            trigger (str): Name of the event to enqueue.
+            model (object): The model the event should be triggered on.
+            *args, **kwargs: Positional and keyword arguments forwarded to the event.
+
+        Returns:
+            TransitionReceipt: A referenceable receipt tracking the enqueued event.
+        """
+        if not self.has_queue:
+            raise MachineError("'submit' requires a queued machine (queued=True or queued='model').")
+        receipt = TransitionReceipt(model, trigger, args, kwargs)
+        func = self._enqueue_partial(trigger, model, args, kwargs)
+        self._attach_receipt(func, receipt)
+        await self._process_async(func, model)
+        return receipt
+
+    def _enqueue_partial(self, trigger, model, args, kwargs):
+        # type: (str, object, tuple, dict) -> Any
+        """Build the callable that represents ``trigger`` when it is appended to a queue.
+
+        This mirrors the inner callable a regular trigger would queue, so :meth:`submit` schedules exactly
+        what ``model.<trigger>()`` would. Hierarchical machines override this to use nested event handling.
+        """
+        event = self.events[trigger]
+        event_data = AsyncEventData(None, event, self, model, args=args, kwargs=kwargs)
+        return partial(event._trigger, event_data)
+
     def remove_model(self, model):
         """Remove a model from the state machine. The model will still contain all previously added triggers
         and callbacks, but will not receive updates when states or transitions are added to the Machine.
-        If an event queue is used, all queued events of that model will be removed."""
+        If an event queue is used, all queued events of that model will be removed. Receipts of events that
+        never run are resolved with :attr:`TransitionStatus.MODEL_REMOVED`."""
         models = listify(model)
+        pending = []  # type: List[TransitionReceipt]
         if self.has_queue == 'model':
             for mod in models:
+                queue = self._transition_queue_dict[id(mod)]
+                pending.extend(self._pending_receipts(queue, keep_running=True))
                 del self._transition_queue_dict[id(mod)]
                 self.models.remove(mod)
         else:
@@ -455,9 +629,27 @@ class AsyncMachine(Machine):
                 self.models.remove(mod)
         if len(self._transition_queue) > 0:
             queue = self._transition_queue
-            new_queue = [queue.popleft()] + [e for e in queue if e.args[0].model not in models]
+            # the first element is currently executed and is kept; only events of removed models are dropped
+            head = queue.popleft()
+            dropped = [entry for entry in queue if entry.args[0].model in models]
+            surviving = [entry for entry in queue if entry.args[0].model not in models]
+            pending.extend(self._pending_receipts(dropped))
             self._transition_queue.clear()
-            self._transition_queue.extend(new_queue)
+            self._transition_queue.append(head)
+            self._transition_queue.extend(surviving)
+        for receipt in pending:
+            receipt._resolve(TransitionStatus.MODEL_REMOVED, result=False)
+
+    @staticmethod
+    def _pending_receipts(queue, keep_running=False):
+        # type: (Any, bool) -> List[TransitionReceipt]
+        entries = list(queue)[1:] if keep_running else list(queue)
+        receipts = []
+        for entry in entries:
+            receipt = getattr(entry, _RECEIPT_ATTR, None)
+            if receipt is not None and not receipt.done:
+                receipts.append(receipt)
+        return receipts
 
     async def _can_trigger(self, model, trigger, *args, **kwargs):
         state = self.get_model_state(model)
@@ -496,23 +688,47 @@ class AsyncMachine(Machine):
                 return await trigger()
             raise MachineError("Attempt to process events synchronously while transition queue is not empty!")
 
-        self._transition_queue_dict[id(model)].append(trigger)
-        # another entry in the queue implies a running transition; skip immediate execution
-        if len(self._transition_queue_dict[id(model)]) > 1:
-            return True
+        queue = self._transition_queue_dict[id(model)]
+        receipt = self._receipt_of(trigger)
+        if receipt is None:
+            receipt = TransitionReceipt(model, self._event_name(trigger), tuple(), {})
+            self._attach_receipt(trigger, receipt)
+        queue.append(trigger)
+        # another entry in the queue implies a running transition; skip immediate execution and hand the
+        # caller a receipt that is resolved once the queued event has actually been processed
+        if len(queue) > 1:
+            return receipt
 
         while self._transition_queue_dict[id(model)]:
+            current = self._transition_queue_dict[id(model)][0]
+            current_receipt = self._receipt_of(current)
             try:
-                await self._transition_queue_dict[id(model)][0]()
-            except BaseException:
-                # if a transition raises an exception, clear queue and delegate exception handling
-                self._transition_queue_dict[id(model)].clear()
+                result = await current()
+            except BaseException as err:
+                # an exception clears the whole queue; resolve the failed event and every event that is
+                # discarded along with it before delegating exception handling to the caller
+                try:
+                    active_queue = self._transition_queue_dict[id(model)]
+                except KeyError:
+                    active_queue = None
+                discarded = self._pending_receipts(active_queue) if active_queue is not None else []
+                if active_queue is not None:
+                    active_queue.clear()
+                if current_receipt is not None:
+                    current_receipt._resolve(TransitionStatus.CALLBACK_ERROR, result=False, error=err)
+                for queued_receipt in discarded:
+                    if queued_receipt is not current_receipt:
+                        queued_receipt._resolve(TransitionStatus.DISCARDED, result=False)
                 raise
+            if current_receipt is not None:
+                status = TransitionStatus.SUCCESS if result else TransitionStatus.GUARD_REJECTED
+                current_receipt._resolve(status, result=bool(result))
             try:
+                # the model (and its queue) may have been removed while the event ran; stop draining then
                 self._transition_queue_dict[id(model)].popleft()
             except KeyError:
-                return True
-        return True
+                return receipt
+        return receipt
 
 
 class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
@@ -524,6 +740,12 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
     state_cls = NestedAsyncState
     transition_cls = NestedAsyncTransition
     event_cls = NestedAsyncEvent
+
+    def _enqueue_partial(self, trigger, model, args, kwargs):
+        # type: (str, object, tuple, dict) -> Any
+        event_data = AsyncEventData(state=None, event=None, machine=self, model=model, args=args, kwargs=kwargs)
+        event_data.result = None
+        return partial(self._trigger_event, event_data, trigger)
 
     async def trigger_event(self, model, trigger, *args, **kwargs):
         """Processes events recursively and forwards arguments if suitable events are found.
