@@ -11,6 +11,7 @@ __all__ = (
     "BaseList",
     "EmbeddedDocumentList",
     "LazyReference",
+    "UnresolvedReference",
 )
 
 
@@ -450,24 +451,55 @@ class StrictDict:
 
 
 class LazyReference(DBRef):
-    __slots__ = ("_cached_doc", "passthrough", "document_type")
+    __slots__ = ("_cached_doc", "passthrough", "document_type", "_database_hint")
 
-    def fetch(self, force=False):
+    def fetch(self, force=False, database=None):
         if not self._cached_doc or force:
-            self._cached_doc = self.document_type.objects.get(pk=self.pk)
+            from mongoengine.connection import _get_db_for_database
+
+            database = database or self._database_hint or self.database
+            db, alias = _get_db_for_database(database)
+
+            if db is not None:
+                collection = db[self.collection]
+                son = collection.find_one({"_id": self.pk})
+                if son is None:
+                    raise DoesNotExist(
+                        "Trying to dereference unknown document %s" % (self)
+                    )
+                self._cached_doc = self.document_type._from_son(son)
+            else:
+                self._cached_doc = self.document_type.objects.get(pk=self.pk)
+
             if not self._cached_doc:
-                raise DoesNotExist("Trying to dereference unknown document %s" % (self))
+                raise DoesNotExist(
+                    "Trying to dereference unknown document %s" % (self)
+                )
+            if database is not None:
+                self._cached_doc._db_context = {
+                    "database": database,
+                    "alias": alias,
+                }
+                self._cached_doc._db_context_for_nested = True
         return self._cached_doc
 
     @property
     def pk(self):
         return self.id
 
-    def __init__(self, document_type, pk, cached_doc=None, passthrough=False):
+    def __init__(
+        self,
+        document_type,
+        pk,
+        cached_doc=None,
+        passthrough=False,
+        database=None,
+    ):
         self.document_type = document_type
         self._cached_doc = cached_doc
         self.passthrough = passthrough
-        super().__init__(self.document_type._get_collection_name(), pk)
+        self._database_hint = database
+        super().__init__(self.document_type._get_collection_name(), pk, database)
 
     def __getitem__(self, name):
         if not self.passthrough:
@@ -486,3 +518,61 @@ class LazyReference(DBRef):
 
     def __repr__(self):
         return f"<LazyReference({self.document_type}, {self.pk!r})>"
+
+
+class UnresolvedReference(DBRef):
+    """A reference that could not be dereferenced.
+
+    This is returned (instead of raising or silently keeping the DBRef) when
+    eager dereferencing cannot resolve a reference, so callers can inspect the
+    database, collection, id and reason the reference was left unresolved.
+    """
+
+    __slots__ = ("reason", "expected_type")
+
+    def __init__(self, collection, id, database=None, reason=None, expected_type=None):
+        super().__init__(collection, id, database)
+        self.reason = reason
+        self.expected_type = expected_type
+
+    @property
+    def unresolved_reason(self):
+        return self.reason
+
+    @property
+    def message(self):
+        if self.reason == "missing":
+            return "referenced document does not exist"
+        if self.reason == "type_mismatch":
+            expected = getattr(self.expected_type, "__name__", self.expected_type)
+            return f"referenced document does not match expected type {expected!r}"
+        if self.reason == "database_unresolved":
+            return "referenced database is not available"
+        return self.reason
+
+    @property
+    def is_missing(self):
+        return self.reason == "missing"
+
+    @property
+    def is_type_mismatch(self):
+        return self.reason == "type_mismatch"
+
+    @property
+    def db(self):
+        return self.database
+
+    @property
+    def pk(self):
+        return self.id
+
+    def __getattr__(self, name):
+        # Prevent the DBRef __getattr__ fallback from masking the reason.
+        raise AttributeError(name)
+
+    def __repr__(self):
+        return (
+            f"<UnresolvedReference(database={self.database!r}, "
+            f"collection={self.collection!r}, id={self.id!r}, "
+            f"reason={self.reason!r})>"
+        )

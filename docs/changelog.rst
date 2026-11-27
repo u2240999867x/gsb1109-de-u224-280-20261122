@@ -8,6 +8,12 @@ Development
 ===========
 - (Fill this out as you fix issues and develop your features).
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
+- ``select_related()`` can now dereference references that point to different
+  databases: it accepts a ``database``/``default_database`` argument, reads
+  DBRefs that carry a database from that database, and batches references per
+  database and collection.  References that cannot be resolved are returned as
+  ``UnresolvedReference`` objects carrying the database, collection, id and
+  reason.
 
 Changes in 1.0.0
 ================

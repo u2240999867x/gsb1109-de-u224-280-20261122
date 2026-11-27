@@ -200,10 +200,12 @@ class BaseQuerySet:
             if queryset._as_pymongo:
                 return queryset._cursor[key]
 
-            return queryset._document._from_son(
+            doc = queryset._document._from_son(
                 queryset._cursor[key],
                 _auto_dereference=self._auto_dereference,
             )
+            doc._db_context = {"database": queryset._collection.database.name}
+            return doc
 
         raise TypeError("Provide a slice or an integer index")
 
@@ -797,10 +799,14 @@ class BaseQuerySet:
                 doc_map[doc["_id"]] = doc
         else:
             for doc in docs:
-                doc_map[doc["_id"]] = self._document._from_son(
+                document = self._document._from_son(
                     doc,
                     _auto_dereference=self._auto_dereference,
                 )
+                document._db_context = {
+                    "database": self._collection.database.name
+                }
+                doc_map[doc["_id"]] = document
 
         return doc_map
 
@@ -886,15 +892,47 @@ class BaseQuerySet:
 
         return new_qs
 
-    def select_related(self, max_depth=1):
+    def select_related(
+        self,
+        max_depth=1,
+        database=None,
+        default_database=None,
+        db_alias=None,
+        default_db=None,
+        db=None,
+        **kwargs,
+    ):
         """Handles dereferencing of :class:`~bson.dbref.DBRef` objects or
         :class:`~bson.object_id.ObjectId` a maximum depth in order to cut down
         the number queries to mongodb.
+
+        The optional ``database``/``default_database`` (also accepted as
+        ``db``/``db_alias``/``default_db``) specify which database is used for
+        this read.  References carrying a database are read from it; legacy
+        references without one are resolved against the default database.
         """
+        from mongoengine.dereference import resolve_select_related_databases
+
+        selected_database, selected_default_database, explicit = (
+            resolve_select_related_databases(
+                database=database,
+                default_database=default_database,
+                db=db,
+                db_alias=db_alias,
+                default_db=default_db,
+                **kwargs,
+            )
+        )
         # Make select related work the same for querysets
         max_depth += 1
         queryset = self.clone()
-        return queryset._dereference(queryset, max_depth=max_depth)
+        return queryset._dereference(
+            queryset,
+            max_depth=max_depth,
+            database=selected_database,
+            default_database=selected_default_database,
+            explicit=explicit,
+        )
 
     def limit(self, n):
         """Limit the number of returned documents to `n`. This may also be
@@ -1692,6 +1730,7 @@ class BaseQuerySet:
             raw_doc,
             _auto_dereference=self._auto_dereference,
         )
+        doc._db_context = {"database": self._collection.database.name}
 
         if self._scalar:
             return self._get_scalar(doc)

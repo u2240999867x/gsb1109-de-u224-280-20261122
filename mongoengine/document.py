@@ -763,12 +763,44 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         self.__objects._collection_obj = collection
         return self
 
-    def select_related(self, max_depth=1):
+    def select_related(
+        self,
+        max_depth=1,
+        database=None,
+        default_database=None,
+        db_alias=None,
+        default_db=None,
+        db=None,
+        **kwargs,
+    ):
         """Handles dereferencing of :class:`~bson.dbref.DBRef` objects to
         a maximum depth in order to cut down the number queries to mongodb.
+
+        The optional ``database``/``default_database`` (also accepted as
+        ``db``/``db_alias``/``default_db``) specify which database is used for
+        this read.  References carrying a database are read from it; legacy
+        references without one are resolved against the default database.
         """
+        from mongoengine.dereference import resolve_select_related_databases
+
         DeReference = _import_class("DeReference")
-        DeReference()([self], max_depth + 1)
+        selected_database, selected_default_database, explicit = (
+            resolve_select_related_databases(
+                database=database,
+                default_database=default_database,
+                db=db,
+                db_alias=db_alias,
+                default_db=default_db,
+                **kwargs,
+            )
+        )
+        DeReference()(
+            [self],
+            max_depth + 1,
+            database=selected_database,
+            default_database=selected_default_database,
+            explicit=explicit,
+        )
         return self
 
     def reload(self, *fields, **kwargs):

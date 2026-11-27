@@ -43,6 +43,10 @@ def _import_class(cls_name):
         from mongoengine.base import document as module
 
         import_classes = ["BaseDocument"]
+    elif cls_name in ("LazyReference", "UnresolvedReference"):
+        from mongoengine.base import datastructures as module
+
+        import_classes = [cls_name]
     elif cls_name in doc_classes:
         from mongoengine import document as module
 

@@ -402,6 +402,44 @@ def get_db(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
     return _dbs[alias]
 
 
+def _get_db_for_database(database):
+    """Return ``(db, alias)`` for a database name (or alias).
+
+    The database may be reachable through a registered alias, through another
+    alias pointing at the same database name, or simply through any of the
+    already opened clients.  ``(None, None)`` is returned when it cannot be
+    resolved at all.
+    """
+    if database is None:
+        return None, None
+
+    alias = None
+    if database in _connection_settings:
+        alias = database
+    else:
+        for candidate, settings in _connection_settings.items():
+            if settings.get("name") == database:
+                alias = candidate
+                break
+
+    if alias is not None:
+        return get_db(alias), alias
+
+    # The database name might refer to a database served by an already-open
+    # client without having a dedicated alias.  PyMongo (and mongomock) both
+    # allow addressing any database by name from a client.
+    for candidate in list(_connections):
+        try:
+            return _connections[candidate][database], candidate
+        except Exception:
+            continue
+
+    try:
+        return get_db()[database], DEFAULT_CONNECTION_NAME
+    except Exception:
+        return None, None
+
+
 def connect(db=None, alias=DEFAULT_CONNECTION_NAME, **kwargs):
     """Connect to the database specified by the 'db' argument.
 

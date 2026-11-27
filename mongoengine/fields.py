@@ -30,6 +30,7 @@ from mongoengine.base import (
     GeoJsonBaseField,
     LazyReference,
     ObjectIdField,
+    UnresolvedReference,
     _DocumentRegistry,
 )
 from mongoengine.base.utils import LazyRegexCompiler
@@ -1192,12 +1193,30 @@ class ReferenceField(BaseField):
         return self.document_type_obj
 
     @staticmethod
-    def _lazy_load_ref(ref_cls, dbref):
-        dereferenced_son = ref_cls._get_db().dereference(dbref, session=_get_session())
+    def _lazy_load_ref(ref_cls, dbref, database=None):
+        from mongoengine.connection import _get_db_for_database
+
+        database = database or getattr(dbref, "database", None)
+        db, alias = _get_db_for_database(database)
+        if db is not None:
+            dereferenced_son = db[dbref.collection].find_one(
+                {"_id": dbref.id}, session=_get_session()
+            )
+            context_database = database or db.name
+        else:
+            dereferenced_son = ref_cls._get_db().dereference(
+                dbref, session=_get_session()
+            )
+            context_database = None
+
         if dereferenced_son is None:
             raise DoesNotExist(f"Trying to dereference unknown document {dbref}")
 
-        return ref_cls._from_son(dereferenced_son)
+        document = ref_cls._from_son(dereferenced_son)
+        if context_database is not None:
+            document._db_context = {"database": context_database, "alias": alias}
+            document._db_context_for_nested = True
+        return document
 
     def __get__(self, instance, owner):
         """Descriptor to allow lazy dereferencing."""
@@ -1208,6 +1227,11 @@ class ReferenceField(BaseField):
         # Get value from document instance if available
         ref_value = instance._data.get(self.name)
         auto_dereference = instance._fields[self.name]._auto_dereference
+
+        UnresolvedReference = _import_class("UnresolvedReference")
+        if isinstance(ref_value, UnresolvedReference):
+            return ref_value
+
         # Dereference DBRefs
         if auto_dereference and isinstance(ref_value, DBRef):
             if hasattr(ref_value, "cls"):
@@ -1216,7 +1240,15 @@ class ReferenceField(BaseField):
             else:
                 cls = self.document_type
 
-            instance._data[self.name] = self._lazy_load_ref(cls, ref_value)
+            context = getattr(instance, "_db_context", None) or {}
+            database = ref_value.database
+            if database is None and getattr(
+                instance, "_db_context_for_nested", False
+            ):
+                database = context.get("database")
+            instance._data[self.name] = self._lazy_load_ref(
+                cls, ref_value, database=database
+            )
 
         return super().__get__(instance, owner)
 
@@ -2451,16 +2483,25 @@ class LazyReferenceField(BaseField):
         if isinstance(value, LazyReference):
             if value.passthrough != self.passthrough:
                 value = LazyReference(
-                    value.document_type, value.pk, passthrough=self.passthrough
+                    value.document_type,
+                    value.pk,
+                    passthrough=self.passthrough,
+                    database=value.database,
                 )
         elif value is not None:
             if isinstance(value, self.document_type):
                 value = LazyReference(
-                    self.document_type, value.pk, passthrough=self.passthrough
+                    self.document_type,
+                    value.pk,
+                    passthrough=self.passthrough,
+                    database=getattr(value, "_db_context", {}).get("database"),
                 )
             elif isinstance(value, DBRef):
                 value = LazyReference(
-                    self.document_type, value.id, passthrough=self.passthrough
+                    self.document_type,
+                    value.id,
+                    passthrough=self.passthrough,
+                    database=value.database,
                 )
             else:
                 # value is the primary key of the referenced document
@@ -2475,8 +2516,25 @@ class LazyReferenceField(BaseField):
             # Document class being used rather than a document object
             return self
 
-        value = self.build_lazyref(instance._data.get(self.name))
+        value = instance._data.get(self.name)
+        if isinstance(value, UnresolvedReference):
+            return value
+
+        value = self.build_lazyref(value)
         if value:
+            context = getattr(instance, "_db_context", None) or {}
+            if (
+                value.database is None
+                and getattr(instance, "_db_context_for_nested", False)
+                and context.get("database")
+            ):
+                value = LazyReference(
+                    value.document_type,
+                    value.pk,
+                    cached_doc=value._cached_doc,
+                    passthrough=value.passthrough,
+                    database=context["database"],
+                )
             instance._data[self.name] = value
 
         return super().__get__(instance, owner)

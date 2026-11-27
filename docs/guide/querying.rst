@@ -548,6 +548,29 @@ references to the depth of 1 level.  If you have more complicated documents and
 want to dereference more of the object at once then increasing the :attr:`max_depth`
 will dereference more levels of the document.
 
+Reading references from several databases
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a single read spans several databases (for example aggregating regional
+databases into one report), pass ``database`` (the database used for this read)
+and optionally ``default_database`` (the database used for legacy references
+that do not carry a database of their own)::
+
+    report = Report.objects.first().select_related(
+        database="region_west", default_database="region_west"
+    )
+
+A :class:`~bson.dbref.DBRef` that includes a database is always read from that
+database.  References without one are resolved against ``default_database``;
+when no database is specified the related model's configured connection keeps
+being used.  References are fetched in batches per database and collection, so
+duplicate pointers are only fetched once.  References that cannot be resolved
+(missing document or a document of an incompatible type) are left as
+:class:`~mongoengine.base.UnresolvedReference` objects exposing ``database``,
+``collection``, ``id`` and ``reason``.
+
+Dereferencing a single document
+-------------------------------
 Turning off dereferencing
 -------------------------
 
