@@ -67,6 +67,7 @@ from botocore.hooks import (
 )
 from botocore.loaders import create_loader
 from botocore.model import ServiceModel
+from botocore.model_releases import ModelReleaseCatalog
 from botocore.parsers import ResponseParserFactory
 from botocore.plugin import get_botocore_plugins, load_client_plugins
 from botocore.regions import EndpointResolver
@@ -152,6 +153,12 @@ class Session:
             self._session_instance_vars['profile'] = profile
         self._client_config = None
         self._last_client_region_used = None
+        # Local model release state.  The same release directory is reused
+        # across runs and may live on a different machine, so the catalog and
+        # any pinned loaders are derived lazily from it.
+        self._model_release_dir = None
+        self._model_release_catalog = None
+        self._pinned_release_loaders = {}
         self._components = ComponentLocator()
         self._internal_components = ComponentLocator()
         self._register_components()
@@ -644,6 +651,75 @@ class Session:
             type_name='service-2'
         )
 
+    # -- local model releases ------------------------------------------
+
+    def configure_model_release_directory(self, release_dir):
+        """Point the session at a directory of approved local releases.
+
+        The same directory is reused across runs and may be reopened on a
+        different machine, so calling this again simply re-points the session
+        at it and discards any cached release state.
+        """
+        self._model_release_dir = release_dir
+        self._model_release_catalog = None
+        self._pinned_release_loaders = {}
+
+    def _get_model_release_catalog(self):
+        if self._model_release_dir is None:
+            raise ValueError(
+                'No local model release directory has been configured. Call '
+                'configure_model_release_directory() first.'
+            )
+        if self._model_release_catalog is None:
+            self._model_release_catalog = ModelReleaseCatalog(
+                self._model_release_dir
+            )
+        return self._model_release_catalog
+
+    def list_model_releases(self):
+        """Return the identifiers of the releases in the release directory."""
+        return self._get_model_release_catalog().list_releases()
+
+    def prepare_model_release(self, release_id):
+        """Validate and stage a release against its manifest.
+
+        The current data loader is used as the source of replaced files, so
+        the normal model search path priority applies. Raises
+        ``ModelReleaseValidationError`` if any staged resource fails its
+        approved digest.
+        """
+        catalog = self._get_model_release_catalog()
+        source_loader = self.get_component('data_loader')
+        return catalog.prepare(release_id, source_loader)
+
+    def activate_model_release(self, release_id):
+        """Activate a fully prepared release.
+
+        Raises ``ModelReleaseBaselineChangedError`` if the release's baseline
+        is no longer the active release.
+        """
+        return self._get_model_release_catalog().activate(release_id)
+
+    def get_active_model_release(self):
+        """Return the identifier of the currently active release, if any."""
+        if self._model_release_dir is None:
+            return None
+        return self._get_model_release_catalog().active_release
+
+    def get_model_release_loader(self, release_id):
+        """Return a data loader pinned to a prepared release.
+
+        The pinned loader is cached per release so repeatedly opening clients
+        (including on a restart) reuses the same validated snapshot.
+        """
+        if release_id not in self._pinned_release_loaders:
+            catalog = self._get_model_release_catalog()
+            base_loader = self.get_component('data_loader')
+            self._pinned_release_loaders[release_id] = (
+                catalog.create_loader(release_id, base_loader)
+            )
+        return self._pinned_release_loaders[release_id]
+
     def set_debug_logger(self, logger_name='botocore'):
         """
         Convenience function to quickly configure full debug output
@@ -857,6 +933,7 @@ class Session:
         aws_session_token=None,
         config=None,
         aws_account_id=None,
+        model_release_id=None,
     ):
         """Create a botocore client.
 
@@ -927,6 +1004,14 @@ class Session:
         :param aws_account_id: The account id to use when creating
             the client.  Same semantics as aws_access_key_id above.
 
+        :type model_release_id: string
+        :param model_release_id: Identifier of a prepared, approved local
+            model release to pin this client to. When provided, the client
+            loads its service model, paginators, waiters, endpoint ruleset
+            and partition data exclusively from that release's validated
+            snapshot. When ``None`` the client uses the normal model search
+            path.
+
         :rtype: botocore.client.BaseClient
         :return: A botocore client instance
 
@@ -954,6 +1039,10 @@ class Session:
             )
 
         loader = self.get_component('data_loader')
+        if model_release_id is not None:
+            # Pin only this client to the approved release. Other clients
+            # created without a release id keep the default model priority.
+            loader = self.get_model_release_loader(model_release_id)
         event_emitter = self.get_component('event_emitter')
         response_parser_factory = self.get_component('response_parser_factory')
         if config is not None and config.signature_version is UNSIGNED:

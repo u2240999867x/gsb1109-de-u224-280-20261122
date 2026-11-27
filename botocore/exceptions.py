@@ -861,3 +861,50 @@ class UnsupportedServiceProtocolsError(BotoCoreError):
         'Botocore supports {botocore_supported_protocols}, but service {service} only '
         'supports {service_supported_protocols}.'
     )
+
+
+class ModelReleaseError(BotoCoreError):
+    """Base error for the local model release machinery."""
+
+    fmt = '{msg}'
+
+
+class UnknownModelReleaseError(ModelReleaseError):
+    """Raised when a requested local model release cannot be found.
+
+    :ivar release_id: The release identifier that could not be resolved.
+    :ivar known_releases: The release identifiers that are available.
+    """
+
+    fmt = (
+        "Unknown local model release: '{release_id}'. Known releases are: "
+        '{known_releases}'
+    )
+
+
+class ModelReleaseValidationError(ModelReleaseError):
+    """Raised when the files staged for a release do not match its manifest.
+
+    :ivar release_id: The release whose preparation failed.
+    :ivar mismatched_resources: The logical resource paths whose staged
+        content does not match the approved content digest.
+    """
+
+    fmt = (
+        'Local model release {release_id} is not consistent with its '
+        'manifest. Mismatched resources: {mismatched_resources}'
+    )
+
+
+class ModelReleaseBaselineChangedError(ModelReleaseError):
+    """Raised when activating a release whose baseline is no longer current.
+
+    :ivar release_id: The release that was requested for activation.
+    :ivar baseline_id: The baseline release recorded by the release manifest.
+    :ivar active_id: The release that is currently active.
+    """
+
+    fmt = (
+        "Cannot activate release '{release_id}': its baseline release "
+        "'{baseline_id}' is no longer the active release '{active_id}'."
+    )
