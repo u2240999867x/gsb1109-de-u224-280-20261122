@@ -30,6 +30,7 @@ from typing_extensions import Sentinel, TypeForm
 
 from . import PydanticDeprecatedSince211
 from ._internal import (
+    _attribute_cache,
     _config,
     _decorators,
     _fields,
@@ -722,6 +723,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         context: Any | None = None,
         by_alias: bool | None = None,
         by_name: bool | None = None,
+        snapshot_reads: bool | None = None,
     ) -> Self:
         """Validate a pydantic model instance.
 
@@ -739,6 +741,10 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             context: Additional context to pass to the validator.
             by_alias: Whether to use the field's alias when validating against the provided input data.
             by_name: Whether to use the field's name when validating against the provided input data.
+            snapshot_reads: Whether to cache attribute reads for the duration of this validation.
+                When enabled, each attribute is read at most once per object. This is
+                useful when the same ORM row is handed to several nested models that
+                share descriptors. Defaults to `None`, which inherits an active batch snapshot.
 
         Raises:
             ValidationError: If the object could not be validated.
@@ -755,15 +761,21 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 code='validate-by-alias-and-name-false',
             )
 
-        return cls.__pydantic_validator__.validate_python(
-            obj,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
+        snapshot_state = _attribute_cache.resolve_snapshot_state(snapshot_reads)
+        try:
+            return cls.__pydantic_validator__.validate_python(
+                _attribute_cache.wrap_input(obj, snapshot_state),
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError as exc:
+            if snapshot_state is None:
+                raise
+            raise _attribute_cache.rewrap_validation_error(exc, cls.__name__) from None
 
     @classmethod
     def model_validate_json(

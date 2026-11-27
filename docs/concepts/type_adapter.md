@@ -53,6 +53,29 @@ print(repr(user_list_adapter.dump_json(user_list)))
     [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] should not be used as a type annotation for
     specifying fields of a `BaseModel`, etc.
 
+## Batch validation
+
+When validating several objects in one logical run, use
+[`TypeAdapter.validate_batch()`][pydantic.type_adapter.TypeAdapter.validate_batch]. With
+`snapshot_reads=True` (the default), attribute reads are cached for the duration of the
+batch, so an expensive descriptor is read at most once per object:
+
+```python
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+
+
+class Item(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    name: str
+
+
+adapter = TypeAdapter(Item)
+items = adapter.validate_batch([orm_item_a, orm_item_b], snapshot_reads=True)
+```
+
+Each object is validated against its own view of the snapshot, so in-place transformations
+made while validating one object cannot affect another object or the original ORM object.
+
 ## Parsing data into a specified type
 
 [`TypeAdapter`][pydantic.type_adapter.TypeAdapter] can be used to apply the parsing logic to populate Pydantic models

@@ -136,6 +136,33 @@ The approach you choose should really depend on your use case.
 You will have to compare verbosity, performance, ease of returning meaningful errors to your users, etc. to choose the right pattern.
 Just be mindful of abusing advanced patterns like the pipeline API just because you can.
 
+## Batch validation
+
+When validating several related objects in one logical run, an expensive descriptor may be
+read repeatedly for the same ORM row. The experimental batch validation API can take a
+snapshot of attribute reads for the duration of the batch, so each descriptor is read at
+most once per object:
+
+```python
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic.experimental.batch import Batch
+
+
+class Clean(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    readings: list[dict] = []
+
+
+adapter = TypeAdapter(Clean)
+rows = [orm_row_a, orm_row_b]
+validated = adapter.validate_batch(rows, snapshot_reads=True)
+```
+
+Containers returned by descriptors are copied for each item in the batch, so a model can
+transform its data in-place without affecting other items or the original ORM object.
+Create a new batch (for example with [`Batch`][pydantic.experimental.batch.Batch] or
+[`snapshot_reads()`][pydantic.experimental.batch.snapshot_reads]) to start a fresh snapshot.
+
 ## Partial Validation
 
 /// version-added | v2.10

@@ -13,3 +13,13 @@
     options:
         members:
             - generate_arguments_schema
+
+## Batch validation API
+
+::: pydantic.experimental.batch
+    options:
+        members:
+            - Batch
+            - BatchAdapter
+            - validate_python
+            - snapshot_reads

@@ -664,6 +664,25 @@ object-relational mappings (ORMs).
 This feature need to be manually enabled, either by setting the [`from_attributes`][pydantic.config.ConfigDict.from_attributes]
 configuration value, or by using the `from_attributes` parameter on [`model_validate()`][pydantic.main.BaseModel.model_validate].
 
+When the same object is validated against several models, expensive descriptors can be read
+multiple times. Pass `snapshot_reads=True` to [`model_validate()`][pydantic.main.BaseModel.model_validate]
+to cache attribute reads for that validation. For several objects, use
+[`TypeAdapter.validate_batch()`][pydantic.type_adapter.TypeAdapter.validate_batch] or the
+experimental [`pydantic.experimental.batch`][pydantic.experimental.batch] API to share one
+snapshot across the whole batch:
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+
+class CleanModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    name: str
+
+
+clean = CleanModel.model_validate(orm_row, snapshot_reads=True)
+```
+
 The example here uses [SQLAlchemy](https://www.sqlalchemy.org/), but the same approach should work for any ORM.
 
 ```python

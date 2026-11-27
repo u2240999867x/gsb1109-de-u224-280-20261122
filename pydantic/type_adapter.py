@@ -16,13 +16,22 @@ from typing import (
     final,
 )
 
-from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator, Some
+from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator, Some, ValidationError as ValidationErrorType
 from typing_extensions import ParamSpec, TypeForm, is_typeddict
 
 from pydantic.errors import PydanticUserError
 from pydantic.main import BaseModel, IncEx
 
-from ._internal import _config, _generate_schema, _mock_val_ser, _namespace_utils, _repr, _typing_extra, _utils
+from ._internal import (
+    _attribute_cache,
+    _config,
+    _generate_schema,
+    _mock_val_ser,
+    _namespace_utils,
+    _repr,
+    _typing_extra,
+    _utils,
+)
 from .config import ConfigDict, ExtraValues
 from .errors import PydanticUndefinedAnnotation
 from .json_schema import (
@@ -63,6 +72,12 @@ def _type_has_config(type_: Any) -> bool:
     except TypeError:
         # type is not a class
         return False
+
+
+def _model_title(adapter: TypeAdapter[Any]) -> str:
+    """Return a human readable title for the adapter's type."""
+    type_ = adapter._type
+    return getattr(type_, '__name__', None) or str(type_)
 
 
 @final
@@ -371,6 +386,7 @@ class TypeAdapter(Generic[T]):
         experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
         by_alias: bool | None = None,
         by_name: bool | None = None,
+        snapshot_reads: bool | None = None,
     ) -> T:
         """Validate a Python object against the model.
 
@@ -393,6 +409,10 @@ class TypeAdapter(Generic[T]):
                 * 'trailing-strings': Enable partial validation and allow trailing strings in the input.
             by_alias: Whether to use the field's alias when validating against the provided input data.
             by_name: Whether to use the field's name when validating against the provided input data.
+            snapshot_reads: Whether to cache attribute reads for the duration of this validation.
+                When enabled, each attribute is read at most once per object. This is
+                useful when the same ORM row is handed to several nested models that
+                share descriptors. Defaults to `None`, which inherits an active batch snapshot.
 
         !!! note
             When using `TypeAdapter` with a Pydantic `dataclass`, the use of the `from_attributes`
@@ -407,16 +427,91 @@ class TypeAdapter(Generic[T]):
                 code='validate-by-alias-and-name-false',
             )
 
-        return self.validator.validate_python(
-            object,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            allow_partial=experimental_allow_partial,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
+        snapshot_state = _attribute_cache.resolve_snapshot_state(snapshot_reads)
+        try:
+            return self.validator.validate_python(
+                _attribute_cache.wrap_input(object, snapshot_state),
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                allow_partial=experimental_allow_partial,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationErrorType as exc:
+            if snapshot_state is None:
+                raise
+            raise _attribute_cache.rewrap_validation_error(exc, _model_title(self)) from None
+
+    def validate_batch(
+        self,
+        objects: Iterable[Any],
+        /,
+        *,
+        snapshot_reads: bool = True,
+        from_attributes: bool | None = None,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> list[T]:
+        """Validate a batch of Python objects against the model in one logical run.
+
+        This is useful when several objects share descriptors (for example, the same
+        ORM row is handed to cleaning, reconciliation, and audit models). When
+        ``snapshot_reads=True`` (the default), each attribute is read at most once per
+        object for the whole batch. Attribute reads are shared between items, but each
+        item is validated against its own view of the snapshot, so in-place changes
+        made while validating one item cannot affect another item or the original object.
+
+        Args:
+            objects: The Python objects to validate.
+            snapshot_reads: Whether to cache attribute reads for the duration of this batch.
+            from_attributes: Whether to extract data from object attributes.
+            strict: Whether to strictly check types.
+            extra: Whether to ignore, allow, or forbid extra data during model validation.
+                See the [`extra` configuration value][pydantic.ConfigDict.extra] for details.
+            context: Additional context to pass to the validator.
+            by_alias: Whether to use the field's alias when validating against the provided input data.
+            by_name: Whether to use the field's name when validating against the provided input data.
+
+        Returns:
+            The validated objects, in input order.
+
+        Raises:
+            ValidationError: If an object could not be validated. Error locations are
+                prefixed with the index of the failing object in the batch.
+        """
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        state = _attribute_cache.active_snapshot()
+        if state is None and snapshot_reads:
+            state = _attribute_cache.SnapshotState()
+
+        values: list[T] = []
+        for index, item in enumerate(objects):
+            input_value = _attribute_cache.wrap_input(item, state)
+            try:
+                values.append(
+                    self.validator.validate_python(
+                        input_value,
+                        strict=strict,
+                        extra=extra,
+                        from_attributes=from_attributes,
+                        context=context,
+                        by_alias=by_alias,
+                        by_name=by_name,
+                    )
+                )
+            except ValidationErrorType as exc:
+                raise _attribute_cache.prefix_validation_error(exc, index, _model_title(self)) from None
+        return values
 
     def validate_json(
         self,
