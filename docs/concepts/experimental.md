@@ -136,6 +136,58 @@ The approach you choose should really depend on your use case.
 You will have to compare verbosity, performance, ease of returning meaningful errors to your users, etc. to choose the right pattern.
 Just be mindful of abusing advanced patterns like the pipeline API just because you can.
 
+## Validation Evidence
+
+When validating a batch of items against a union, a plain `ValidationError` only tells you which rows ultimately failed. It cannot tell you *which branch a row actually took*, which branches were only tried as candidates (and what they failed on before another branch succeeded), or which nested nodes were never reached at all.
+
+The experimental validation evidence API records exactly this, on top of Pydantic's normal validation:
+
+* which union choice was actually adopted per row, versus choices that were only attempted,
+* the errors produced by candidate-only checks, kept separate from the final result,
+* every nested model/field visited, with its position (batch index and field path),
+* nodes that were never entered (e.g. the inner model of a `None` nullable field),
+* per-node execution time,
+* auxiliary [`TypeAdapter`][pydantic.TypeAdapter] checks, attributed to the validation that triggered them.
+
+It is explicitly opt-in, in two steps. First, build the validator while instrumentation is enabled — this rewrites the core schema so the evidence is collected:
+
+```python
+from pydantic import TypeAdapter
+from pydantic.experimental.evidence import evidence_enabled, evidence_context
+
+with evidence_enabled():
+    # Models / TypeAdapters built inside this block are instrumented.
+    batch_validator = TypeAdapter(list[InvoiceA | InvoiceB])
+```
+
+Then run one or more validation calls inside an evidence context. Each context owns an independent report, so batches validated concurrently (for example in different threads) never share events:
+
+```python
+with evidence_context('batch-1') as report:
+    try:
+        batch_validator.validate_python(batch)
+    except ValidationError:
+        ...  # the call still raises exactly as it would without evidence
+
+for attempt in report.attempts:
+    print(attempt.node, attempt.status, attempt.adopted, attempt.loc, attempt.duration_ns)
+```
+
+Each [`NodeAttempt`][pydantic.experimental.evidence.NodeAttempt] carries the node identity, its status (`success`, `error` or `exception`), its location inside the input, its duration, and (for union choices) whether it was the branch actually adopted. Errors recorded for non-adopted candidates keep their original, user-facing locations and do not leak into the raised `ValidationError`.
+
+Auxiliary checks performed from inside a validator (for example a local-state lookup) can be attributed by calling the adapter through `check_type_adapter`:
+
+```python
+from pydantic.experimental.evidence import check_type_adapter
+
+check_type_adapter(local_state_adapter, value, name='local-state')
+```
+
+When evidence is disabled (the default), validation behaves exactly as before: no schema is rewritten and existing plugin callbacks and model results are unchanged.
+
+??? api "API Documentation"
+    [`pydantic.experimental.evidence`][pydantic.experimental.evidence]<br>
+
 ## Partial Validation
 
 /// version-added | v2.10

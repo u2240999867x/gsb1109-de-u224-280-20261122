@@ -33,10 +33,18 @@ def create_schema_validator(
     Returns:
         If plugins are installed then return `PluggableSchemaValidator`, otherwise return `SchemaValidator`.
     """
+    from ..experimental.evidence import evidence_is_enabled, instrument_core_schema
     from . import SchemaTypePath
     from ._loader import get_plugins
 
     plugins = get_plugins()
+
+    if evidence_is_enabled():
+        # Instrumented wrappers placed on nested models only run when pydantic-core rebuilds
+        # them from the schema instead of reusing the prebuilt per-model validators.
+        schema = instrument_core_schema(schema)
+        _use_prebuilt = False
+
     if plugins:
         return PluggableSchemaValidator(
             schema,

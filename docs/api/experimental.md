@@ -1,5 +1,9 @@
 # Experimental API
 
+## Validation Evidence API
+
+::: pydantic.experimental.evidence
+
 ## Pipeline API
 
 ::: pydantic.experimental.pipeline
