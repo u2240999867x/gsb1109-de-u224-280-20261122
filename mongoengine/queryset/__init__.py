@@ -4,6 +4,7 @@ from mongoengine.queryset.manager import *
 from mongoengine.queryset.queryset import *
 from mongoengine.queryset.transform import *
 from mongoengine.queryset.visitor import *
+from mongoengine.queryset.rules import *
 
 # Expose just the public subset of all imported objects and constants.
 __all__ = (
@@ -18,6 +19,16 @@ __all__ = (
     "CASCADE",
     "DENY",
     "PULL",
+    "UpdateRule",
+    "Rule",
+    "RuleSet",
+    "RuleApplicationResult",
+    "RuleCorrection",
+    "RuleConflict",
+    "RuleConflictError",
+    "apply_rules",
+    "DELETE",
+    "REMOVE",
     # Errors that might be related to a queryset, mostly here for backward
     # compatibility
     "DoesNotExist",

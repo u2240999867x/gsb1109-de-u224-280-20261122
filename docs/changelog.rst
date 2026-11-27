@@ -7,6 +7,10 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add ``QuerySet.apply_rules``/``update_rules`` (and ``Document.apply_rules``)
+  to evaluate and commit several cleaning rules together against a document's
+  pre-image, reporting rule conflicts and leaving the submission untouched when
+  any conflict exists.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

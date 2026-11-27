@@ -359,6 +359,25 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         return True
 
+    def apply_rules(self, rules, dry_run=False, raise_on_conflict=False):
+        """Evaluate several cleaning rules on this document together.
+
+        Rules are evaluated against the document's pre-image and written with
+        a single update per document.  See
+        :meth:`~mongoengine.queryset.QuerySet.apply_rules` for details.
+        """
+        if self.pk is None:
+            raise InvalidDocumentError("The document does not have a primary key.")
+
+        id_field = self._meta["id_field"]
+        query = {id_field: self.pk}
+        result = self._qs(**query).apply_rules(
+            rules,
+            dry_run=dry_run,
+            raise_on_conflict=raise_on_conflict,
+        )
+        return result
+
     def save(
         self,
         force_insert=False,

@@ -13,6 +13,7 @@ __all__ = (
     "FieldDoesNotExist",
     "ValidationError",
     "SaveConditionError",
+    "RuleConflictError",
     "DeprecatedError",
 )
 
@@ -59,6 +60,22 @@ class BulkWriteError(OperationError):
 
 class SaveConditionError(OperationError):
     pass
+
+
+class RuleConflictError(OperationError):
+    """Raised when several batch rules try to write the same field of the
+    same embedded element with different corrections.
+
+    The full evaluation that produced the conflict is available as
+    ``self.result`` and ``self.conflicts``.
+    """
+
+    def __init__(self, message="", result=None):
+        if not message and result is not None:
+            message = "Conflicting corrections: %s" % (result.conflicts,)
+        super().__init__(message)
+        self.result = result
+        self.conflicts = list(result.conflicts) if result is not None else []
 
 
 class FieldDoesNotExist(MongoEngineException):

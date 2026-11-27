@@ -629,6 +629,61 @@ class BaseQuerySet:
                 raise OperationError(message)
             raise OperationError("Update failed (%s)" % err)
 
+    def apply_rules(
+        self,
+        rules=None,
+        dry_run=False,
+        raise_on_conflict=False,
+        write_concern=None,
+        **kwargs,
+    ):
+        """Evaluate several cleaning rules together and write the result.
+
+        Every rule is evaluated against the documents as they are *before*
+        this call (the pre-image).  Corrections that different rules produce
+        for the same field of the same element are reported as conflicts;
+        documents without conflicts are written with a single update each.
+
+        :param rules: an iterable of
+            :class:`~mongoengine.queryset.rules.UpdateRule` objects (or rule
+            dicts).
+        :param dry_run: evaluate and report without writing anything.
+        :param raise_on_conflict: raise
+            :class:`~mongoengine.errors.RuleConflictError` instead of simply
+            returning a result carrying conflicts.
+        :param write_concern: extra options passed to the underlying
+            collection for the batch writes.
+        :returns: a
+            :class:`~mongoengine.queryset.rules.RuleApplicationResult`.
+        """
+        from mongoengine.queryset.rules import apply_rules
+
+        return apply_rules(
+            self,
+            rules,
+            dry_run=dry_run,
+            raise_on_conflict=raise_on_conflict,
+            write_concern=write_concern,
+            **kwargs,
+        )
+
+    def update_rules(
+        self,
+        rules=None,
+        dry_run=False,
+        raise_on_conflict=False,
+        write_concern=None,
+        **kwargs,
+    ):
+        """Alias of :meth:`apply_rules`."""
+        return self.apply_rules(
+            rules,
+            dry_run=dry_run,
+            raise_on_conflict=raise_on_conflict,
+            write_concern=write_concern,
+            **kwargs,
+        )
+
     def upsert_one(self, write_concern=None, read_concern=None, **update):
         """Overwrite or add the first document matched by the query.
 

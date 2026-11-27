@@ -290,6 +290,51 @@ This is done by using ``__raw__`` keyword argument to the update method and prov
 
     )
 
+.. _guide-batch-rules:
+
+Applying several rules together
+===============================
+Cleaning workflows often need to submit several rules in one go.  A rule is
+written with model field names and selects the elements of a list field it
+should correct; :meth:`~mongoengine.queryset.QuerySet.apply_rules` (also
+available as ``update_rules``) evaluates them against the *pre-image* of the
+document and applies the resulting corrections in one update per document::
+
+    from mongoengine import Q
+    from mongoengine.queryset.rules import DELETE, UpdateRule
+
+    rules = [
+        UpdateRule(
+            name="A",
+            path="devices.readings",
+            match=Q(no="07", state="Pending"),
+            update={"state": "Reviewed", "note": "Checked"},
+        ),
+        UpdateRule(
+            name="B",
+            path="devices.readings",
+            scope=Q(device="east"),
+            match=Q(no__in=["07", "08"])
+            & (Q(score__gte=80) | Q(state="Reviewed")),
+            update={"note": DELETE},
+        ),
+    ]
+
+    result = Submission.objects.apply_rules(rules)
+    result.applied     # corrections written to the database
+    result.conflicts   # corrections fighting over the same field
+
+``match`` conditions are relative to the selected element and ``scope``
+conditions to the element that encloses the target list (here, the device).
+Rules are all evaluated against the state read before any rule runs, so the
+order of the list does not change the outcome.
+
+Rules that write different values to the same field of the same element (or to
+overlapping parent/child paths) are reported as conflicts.  When any conflict
+exists, the whole submission is left untouched -- not even the non-conflicting
+corrections are written.  Pass ``dry_run=True`` to only inspect the evaluation,
+or ``raise_on_conflict=True`` to raise
+:class:`~mongoengine.errors.RuleConflictError` carrying the same result.
 
 Sorting/Ordering results
 ========================
