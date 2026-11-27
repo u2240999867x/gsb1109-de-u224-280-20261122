@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add optional per-response stream metering with `httpx.StreamMetrics`, sampling the headers, source-wait, and consumer-stall phases against a caller-provided monotonic clock, attachable via `httpx.Response(..., stream_metrics=...)` or the `"stream_metrics"` request extension.
 
 ## 0.28.1 (6th December, 2024)
 

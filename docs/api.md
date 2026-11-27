@@ -70,6 +70,8 @@
   * The amount of time elapsed between sending the request and calling `close()` on the corresponding response received for that request.
   [total_seconds()](https://docs.python.org/3/library/datetime.html#datetime.timedelta.total_seconds) to correctly get
   the total elapsed seconds.
+* `.stream_metrics` - **Optional[StreamMetrics]**
+  * The optional stream metrics instance metering this response, if one has been attached.
 * `def .raise_for_status()` - **Response**
 * `def .json()` - **Any**
 * `def .read()` - **bytes**

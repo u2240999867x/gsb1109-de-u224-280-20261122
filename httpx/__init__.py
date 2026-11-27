@@ -5,6 +5,7 @@ from ._client import *
 from ._config import *
 from ._content import *
 from ._exceptions import *
+from ._metrics import *
 from ._models import *
 from ._status_codes import *
 from ._transports import *
@@ -86,6 +87,8 @@ __all__ = [
     "StreamClosed",
     "StreamConsumed",
     "StreamError",
+    "StreamMetrics",
+    "StreamState",
     "SyncByteStream",
     "Timeout",
     "TimeoutException",

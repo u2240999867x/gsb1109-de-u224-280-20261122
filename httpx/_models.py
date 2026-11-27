@@ -30,6 +30,7 @@ from ._exceptions import (
     StreamConsumed,
     request_context,
 )
+from ._metrics import StreamMetrics
 from ._multipart import get_multipart_boundary_from_content_type
 from ._status_codes import codes
 from ._types import (
@@ -527,6 +528,7 @@ class Response:
         extensions: ResponseExtensions | None = None,
         history: list[Response] | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        stream_metrics: StreamMetrics | None = None,
     ) -> None:
         self.status_code = status_code
         self.headers = Headers(headers)
@@ -567,6 +569,7 @@ class Response:
             self.stream = stream
 
         self._num_bytes_downloaded = 0
+        self._stream_metrics = stream_metrics
 
     def _prepare(self, default_headers: dict[str, str]) -> None:
         for key, value in default_headers.items():
@@ -856,6 +859,18 @@ class Response:
     def num_bytes_downloaded(self) -> int:
         return self._num_bytes_downloaded
 
+    @property
+    def stream_metrics(self) -> StreamMetrics | None:
+        """
+        The optional `StreamMetrics` instance metering this response,
+        if one has been attached.
+        """
+        return getattr(self, "_stream_metrics", None)
+
+    @stream_metrics.setter
+    def stream_metrics(self, metrics: StreamMetrics | None) -> None:
+        self._stream_metrics = metrics
+
     def __repr__(self) -> str:
         return f"<Response [{self.status_code} {self.reason_phrase}]>"
 
@@ -863,7 +878,8 @@ class Response:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+            if name
+            not in ["extensions", "stream", "is_closed", "_decoder", "_stream_metrics"]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:
@@ -893,16 +909,33 @@ class Response:
         else:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
+            metrics = self.stream_metrics
+            if metrics is not None:
+                metrics._decoded_layer_started()
             with request_context(request=self._request):
                 for raw_bytes in self.iter_raw():
                     decoded = decoder.decode(raw_bytes)
                     for chunk in chunker.decode(decoded):
+                        if metrics is not None:
+                            metrics._chunk_delivered()
                         yield chunk
+                        if metrics is not None:
+                            metrics._consumer_resumed()
                 decoded = decoder.flush()
                 for chunk in chunker.decode(decoded):
+                    if metrics is not None:
+                        metrics._chunk_delivered()
                     yield chunk  # pragma: no cover
+                    if metrics is not None:
+                        metrics._consumer_resumed()  # pragma: no cover
                 for chunk in chunker.flush():
+                    if metrics is not None:
+                        metrics._chunk_delivered()
                     yield chunk
+                    if metrics is not None:
+                        metrics._consumer_resumed()
+            if metrics is not None:
+                metrics._decoded_layer_finished()
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -946,15 +979,42 @@ class Response:
         self.is_stream_consumed = True
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
+        metrics = self.stream_metrics
 
         with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
+            if metrics is not None:
+                metrics._stream_started()
+            stream_iterator = iter(self.stream)
+            while True:
+                pull_started_at = (
+                    metrics._pull_started() if metrics is not None else 0.0
+                )
+                try:
+                    raw_stream_bytes = next(stream_iterator)
+                except StopIteration:
+                    if metrics is not None:
+                        metrics._raw_stream_finished(pull_started_at)
+                    break
+                except Exception:
+                    if metrics is not None:
+                        metrics._raw_read_failed(pull_started_at)
+                    raise
+                if metrics is not None:
+                    metrics._raw_chunk_received(pull_started_at, len(raw_stream_bytes))
                 self._num_bytes_downloaded += len(raw_stream_bytes)
                 for chunk in chunker.decode(raw_stream_bytes):
+                    if metrics is not None and not metrics._decoded_layer:
+                        metrics._chunk_delivered()
                     yield chunk
+                    if metrics is not None and not metrics._decoded_layer:
+                        metrics._consumer_resumed()
 
         for chunk in chunker.flush():
+            if metrics is not None and not metrics._decoded_layer:
+                metrics._chunk_delivered()
             yield chunk
+            if metrics is not None and not metrics._decoded_layer:
+                metrics._consumer_resumed()
 
         self.close()
 
@@ -968,6 +1028,9 @@ class Response:
 
         if not self.is_closed:
             self.is_closed = True
+            metrics = self.stream_metrics
+            if metrics is not None:
+                metrics._response_closed()
             with request_context(request=self._request):
                 self.stream.close()
 
@@ -993,16 +1056,33 @@ class Response:
         else:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
+            metrics = self.stream_metrics
+            if metrics is not None:
+                metrics._decoded_layer_started()
             with request_context(request=self._request):
                 async for raw_bytes in self.aiter_raw():
                     decoded = decoder.decode(raw_bytes)
                     for chunk in chunker.decode(decoded):
+                        if metrics is not None:
+                            metrics._chunk_delivered()
                         yield chunk
+                        if metrics is not None:
+                            metrics._consumer_resumed()
                 decoded = decoder.flush()
                 for chunk in chunker.decode(decoded):
+                    if metrics is not None:
+                        metrics._chunk_delivered()
                     yield chunk  # pragma: no cover
+                    if metrics is not None:
+                        metrics._consumer_resumed()  # pragma: no cover
                 for chunk in chunker.flush():
+                    if metrics is not None:
+                        metrics._chunk_delivered()
                     yield chunk
+                    if metrics is not None:
+                        metrics._consumer_resumed()
+            if metrics is not None:
+                metrics._decoded_layer_finished()
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1050,15 +1130,42 @@ class Response:
         self.is_stream_consumed = True
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
+        metrics = self.stream_metrics
 
         with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
+            if metrics is not None:
+                metrics._stream_started()
+            stream_iterator = self.stream.__aiter__()
+            while True:
+                pull_started_at = (
+                    metrics._pull_started() if metrics is not None else 0.0
+                )
+                try:
+                    raw_stream_bytes = await stream_iterator.__anext__()
+                except StopAsyncIteration:
+                    if metrics is not None:
+                        metrics._raw_stream_finished(pull_started_at)
+                    break
+                except Exception:
+                    if metrics is not None:
+                        metrics._raw_read_failed(pull_started_at)
+                    raise
+                if metrics is not None:
+                    metrics._raw_chunk_received(pull_started_at, len(raw_stream_bytes))
                 self._num_bytes_downloaded += len(raw_stream_bytes)
                 for chunk in chunker.decode(raw_stream_bytes):
+                    if metrics is not None and not metrics._decoded_layer:
+                        metrics._chunk_delivered()
                     yield chunk
+                    if metrics is not None and not metrics._decoded_layer:
+                        metrics._consumer_resumed()
 
         for chunk in chunker.flush():
+            if metrics is not None and not metrics._decoded_layer:
+                metrics._chunk_delivered()
             yield chunk
+            if metrics is not None and not metrics._decoded_layer:
+                metrics._consumer_resumed()
 
         await self.aclose()
 
@@ -1072,6 +1179,9 @@ class Response:
 
         if not self.is_closed:
             self.is_closed = True
+            metrics = self.stream_metrics
+            if metrics is not None:
+                metrics._response_closed()
             with request_context(request=self._request):
                 await self.stream.aclose()
 

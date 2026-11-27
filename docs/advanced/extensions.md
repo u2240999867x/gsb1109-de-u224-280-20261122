@@ -97,8 +97,53 @@ The following event types are currently exposed...
 
 The exact set of trace events may be subject to change across different versions of `httpcore`. If you need to rely on a particular set of events it is recommended that you pin installation of the package to a fixed version.
 
-### `"sni_hostname"`
+### `"stream_metrics"`
 
+The `"stream_metrics"` extension attaches an `httpx.StreamMetrics` instance to the
+response, providing optional stream metering aimed at archival-style pipelines that
+need to know where the time for a response actually went.
+
+`response.elapsed` measures the complete request/response cycle, which conflates the
+source delivering data, time spent processing each batch, and time spent paused
+between batches. A `StreamMetrics` instance instead samples three phases against a
+caller-provided monotonic clock:
+
+* `headers_elapsed` - From the request being sent to the response headers arriving.
+* `source_wait_elapsed` - Time spent waiting on the underlying stream for raw chunks.
+* `consumer_stall_elapsed` - Time the consumer spent paused between being delivered
+  a chunk and requesting the next one.
+
+```python
+import time
+
+import httpx
+
+metrics = httpx.StreamMetrics(clock=time.monotonic)
+client = httpx.Client()
+with client.stream(
+    "GET", "https://www.example.com", extensions={"stream_metrics": metrics}
+) as response:
+    for chunk in response.iter_bytes():
+        ...  # Process each chunk.
+
+print(metrics.receipt())
+# {'state': <StreamState.COMPLETE: 'complete'>,
+#  'headers_elapsed': datetime.timedelta(...),
+#  'source_wait_elapsed': datetime.timedelta(...),
+#  'consumer_stall_elapsed': datetime.timedelta(...),
+#  'num_bytes_downloaded': ...,
+#  'num_chunks_delivered': ...}
+```
+
+The `state` is only `StreamState.COMPLETE` once the final consumable data has
+actually been delivered. Closing the response early reports `StreamState.CLOSED`,
+and a failure while reading the underlying stream reports `StreamState.FAILED`,
+each keeping the read statistics gathered up to that point.
+
+The meter is also available as `response.stream_metrics`, and may be attached
+directly when instantiating a response, using `httpx.Response(..., stream_metrics=...)`.
+
+### `"sni_hostname"`
 The server's hostname, which is used to confirm the hostname supplied by the SSL certificate.
 
 If you want to connect to an explicit IP address rather than using the standard DNS hostname lookup, then you'll need to use this request extension.

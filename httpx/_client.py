@@ -1010,12 +1010,19 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
+        metrics = request.extensions.get("stream_metrics")
+        if metrics is not None:
+            metrics.request_sent()
+
         with request_context(request=request):
             response = transport.handle_request(request)
 
         assert isinstance(response.stream, SyncByteStream)
 
         response.request = request
+        if metrics is not None:
+            metrics.headers_received()
+            response.stream_metrics = metrics
         response.stream = BoundSyncStream(
             response.stream, response=response, start=start
         )
@@ -1726,11 +1733,18 @@ class AsyncClient(BaseClient):
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
+        metrics = request.extensions.get("stream_metrics")
+        if metrics is not None:
+            metrics.request_sent()
+
         with request_context(request=request):
             response = await transport.handle_async_request(request)
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
+        if metrics is not None:
+            metrics.headers_received()
+            response.stream_metrics = metrics
         response.stream = BoundAsyncStream(
             response.stream, response=response, start=start
         )
