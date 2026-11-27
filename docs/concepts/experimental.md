@@ -136,6 +136,115 @@ The approach you choose should really depend on your use case.
 You will have to compare verbosity, performance, ease of returning meaningful errors to your users, etc. to choose the right pattern.
 Just be mindful of abusing advanced patterns like the pipeline API just because you can.
 
+## URL Manifests
+
+/// version-added | v2.15
+///
+
+A *manifest* is a tree of sub-manifests whose relative download references are
+resolved against a base URL that belongs to the manifest tree. A single
+declaration accepts both raw JSON and already-validated Python sub-manifest
+instances, so the same model can be scheduled against several mirror stations.
+
+??? api "API Documentation"
+    [`pydantic.experimental.manifest`][pydantic.experimental.manifest]<br>
+
+A model opts in by subclassing `ManifestBase` and declaring a `ManifestConfig`:
+
+* `base_field` names the column that establishes the current manifest's base.
+  The field itself may use any inbound (validation) alias.
+* `url_fields` names the columns (a `str`, or a `list[str]`) whose values are
+  download references resolved against the current manifest's base.
+* `relative=True` resolves the base column against the parent manifest's base;
+  otherwise an absolute URL stands on its own. A sub-manifest with no base of
+  its own inherits the parent base.
+* `default_factory` produces a validated base when the base column is absent.
+  It may accept a `station` keyword argument.
+* `children_field` names the nested sub-manifest column; when omitted every
+  nested manifest is treated as a child.
+
+The root manifest receives an inbound base through `ManifestContext(entry=...)`
+or builds one with its factory. Only literal `.` and `..` path segments are
+treated as directories, percent-encoded dots such as `%2e` are preserved, and
+an empty query marker (`?`) together with the order of repeated query
+parameters are kept verbatim.
+
+```python
+from pydantic import Field
+from pydantic.experimental.manifest import (
+    ManifestBase,
+    ManifestConfig,
+    ManifestContext,
+)
+
+
+class SubManifest(ManifestBase):
+    name: str
+    downloads: list[str]
+    base_url: str | None = None
+
+
+class NorthManifest(SubManifest):
+    # The base column is relative to the parent manifest's base.
+    manifest = ManifestConfig(
+        base_field='base_url',
+        url_fields=('downloads',),
+        relative=True,
+    )
+
+
+def station_base(*, station):
+    return {'west': 'https://west.example/v3/day/index?rev=8'}[station]
+
+
+class DayManifest(ManifestBase):
+    # The sub-manifest list is declared before the base column.
+    submanifests: list[SubManifest]
+    entry: str | None = Field(default=None, validation_alias='entry')
+    manifest = ManifestConfig(
+        base_field='entry',
+        children_field='submanifests',
+        default_factory=station_base,
+    )
+
+
+west = DayManifest.model_validate(
+    {
+        'submanifests': [
+            {
+                'name': 'north',
+                'base_url': '../%2e/north/list?tag=a&tag=b',
+                'downloads': ['', '?', './lot.csv'],
+            }
+        ]
+    },
+    context=ManifestContext(station='west'),
+)
+
+# The download queue reads the final request URLs straight from the model.
+assert west.submanifests[0].request_urls() == [
+    'https://west.example/v3/%2e/north/list?tag=a&tag=b',
+    'https://west.example/v3/%2e/north/list?',
+    'https://west.example/v3/%2e/north/lot.csv',
+]
+```
+
+Validated Python sub-manifests can be handed to another station. The original
+instance is never mutated; reusing it preserves its defaults, field validation
+and the fields that were explicitly provided, while a rebased copy carries the
+new request URLs. Override `manifest_verify_url` to reject an address for the
+current station — the error location points at the owning sub-manifest and
+download item, and previously validated manifests stay usable.
+
+```python
+class RestrictedNorth(NorthManifest):
+    def manifest_verify_url(self, url, *, field_name, index):
+        if self.manifest_station == 'west' and 'archive.example' in url:
+            raise ValueError('west station cannot request the archive host')
+```
+
+Plain `HttpUrl` fields are unaffected and keep their usual validation rules.
+
 ## Partial Validation
 
 /// version-added | v2.10
