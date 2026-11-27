@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* `WSGITransport` now streams the request body on demand instead of reading it
+  eagerly, and forwards response data written via `write()` so that uploads can
+  be interleaved with response receipts and stopped mid-stream.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.
