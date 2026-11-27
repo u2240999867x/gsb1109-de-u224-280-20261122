@@ -37,6 +37,23 @@ print(ta.validate_python([1, 2, 'a', 3]))
 #> [1, 2, 3]
 ```
 
+To find out which items were omitted, pass an [`OmitReceipt`][pydantic.omit_receipt.OmitReceipt] to
+[`TypeAdapter.validate_python`][pydantic.TypeAdapter.validate_python] or
+[`TypeAdapter.validate_json`][pydantic.TypeAdapter.validate_json]. The receipt records every omission
+using the *original* indexes and keys of the input, together with the errors that caused it:
+
+```python
+from pydantic import OmitReceipt, OnErrorOmit, TypeAdapter
+
+ta = TypeAdapter(list[OnErrorOmit[int]])
+receipt = OmitReceipt()
+
+ta.validate_python([1, 'a', 3], omit_receipt=receipt)
+
+print([(r.locator, r.status) for r in receipt.omissions])
+#> [(1, 'omitted')]
+```
+
 See the [API documentation][pydantic.types.OnErrorOmit] for more details on where it can be applied.
 
 ### `FailFast`

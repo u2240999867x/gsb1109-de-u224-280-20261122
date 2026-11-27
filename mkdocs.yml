@@ -134,6 +134,7 @@ nav:
           - Functional Serializers: api/functional_serializers.md
           - Standard Library Types: api/standard_library_types.md
           - Pydantic Types: api/types.md
+          - Omit Receipts: api/omit_receipt.md
           - Network Types: api/networks.md
           - Version Information: api/version.md
           - Annotated Handlers: api/annotated_handlers.md

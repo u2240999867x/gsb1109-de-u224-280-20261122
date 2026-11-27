@@ -3228,9 +3228,11 @@ print(model)
 ```
 
 !!! note
-    The omitted items are discarded silently: no error is reported and there is no way to know
-    which items were invalid. If you need to keep track of them, use a
-    [wrap validator](../concepts/validators.md#field-wrap-validator) instead.
+    By default, the omitted items are discarded silently: no error is reported. To keep track of
+    which items were omitted, where (using the original indexes and keys of the input) and why, pass an
+    [`OmitReceipt`][pydantic.omit_receipt.OmitReceipt] to
+    [`TypeAdapter.validate_python`][pydantic.TypeAdapter.validate_python] or
+    [`TypeAdapter.validate_json`][pydantic.TypeAdapter.validate_json].
 
 !!! warning
     `OnErrorOmit` is only meaningful when the annotated type is part of a collection.

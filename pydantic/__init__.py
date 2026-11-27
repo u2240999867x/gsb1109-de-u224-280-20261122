@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from .json_schema import WithJsonSchema
     from .main import *
     from .networks import *
+    from .omit_receipt import OmitReceipt, OmitRecord
     from .type_adapter import TypeAdapter
     from .types import *
     from .validate_call_decorator import validate_call
@@ -197,6 +198,9 @@ __all__ = (
     'Discriminator',
     'JsonValue',
     'FailFast',
+    # omit_receipt
+    'OmitReceipt',
+    'OmitRecord',
     # type_adapter
     'TypeAdapter',
     # version
@@ -358,6 +362,9 @@ _dynamic_imports: 'dict[str, tuple[str, str]]' = {
     'JsonValue': (__spec__.parent, '.types'),
     'OnErrorOmit': (__spec__.parent, '.types'),
     'FailFast': (__spec__.parent, '.types'),
+    # omit_receipt
+    'OmitReceipt': (__spec__.parent, '.omit_receipt'),
+    'OmitRecord': (__spec__.parent, '.omit_receipt'),
     # type_adapter
     'TypeAdapter': (__spec__.parent, '.type_adapter'),
     # warnings

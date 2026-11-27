@@ -32,6 +32,7 @@ from .json_schema import (
     JsonSchemaMode,
     JsonSchemaValue,
 )
+from .omit_receipt import OmitReceipt
 from .plugin._schema_validator import PluggableSchemaValidator, create_schema_validator
 
 T = TypeVar('T')
@@ -371,6 +372,7 @@ class TypeAdapter(Generic[T]):
         experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
         by_alias: bool | None = None,
         by_name: bool | None = None,
+        omit_receipt: OmitReceipt | None = None,
     ) -> T:
         """Validate a Python object against the model.
 
@@ -393,6 +395,10 @@ class TypeAdapter(Generic[T]):
                 * 'trailing-strings': Enable partial validation and allow trailing strings in the input.
             by_alias: Whether to use the field's alias when validating against the provided input data.
             by_name: Whether to use the field's name when validating against the provided input data.
+            omit_receipt: An optional [`OmitReceipt`][pydantic.omit_receipt.OmitReceipt] to populate with
+                an account of the items omitted by [`OnErrorOmit`][pydantic.types.OnErrorOmit] during this
+                call. The receipt is populated as validation proceeds, so it can still be inspected if the
+                call raises a [`ValidationError`][pydantic_core.ValidationError].
 
         !!! note
             When using `TypeAdapter` with a Pydantic `dataclass`, the use of the `from_attributes`
@@ -407,16 +413,35 @@ class TypeAdapter(Generic[T]):
                 code='validate-by-alias-and-name-false',
             )
 
-        return self.validator.validate_python(
-            object,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            allow_partial=experimental_allow_partial,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
+        if omit_receipt is None:
+            return self.validator.validate_python(
+                object,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                allow_partial=experimental_allow_partial,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+
+        token = omit_receipt._begin()
+        succeeded = False
+        try:
+            result = self.validator.validate_python(
+                object,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                allow_partial=experimental_allow_partial,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+            succeeded = True
+            return result
+        finally:
+            omit_receipt._end(token, succeeded)
 
     def validate_json(
         self,
@@ -429,6 +454,7 @@ class TypeAdapter(Generic[T]):
         experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
         by_alias: bool | None = None,
         by_name: bool | None = None,
+        omit_receipt: OmitReceipt | None = None,
     ) -> T:
         """!!! abstract "Usage Documentation"
             [JSON Parsing](../concepts/json.md#json-parsing)
@@ -453,6 +479,10 @@ class TypeAdapter(Generic[T]):
                 * 'trailing-strings': Enable partial validation and allow trailing strings in the input.
             by_alias: Whether to use the field's alias when validating against the provided input data.
             by_name: Whether to use the field's name when validating against the provided input data.
+            omit_receipt: An optional [`OmitReceipt`][pydantic.omit_receipt.OmitReceipt] to populate with
+                an account of the items omitted by [`OnErrorOmit`][pydantic.types.OnErrorOmit] during this
+                call. The receipt is populated as validation proceeds, so it can still be inspected if the
+                call raises a [`ValidationError`][pydantic_core.ValidationError].
 
         Returns:
             The validated object.
@@ -463,15 +493,33 @@ class TypeAdapter(Generic[T]):
                 code='validate-by-alias-and-name-false',
             )
 
-        return self.validator.validate_json(
-            data,
-            strict=strict,
-            extra=extra,
-            context=context,
-            allow_partial=experimental_allow_partial,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
+        if omit_receipt is None:
+            return self.validator.validate_json(
+                data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                allow_partial=experimental_allow_partial,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+
+        token = omit_receipt._begin()
+        succeeded = False
+        try:
+            result = self.validator.validate_json(
+                data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                allow_partial=experimental_allow_partial,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+            succeeded = True
+            return result
+        finally:
+            omit_receipt._end(token, succeeded)
 
     def validate_strings(
         self,

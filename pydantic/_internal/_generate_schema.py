@@ -70,6 +70,7 @@ from ..errors import (
 )
 from ..functional_validators import AfterValidator, BeforeValidator, FieldValidatorModes, PlainValidator, WrapValidator
 from ..json_schema import JsonSchemaValue
+from ..omit_receipt import _wrap_omit_member_schema
 from ..version import version_short
 from ..warnings import (
     ArbitraryTypeWarning,
@@ -501,25 +502,34 @@ class GenerateSchema:
     # the following methods can be overridden but should be considered
     # unstable / private APIs
     def _list_schema(self, items_type: Any) -> CoreSchema:
-        return core_schema.list_schema(self.generate_schema(items_type))
+        return core_schema.list_schema(_wrap_omit_member_schema(self.generate_schema(items_type), 'item'))
 
     def _dict_schema(self, keys_type: Any, values_type: Any) -> CoreSchema:
-        return core_schema.dict_schema(self.generate_schema(keys_type), self.generate_schema(values_type))
+        return core_schema.dict_schema(
+            _wrap_omit_member_schema(self.generate_schema(keys_type), 'key'),
+            _wrap_omit_member_schema(self.generate_schema(values_type), 'value'),
+        )
 
     def _frozendict_schema(self, keys_type: Any, values_type: Any) -> CoreSchema:
-        return core_schema.frozendict_schema(self.generate_schema(keys_type), self.generate_schema(values_type))
+        return core_schema.frozendict_schema(
+            _wrap_omit_member_schema(self.generate_schema(keys_type), 'key'),
+            _wrap_omit_member_schema(self.generate_schema(values_type), 'value'),
+        )
 
     def _ordered_dict_schema(self, keys_type: Any, values_type: Any) -> CoreSchema:
-        return core_schema.ordered_dict_schema(self.generate_schema(keys_type), self.generate_schema(values_type))
+        return core_schema.ordered_dict_schema(
+            _wrap_omit_member_schema(self.generate_schema(keys_type), 'key'),
+            _wrap_omit_member_schema(self.generate_schema(values_type), 'value'),
+        )
 
     def _counter_schema(self, keys_type: Any) -> CoreSchema:
         return core_schema.counter_schema(self.generate_schema(keys_type), core_schema.int_schema())
 
     def _set_schema(self, items_type: Any) -> CoreSchema:
-        return core_schema.set_schema(self.generate_schema(items_type))
+        return core_schema.set_schema(_wrap_omit_member_schema(self.generate_schema(items_type), 'item'))
 
     def _frozenset_schema(self, items_type: Any) -> CoreSchema:
-        return core_schema.frozenset_schema(self.generate_schema(items_type))
+        return core_schema.frozenset_schema(_wrap_omit_member_schema(self.generate_schema(items_type), 'item'))
 
     def _enum_schema(self, enum_type: type[Enum]) -> CoreSchema:
         cases: list[Any] = list(enum_type.__members__.values())
@@ -682,7 +692,7 @@ class GenerateSchema:
         return schema
 
     def _deque_schema(self, items_type: Any) -> CoreSchema:
-        return core_schema.deque_schema(self.generate_schema(items_type))
+        return core_schema.deque_schema(_wrap_omit_member_schema(self.generate_schema(items_type), 'item'))
 
     def _mapping_schema(self, tp: Any, keys_type: Any, values_type: Any) -> CoreSchema:
         from ._validators import MAPPING_ORIGIN_MAP, defaultdict_validator, get_defaultdict_default_default_factory
@@ -698,7 +708,11 @@ class GenerateSchema:
             # with unsupported metadata).
             warnings.simplefilter('ignore', category=UnsupportedFieldAttributeWarning)
             values_schema = self.generate_schema(values_type)
-        dict_schema = core_schema.dict_schema(keys_schema, values_schema, strict=False)
+        dict_schema = core_schema.dict_schema(
+            _wrap_omit_member_schema(keys_schema, 'key'),
+            _wrap_omit_member_schema(values_schema, 'value'),
+            strict=False,
+        )
 
         if mapped_origin is dict:
             schema = dict_schema
@@ -1737,7 +1751,9 @@ class GenerateSchema:
                 return core_schema.tuple_schema([])
         elif params[-1] is Ellipsis:
             if len(params) == 2:
-                return core_schema.tuple_schema([self.generate_schema(params[0])], variadic_item_index=0)
+                return core_schema.tuple_schema(
+                    [_wrap_omit_member_schema(self.generate_schema(params[0]), 'item')], variadic_item_index=0
+                )
             else:
                 # TODO: something like https://github.com/pydantic/pydantic/issues/5952
                 raise ValueError('Variable tuples can only have one type')
@@ -1811,7 +1827,7 @@ class GenerateSchema:
         from ._serializers import serialize_sequence_via_list
 
         item_type_schema = self.generate_schema(items_type)
-        list_schema = core_schema.list_schema(item_type_schema)
+        list_schema = core_schema.list_schema(_wrap_omit_member_schema(item_type_schema, 'item'))
 
         json_schema = smart_deepcopy(list_schema)
         python_schema = core_schema.is_instance_schema(typing.Sequence, cls_repr='Sequence')
