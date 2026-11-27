@@ -46,6 +46,11 @@ class Parameters(RedBase, Mapping): # Mapping so that mytask(**Parameters(...)) 
                 for name, value in params.items()
             }
         self._params = params
+        # Cache for parameter values fetched while observing
+        # a condition. If not None, fetched values are stored
+        # here (and reused) so that a run allowed by a condition
+        # gets the same values the condition was evaluated with.
+        self._cond_params = None
 
     @classmethod
     def _from_signature(cls, __func:Callable, **kwargs) -> 'Parameters':
@@ -71,8 +76,15 @@ class Parameters(RedBase, Mapping): # Mapping so that mytask(**Parameters(...)) 
         item = __item
         if callable(item) and hasattr(item, "__rocketry__") and "param_name" in item.__rocketry__:
             item = item.__rocketry__['param_name']
+        cache = self._cond_params
+        if cache is not None and item in cache:
+            return cache[item]
         value = self._params[item]
-        return value if not isinstance(value, BaseArgument) else value.get_value(**kwargs)
+        if isinstance(value, BaseArgument):
+            value = value.get_value(**kwargs)
+        if cache is not None:
+            cache[item] = value
+        return value
 
     def __iter__(self):
         return iter(self._params)

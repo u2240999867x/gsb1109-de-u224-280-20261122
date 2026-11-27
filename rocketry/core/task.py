@@ -249,6 +249,7 @@ class Task(RedBase, BaseModel):
     _run_stack: List[TaskRun] = PrivateAttr(default_factory=list)
     _lock: Optional[Type] = PrivateAttr(default=None)
     _main_alive: bool = PrivateAttr(default=False)
+    _cond_params: Optional[dict] = PrivateAttr(default=None)
 
     _mark_running = False
 
@@ -482,6 +483,13 @@ class Task(RedBase, BaseModel):
             params = self.get_extra_params(params, execution=execution)
             direct_params = self._get_direct_params()
 
+            cond_params, self._cond_params = self._cond_params, None
+            if cond_params:
+                # Reuse the values fetched in the condition check
+                # that allowed this run instead of fetching anew
+                params = self._inject_cond_params(params, cond_params, is_session_params=True)
+                direct_params = self._inject_cond_params(direct_params, cond_params, is_session_params=False)
+
             task_run.run_id = self.get_run_id(task_run, params=params | direct_params)
 
             # Run the actual task
@@ -563,7 +571,17 @@ class Task(RedBase, BaseModel):
         if self.disabled:
             return False
 
-        cond = self.start_cond.observe(task=self)
+        session_params = self.session.parameters
+        session_params._cond_params = {}
+        try:
+            cond = self.start_cond.observe(task=self)
+        finally:
+            cond_params = session_params._cond_params
+            session_params._cond_params = None
+        if cond:
+            # The run allowed by this condition check must get
+            # the same parameter values the check was made with
+            self._cond_params = cond_params
 
         return cond
 
@@ -697,7 +715,7 @@ class Task(RedBase, BaseModel):
         except Exception:
             # Task crashed before actually running the execute.
             try:
-                self.log_failure()
+                self.log_failure(task_run)
             except TaskLoggingError as exc:
                 task_run.exception = exc
 
@@ -805,6 +823,22 @@ class Task(RedBase, BaseModel):
         if self.batches:
             direct_params.update(self.batches.pop(0))
         return direct_params
+
+    def _inject_cond_params(self, params:Parameters, cond_params:dict, is_session_params:bool) -> Parameters:
+        """Override parameters with the values fetched during
+        the start condition check that allowed this run.
+
+        Session level parameters are matched by their key while
+        task level parameters are matched by the session parameter
+        they point to (i.e. using ``Arg``)."""
+        from rocketry.args import Arg
+        params = params.copy()
+        for key, value in params.items():
+            if isinstance(value, Arg) and value.key in cond_params:
+                params[key] = cond_params[value.key]
+            elif is_session_params and key in cond_params:
+                params[key] = cond_params[key]
+        return params
 
     def get_task_params(self):
         "Get parameters passed to the task"
@@ -1300,6 +1334,7 @@ class Task(RedBase, BaseModel):
         priv_attrs['_process'] = None
         priv_attrs['_thread'] = None
         priv_attrs['_run_stack'] = None
+        priv_attrs['_cond_params'] = None
 
         # We also get rid of the conditions as if there is a task
         # containing an attr that cannot be pickled (like FuncTask

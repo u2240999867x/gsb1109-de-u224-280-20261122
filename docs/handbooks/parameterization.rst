@@ -172,6 +172,17 @@ To use in custom parameter pairs:
         assert arg == "Hello world"
         return "Hello world 2"
 
+.. note::
+
+    If a start condition reads a session parameter, the
+    value it fetched is reused by the run the condition
+    allowed. In other words, the task gets the parameter
+    values the passing condition check was evaluated with,
+    even if the parameter is dynamic (ie. a ``FuncArg``)
+    and its value has changed in between. If the condition
+    does not allow the task to start, the fetched values
+    are discarded and the next check fetches them anew.
+
 .. warning::
 
     The arguments may end up in infinite recursion if 
