@@ -49,3 +49,11 @@ from .deprecated import (
 )
 from .__version__ import __author__, __version__
 from .internal.garbagecollector import free_resources
+from .exceptions import (
+    DownloadError,
+    DownloadInterrupted,
+    DownloadResponseMismatch,
+    IncompleteDownload,
+    StaleDownload,
+)
+from .plugins.sources.resume import DownloadProgress, DownloadReport

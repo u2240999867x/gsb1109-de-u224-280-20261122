@@ -33,5 +33,7 @@ INITIALIZERS = "initializers"
 BATCH_SIZE = "batch_size"
 URL = "url"
 SHEET_STREAM = "sheet_stream"
+RESUMABLE = "resumable"
+DOWNLOAD_PROGRESS = "download_progress"
 
 INPUT = "input"

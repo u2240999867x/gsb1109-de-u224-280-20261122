@@ -40,6 +40,7 @@ def get_sheet(**keywords):
             sheet_params[field] = keywords.pop(field)
     named_content = sources.get_sheet_stream(**keywords)
     sheet = Sheet(named_content.payload, named_content.name, **sheet_params)
+    _attach_download(sheet, named_content)
     return sheet
 
 
@@ -54,6 +55,7 @@ def get_book(**keywords):
         filename=book_stream.filename,
         path=book_stream.path,
     )
+    _attach_download(book, book_stream)
     return book
 
 
@@ -265,6 +267,14 @@ def get_io_type(file_type):
     if io_type is None:
         io_type = "string"
     return io_type
+
+
+def _attach_download(target, stream):
+    progress = getattr(stream, "download_progress", None)
+    if progress is None:
+        return
+    target.download_progress = progress
+    target.download_report = getattr(stream, "download_report", None)
 
 
 def _split_keywords(**keywords):

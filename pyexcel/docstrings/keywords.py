@@ -124,6 +124,26 @@ skip_hidden_sheets:
 
 """
 
+RESUMABLE_PARAMS = """
+resumable :
+    defaults to False. When True, the url download participates in
+    resumable collection. Each call still starts from the given url and
+    follows plain GET routing responses; Range and If-Range headers are
+    only sent to the resolved file address when progress exists. Calls
+    that do not receive the whole file raise a DownloadError and leave
+    the next byte on the shared download_progress. Pass the same
+    download_progress to share one collection across get_sheet and
+    get_book calls.
+
+download_progress :
+    a DownloadProgress instance holding the bytes already received, the
+    strong ETag, the announced total length and the resume offset. When
+    resumable is True without this parameter, a new collection is
+    created. The returned sheet or book exposes the same instance as
+    download_progress, together with its latest download_report.
+
+"""
+
 FILE_PARAMS = """
 file_name :
     a file with supported file extension
@@ -215,6 +235,7 @@ sheet_name :
 """
     + PAGINATION_PARAMS
     + OPTIONAL_PARAMS
+    + RESUMABLE_PARAMS
     + CSV_PARAMS
     + XLRD_PARAMS
 )
@@ -345,6 +366,7 @@ url :
 """
     + OPTIONAL_BOOK_PARAMS
     + OPTIONAL_PARAMS
+    + RESUMABLE_PARAMS
     + CSV_PARAMS
 )
 

@@ -24,8 +24,11 @@ def get_sheet_stream(**keywords):
     sheets = a_source.get_data()
     if sheets:
         sheet_name, data = _one_sheet_tuple(sheets.items())
-        return SheetStream(sheet_name, data)
-    return SheetStream(DEFAULT_NO_DATA, [[]])
+        sheet_stream = SheetStream(sheet_name, data)
+    else:
+        sheet_stream = SheetStream(DEFAULT_NO_DATA, [[]])
+    _attach_download(sheet_stream, a_source)
+    return sheet_stream
 
 
 def get_book_stream(**keywords):
@@ -38,7 +41,20 @@ def get_book_stream(**keywords):
     a_source = SOURCE.get_book_source(**keywords)
     filename, path = a_source.get_source_info()
     sheets = a_source.get_data()
-    return BookStream(sheets, filename=filename, path=path)
+    book_stream = BookStream(sheets, filename=filename, path=path)
+    _attach_download(book_stream, a_source)
+    return book_stream
+
+
+def _attach_download(stream, a_source):
+    get_progress = getattr(a_source, "get_download_progress", None)
+    if get_progress is None:
+        return
+    progress = get_progress()
+    if progress is None:
+        return
+    stream.download_progress = progress
+    stream.download_report = a_source.get_download_report()
 
 
 def save_sheet(sheet, **keywords):
