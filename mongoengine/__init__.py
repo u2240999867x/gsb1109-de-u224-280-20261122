@@ -1,5 +1,6 @@
 # Import submodules so that we can expose their __all__
 from mongoengine import (
+    approval,
     connection,
     document,
     errors,
@@ -12,6 +13,7 @@ from mongoengine import (
 # mongoengine, e.g. instead of `from mongoengine.connection import connect`,
 # users can simply use `from mongoengine import connect`, or even
 # `from mongoengine import *` and then `connect('testdb')`.
+from mongoengine.approval import *  # noqa: F401
 from mongoengine.connection import *  # noqa: F401
 from mongoengine.document import *  # noqa: F401
 from mongoengine.errors import *  # noqa: F401
@@ -26,6 +28,7 @@ __all__ = (
     + list(queryset.__all__)
     + list(signals.__all__)
     + list(errors.__all__)
+    + list(approval.__all__)
 )
 
 

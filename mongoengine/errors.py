@@ -14,6 +14,12 @@ __all__ = (
     "ValidationError",
     "SaveConditionError",
     "DeprecatedError",
+    "BatchApprovalError",
+    "ApprovalConflict",
+    "ApprovalIDConflict",
+    "ApprovalInProgress",
+    "StalePreviewError",
+    "BatchWriteError",
 )
 
 
@@ -163,3 +169,42 @@ class DeprecatedError(MongoEngineException):
     """Raise when a user uses a feature that has been Deprecated"""
 
     pass
+
+
+class BatchApprovalError(OperationError):
+    """Base error for batch preview and approval operations."""
+
+    pass
+
+
+class ApprovalConflict(BatchApprovalError):
+    """Raised when an approval id was already used with a different manifest."""
+
+    pass
+
+
+class ApprovalIDConflict(ApprovalConflict):
+    """Raised when an approval id was already used with a different manifest."""
+
+    pass
+
+
+class ApprovalInProgress(BatchApprovalError):
+    """Raised when another run currently owns the approval id."""
+
+    pass
+
+
+class StalePreviewError(BatchApprovalError):
+    """Raised when an approval no longer matches the preview it was based on."""
+
+    pass
+
+
+class BatchWriteError(BatchApprovalError):
+    """Raised when writing one of the approved rows failed."""
+
+    def __init__(self, message="", line=None, errors=None):
+        super().__init__(message)
+        self.line = line
+        self.errors = errors or {}

@@ -49,6 +49,22 @@ Context Managers
 .. autoclass:: mongoengine.context_managers.no_dereference
 .. autoclass:: mongoengine.context_managers.query_counter
 
+Batch Preview and Approval
+==========================
+
+.. autofunction:: mongoengine.approval.preview_batch
+.. autofunction:: mongoengine.approval.approve_batch
+.. autofunction:: mongoengine.approval.get_approval_receipt
+.. autofunction:: mongoengine.approval.redeliver_receipt
+.. autoclass:: mongoengine.approval.BatchPreview
+   :members:
+.. autoclass:: mongoengine.approval.ApprovalReceipt
+   :members:
+.. autoclass:: mongoengine.approval.PreviewRow
+   :members:
+.. autoclass:: mongoengine.approval.ReceiptRow
+   :members:
+
 Querying
 ========
 

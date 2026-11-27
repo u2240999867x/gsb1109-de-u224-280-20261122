@@ -207,6 +207,42 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         return get_db(cls._meta.get("db_alias", DEFAULT_CONNECTION_NAME))
 
     @classmethod
+    def preview_batch(cls, *args, **kwargs):
+        """Preview an inbound batch that writes documents of this model."""
+        from mongoengine.approval import preview_batch
+
+        kwargs.setdefault("default_document", cls)
+        return preview_batch(*args, **kwargs)
+
+    @classmethod
+    def approve_batch(cls, *args, **kwargs):
+        """Approve an inbound batch that writes documents of this model."""
+        from mongoengine.approval import approve_batch
+
+        kwargs.setdefault("default_document", cls)
+        return approve_batch(*args, **kwargs)
+
+    @classmethod
+    def batch_preview(cls, *args, **kwargs):
+        from mongoengine.approval import preview_batch
+
+        kwargs.setdefault("default_document", cls)
+        return preview_batch(*args, **kwargs)
+
+    @classmethod
+    def batch_approve(cls, *args, **kwargs):
+        from mongoengine.approval import approve_batch
+
+        kwargs.setdefault("default_document", cls)
+        return approve_batch(*args, **kwargs)
+
+    @classmethod
+    def get_approval_receipt(cls, approval_id, **kwargs):
+        from mongoengine.approval import get_approval_receipt
+
+        return get_approval_receipt(approval_id, **kwargs)
+
+    @classmethod
     def _disconnect(cls):
         """Detach the Document class from the (cached) database collection"""
         cls._collection = None

@@ -2113,13 +2113,24 @@ class SequenceField(BaseField):
         )
         super().__init__(*args, **kwargs)
 
+    def get_db_alias(self):
+        """Return the alias of the database holding this field's counter.
+
+        This is the field's ``db_alias`` (the default connection when it was
+        not set).  Two models whose documents use different ``meta.db_alias``
+        values therefore share one counter when their ``SequenceField`` leaves
+        ``db_alias`` unset, while a field with its own ``db_alias`` keeps its
+        counter in that database.
+        """
+        return self.db_alias or DEFAULT_CONNECTION_NAME
+
     def generate(self):
         """
         Generate and Increment the counter
         """
         sequence_name = self.get_sequence_name()
         sequence_id = f"{sequence_name}.{self.name}"
-        collection = get_db(alias=self.db_alias)[self.collection_name]
+        collection = get_db(alias=self.get_db_alias())[self.collection_name]
 
         counter = collection.find_one_and_update(
             filter={"_id": sequence_id},
@@ -2134,7 +2145,7 @@ class SequenceField(BaseField):
         """Helper method to set the next sequence value"""
         sequence_name = self.get_sequence_name()
         sequence_id = f"{sequence_name}.{self.name}"
-        collection = get_db(alias=self.db_alias)[self.collection_name]
+        collection = get_db(alias=self.get_db_alias())[self.collection_name]
         counter = collection.find_one_and_update(
             filter={"_id": sequence_id},
             update={"$set": {"next": value}},
@@ -2143,22 +2154,6 @@ class SequenceField(BaseField):
             session=_get_session(),
         )
         return self.value_decorator(counter["next"])
-
-    def get_next_value(self):
-        """Helper method to get the next value for previewing.
-
-        .. warning:: There is no guarantee this will be the next value
-        as it is only fixed on set.
-        """
-        sequence_name = self.get_sequence_name()
-        sequence_id = f"{sequence_name}.{self.name}"
-        collection = get_db(alias=self.db_alias)[self.collection_name]
-        data = collection.find_one({"_id": sequence_id}, session=_get_session())
-
-        if data:
-            return self.value_decorator(data["next"] + 1)
-
-        return self.value_decorator(1)
 
     def get_sequence_name(self):
         if self.sequence_name:
@@ -2172,6 +2167,29 @@ class SequenceField(BaseField):
                 .strip("_")
                 .lower()
             )
+
+    def get_sequence_id(self):
+        """Return the ``_id`` of this field's document in the counter collection."""
+        return f"{self.get_sequence_name()}.{self.name}"
+
+    def get_counter_collection(self):
+        """Return the collection holding this field's counter."""
+        return get_db(alias=self.get_db_alias())[self.collection_name]
+
+    def get_next_value(self, session=None):
+        """Helper method to get the next value for previewing.
+
+        .. warning:: There is no guarantee this will be the next value
+        as it is only fixed on set.
+        """
+        data = self.get_counter_collection().find_one(
+            {"_id": self.get_sequence_id()}, session=session
+        )
+
+        if data:
+            return self.value_decorator(data["next"] + 1)
+
+        return self.value_decorator(1)
 
     def __get__(self, instance, owner):
         value = super().__get__(instance, owner)

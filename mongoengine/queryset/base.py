@@ -302,6 +302,20 @@ class BaseQuerySet:
             result = None
         return result
 
+    def preview_batch(self, *args, **kwargs):
+        """Preview an inbound batch for this queryset's document model."""
+        from mongoengine.approval import preview_batch
+
+        kwargs.setdefault("default_document", self._document)
+        return preview_batch(*args, **kwargs)
+
+    def approve_batch(self, *args, **kwargs):
+        """Approve an inbound batch for this queryset's document model."""
+        from mongoengine.approval import approve_batch
+
+        kwargs.setdefault("default_document", self._document)
+        return approve_batch(*args, **kwargs)
+
     def insert(
         self, doc_or_docs, load_bulk=True, write_concern=None, signal_kwargs=None
     ):

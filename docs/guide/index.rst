@@ -9,6 +9,7 @@ User Guide
    connecting
    defining-documents
    document-instances
+   batch-approval
    querying
    validation
    gridfs

@@ -7,6 +7,13 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add batch preview and approval for :class:`~mongoengine.fields.SequenceField`
+  documents.  ``mongoengine.approval.preview_batch`` simulates an ordered
+  manifest without writing (numbers, bins and rejected rows), and
+  ``approve_batch`` writes accepted documents, counter increments and an
+  idempotent receipt together, rolling the whole batch back on failure.
+- ``SequenceField`` learned ``get_db_alias()``, ``get_sequence_id()`` and
+  ``get_counter_collection()`` helpers.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0
