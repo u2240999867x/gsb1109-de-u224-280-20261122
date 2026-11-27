@@ -25,6 +25,7 @@ from pystac.serialization import (
     identify_stac_object_type,
     migrate_to_latest,
 )
+from pystac.shard_summaries import ShardSummaries
 from pystac.summaries import Summaries
 from pystac.utils import (
     datetime_to_str,
@@ -469,6 +470,9 @@ class Collection(Catalog, Assets):
         providers : Optional list of providers of this Collection.
         summaries : An optional map of property summaries,
             either a set of values or statistics such as a range.
+        shard_summaries : Optional :class:`~pystac.ShardSummaries` with
+            per-provider, per-partition cloud cover shard data used to decide
+            whether a device can be skipped without reading its Items.
         extra_fields : Extra fields that are part of the top-level
             JSON properties of the Collection.
         assets : A dictionary mapping string keys to :class:`~pystac.Asset` objects. All
@@ -506,6 +510,10 @@ class Collection(Catalog, Assets):
     """A map of property summaries, either a set of values or statistics such as a
     range."""
 
+    shard_summaries: ShardSummaries
+    """Optional per-provider, per-partition cloud cover shard summaries. Used to
+    decide whether a device can be excluded from a query without reading Items."""
+
     links: list[Link]
     """A list of :class:`~pystac.Link` objects representing all links associated with
     this Collection."""
@@ -533,6 +541,7 @@ class Collection(Catalog, Assets):
         keywords: list[str] | None = None,
         providers: list[Provider] | None = None,
         summaries: Summaries | None = None,
+        shard_summaries: ShardSummaries | None = None,
         assets: dict[str, Asset] | None = None,
         strategy: HrefLayoutStrategy | None = None,
     ):
@@ -553,6 +562,7 @@ class Collection(Catalog, Assets):
         self.keywords = keywords
         self.providers = providers
         self.summaries = summaries or Summaries.empty()
+        self.shard_summaries = shard_summaries or ShardSummaries()
         self._item_assets: _ItemAssets | None = None
 
         self.assets = {}
@@ -590,6 +600,8 @@ class Collection(Catalog, Assets):
             d["providers"] = list(map(lambda x: x.to_dict(), self.providers))
         if not self.summaries.is_empty():
             d["summaries"] = self.summaries.to_dict()
+        if not self.shard_summaries.is_empty():
+            d["shard_summaries"] = self.shard_summaries.to_dict()
         if any(self.assets):
             d["assets"] = {k: v.to_dict() for k, v in self.assets.items()}
 
@@ -609,6 +621,7 @@ class Collection(Catalog, Assets):
             keywords=self.keywords.copy() if self.keywords is not None else None,
             providers=deepcopy(self.providers),
             summaries=self.summaries.clone(),
+            shard_summaries=self.shard_summaries.clone(),
             assets={k: asset.clone() for k, asset in self.assets.items()},
         )
 
@@ -674,6 +687,10 @@ class Collection(Catalog, Assets):
         if summaries is not None:
             summaries = Summaries(summaries)
 
+        shard_summaries = d.pop("shard_summaries", None)
+        if shard_summaries is not None:
+            shard_summaries = ShardSummaries.from_dict(shard_summaries)
+
         assets = d.pop("assets", None)
         if assets:
             assets = {k: Asset.from_dict(v) for k, v in assets.items()}
@@ -692,6 +709,7 @@ class Collection(Catalog, Assets):
             keywords=keywords,
             providers=providers,
             summaries=summaries,
+            shard_summaries=shard_summaries,
             href=href,
             catalog_type=catalog_type,
             assets=assets,

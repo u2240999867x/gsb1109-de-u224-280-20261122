@@ -34,6 +34,12 @@ __all__ = [
     "SpatialExtent",
     "TemporalExtent",
     "Summaries",
+    "ShardSummaries",
+    "FullShardSummary",
+    "ShardCorrection",
+    "ShardCorrectionEntry",
+    "UNKNOWN",
+    "NOT_APPLICABLE",
     "CommonMetadata",
     "RangeSummary",
     "Item",
@@ -84,6 +90,14 @@ from pystac.collection import (
 )
 from pystac.common_metadata import CommonMetadata
 from pystac.summaries import RangeSummary, Summaries
+from pystac.shard_summaries import (
+    FullShardSummary,
+    NOT_APPLICABLE,
+    ShardCorrection,
+    ShardCorrectionEntry,
+    ShardSummaries,
+    UNKNOWN,
+)
 from pystac.asset import Asset
 from pystac.item import Item
 from pystac.item_assets import ItemAssetDefinition

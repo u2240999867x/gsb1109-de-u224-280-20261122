@@ -60,6 +60,9 @@ These are representations of :stac-spec:`Collections
   field.
 * :class:`pystac.Summaries`: Class for working with various types of
   :stac-spec:`CollectionSummaries <collection-spec/collection-spec.md#summaries>`
+* :class:`pystac.ShardSummaries`: Optional per-provider, per-partition cloud
+  cover shard summaries attached to a Collection, used to decide whether a
+  device can be excluded from a query without reading its Items.
 * :class:`pystac.ItemCollection`: Represents a GeoJSON FeatureCollection in which all
   Features are STAC Items.
 

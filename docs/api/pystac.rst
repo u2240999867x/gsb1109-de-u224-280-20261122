@@ -105,6 +105,13 @@ Summaries
    :members:
    :undoc-members:
 
+ShardSummaries
+--------------
+
+.. autoclass:: pystac.ShardSummaries
+   :members:
+   :undoc-members:
+
 Item
 ----
 
