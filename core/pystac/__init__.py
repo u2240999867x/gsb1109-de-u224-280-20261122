@@ -39,6 +39,11 @@ __all__ = [
     "Item",
     "Asset",
     "ItemAssetDefinition",
+    "AssetTemplateRegistry",
+    "TrackedAsset",
+    "ingest_asset",
+    "enable_asset_tracking",
+    "unregistered_assets",
     "ItemCollection",
     "Provider",
     "ProviderRole",
@@ -87,6 +92,13 @@ from pystac.summaries import RangeSummary, Summaries
 from pystac.asset import Asset
 from pystac.item import Item
 from pystac.item_assets import ItemAssetDefinition
+from pystac.asset_templates import (
+    AssetTemplateRegistry,
+    TrackedAsset,
+    enable_asset_tracking,
+    ingest_asset,
+    unregistered_assets,
+)
 from pystac.item_collection import ItemCollection
 from pystac.provider import ProviderRole, Provider
 from pystac.utils import HREF
