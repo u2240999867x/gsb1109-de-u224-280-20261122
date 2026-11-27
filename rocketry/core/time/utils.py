@@ -18,7 +18,11 @@ def get_period_span(period:'TimePeriod', session=None) -> Tuple[datetime.datetim
     if session is None:
         now = datetime.datetime.fromtimestamp(time.time())
     else:
-        now = session._get_datetime_now()
+        # Note: the span is formed using the actual current time.
+        # Log records written during the ongoing scheduler cycle
+        # (after the cycle's business time was read) are still
+        # considered to be arrived and are not excluded.
+        now = session._format_timestamp(session.get_time())
 
     if hasattr(period, "use_reference"):
         # Period requires reference date

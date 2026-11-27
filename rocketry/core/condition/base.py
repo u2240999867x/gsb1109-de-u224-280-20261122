@@ -337,7 +337,7 @@ class BaseComparable(BaseCondition):
 
     def _set_comparison(self, key, val):
         obj = copy(self)
-        obj._comps[key] = val
+        obj._comps = {**self._comps, key: val}
         return obj
 
     @classmethod

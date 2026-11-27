@@ -128,3 +128,21 @@ def test_logic():
     assert Not(false) != false
 
     assert Not(false) != "invalid"
+
+
+def test_comparison_does_not_mutate():
+    "Comparing a condition must not alter the original condition"
+    from rocketry.conditions import TaskSucceeded
+
+    cond = TaskSucceeded(task="mytask")
+    cond_eq = cond == 1
+    cond_ge = cond >= 2
+
+    assert cond._comps == {}
+    assert cond_eq._comps == {"__eq__": 1}
+    assert cond_ge._comps == {"__ge__": 2}
+
+    # Chained comparisons on the same object are independent
+    cond_ne = cond != 3
+    assert cond_ne._comps == {"__ne__": 3}
+    assert cond_eq._comps == {"__eq__": 1}

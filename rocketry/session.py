@@ -221,6 +221,7 @@ class Session(RedBase):
         self._cond_parsers = self._cls_cond_parsers.copy()
         self._cond_cache: Dict = {} # Cached by CondParser to speed up expensive conditions
         self._cond_states = {} # Used by FuncConds to relay condiiton states to conditions
+        self._cycle_now = None # Business time frozen for the ongoing scheduler cycle
         if delete_existing_loggers:
             self.delete_task_loggers()
 
@@ -612,6 +613,12 @@ class Session(RedBase):
         return time.time()
 
     def _get_datetime_now(self):
+        if self._cycle_now is not None:
+            # A scheduler cycle is ongoing: the business time
+            # was read once at the beginning of the cycle and
+            # all condition checks in the cycle use this same
+            # reference time.
+            return self._cycle_now
         return self._format_timestamp(self.get_time())
 
     def _format_timestamp(self, dt:float):

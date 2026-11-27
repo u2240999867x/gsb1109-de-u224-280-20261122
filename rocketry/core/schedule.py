@@ -166,27 +166,35 @@ class Scheduler(RedBase):
         tasks = self.tasks
         self.logger.debug(f"Beginning cycle with {len(tasks)} tasks...", extra={"action": "run"})
 
-        # Running hooks
-        hooker = _Hooker(self.session.hooks.scheduler_cycle)
-        hooker.prerun(scheduler=self)
+        # Read the business time once for this cycle. All the
+        # condition checks in this cycle use this same reference
+        # time so that tasks cannot draw contradictory conclusions
+        # from a clock that moves mid-cycle.
+        self.session._cycle_now = self.session._get_datetime_now()
+        try:
+            # Running hooks
+            hooker = _Hooker(self.session.hooks.scheduler_cycle)
+            hooker.prerun(scheduler=self)
 
-        for task in tasks:
-            with task.lock:
-                self.handle_logs()
-                task._clean_run_stack()
-                if task.on_startup or task.on_shutdown:
-                    # Startup or shutdown tasks are not run in main sequence
-                    pass
-                elif self._flag_enabled.is_set() and self.is_task_runnable(task):
-                    # Run the actual task
-                    await self.run_task(task)
-                    # Reset force_run as a run has forced
-                    task.force_run = False
-                await task._check_termination()
-        self.handle_logs()
-        self.check_thread_errors()
-        # Running hooks
-        hooker.postrun()
+            for task in tasks:
+                with task.lock:
+                    self.handle_logs()
+                    task._clean_run_stack()
+                    if task.on_startup or task.on_shutdown:
+                        # Startup or shutdown tasks are not run in main sequence
+                        pass
+                    elif self._flag_enabled.is_set() and self.is_task_runnable(task):
+                        # Run the actual task
+                        await self.run_task(task)
+                        # Reset force_run as a run has forced
+                        task.force_run = False
+                    await task._check_termination()
+            self.handle_logs()
+            self.check_thread_errors()
+            # Running hooks
+            hooker.postrun()
+        finally:
+            self.session._cycle_now = None
 
         self.n_cycles += 1
 
