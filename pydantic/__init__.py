@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .functional_validators import (
         AfterValidator,
         BeforeValidator,
+        DeclarationStore,
         InstanceOf,
         ModelWrapValidatorHandler,
         PlainValidator,
@@ -73,6 +74,7 @@ __all__ = (
     'WrapValidator',
     'SkipValidation',
     'ValidateAs',
+    'DeclarationStore',
     'InstanceOf',
     'ModelWrapValidatorHandler',
     # JSON Schema
@@ -234,6 +236,7 @@ _dynamic_imports: 'dict[str, tuple[str, str]]' = {
     'SkipValidation': (__spec__.parent, '.functional_validators'),
     'InstanceOf': (__spec__.parent, '.functional_validators'),
     'ValidateAs': (__spec__.parent, '.functional_validators'),
+    'DeclarationStore': (__spec__.parent, '.functional_validators'),
     'ModelWrapValidatorHandler': (__spec__.parent, '.functional_validators'),
     # JSON Schema
     'WithJsonSchema': (__spec__.parent, '.json_schema'),

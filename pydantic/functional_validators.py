@@ -16,6 +16,9 @@ from .annotated_handlers import GetCoreSchemaHandler
 from .errors import PydanticUserError
 from .warnings import ArbitraryTypeWarning
 
+if TYPE_CHECKING:
+    from pydantic_core.core_schema import SerializationCallable, SerializationInfo, ValidationInfo
+
 _inspect_validator = _decorators.inspect_validator
 
 
@@ -851,6 +854,116 @@ else:
 _FromTypeT = TypeVar('_FromTypeT')
 
 
+class DeclarationStore:
+    """A per-validation store collecting the declarations accepted by a round-trip [`ValidateAs`][pydantic.functional_validators.ValidateAs].
+
+    Pass an instance as the validation `context`. During validation, every accepted
+    `from_type` value (the *declaration*) is recorded under the key most recently
+    reported with [`track_key`][pydantic.functional_validators.DeclarationStore.track_key],
+    so that the accepted declarations can later be exported again through the same
+    type adapter (see [`view`][pydantic.functional_validators.DeclarationStore.view]).
+
+    Example:
+        ```python {lint="skip"}
+        from typing import Annotated
+
+        from pydantic import (
+            BaseModel,
+            BeforeValidator,
+            DeclarationStore,
+            TypeAdapter,
+            ValidateAs,
+            ValidationInfo,
+        )
+
+        class Declaration(BaseModel):
+            n: int
+
+        class Quantity:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+        def clean_key(key: str, info: ValidationInfo) -> str:
+            cleaned = key.lower()
+            if isinstance(info.context, DeclarationStore):
+                info.context.track_key(cleaned)
+            return cleaned
+
+        ta = TypeAdapter(
+            dict[
+                Annotated[str, BeforeValidator(clean_key)],
+                Annotated[Quantity, ValidateAs(Declaration, lambda d: Quantity(d.n), round_trip=True)],
+            ]
+        )
+
+        store = DeclarationStore()
+        result = ta.validate_python({'A': {'n': 1}}, context=store)
+        print(ta.dump_python(store.view()))
+        #> {'a': {'n': 1}}
+        ```
+    """
+
+    def __init__(self) -> None:
+        self._declarations: dict[Any, Any] = {}
+        self._current_key: Any = None
+
+    def track_key(self, key: Any) -> None:
+        """Record the key of the mapping entry currently being validated.
+
+        This is meant to be called from a validator on the mapping's key type, so that
+        declarations can be associated with the (cleaned) key they were declared under:
+
+        ```python {lint="skip"}
+        def clean_key(key: str, info: ValidationInfo) -> str:
+            cleaned = key.lower()
+            if isinstance(info.context, DeclarationStore):
+                info.context.track_key(cleaned)
+            return cleaned
+        ```
+
+        Args:
+            key: The key the next accepted declaration should be recorded under.
+        """
+        self._current_key = key
+
+    def record(self, declaration: Any) -> None:
+        """Record an accepted declaration under the current key.
+
+        If several declarations are recorded under the same key, the last one wins,
+        mirroring the behavior of the surrounding mapping validation.
+        """
+        self._declarations[self._current_key] = declaration
+
+    def view(self, *keys: Any) -> dict[Any, Any]:
+        """Return the accepted declarations as a dict, optionally restricted to `keys`.
+
+        Args:
+            keys: If provided, only the declarations recorded under these keys are returned.
+
+        Raises:
+            KeyError: If one of the selected keys has no recorded declaration.
+        """
+        if not keys:
+            return dict(self._declarations)
+        selected: dict[Any, Any] = {}
+        for key in keys:
+            try:
+                selected[key] = self._declarations[key]
+            except KeyError:
+                raise KeyError(f'No declaration recorded for key {key!r}.') from None
+        return selected
+
+
+def _is_from_type_instance(value: Any, from_type: Any) -> bool:
+    """Return whether `value` is an instance of `from_type`, unwrapping `Annotated` forms."""
+    while hasattr(from_type, '__metadata__'):
+        from_type = from_type.__origin__
+    try:
+        return isinstance(value, from_type)
+    except TypeError:
+        return False
+
+
 class ValidateAs:
     """A helper class to validate a custom type from a type that is natively supported by Pydantic.
 
@@ -858,6 +971,12 @@ class ValidateAs:
         from_type: The type natively supported by Pydantic to use to perform validation.
         instantiation_hook: A callable taking the validated type as an argument, and returning
             the populated custom type.
+        round_trip: Whether to enable the round-trip declaration behavior. When enabled, the
+            `from_type` values accepted during validation (the *declarations*) are recorded in a
+            [`DeclarationStore`][pydantic.functional_validators.DeclarationStore] passed as the
+            validation `context`, and serialization of such declarations emits the accepted
+            `from_type` form again (instead of the custom type's serialization), so that the
+            output can be validated back by the same type adapter.
 
     Example:
         ```python {lint="skip"}
@@ -885,19 +1004,34 @@ class ValidateAs:
         ```
     """
 
-    def __init__(self, from_type: TypeForm[_FromTypeT], /, instantiation_hook: Callable[[_FromTypeT], Any]) -> None:
+    def __init__(
+        self,
+        from_type: TypeForm[_FromTypeT],
+        /,
+        instantiation_hook: Callable[[_FromTypeT], Any],
+        *,
+        round_trip: bool = False,
+    ) -> None:
         self.from_type = from_type
         self.instantiation_hook = instantiation_hook
+        self.round_trip = round_trip
+        self._declaration_adapter: Any = None
 
     def __get_pydantic_core_schema__(self, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
         # Lazy import to avoid cycle:
         from pydantic._internal._generate_schema import GENERATE_SCHEMA_ERRORS
 
         from_type_schema = handler(self.from_type)
-        schema = core_schema.no_info_after_validator_function(
-            self.instantiation_hook,
-            schema=from_type_schema,
-        )
+        if self.round_trip:
+            schema = core_schema.with_info_after_validator_function(
+                self._instantiate_and_record,
+                schema=from_type_schema,
+            )
+        else:
+            schema = core_schema.no_info_after_validator_function(
+                self.instantiation_hook,
+                schema=from_type_schema,
+            )
         try:
             ser_schema = handler(source)
         except GENERATE_SCHEMA_ERRORS:
@@ -907,7 +1041,28 @@ class ValidateAs:
         # wrap serializer workaround below can be replaced with
         # `schema['serialization'] = _core_utils.as_ser_schema(ser_schema)`.
         # The same workaround is used in other parts of the code base, so grep for similar cases when fixing:
-        schema['serialization'] = core_schema.wrap_serializer_function_ser_schema(
-            function=lambda v, h: h(v), schema=ser_schema
-        )
+        if self.round_trip:
+            schema['serialization'] = core_schema.wrap_serializer_function_ser_schema(
+                function=self._serialize_round_trip, schema=ser_schema, info_arg=True
+            )
+        else:
+            schema['serialization'] = core_schema.wrap_serializer_function_ser_schema(
+                function=lambda v, h: h(v), schema=ser_schema
+            )
         return schema
+
+    def _instantiate_and_record(self, value: _FromTypeT, info: ValidationInfo) -> Any:
+        instance = self.instantiation_hook(value)
+        if isinstance(info.context, DeclarationStore):
+            info.context.record(value)
+        return instance
+
+    def _serialize_round_trip(self, value: Any, handler: SerializationCallable, info: SerializationInfo) -> Any:
+        if _is_from_type_instance(value, self.from_type):
+            if self._declaration_adapter is None:
+                # Lazy import to avoid cycle:
+                from pydantic import TypeAdapter
+
+                self._declaration_adapter = TypeAdapter(self.from_type)
+            return self._declaration_adapter.dump_python(value, mode=info.mode, by_alias=info.by_alias)
+        return handler(value)

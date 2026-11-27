@@ -833,6 +833,35 @@ Pydantic provides a few special utilities that can be used to customize validati
     #> MyCls(a=1)
     ```
 
+    With `round_trip=True`, the `from_type` values accepted during validation (the *declarations*)
+    can be recorded in a [`DeclarationStore`][pydantic.functional_validators.DeclarationStore] passed
+    as the validation `context`, and exported again through the same type adapter, so that the output
+    can be validated back:
+
+    ```python {lint="skip"}
+    from typing import Annotated
+
+    from pydantic import BaseModel, DeclarationStore, TypeAdapter, ValidateAs
+
+    class MyCls:
+        def __init__(self, a: int) -> None:
+            self.a = a
+
+    class ValModel(BaseModel):
+        a: int
+
+
+    ta = TypeAdapter(
+        Annotated[MyCls, ValidateAs(ValModel, lambda v: MyCls(a=v.a), round_trip=True)]
+    )
+
+    store = DeclarationStore()
+    ta.validate_python({'a': 1}, context=store)
+
+    print(ta.dump_python(store.view()[None]))
+    #> {'a': 1}
+    ```
+
 * [`PydanticUseDefault`][pydantic_core.PydanticUseDefault] can be used to notify Pydantic that the default value
   should be used.
 
