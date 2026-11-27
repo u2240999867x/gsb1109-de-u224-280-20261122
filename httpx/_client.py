@@ -26,6 +26,7 @@ from ._exceptions import (
     TooManyRedirects,
     request_context,
 )
+from ._exports import AsyncExportManager
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
@@ -50,6 +51,9 @@ from ._utils import URLPattern, get_environment_proxies
 
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
+    from pathlib import Path  # pragma: no cover
+
+    from ._exports import ExportResult  # pragma: no cover
 
 __all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
 
@@ -1428,6 +1432,40 @@ class AsyncClient(BaseClient):
                 {URLPattern(key): transport for key, transport in mounts.items()}
             )
         self._mounts = dict(sorted(self._mounts.items()))
+
+        # Lazily created so that clients which do not track exports pay no
+        # cost, but shared between every caller of this client so that
+        # overlapping progress requests for one export converge on one state.
+        self._export_manager: AsyncExportManager | None = None
+
+    def export_manager(self) -> AsyncExportManager:
+        """
+        Return the `AsyncExportManager` bound to this client.
+
+        The same instance is returned on every call, so coroutines tracking
+        the same export share their revision and confirmation state even when
+        their progress requests overlap.
+        """
+        if self._export_manager is None:
+            self._export_manager = AsyncExportManager(self)
+        return self._export_manager
+
+    async def export_archive(
+        self,
+        export_id: str,
+        progress_url: URL | str,
+        destination: Path,
+    ) -> ExportResult:
+        """
+        Track the export identified by `export_id` from `progress_url` and
+        archive its confirmed artifact at `destination`.
+
+        This is a convenience wrapper around the client's shared
+        `AsyncExportManager`; see `AsyncExportManager.archive()` for the full
+        semantics, including overlapping polls, candidate withdrawal and
+        cached confirmation.
+        """
+        return await self.export_manager().archive(export_id, progress_url, destination)
 
     def _init_transport(
         self,

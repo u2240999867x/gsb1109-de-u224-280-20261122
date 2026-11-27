@@ -5,6 +5,7 @@ from ._client import *
 from ._config import *
 from ._content import *
 from ._exceptions import *
+from ._exports import *
 from ._models import *
 from ._status_codes import *
 from ._transports import *
@@ -34,6 +35,7 @@ __all__ = [
     "AsyncBaseTransport",
     "AsyncByteStream",
     "AsyncClient",
+    "AsyncExportManager",
     "AsyncHTTPTransport",
     "Auth",
     "BaseTransport",
@@ -50,6 +52,10 @@ __all__ = [
     "DecodingError",
     "delete",
     "DigestAuth",
+    "ExportConfirmationError",
+    "ExportError",
+    "ExportProtocolError",
+    "ExportResult",
     "FunctionAuth",
     "get",
     "head",
