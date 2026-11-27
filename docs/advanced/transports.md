@@ -127,6 +127,7 @@ For some more complex cases you might need to customise the ASGI transport. This
 * Inspect 500 error responses rather than raise exceptions by setting `raise_app_exceptions=False`.
 * Mount the ASGI application at a subpath by setting `root_path`.
 * Use a given client address for requests by setting `client`.
+* Stream the response body incrementally rather than buffering it, by setting `stream=True` (or a finite `max_in_flight`).
 
 For example:
 
@@ -139,6 +140,36 @@ async with httpx.AsyncClient(transport=transport, base_url="http://testserver") 
 ```
 
 See [the ASGI documentation](https://asgi.readthedocs.io/en/latest/specs/www.html#connection-scope) for more details on the `client` and `root_path` keys.
+
+### Streaming responses
+
+By default the ASGI transport runs the application to completion and buffers the
+whole response body before returning. For applications that produce long
+responses incrementally, you can opt in to streaming:
+
+```python
+transport = httpx.ASGITransport(app=app, stream=True, max_in_flight=1)
+
+async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with client.stream("GET", "/pages") as response:
+        assert response.status_code == 200
+        async for chunk in response.aiter_raw():
+            ...
+```
+
+With streaming enabled, the response status and headers are delivered as soon
+as the application sends `http.response.start`, and each body chunk is delivered
+as it is produced. `max_in_flight` bounds the number of body chunks buffered
+ahead of the reader; when the limit is reached the application is paused inside
+`send()`, providing backpressure. It defaults to `1` when streaming is enabled.
+
+Exceptions raised before `http.response.start` behave as usual: they are raised
+from the request (or turned into a `500` response when
+`raise_app_exceptions=False`). Exceptions raised after the response has started
+are raised from the response stream after the chunks already delivered, so the
+status and body that were sent are not reinterpreted as a whole-response `500`
+or as a normal completion. Closing or cancelling the response disconnects the
+application, which observes `http.disconnect` on `receive()`.
 
 ### ASGI startup and shutdown
 

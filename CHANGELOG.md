@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add opt-in streaming responses to `ASGITransport`, with a bounded
+  `max_in_flight` buffer for backpressure, incremental response delivery, and
+  disconnect-aware cleanup.
 
 ## 0.28.1 (6th December, 2024)
 
