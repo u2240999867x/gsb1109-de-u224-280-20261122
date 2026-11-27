@@ -21,6 +21,7 @@ Our exception hierarchy:
       - UnsupportedProtocol
     + DecodingError
     + TooManyRedirects
+    + FormValueLimitExceeded
   x HTTPStatusError
 * InvalidURL
 * CookieConflict
@@ -45,6 +46,7 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "FormValueLimitExceeded",
     "HTTPError",
     "HTTPStatusError",
     "InvalidURL",
@@ -250,6 +252,29 @@ class TooManyRedirects(RequestError):
     """
     Too many redirects.
     """
+
+
+class FormValueLimitExceeded(RequestError):
+    """
+    A streamed form field contained a single run of combining marks longer
+    than the configured limit.
+
+    Raised while the request body is being streamed, so any preceding fields
+    may already have been sent. The offending field is available as
+    `.field_name` and the configured limit as `.limit`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field_name: str,
+        limit: int,
+        request: Request | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
+        self.field_name = field_name
+        self.limit = limit
 
 
 # Client errors

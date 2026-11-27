@@ -10,7 +10,13 @@ import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
 
-from ._content import ByteStream, UnattachedStream, encode_request, encode_response
+from ._content import (
+    ByteStream,
+    UnattachedStream,
+    encode_request,
+    encode_response,
+    encode_streaming_urlencoded_data,
+)
 from ._decoders import (
     SUPPORTED_DECODERS,
     ByteChunker,
@@ -43,6 +49,7 @@ from ._types import (
     RequestFiles,
     ResponseContent,
     ResponseExtensions,
+    StreamingFormData,
     SyncByteStream,
 )
 from ._urls import URL
@@ -392,6 +399,8 @@ class Request:
         data: RequestData | None = None,
         files: RequestFiles | None = None,
         json: typing.Any | None = None,
+        form: StreamingFormData | None = None,
+        form_combining_limit: int | None = None,
         stream: SyncByteStream | AsyncByteStream | None = None,
         extensions: RequestExtensions | None = None,
     ) -> None:
@@ -405,17 +414,34 @@ class Request:
 
         if stream is None:
             content_type: str | None = self.headers.get("content-type")
-            headers, stream = encode_request(
-                content=content,
-                data=data,
-                files=files,
-                json=json,
-                boundary=get_multipart_boundary_from_content_type(
-                    content_type=content_type.encode(self.headers.encoding)
-                    if content_type
-                    else None
-                ),
-            )
+            if form is not None:
+                if any(
+                    value is not None for value in (content, data, files, json)
+                ):
+                    raise TypeError(
+                        "Streaming 'form' data cannot be combined with "
+                        "'content', 'data', 'files', or 'json'."
+                    )
+                if form_combining_limit is None:
+                    raise ValueError(
+                        "A 'form_combining_limit' must be provided when using "
+                        "streaming 'form' data."
+                    )
+                headers, stream = encode_streaming_urlencoded_data(
+                    form, combining_limit=form_combining_limit
+                )
+            else:
+                headers, stream = encode_request(
+                    content=content,
+                    data=data,
+                    files=files,
+                    json=json,
+                    boundary=get_multipart_boundary_from_content_type(
+                        content_type=content_type.encode(self.headers.encoding)
+                        if content_type
+                        else None
+                    ),
+                )
             self._prepare(headers)
             self.stream = stream
             # Load the request body, except for streaming content.

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add streaming `application/x-www-form-urlencoded` uploads via `Request(form=..., form_combining_limit=...)`. Field values are pulled one chunk at a time from ordered `(name, source)` pairs, with incremental Unicode NFC and CRLF normalization, bounded combining-sequence limits (`FormValueLimitExceeded`), and chunked transfer encoding.
 
 ## 0.28.1 (6th December, 2024)
 

@@ -169,6 +169,45 @@ Form encoded data can also include multiple values from a given key.
 }
 ```
 
+## Sending Streaming Form Data
+
+When a field value is a long or chunked piece of text — for example a set of
+repeated notes read from a character stream — you can stream the form instead
+of materializing every value in memory. Pass an ordered sequence of
+`(name, source)` pairs as `form=`, where each source is a string, bytes, or an
+iterable (sync or async) of `str`/`bytes` chunks. The pair order is preserved,
+including repeated names and empty values.
+
+Each field value is normalized before it is percent-encoded: Unicode is
+composed to NFC and line breaks are normalized to CRLF (an existing CRLF counts
+as a single line break, while a lone CR or LF each become one). Normalization is
+incremental, so a value is never held in memory whole and characters or line
+breaks that span chunk boundaries are handled correctly.
+
+`form_combining_limit` bounds the length of a single run of consecutive
+combining marks within one field. If a field exceeds it,
+`httpx.FormValueLimitExceeded` is raised while the body is being streamed, and
+the fields sent before it may already have left the client.
+
+```python
+def notes():
+    yield "first note\r"
+    yield "\nwith accents"
+    yield "plus+space &separator"
+
+request = httpx.Request(
+    "POST",
+    "https://httpbin.org/post",
+    form=[("note", notes()), ("note", iter(["second"]))],
+    form_combining_limit=8,
+)
+```
+
+Because the encoded length cannot be known ahead of time, streaming forms are
+always sent with `Transfer-Encoding: chunked` and never report a
+`Content-Length`. The regular dictionary-style `data=` API remains available
+for in-memory forms.
+
 ## Sending Multipart File Uploads
 
 You can also upload files, using HTTP multipart encoding:

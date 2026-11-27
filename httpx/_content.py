@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import codecs
 import inspect
+import unicodedata
 import warnings
 from json import dumps as json_dumps
 from typing import (
@@ -11,21 +13,35 @@ from typing import (
     Iterator,
     Mapping,
 )
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
-from ._exceptions import StreamClosed, StreamConsumed
+from ._exceptions import (
+    FormValueLimitExceeded,
+    StreamClosed,
+    StreamConsumed,
+)
 from ._multipart import MultipartStream
 from ._types import (
     AsyncByteStream,
+    FormValueChunk,
+    FormValueSource,
     RequestContent,
     RequestData,
     RequestFiles,
     ResponseContent,
+    StreamingFormData,
     SyncByteStream,
 )
 from ._utils import peek_filelike_length, primitive_value_to_str
 
-__all__ = ["ByteStream"]
+__all__ = [
+    "AsyncURLencodedFormStream",
+    "ByteStream",
+    "URLencodedFormStream",
+    "encode_streaming_urlencoded_data",
+]
+
+_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
 
 class ByteStream(AsyncByteStream, SyncByteStream):
@@ -147,6 +163,309 @@ def encode_urlencoded_data(
     content_type = "application/x-www-form-urlencoded"
     headers = {"Content-Length": content_length, "Content-Type": content_type}
     return headers, ByteStream(body)
+
+
+class _FormValueNormalizer:
+    """
+    Incrementally applies Unicode NFC and CRLF newline normalization to the
+    chunked text source of a single form field.
+
+    Only the current combining sequence is retained between chunks, so the
+    full field value is never buffered. The retained sequence is bounded by
+    the caller-supplied limit on its length.
+    """
+
+    def __init__(self, field_name: str, combining_limit: int) -> None:
+        self._field_name = field_name
+        self._combining_limit = combining_limit
+        self._ready = ""
+        self._base = ""
+        self._marks: list[str] = []
+        self._combining_count = 0
+        self._pending_cr = False
+
+    def feed(self, text: str) -> str:
+        for char in text:
+            if self._pending_cr:
+                self._pending_cr = False
+                self._accept_line_break()
+                if char == "\n":
+                    # The LF completes an already-counted CRLF pair; drop it
+                    # so the pair collapses to a single CRLF.
+                    continue
+
+            if char == "\r":
+                self._pending_cr = True
+            elif char == "\n":
+                self._accept_line_break()
+            else:
+                self._accept_char(char)
+
+        ready = self._ready
+        self._ready = ""
+        return ready
+
+    def finish(self) -> str:
+        if self._pending_cr:
+            self._pending_cr = False
+            self._accept_line_break()
+        self._flush_combining()
+        ready = self._ready
+        self._ready = ""
+        return ready
+
+    def _accept_line_break(self) -> None:
+        # Line breaks are starters, so they close any open combining sequence.
+        self._flush_combining()
+        self._ready += "\r\n"
+
+    def _accept_char(self, char: str) -> None:
+        if unicodedata.category(char).startswith("M"):
+            # Marks are kept in the open run even when there is no preceding
+            # base, e.g. when a field begins with a combining mark.
+            self._marks.append(char)
+            self._combining_count += 1
+            if self._combining_count > self._combining_limit:
+                raise FormValueLimitExceeded(
+                    "Form field "
+                    f"{self._field_name!r} contains a combining sequence of "
+                    f"{self._combining_count} marks, exceeding the limit of "
+                    f"{self._combining_limit}.",
+                    field_name=self._field_name,
+                    limit=self._combining_limit,
+                )
+        else:
+            self._flush_combining()
+            self._base = char
+
+    def _flush_combining(self) -> None:
+        if self._base or self._marks:
+            sequence = self._base + "".join(self._marks)
+            # Normalizing each run independently is equivalent to normalizing
+            # the whole value, because NFC boundaries occur at starter chars.
+            self._ready += unicodedata.normalize("NFC", sequence)
+        self._base = ""
+        self._marks = []
+        self._combining_count = 0
+
+
+def _is_async_source(source: FormValueSource) -> bool:
+    if isinstance(source, (str, bytes)):
+        return False
+    return isinstance(source, AsyncIterable) or hasattr(source, "aread")
+
+
+def _normalize_form_name(name: str) -> str:
+    # Field names are short and known up front, so they are normalized whole,
+    # using the same NFC + CRLF contract as the field values.
+    collapsed = name.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    return unicodedata.normalize("NFC", collapsed)
+
+
+def _decode_form_chunk(
+    decoder: codecs.IncrementalDecoder, chunk: FormValueChunk
+) -> str:
+    if isinstance(chunk, bytes):
+        # Incremental decoding keeps a multi-byte character split across
+        # chunks intact instead of failing on each chunk individually.
+        return decoder.decode(chunk)
+    return decoder.decode(b"") + chunk
+
+
+def _validate_form_fields(
+    fields: StreamingFormData,
+) -> list[tuple[str, FormValueSource]]:
+    plain_fields = list(fields)
+    for field in plain_fields:
+        if not isinstance(field, tuple) or len(field) != 2:
+            raise TypeError(
+                "Streaming form fields must be (name, value) two-tuples."
+            )
+        name, source = field
+        if not isinstance(name, str):
+            raise TypeError(
+                f"Invalid type for form field name. Expected str, got "
+                f"{type(name)}: {name!r}"
+            )
+        if not isinstance(source, (str, bytes, Iterable, AsyncIterable)) and not (
+            hasattr(source, "read") or hasattr(source, "aread")
+        ):
+            raise TypeError(
+                "Invalid type for streaming form field value. Expected str, "
+                "bytes, a text iterable, or a file-like object, got "
+                f"{type(source)}."
+            )
+    return plain_fields
+
+
+class URLencodedFormStream(SyncByteStream):
+    """
+    Streaming `application/x-www-form-urlencoded` request content.
+
+    Each field value is pulled from its chunked text source one field at a
+    time. Unicode NFC and CRLF newline normalization are applied to a value
+    before it is percent-encoded, so neither a whole field value nor the
+    whole form body ever needs to be held in memory.
+
+    The encoded length is not known up front, so the stream is always sent
+    with `Transfer-Encoding: chunked`.
+    """
+
+    content_type = _FORM_CONTENT_TYPE
+
+    def __init__(
+        self, fields: list[tuple[str, FormValueSource]], combining_limit: int
+    ) -> None:
+        self.fields = fields
+        self.combining_limit = combining_limit
+
+    def get_headers(self) -> dict[str, str]:
+        return {
+            "Transfer-Encoding": "chunked",
+            "Content-Type": self.content_type,
+        }
+
+    def iter_chunks(self) -> Iterator[bytes]:
+        for index, (name, source) in enumerate(self.fields):
+            if index:
+                yield b"&"
+            yield quote_plus(_normalize_form_name(name)).encode("utf-8") + b"="
+            normalizer = _FormValueNormalizer(name, self.combining_limit)
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            for chunk in self.iter_source_chunks(source):
+                ready = normalizer.feed(_decode_form_chunk(decoder, chunk))
+                if ready:
+                    yield quote_plus(ready).encode("utf-8")
+            tail = normalizer.feed(decoder.decode(b"", final=True))
+            tail += normalizer.finish()
+            if tail:
+                yield quote_plus(tail).encode("utf-8")
+
+    @staticmethod
+    def iter_source_chunks(
+        source: FormValueSource,
+    ) -> Iterator[FormValueChunk]:
+        if isinstance(source, (str, bytes)):
+            if source:
+                yield source
+            return
+        if hasattr(source, "read"):
+            chunk = source.read(IteratorByteStream.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = source.read(IteratorByteStream.CHUNK_SIZE)
+            return
+        for chunk in source:  # type: ignore[union-attr]
+            if not isinstance(chunk, (str, bytes)):
+                raise TypeError(
+                    "Streaming form field chunks must be str or bytes, "
+                    f"got {type(chunk)}."
+                )
+            yield chunk
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self.iter_chunks()
+
+
+class AsyncURLencodedFormStream(AsyncByteStream):
+    """
+    Async counterpart of `URLencodedFormStream`, for field values backed by
+    async chunk iterables or async file-like objects.
+    """
+
+    content_type = _FORM_CONTENT_TYPE
+
+    def __init__(
+        self, fields: list[tuple[str, FormValueSource]], combining_limit: int
+    ) -> None:
+        self.fields = fields
+        self.combining_limit = combining_limit
+
+    def get_headers(self) -> dict[str, str]:
+        return {
+            "Transfer-Encoding": "chunked",
+            "Content-Type": self.content_type,
+        }
+
+    async def iter_chunks(self) -> AsyncIterator[bytes]:
+        for index, (name, source) in enumerate(self.fields):
+            if index:
+                yield b"&"
+            yield quote_plus(_normalize_form_name(name)).encode("utf-8") + b"="
+            normalizer = _FormValueNormalizer(name, self.combining_limit)
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            async for chunk in self.iter_source_chunks(source):
+                ready = normalizer.feed(_decode_form_chunk(decoder, chunk))
+                if ready:
+                    yield quote_plus(ready).encode("utf-8")
+            tail = normalizer.feed(decoder.decode(b"", final=True))
+            tail += normalizer.finish()
+            if tail:
+                yield quote_plus(tail).encode("utf-8")
+
+    @staticmethod
+    async def iter_source_chunks(
+        source: FormValueSource,
+    ) -> AsyncIterator[FormValueChunk]:
+        if isinstance(source, (str, bytes)):
+            if source:
+                yield source
+            return
+        if hasattr(source, "aread"):
+            chunk = await source.aread(AsyncIteratorByteStream.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = await source.aread(AsyncIteratorByteStream.CHUNK_SIZE)
+            return
+        if hasattr(source, "read"):
+            chunk = source.read(AsyncIteratorByteStream.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = source.read(AsyncIteratorByteStream.CHUNK_SIZE)
+            return
+        async for chunk in source:  # type: ignore[union-attr]
+            if not isinstance(chunk, (str, bytes)):
+                raise TypeError(
+                    "Streaming form field chunks must be str or bytes, "
+                    f"got {type(chunk)}."
+                )
+            yield chunk
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self.iter_chunks():
+            yield chunk
+
+
+def encode_streaming_urlencoded_data(
+    fields: StreamingFormData,
+    *,
+    combining_limit: int,
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    """
+    Build a one-shot streaming urlencoded form from an ordered sequence of
+    `(field name, chunked text source)` pairs.
+
+    `combining_limit` is the maximum number of consecutive combining marks
+    allowed within a single field value. A field exceeding it raises
+    `FormValueLimitExceeded` while the body is being streamed, by which point
+    earlier fields may already have been sent.
+    """
+    if not isinstance(combining_limit, int) or isinstance(
+        combining_limit, bool
+    ) or combining_limit < 0:
+        raise ValueError("'combining_limit' must be a non-negative integer.")
+
+    plain_fields = _validate_form_fields(fields)
+    if any(_is_async_source(source) for _, source in plain_fields):
+        async_stream = AsyncURLencodedFormStream(
+            plain_fields, combining_limit=combining_limit
+        )
+        return async_stream.get_headers(), async_stream
+
+    sync_stream = URLencodedFormStream(
+        plain_fields, combining_limit=combining_limit
+    )
+    return sync_stream.get_headers(), sync_stream
 
 
 def encode_multipart_data(

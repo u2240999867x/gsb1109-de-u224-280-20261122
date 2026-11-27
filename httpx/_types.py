@@ -16,6 +16,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -70,6 +71,30 @@ ResponseContent = Union[str, bytes, Iterable[bytes], AsyncIterable[bytes]]
 ResponseExtensions = Mapping[str, Any]
 
 RequestData = Mapping[str, Any]
+
+# A text source for a single form field value. Chunks are decoded as UTF-8
+# and normalized together, so a value never has to be held in memory whole.
+FormValueChunk = Union[str, bytes]
+
+
+class _SyncFormValueReader(Protocol):
+    def read(self, size: int) -> FormValueChunk: ...
+
+
+class _AsyncFormValueReader(Protocol):
+    async def aread(self, size: int) -> FormValueChunk: ...
+
+
+FormValueSource = Union[
+    FormValueChunk,
+    Iterable[FormValueChunk],
+    AsyncIterable[FormValueChunk],
+    _SyncFormValueReader,
+    _AsyncFormValueReader,
+]
+# Field names alongside the chunked text source of each value, in the exact
+# order the pairs must appear in the encoded form.
+StreamingFormData = Sequence[Tuple[str, FormValueSource]]
 
 FileContent = Union[IO[bytes], bytes, str]
 FileTypes = Union[
