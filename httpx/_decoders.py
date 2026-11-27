@@ -33,12 +33,90 @@ except ImportError:  # pragma: no cover
     zstandard = None  # type: ignore
 
 
+class DecoderStatus(typing.NamedTuple):
+    """
+    The outcome of one encoding layer, or one gzip member.
+
+    `status` is one of "complete", "incomplete", "checksum", or "error".
+    """
+
+    encoding: str
+    status: str
+    member: int | None = None
+    detail: str = ""
+
+    @property
+    def layer(self) -> str:
+        if self.member is None:
+            return self.encoding
+        return f"{self.encoding} member {self.member}"
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete"
+
+    @property
+    def incomplete(self) -> bool:
+        return self.status == "incomplete"
+
+    @property
+    def missing_tail(self) -> bool:
+        return self.status == "incomplete"
+
+    @property
+    def checksum_failed(self) -> bool:
+        return self.status == "checksum"
+
+    @property
+    def message(self) -> str:
+        if self.status == "complete":
+            return f"{self.layer} is complete"
+        if self.status == "incomplete":
+            return f"{self.layer} is incomplete: missing tail"
+        if self.status == "checksum":
+            message = f"{self.layer} checksum failed"
+        else:
+            message = f"{self.layer} decoding error"
+        if self.detail:
+            message = f"{message}: {self.detail}"
+        return message
+
+    def describe(self) -> str:
+        return self.message
+
+
+def _status_from_zlib_error(exc: zlib.error) -> str:
+    message = str(exc)
+    if "incorrect data check" in message or "incorrect length check" in message:
+        return "checksum"
+    return "error"
+
+
 class ContentDecoder:
     def decode(self, data: bytes) -> bytes:
         raise NotImplementedError()  # pragma: no cover
 
     def flush(self) -> bytes:
         raise NotImplementedError()  # pragma: no cover
+
+    def get_statuses(self) -> list[DecoderStatus]:
+        return []
+
+    def is_finalized(self) -> bool:
+        return True
+
+    def get_decoding_error(self) -> DecodingError | None:
+        if not self.is_finalized():
+            return None
+        statuses = self.get_statuses()
+        if not any(status.status != "complete" for status in statuses):
+            return None
+        message = "Content decoding failed: " + "; ".join(
+            status.describe() for status in statuses
+        )
+        exc = DecodingError(message)
+        exc.statuses = statuses
+        return exc
 
 
 class IdentityDecoder(ContentDecoder):
@@ -53,33 +131,141 @@ class IdentityDecoder(ContentDecoder):
         return b""
 
 
+def _looks_like_zlib(data: bytes) -> bool:
+    # A zlib stream starts with a CMF/FLG pair. The low nibble of CMF is
+    # the compression method (8 for deflate), and the two-byte header is
+    # zero modulo 31.
+    if len(data) < 2:
+        return False
+    cmf, flg = data[0], data[1]
+    return (cmf & 0x0F) == 8 and ((cmf << 8) | flg) % 31 == 0
+
+
 class DeflateDecoder(ContentDecoder):
     """
     Handle 'deflate' decoding.
 
     See: https://stackoverflow.com/questions/1838699
+
+    The zlib-wrapped form carries a four-byte Adler-32 trailer. We deliberately
+    hold those four bytes back until the next decode call or `flush()`, so that
+    a bad checksum cannot discard decompressed output that was produced from the
+    same input block. A stream that ends without a complete trailer is reported
+    as incomplete instead of being treated as a successful response.
     """
 
+    ZLIB_TRAILER_SIZE = 4
+
     def __init__(self) -> None:
-        self.first_attempt = True
-        self.decompressor = zlib.decompressobj()
+        self.wrapper: str | None = None
+        self.decompressor: typing.Any = None
+        self.pending = b""
+        self.seen_data = False
+        self.finished = False
+        self.failed = False
+        self.failure_status: str | None = None
+        self.failure_detail = ""
+        self._finalized = False
+
+    def _start(self, data: bytes) -> None:
+        if _looks_like_zlib(data):
+            self.wrapper = "zlib"
+            self.decompressor = zlib.decompressobj()
+        else:
+            self.wrapper = "raw"
+            self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+
+    def _feed(self, data: bytes) -> bytes:
+        assert self.decompressor is not None
+        try:
+            output: bytes = self.decompressor.decompress(data)
+        except zlib.error as exc:
+            self.failed = True
+            self.failure_status = _status_from_zlib_error(exc)
+            self.failure_detail = str(exc)
+            return b""
+
+        if self.decompressor.eof:
+            self.finished = True
+        return output
 
     def decode(self, data: bytes) -> bytes:
-        was_first_attempt = self.first_attempt
-        self.first_attempt = False
-        try:
-            return self.decompressor.decompress(data)
-        except zlib.error as exc:
-            if was_first_attempt:
-                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-                return self.decode(data)
-            raise DecodingError(str(exc)) from exc
+        if not data:
+            return b""
+
+        self.seen_data = True
+        self.pending += data
+
+        if self.wrapper is None:
+            if len(self.pending) < 2:
+                return b""
+            self._start(self.pending)
+
+        if self.failed:
+            self.pending = b""
+            return b""
+
+        # Feed the stream body first, then the last four bytes separately.
+        # That way a bad Adler-32 value cannot throw away output that was
+        # decompressed from the earlier part of the same input block.
+        if self.wrapper == "zlib":
+            chunk = self.pending[: -self.ZLIB_TRAILER_SIZE]
+            trailer = self.pending[-self.ZLIB_TRAILER_SIZE :]
+        else:
+            chunk = self.pending
+            trailer = b""
+        self.pending = b""
+
+        output = b""
+        if chunk:
+            output += self._feed(chunk)
+        if trailer and not self.failed:
+            output += self._feed(trailer)
+        return output
 
     def flush(self) -> bytes:
-        try:
-            return self.decompressor.flush()
-        except zlib.error as exc:  # pragma: no cover
-            raise DecodingError(str(exc)) from exc
+        if not self.seen_data:
+            return b""
+        if self._finalized:
+            return b""
+        self._finalized = True
+
+        output = b""
+        if self.wrapper is None:
+            # Compressed data too short to identify the wrapper. Treat it as
+            # raw deflate and let zlib report the malformed stream.
+            self._start(self.pending)
+        assert self.decompressor is not None
+
+        if self.pending and not self.failed:
+            chunk = self.pending
+            self.pending = b""
+            output += self._feed(chunk)
+
+        if not self.failed and not self.finished:
+            try:
+                output += self.decompressor.flush()
+            except zlib.error as exc:  # pragma: no cover
+                self.failed = True
+                self.failure_status = _status_from_zlib_error(exc)
+                self.failure_detail = str(exc)
+
+        if self.decompressor.eof:
+            self.finished = True
+        return output
+
+    def get_statuses(self) -> list[DecoderStatus]:
+        if not self.seen_data:
+            return []
+        if self.failed:
+            status = self.failure_status or "error"
+            return [DecoderStatus("deflate", status, detail=self.failure_detail)]
+        if self.finished:
+            return [DecoderStatus("deflate", "complete")]
+        return [DecoderStatus("deflate", "incomplete")]
+
+    def is_finalized(self) -> bool:
+        return self._finalized
 
 
 class GZipDecoder(ContentDecoder):
@@ -87,22 +273,110 @@ class GZipDecoder(ContentDecoder):
     Handle 'gzip' decoding.
 
     See: https://stackoverflow.com/questions/1838699
+
+    A gzip payload may contain multiple consecutive members. Each member has
+    its own eight-byte trailer, and each member is validated independently. As
+    with deflate, we hold trailer bytes back so that output is still available
+    if a checksum is bad, and we report a truncated final member as incomplete
+    rather than silently ending the response.
     """
+
+    TRAILER_SIZE = 8
 
     def __init__(self) -> None:
         self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        self.pending = b""
+        self.seen_data = False
+        self.member = 1
+        self.member_active = False
+        self.failed = False
+        self.finished = False
+        self.statuses: list[DecoderStatus] = []
+        self._finalized = False
+
+    def _feed(self, data: bytes) -> bytes:
+        output = b""
+        while data and not self.failed:
+            self.member_active = True
+            try:
+                output += self.decompressor.decompress(data)
+            except zlib.error as exc:
+                self.failed = True
+                self.statuses.append(
+                    DecoderStatus(
+                        "gzip",
+                        _status_from_zlib_error(exc),
+                        self.member,
+                        str(exc),
+                    )
+                )
+                return output
+
+            if not self.decompressor.eof:
+                return output
+
+            self.statuses.append(DecoderStatus("gzip", "complete", self.member))
+            self.member_active = False
+            leftover = self.decompressor.unused_data
+            self.member += 1
+            self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+            data = leftover
+        return output
 
     def decode(self, data: bytes) -> bytes:
-        try:
-            return self.decompressor.decompress(data)
-        except zlib.error as exc:
-            raise DecodingError(str(exc)) from exc
+        if not data:
+            return b""
+        self.seen_data = True
+        if self.failed:
+            return b""
+        self.pending += data
+
+        # Feed the stream body without the final eight-byte gzip trailer, then
+        # feed the trailer separately. A bad CRC/ISIZE then cannot discard the
+        # output that was decompressed from the same input block.
+        if len(self.pending) <= self.TRAILER_SIZE:
+            return b""
+        chunk = self.pending[: -self.TRAILER_SIZE]
+        trailer = self.pending[-self.TRAILER_SIZE :]
+        self.pending = b""
+
+        output = self._feed(chunk)
+        if trailer and not self.failed:
+            output += self._feed(trailer)
+        return output
 
     def flush(self) -> bytes:
-        try:
-            return self.decompressor.flush()
-        except zlib.error as exc:  # pragma: no cover
-            raise DecodingError(str(exc)) from exc
+        if not self.seen_data:
+            return b""
+        if self._finalized:
+            return b""
+        self._finalized = True
+
+        output = b""
+        if self.pending and not self.failed:
+            chunk = self.pending
+            self.pending = b""
+            output += self._feed(chunk)
+
+        if not self.failed:
+            if self.decompressor.eof:
+                self.finished = True
+                if self.member_active:
+                    self.statuses.append(DecoderStatus("gzip", "complete", self.member))
+                    self.member_active = False
+            elif self.member_active:
+                self.statuses.append(DecoderStatus("gzip", "incomplete", self.member))
+                self.member_active = False
+
+        return output
+
+    def get_statuses(self) -> list[DecoderStatus]:
+        if not self.seen_data:
+            return []
+        return list(self.statuses)
+
+    def is_finalized(self) -> bool:
+        return self._finalized
 
 
 class BrotliDecoder(ContentDecoder):
@@ -223,6 +497,15 @@ class MultiDecoder(ContentDecoder):
         for child in self.children:
             data = child.decode(data) + child.flush()
         return data
+
+    def get_statuses(self) -> list[DecoderStatus]:
+        statuses: list[DecoderStatus] = []
+        for child in self.children:
+            statuses.extend(child.get_statuses())
+        return statuses
+
+    def is_finalized(self) -> bool:
+        return all(child.is_finalized() for child in self.children)
 
 
 class ByteChunker:

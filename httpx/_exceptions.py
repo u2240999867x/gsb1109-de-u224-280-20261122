@@ -245,6 +245,40 @@ class DecodingError(RequestError):
     Decoding of the response failed, due to a malformed encoding.
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: Request | None = None,
+        statuses: typing.Sequence[typing.Any] | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
+        self.statuses = list(statuses) if statuses is not None else []
+
+    @property
+    def incomplete_layers(self) -> list[typing.Any]:
+        return [
+            status
+            for status in self.statuses
+            if getattr(status, "status", None) == "incomplete"
+        ]
+
+    @property
+    def checksum_failed_layers(self) -> list[typing.Any]:
+        return [
+            status
+            for status in self.statuses
+            if getattr(status, "status", None) == "checksum"
+        ]
+
+    @property
+    def complete_layers(self) -> list[typing.Any]:
+        return [
+            status
+            for status in self.statuses
+            if getattr(status, "status", None) == "complete"
+        ]
+
 
 class TooManyRedirects(RequestError):
     """

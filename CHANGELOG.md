@@ -12,6 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* Gzip decoding now reads every member of a multi-member response, and
+  truncated gzip members or deflate/zlib trailers are reported as
+  `DecodingError` instead of being treated as a complete response. The error
+  exposes per-layer `statuses` with `incomplete_layers`,
+  `checksum_failed_layers`, and `complete_layers` helpers.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.

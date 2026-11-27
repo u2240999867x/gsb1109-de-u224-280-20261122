@@ -15,6 +15,7 @@ from ._decoders import (
     SUPPORTED_DECODERS,
     ByteChunker,
     ContentDecoder,
+    DecoderStatus,
     IdentityDecoder,
     LineDecoder,
     MultiDecoder,
@@ -23,6 +24,7 @@ from ._decoders import (
 )
 from ._exceptions import (
     CookieConflict,
+    DecodingError,
     HTTPStatusError,
     RequestNotRead,
     ResponseNotRead,
@@ -543,6 +545,15 @@ class Response:
         self.is_closed = False
         self.is_stream_consumed = False
 
+        # The decoded prefix that was obtained from the stream but has not yet
+        # been handed to the caller, along with any decoding failure that has
+        # already been determined by the decoder.
+        self._decoding_error: DecodingError | None = None
+        self._decoding_statuses: list[DecoderStatus] = []
+        self._decoding_finalized = False
+        self._decoding_started = False
+        self._explicitly_closed = False
+
         self.default_encoding = default_encoding
 
         if stream is None:
@@ -873,6 +884,48 @@ class Response:
         self.extensions = {}
         self.stream = UnattachedStream()
 
+    def _get_decoding_error(self) -> DecodingError | None:
+        if self._decoding_error is None:
+            decoder = self._get_content_decoder()
+            self._decoding_error = decoder.get_decoding_error()
+        return self._decoding_error
+
+    def _record_decoder_statuses(self) -> None:
+        self._decoding_statuses = list(self._get_content_decoder().get_statuses())
+
+    def _finalize_decoding(self, decoder: ContentDecoder, decoded: bytes) -> bytes:
+        self._decoding_finalized = True
+        self._record_decoder_statuses()
+        self._decoding_error = decoder.get_decoding_error()
+        return decoded
+
+    def _check_decoding_error(self) -> None:
+        """
+        Raise a determined decoding failure.
+
+        The same `DecodingError` instance is retained on the response, so a
+        caller that has already observed the decoded prefix can retrieve the
+        failure again without losing it to a subsequent stream-state error.
+        """
+        error = self._decoding_error
+        if error is None:
+            return
+        raise error
+
+    def _check_stopped(self) -> None:
+        """
+        Handle a caller closing the response between two decoded chunks.
+
+        A determined decoding failure takes priority over the generic
+        "stream closed" signal, so a caller that has already received the
+        final decoded prefix still learns that the report was bad.
+        """
+        if not self._explicitly_closed:
+            return
+        if self._decoding_error is not None:
+            self._check_decoding_error()
+        raise StreamClosed()
+
     def read(self) -> bytes:
         """
         Read and return the response content.
@@ -893,16 +946,45 @@ class Response:
         else:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
+            self._decoding_started = True
             with request_context(request=self._request):
-                for raw_bytes in self.iter_raw():
+                raw_iterator = self.iter_raw()
+                try:
+                    raw_bytes: bytes | None = next(raw_iterator)
+                except StopIteration:
+                    raw_bytes = None
+
+                while raw_bytes is not None:
                     decoded = decoder.decode(raw_bytes)
                     for chunk in chunker.decode(decoded):
                         yield chunk
+                        self._check_stopped()
+
+                    # Do not pull another block after the caller has closed
+                    # the response. If the decoder has already determined a
+                    # failure from data received before the close, that
+                    # failure takes precedence over the plain stop signal.
+                    if self._explicitly_closed:
+                        self._check_decoding_error()
+                        raise StreamClosed()
+
+                    try:
+                        raw_bytes = next(raw_iterator)
+                    except StopIteration:
+                        raw_bytes = None
+
+                # Finalize before releasing the chunker's trailing short
+                # chunk, so the per-layer outcome (complete, missing tail, or
+                # bad checksum) is already known when that chunk is handed out.
                 decoded = decoder.flush()
+                decoded = self._finalize_decoding(decoder, decoded)
                 for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
+                    yield chunk
+                    self._check_stopped()
                 for chunk in chunker.flush():
                     yield chunk
+                    self._check_stopped()
+                self._check_decoding_error()
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -956,7 +1038,16 @@ class Response:
         for chunk in chunker.flush():
             yield chunk
 
-        self.close()
+        self._close(explicit=False)
+
+    def _close(self, *, explicit: bool) -> None:
+        if explicit:
+            self._explicitly_closed = True
+        if not self.is_closed:
+            self.is_closed = True
+            with request_context(request=self._request):
+                assert isinstance(self.stream, SyncByteStream)
+                self.stream.close()
 
     def close(self) -> None:
         """
@@ -966,10 +1057,7 @@ class Response:
         if not isinstance(self.stream, SyncByteStream):
             raise RuntimeError("Attempted to call a sync close on an async stream.")
 
-        if not self.is_closed:
-            self.is_closed = True
-            with request_context(request=self._request):
-                self.stream.close()
+        self._close(explicit=True)
 
     async def aread(self) -> bytes:
         """
@@ -993,16 +1081,38 @@ class Response:
         else:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
+            self._decoding_started = True
             with request_context(request=self._request):
-                async for raw_bytes in self.aiter_raw():
+                raw_iterator = self.aiter_raw()
+                try:
+                    raw_bytes: bytes | None = await raw_iterator.__anext__()
+                except StopAsyncIteration:
+                    raw_bytes = None
+
+                while raw_bytes is not None:
                     decoded = decoder.decode(raw_bytes)
                     for chunk in chunker.decode(decoded):
                         yield chunk
+                        self._check_stopped()
+
+                    if self._explicitly_closed:
+                        self._check_decoding_error()
+                        raise StreamClosed()
+
+                    try:
+                        raw_bytes = await raw_iterator.__anext__()
+                    except StopAsyncIteration:
+                        raw_bytes = None
+
                 decoded = decoder.flush()
+                decoded = self._finalize_decoding(decoder, decoded)
                 for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
+                    yield chunk
+                    self._check_stopped()
                 for chunk in chunker.flush():
                     yield chunk
+                    self._check_stopped()
+                self._check_decoding_error()
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1060,7 +1170,16 @@ class Response:
         for chunk in chunker.flush():
             yield chunk
 
-        await self.aclose()
+        await self._aclose(explicit=False)
+
+    async def _aclose(self, *, explicit: bool) -> None:
+        if explicit:
+            self._explicitly_closed = True
+        if not self.is_closed:
+            self.is_closed = True
+            with request_context(request=self._request):
+                assert isinstance(self.stream, AsyncByteStream)
+                await self.stream.aclose()
 
     async def aclose(self) -> None:
         """
@@ -1070,10 +1189,7 @@ class Response:
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async close on a sync stream.")
 
-        if not self.is_closed:
-            self.is_closed = True
-            with request_context(request=self._request):
-                await self.stream.aclose()
+        await self._aclose(explicit=True)
 
 
 class Cookies(typing.MutableMapping[str, str]):
