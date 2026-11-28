@@ -1,0 +1,13 @@
+# headers.lark (LALR-305 probe) — imported header rules and their lexer terms.
+# Actual rule declaration coordinates (see `nl -ba`):
+#   line 7: left
+#   line 9: right
+#   line 11: NAME
+#   line 13: pad (empty rule)
+left: NAME pad
+
+right: NAME pad
+
+NAME: /[a-z]+/
+
+pad:

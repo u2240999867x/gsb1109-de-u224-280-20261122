@@ -1,0 +1,17 @@
+# entry_right1.lark — entry paired with headers_right1.lark (right wins; contrast only).
+%import headers_right1.left
+%import headers_right1.right
+
+batch: "sync" "delta" left ";" lt
+     | "sync" "delta" right ";" rt
+
+checkpoint: "resume" "delta" left ";" rt
+          | "resume" "delta" right ";" lt
+
+lt: LOW | HIGH "?"
+rt: LOW ["?"]
+
+HIGH.2: /[a-z]+/
+LOW: /[a-z]+/
+
+%ignore /\s+/

@@ -1,0 +1,14 @@
+# headers_left1.lark — variant A: force the imported `left` rule to win R/R.
+# This is the maintainer's proposed change, applied in the import directory.
+# Actual declaration coordinates (see `nl -ba`):
+#   line 8: left.1 (rule priority 1)
+#   line 10: right (default priority None -> 0)
+#   line 12: NAME
+#   line 14: pad (empty)
+left.1: NAME pad
+
+right: NAME pad
+
+NAME: /[a-z]+/
+
+pad:

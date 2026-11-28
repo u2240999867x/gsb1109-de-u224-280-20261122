@@ -1,0 +1,26 @@
+# entry.lark (LALR-305 probe) — main entry grammar; whitespace ignored here.
+# Actual declaration coordinates (see `nl -ba`):
+#   line 10-11: %import of left / right
+#   line 13-14: batch alternatives (left;lt / right;rt)
+#   line 16-17: checkpoint alternatives (left;rt / right;lt)
+#   line 19: lt
+#   line 20: rt
+#   line 22: HIGH.2 (terminal priority 2)
+#   line 23: LOW (terminal priority 0)
+#   line 25: %ignore whitespace
+%import headers.left
+%import headers.right
+
+batch: "sync" "delta" left ";" lt
+     | "sync" "delta" right ";" rt
+
+checkpoint: "resume" "delta" left ";" rt
+          | "resume" "delta" right ";" lt
+
+lt: LOW | HIGH "?"
+rt: LOW ["?" ]
+
+HIGH.2: /[a-z]+/
+LOW: /[a-z]+/
+
+%ignore /\s+/

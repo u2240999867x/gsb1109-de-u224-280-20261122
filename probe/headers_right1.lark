@@ -1,0 +1,15 @@
+# headers_right1.lark — variant B: force the imported `right` rule to win R/R.
+# Used only to expose the alternate competing interpretation of the same text;
+# it is NOT the proposed change.
+# Actual declaration coordinates (see `nl -ba`):
+#   line 9: left (default priority None -> 0)
+#   line 11: right.1 (rule priority 1)
+#   line 13: NAME
+#   line 15: pad (empty)
+left: NAME pad
+
+right.1: NAME pad
+
+NAME: /[a-z]+/
+
+pad:
