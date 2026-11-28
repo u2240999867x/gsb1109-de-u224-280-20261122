@@ -797,3 +797,39 @@ All setters in ``attrs.setters`` are also available from ``attr.setters`` (it's 
 
    .. tip::
       Use `attrs.define`'s *frozen* argument (or `attrs.frozen`) to freeze whole classes; it is more efficient.
+
+
+Managed Bindings
+----------------
+
+.. module:: attrs.managed
+
+Managed bindings allow multiple fields to share one mutable list while retaining each field's converter and validator.
+A scan builds a candidate for every participating field; the underlying list changes only when all candidates agree and all validators pass.
+
+.. autoclass:: ManagedList
+   :members:
+
+.. autoclass:: ManagedSequence
+
+.. autoclass:: ManagedDetails
+
+.. autofunction:: field
+
+.. autofunction:: scan
+
+.. autofunction:: rebind
+
+.. autofunction:: current_value
+
+.. autofunction:: confirmed
+
+.. autoclass:: RejectionReason
+
+.. autoexception:: ManagedRejectionError
+
+.. autoexception:: InconsistentManagedValueError
+
+.. autofunction:: rejection_reasons
+
+.. autofunction:: clear_rejection_reasons

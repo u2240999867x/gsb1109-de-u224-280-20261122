@@ -70,6 +70,7 @@ __all__ = [
     "has",
     "ib",
     "make_class",
+    "managed",
     "mutable",
     "resolve_types",
     "s",
@@ -80,7 +81,7 @@ __all__ = [
 ]
 
 
-_LAZY_SUBMODULES = {"converters", "validators", "filters"}
+_LAZY_SUBMODULES = {"converters", "filters", "managed", "validators"}
 
 
 def _make_getattr(mod_name: str) -> Callable:

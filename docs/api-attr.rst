@@ -209,6 +209,15 @@ All objects from `attrs.setters` are also available in ``attr.setters``.
 Please refer to the former for details.
 
 
+Managed Bindings
+----------------
+
+.. module:: attr.managed
+
+All objects from `attrs.managed` are also available in ``attr.managed``.
+Please refer to the former for details.
+
+
 Deprecated APIs
 ---------------
 
