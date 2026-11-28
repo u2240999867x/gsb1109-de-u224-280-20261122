@@ -314,13 +314,33 @@ def attrs(
 def fields(cls: type[AttrsInstance] | AttrsInstance) -> Any: ...
 def fields_dict(cls: type[AttrsInstance]) -> dict[str, Attribute[Any]]: ...
 def validate(inst: AttrsInstance) -> None: ...
+@overload
 def resolve_types(
     cls: _A,
-    globalns: dict[str, Any] | None = ...,
-    localns: dict[str, Any] | None = ...,
+    globalns: dict[Any, Any] | None = ...,
+    localns: dict[Any, Any] | None = ...,
     attribs: list[Attribute[Any]] | None = ...,
     include_extras: bool = ...,
+    in_place: Literal[True] = ...,
 ) -> _A: ...
+@overload
+def resolve_types(
+    cls: _A,
+    globalns: dict[Any, Any] | None = ...,
+    localns: dict[Any, Any] | None = ...,
+    attribs: list[Attribute[Any]] | None = ...,
+    include_extras: bool = ...,
+    in_place: Literal[False] = ...,
+) -> tuple[Attribute[Any], ...]: ...
+@overload
+def resolve_types(
+    cls: _A,
+    globalns: dict[Any, Any] | None = ...,
+    localns: dict[Any, Any] | None = ...,
+    attribs: list[Attribute[Any]] | None = ...,
+    include_extras: bool = ...,
+    in_place: bool = ...,
+) -> _A | tuple[Attribute[Any], ...]: ...
 
 # TODO: add support for returning a proper attrs class from the mypy plugin
 # we use Any instead of _CountingAttr so that e.g. `make_class('Foo',

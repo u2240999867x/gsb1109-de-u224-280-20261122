@@ -701,6 +701,326 @@ class TestAnnotations:
         assert int is attr.fields(A).n.type
 
 
+class TestResolveTypesView:
+    """
+    Tests for the independent field view returned by
+    ``resolve_types(..., in_place=False)``.
+    """
+
+    def test_view_is_a_field_tuple(self):
+        """
+        The view behaves like ``attrs.fields()``: a tuple that also provides
+        name accessors.
+        """
+
+        @attr.define
+        class C:
+            x: "int"
+
+        view = attr.resolve_types(C, in_place=False)
+
+        assert isinstance(view, tuple)
+        assert int is view.x.type
+        assert int is view[0].type
+
+    def test_view_does_not_mutate_class(self):
+        """
+        Building a view neither touches the class's real fields nor is affected
+        by a later resolution.
+        """
+
+        @attr.define
+        class C:
+            x: "int"
+
+        view = attr.resolve_types(C, in_place=False)
+
+        assert "int" == attr.fields(C).x.type
+        assert int is view.x.type
+
+        attr.resolve_types(C)
+
+        assert int is attr.fields(C).x.type
+        assert int is view.x.type
+
+    def test_include_extras(self):
+        """
+        ``include_extras`` controls whether ``Annotated`` metadata is kept for
+        every view individually.
+        """
+        from typing import Annotated
+
+        globs = {"Annotated": Annotated}
+
+        @attr.define
+        class C:
+            x: 'Annotated[float, "unit"]'
+
+        without = attr.resolve_types(
+            C, globs, include_extras=False, in_place=False
+        )
+        with_extras = attr.resolve_types(
+            C, globs, include_extras=True, in_place=False
+        )
+
+        assert float is without.x.type
+        assert Annotated[float, "unit"] == with_extras.x.type
+        assert 'Annotated[float, "unit"]' == attr.fields(C).x.type
+
+    def test_resolves_declaring_class_namespace(self):
+        """
+        Each field is resolved against the namespace of the class that declared
+        it, not the class it's accessed on.
+        """
+
+        @attr.define
+        class Base:
+            x: '"Amount"'  # noqa: F821
+
+        @attr.define
+        class Sub(Base):
+            pass
+
+        class Decimal:
+            pass
+
+        class Count:
+            pass
+
+        view = attr.resolve_types(
+            Sub,
+            globalns={Base: {"Amount": Decimal}, Sub: {"Amount": Count}},
+            in_place=False,
+        )
+
+        assert Decimal is view.x.type
+
+    def test_winning_declaration_in_diamond(self):
+        """
+        When two paths inherit a field and one explicitly redeclares it, the
+        view uses the declaration that actually wins the MRO *and* the
+        namespace of the winning declaring class.
+        """
+
+        @attr.define
+        class Base:
+            x: '"Amount"'  # noqa: F821
+
+        @attr.define
+        class Left(Base):
+            pass
+
+        @attr.define
+        class Right(Base):
+            x: '"Amount"'  # noqa: F821
+
+        @attr.define
+        class Diamond(Left, Right):
+            pass
+
+        class Decimal:
+            pass
+
+        class Count:
+            pass
+
+        view = attr.resolve_types(
+            Diamond,
+            globalns={Base: {"Amount": Decimal}, Right: {"Amount": Count}},
+            in_place=False,
+        )
+
+        # Right wins the MRO for "x".
+        assert Count is view.x.type
+
+    def test_forward_references_between_fields(self):
+        """
+        Forward references between fields of the same inheritance graph resolve
+        in a view.
+        """
+
+        @attr.define
+        class A:
+            b: '"B"'
+
+        @attr.define
+        class B:
+            a: "A"
+
+        view = attr.resolve_types(A, globals(), locals(), in_place=False)
+
+        assert B is view.b.type
+
+    def test_failure_leaves_everything_intact(self):
+        """
+        A view that fails to resolve can't damage the class's fields or an
+        earlier view, and a later view still works.
+        """
+
+        @attr.define
+        class C:
+            x: '"Amount"'  # noqa: F821
+
+        class Decimal:
+            pass
+
+        good = attr.resolve_types(
+            C, globalns={"Amount": Decimal}, in_place=False
+        )
+        assert Decimal is good.x.type
+
+        with pytest.raises(NameError):
+            attr.resolve_types(C, globalns={}, in_place=False)
+
+        assert '"Amount"' == attr.fields(C).x.type
+        assert Decimal is good.x.type
+
+        again = attr.resolve_types(
+            C, globalns={"Amount": Decimal}, in_place=False
+        )
+        assert Decimal is again.x.type
+
+    def test_missing_namespace_entry_raises(self):
+        """
+        In a mapping of declaring class -> namespace, a declaring class that's
+        missing resolves without the other classes' names.
+        """
+
+        @attr.define
+        class Base:
+            x: '"Amount"'  # noqa: F821
+
+        @attr.define
+        class Sub(Base):
+            pass
+
+        class Decimal:
+            pass
+
+        with pytest.raises(NameError):
+            attr.resolve_types(
+                Sub, globalns={Base: {"Other": Decimal}}, in_place=False
+            )
+
+    def test_in_field_transformer(self):
+        """
+        The view is usable from a ``field_transformer`` where *cls* isn't an
+        attrs class yet.
+        """
+        seen = {}
+
+        def hook(cls, attribs):
+            view = attr.resolve_types(
+                cls, attribs=attribs, include_extras=False, in_place=False
+            )
+            seen["types"] = {f.name: f.type for f in view}
+            return attribs
+
+        @attr.define(field_transformer=hook)
+        class C:
+            x: "int"
+            y: "str"
+
+        assert {"x": int, "y": str} == seen["types"]
+
+    def test_two_views_diamond_with_annotated_containers(self):
+        """
+        End-to-end: one view drops ``Annotated`` metadata while another keeps
+        it, each resolving every field in the namespace of its declaring class.
+
+        A field travels a diamond; one path explicitly replaces its declaration
+        under the same name, so the winning declaration and the namespace of
+        the class that declared it both matter.
+        """
+        from typing import Annotated, Dict, List
+
+        @attr.define
+        class Base:
+            # "Amount" is a decimal quantity in the parent plugin's namespace.
+            both: 'Annotated[Dict[str, "Amount"], "unit"]'  # noqa: F821
+
+        @attr.define
+        class Left(Base):
+            pass
+
+        @attr.define
+        class Right(Base):
+            # This path replaces the declaration but keeps the same name;
+            # in the sub-module namespace "Amount" is an integer count.
+            both: 'Annotated[List["Amount"], "count"]'  # noqa: F821
+
+        @attr.define
+        class Diamond(Left, Right):
+            pass
+
+        class DecimalAmount:
+            pass
+
+        class IntCount:
+            pass
+
+        parent_ns = {
+            "Annotated": Annotated,
+            "Dict": Dict,
+            "Amount": DecimalAmount,
+        }
+        sub_ns = {"Annotated": Annotated, "List": List, "Amount": IntCount}
+
+        no_extras = attr.resolve_types(
+            Diamond,
+            globalns={Base: parent_ns, Left: sub_ns, Right: sub_ns},
+            localns={Base: parent_ns, Left: sub_ns, Right: sub_ns},
+            include_extras=False,
+            in_place=False,
+        )
+
+        # The sub-module's ``Right`` wins the MRO and replaces the field, so it
+        # is the declaring class and "Amount" is the integer count.
+        assert List[IntCount] == no_extras.both.type
+
+        extras = attr.resolve_types(
+            Diamond,
+            globalns={Base: parent_ns, Left: sub_ns, Right: sub_ns},
+            localns={Base: parent_ns, Left: sub_ns, Right: sub_ns},
+            include_extras=True,
+            in_place=False,
+        )
+
+        assert Annotated[List[IntCount], "count"] == extras.both.type
+
+        # The class's own field is untouched and both views are independent.
+        assert (
+            'Annotated[List["Amount"], "count"]'
+            == attr.fields(Diamond).both.type
+        )
+        assert List[IntCount] == no_extras.both.type
+
+        # A failing view doesn't damage the class or the earlier views.
+        with pytest.raises(NameError):
+            attr.resolve_types(
+                Diamond,
+                globalns={Right: {"Annotated": Annotated, "List": List}},
+                include_extras=True,
+                in_place=False,
+            )
+
+        assert (
+            'Annotated[List["Amount"], "count"]'
+            == attr.fields(Diamond).both.type
+        )
+        assert List[IntCount] == no_extras.both.type
+        assert Annotated[List[IntCount], "count"] == extras.both.type
+
+        # A later view still resolves as usual.
+        again = attr.resolve_types(
+            Diamond,
+            globalns={Base: parent_ns, Left: sub_ns, Right: sub_ns},
+            include_extras=False,
+            in_place=False,
+        )
+        assert List[IntCount] == again.both.type
+
+
 @pytest.mark.parametrize(
     "annot",
     [

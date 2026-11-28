@@ -57,6 +57,29 @@ As of Python 3.14, this is no longer necessary because it introduced [*deferred 
 
 In both cases, if you need to resolve these to real types, you can call {func}`attrs.resolve_types`, which will update the attributes in place.
 
+If you don't want to mutate the class's fields -- for example because you need different resolutions with different local namespaces or different `Annotated <typing.Annotated>` handling -- pass ``in_place=False``.
+You then get back an independent, resolved field view that behaves like {func}`attrs.fields`:
+
+```{doctest}
+>>> from attrs import define, fields, resolve_types
+>>> from typing import Annotated
+>>> @define
+... class Quantity:
+...     amount: 'Annotated[float, "USD"]'
+
+>>> without_extras = resolve_types(Quantity, include_extras=False, in_place=False)
+>>> without_extras.amount.type
+<class 'float'>
+>>> with_extras = resolve_types(Quantity, include_extras=True, in_place=False)
+>>> with_extras.amount.type
+typing.Annotated[float, 'USD']
+>>> fields(Quantity).amount.type
+'Annotated[float, "USD"]'
+```
+
+Each field is resolved against the namespace of the class that actually declared it, so inherited fields keep the meaning their annotation had at its declaration site.
+If *globalns* or *localns* is a mapping of declaring class to namespace, every declaring class is resolved using its own entry.
+
 
 ## Class variables and constants
 

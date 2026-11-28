@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 
 
-from ._compat import get_generic_base
-from ._make import _OBJ_SETATTR, NOTHING, fields
+from ._compat import _get_annotations, get_generic_base
+from ._make import _OBJ_SETATTR, NOTHING, _make_attr_tuple_class, fields
 from .exceptions import AttrsAttributeNotFoundError
 
 
@@ -422,8 +422,160 @@ def assoc(inst, **changes):
     return new
 
 
-def resolve_types(
+def _declaring_class(cls, field):
+    """
+    Return the class that actually declared *field* on *cls*, together with the
+    raw annotation it declared it with (or ``None`` if it wasn't annotated).
+
+    This is the class whose namespace must be used to resolve the annotation:
+    an inherited field keeps the annotation -- and therefore the names -- of
+    the class that actually declared it, not the class it is inherited into.
+    A field that was (re)defined locally on *cls* belongs to *cls*, even if a
+    base class happens to have an annotation of the same name.
+    """
+    if not field.inherited:
+        return cls, _get_annotations(cls).get(field.name)
+
+    # Walk the MRO for the class that defined the field itself (as opposed to
+    # one that only inherited a copy of it).
+    for base in cls.__mro__[1:]:
+        own = base.__dict__.get("__attrs_attrs__")
+        if own is None:
+            continue
+        for candidate in own:
+            if candidate.name == field.name and not candidate.inherited:
+                return base, _get_annotations(base).get(field.name)
+
+    return cls, _get_annotations(cls).get(field.name)
+
+
+def _is_class_namespace_map(namespaces):
+    """
+    Whether *namespaces* maps declaring classes to their own namespaces,
+    instead of being a single namespace.
+
+    A regular namespace like ``globals()`` is keyed by names (strings), so a
+    dict whose keys are all classes and whose values are all dicts is
+    unambiguously a per-declaring-class mapping.
+    """
+    return (
+        isinstance(namespaces, dict)
+        and bool(namespaces)
+        and all(isinstance(key, type) for key in namespaces)
+        and all(isinstance(value, dict) for value in namespaces.values())
+    )
+
+
+def _namespace_for(namespaces, declaring, is_map):
+    """
+    Pick the resolution environment that applies to *declaring*.
+
+    *namespaces* is either a plain namespace used for every class, or a mapping
+    of declaring class -> namespace.  A declaring class that's missing from
+    such a mapping is resolved without any extras from it.
+    """
+    if not is_map:
+        return namespaces
+
+    return namespaces.get(declaring)
+
+
+def _resolve_type(declaring, name, raw, globalns, localns, include_extras):
+    """
+    Resolve a single raw annotation *raw* declared on *declaring*.
+
+    A caller-provided *globalns* replaces the declaring class's module
+    namespace (just like it does for `typing.get_type_hints`); when it's not
+    given, the module namespace is used.
+    """
+    import sys
+    import typing
+
+    if globalns is not None:
+        resolved_globalns = dict(globalns)
+    else:
+        module = sys.modules.get(getattr(declaring, "__module__", None))
+        resolved_globalns = dict(vars(module)) if module is not None else {}
+
+    # Make forward references between the involved classes resolvable, but
+    # never override names the caller provided explicitly.
+    for base in declaring.__mro__:
+        resolved_globalns.setdefault(base.__name__, base)
+
+    # Resolve the annotation in a throwaway class so that exactly one
+    # annotation is evaluated against the declaring class's environment,
+    # without inheriting or mutating anything else.
+    shim = type(
+        f"_resolve_{name}",
+        (),
+        {
+            "__annotations__": {name: raw},
+            "__module__": getattr(declaring, "__module__", None),
+        },
+    )
+
+    hints = typing.get_type_hints(
+        shim,
+        globalns=resolved_globalns,
+        localns=localns,
+        include_extras=include_extras,
+    )
+
+    return hints[name]
+
+
+def _resolve_field_view(
     cls, globalns=None, localns=None, attribs=None, include_extras=True
+):
+    """
+    Build an independent, resolved view of *cls*'s fields.
+
+    Every field is resolved against the namespace of the class that actually
+    declared it -- not against *cls* -- so that inherited fields keep the
+    meaning that their name had at their declaration site.
+    """
+    import copy
+
+    fields_for = list(fields(cls) if attribs is None else attribs)
+
+    owners = [_declaring_class(cls, field) for field in fields_for]
+
+    globalns_is_map = _is_class_namespace_map(globalns)
+    localns_is_map = _is_class_namespace_map(localns)
+
+    resolved = []
+    for field, (declaring, raw) in zip(fields_for, owners, strict=True):
+        # Work on a copy so that neither the class's real ``Attribute`` nor any
+        # previously returned view is affected -- even for fields we don't have
+        # to resolve.
+        new_field = copy.copy(field)
+
+        if declaring is not None and raw is not None:
+            new_type = _resolve_type(
+                declaring,
+                field.name,
+                raw,
+                _namespace_for(globalns, declaring, globalns_is_map),
+                _namespace_for(localns, declaring, localns_is_map),
+                include_extras,
+            )
+            _OBJ_SETATTR(new_field, "type", new_type)
+
+        resolved.append(new_field)
+
+    AttrsClass = _make_attr_tuple_class(
+        cls.__name__, [f.name for f in resolved]
+    )
+    return AttrsClass(resolved)
+
+
+def resolve_types(
+    cls,
+    globalns=None,
+    localns=None,
+    attribs=None,
+    include_extras=True,
+    in_place=True,
 ):
     """
     Resolve any strings and forward annotations in type annotations.
@@ -437,6 +589,9 @@ def resolve_types(
     exists inside a method, you may pass *globalns* or *localns* to specify
     other dictionaries in which to look up these names. See the docs of
     `typing.get_type_hints` for more details.
+
+    By default, the types are resolved in place. Pass ``in_place=False`` to get
+    an independent field view instead; see below.
 
     Args:
         cls (type): Class to resolve.
@@ -454,6 +609,20 @@ def resolve_types(
             Resolve more accurately by passing ``include_extras=True`` to
             `typing.get_type_hints`.
 
+        in_place (bool):
+            If ``True`` (the default), resolve the types of the class's fields
+            in place and return *cls*. If ``False``, leave *cls* and its fields
+            untouched and return an independent, resolved field view instead.
+            Like `attrs.fields`, the view allows accessing its fields by name.
+            Each field in a view is resolved against the namespace of the class
+            that actually declared it, so inherited fields keep their original
+            meaning even if a name is rebound elsewhere.
+
+            *globalns* and *localns* may also be mappings of declaring class to
+            namespace, in which case each declaring class is resolved using its
+            own entry. A declaring class that's missing from such a mapping is
+            resolved without extra local names.
+
     Raises:
         TypeError: If *cls* is not a class.
 
@@ -463,14 +632,28 @@ def resolve_types(
         NameError: If types cannot be resolved because of missing variables.
 
     Returns:
-        *cls* so you can use this function also as a class decorator. Please
-        note that you have to apply it **after** `attrs.define`. That means the
-        decorator has to come in the line **before** `attrs.define`.
+        *cls* if *in_place* is ``True`` so you can use this function also as a
+        class decorator. Please note that you have to apply it **after**
+        `attrs.define`. That means the decorator has to come in the line
+        **before** `attrs.define`.
+
+        A tuple of resolved `attrs.Attribute` instances if *in_place* is
+        ``False``.
 
     ..  versionadded:: 20.1.0
     ..  versionadded:: 21.1.0 *attribs*
     ..  versionadded:: 23.1.0 *include_extras*
+    ..  versionadded:: 26.2.0 *in_place*
     """
+    if not in_place:
+        return _resolve_field_view(
+            cls,
+            globalns=globalns,
+            localns=localns,
+            attribs=attribs,
+            include_extras=include_extras,
+        )
+
     # Since calling get_type_hints is expensive we cache whether we've
     # done it already.
     if getattr(cls, "__attrs_types_resolved__", None) != cls:
