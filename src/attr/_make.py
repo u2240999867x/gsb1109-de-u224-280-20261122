@@ -658,6 +658,7 @@ class _ClassBuilder:
         "_cache_hash",
         "_cls",
         "_cls_dict",
+        "_cooperative_setattr",
         "_delete_attribs",
         "_frozen",
         "_has_custom_setattr",
@@ -716,6 +717,7 @@ class _ClassBuilder:
         self._delete_attribs = not bool(these)
         self._is_exc = props.is_exception
         self._on_setattr = props.on_setattr_hook
+        self._cooperative_setattr = props.cooperative_setattr
 
         self._has_custom_setattr = has_custom_setattr
         self._wrote_own_setattr = False
@@ -1182,7 +1184,7 @@ class _ClassBuilder:
                     _lazy_is_generator(on_setattr),
                 )
 
-        if not sa_attrs:
+        if not sa_attrs and not self._cooperative_setattr:
             return self
 
         if self._has_custom_setattr:
@@ -1190,19 +1192,83 @@ class _ClassBuilder:
             msg = "Can't combine custom __setattr__ with on_setattr hooks."
             raise ValueError(msg)
 
-        # docstring comes from _add_method_dunders
+        if self._cooperative_setattr:
+            __setattr__ = self._make_cooperative_setattr(sa_attrs)
+        else:
+            # docstring comes from _add_method_dunders
+            def __setattr__(self, name, val):
+                try:
+                    a, hook, is_gen = sa_attrs[name]
+                except KeyError:
+                    _OBJ_SETATTR(self, name, val)
+
+                    return
+
+                if is_gen():
+                    gen = hook(self, a, val)
+                    nval = next(gen)
+                    _OBJ_SETATTR(self, name, nval)
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        return
+
+                    gen.close()
+                    msg = "Generator on_setattr hook yielded more than once."
+                    raise RuntimeError(msg)
+
+                nval = hook(self, a, val)
+                _OBJ_SETATTR(self, name, nval)
+
+                return
+
+        self._cls_dict["__attrs_own_setattr__"] = True
+        self._cls_dict["__setattr__"] = self._add_method_dunders(__setattr__)
+        self._wrote_own_setattr = True
+
+        return self
+
+    def _make_cooperative_setattr(self, sa_attrs):
+        """
+        Build a cooperative ``__setattr__`` that passes every assignment down
+        the ``super()`` chain instead of writing it directly.
+
+        Only hooks for attributes the class declares itself run here; hooks
+        for inherited attributes belong to the class that declared them, and
+        attributes redeclared by a subclass stay owned by that subclass.
+        ``DeferredAssignment`` raised anywhere below is turned into a resumable
+        assignment and does not change the current value.
+        """
+        cls = self._cls
+        own_hooked = frozenset(
+            name for name in sa_attrs if name not in self._base_names
+        )
+
         def __setattr__(self, name, val):
-            try:
-                a, hook, is_gen = sa_attrs[name]
-            except KeyError:
-                _OBJ_SETATTR(self, name, val)
+            entry = sa_attrs.get(name)
+            if entry is None or name not in own_hooked:
+                # Either no hook or an inherited one: the next class in the
+                # chain owns this assignment.
+                super(cls, self).__setattr__(name, val)
+
+                return
+
+            a, hook, is_gen = entry
+
+            # A subclass may have redeclared this attribute; in that case the
+            # subclass's hook is the effective one and we must not run ours.
+            if getattr(type(self).__attrs_attrs__, name) is not a:
+                super(cls, self).__setattr__(name, val)
 
                 return
 
             if is_gen():
+                # Generator hooks keep their documented before/after semantics
+                # and are not part of cooperative deferral; their yielded
+                # value still travels down the cooperative chain.
                 gen = hook(self, a, val)
                 nval = next(gen)
-                _OBJ_SETATTR(self, name, nval)
+                super(cls, self).__setattr__(name, nval)
                 try:
                     next(gen)
                 except StopIteration:
@@ -1212,16 +1278,20 @@ class _ClassBuilder:
                 msg = "Generator on_setattr hook yielded more than once."
                 raise RuntimeError(msg)
 
-            nval = hook(self, a, val)
-            _OBJ_SETATTR(self, name, nval)
+            # The hook runs at most once per assignment: whether it defers
+            # itself or a layer below does, the armed continuation re-enters
+            # the chain below this class and skips the hook.
+            try:
+                nval = hook(self, a, val)
+                super(cls, self).__setattr__(name, nval)
+            except setters.DeferredAssignment as deferred:
 
-            return
+                def resume(confirmed_value=deferred.deferred_value):
+                    super(cls, self).__setattr__(name, confirmed_value)
 
-        self._cls_dict["__attrs_own_setattr__"] = True
-        self._cls_dict["__setattr__"] = self._add_method_dunders(__setattr__)
-        self._wrote_own_setattr = True
+                deferred.arm(resume)
 
-        return self
+        return __setattr__
 
     def _add_method_dunders_unsafe(self, method: Callable) -> Callable:
         """
@@ -1376,6 +1446,7 @@ def attrs(
     match_args=True,
     unsafe_hash=None,
     force_kw_only=True,
+    cooperative_setattr=False,
 ):
     r"""
     A class decorator that adds :term:`dunder methods` according to the
@@ -1455,6 +1526,9 @@ def attrs(
        *kw_only* now only applies to attributes defined in the current class,
        and respects attribute-level ``kw_only=False`` settings.
     .. versionadded:: 25.4.0 *force_kw_only*
+    .. versionadded:: 26.2.0
+       *cooperative_setattr* for cooperative ``super().__setattr__`` chains
+       and deferred, resumable assignments.
     """
     if repr_ns is not None:
         import warnings
@@ -1485,6 +1559,10 @@ def attrs(
 
         if has_own_setattr and is_frozen:
             msg = "Can't freeze a class with a custom __setattr__."
+            raise ValueError(msg)
+
+        if cooperative_setattr and is_frozen:
+            msg = "Frozen classes can't use cooperative_setattr."
             raise ValueError(msg)
 
         eq = not is_exc and _determine_whether_to_implement(
@@ -1559,6 +1637,7 @@ def attrs(
             ),
             on_setattr_hook=on_setattr,
             field_transformer=field_transformer,
+            cooperative_setattr=cooperative_setattr,
         )
 
         if not props.is_hashable and cache_hash:
@@ -2965,7 +3044,14 @@ class ClassProps:
         field_transformer (Callable[[Attribute[Any]], Attribute[Any]] | None):
             The class's `field transformers <transform-fields>`.
 
+        cooperative_setattr (bool):
+            Whether the generated ``__setattr__`` cooperates with
+            ``super().__setattr__`` and supports deferred, resumable
+            assignments via `attrs.setters.DeferredAssignment`.
+
     .. versionadded:: 25.4.0
+    .. versionchanged:: 26.2.0
+       Added *cooperative_setattr*.
     """
 
     class Hashability(enum.Enum):
@@ -3015,6 +3101,7 @@ class ClassProps:
         "added_pickling",
         "on_setattr_hook",
         "field_transformer",
+        "cooperative_setattr",
     )
 
     def __init__(
@@ -3035,6 +3122,7 @@ class ClassProps:
         added_pickling,
         on_setattr_hook,
         field_transformer,
+        cooperative_setattr=False,
     ):
         self.is_exception = is_exception
         self.is_slotted = is_slotted
@@ -3052,6 +3140,7 @@ class ClassProps:
         self.added_pickling = added_pickling
         self.on_setattr_hook = on_setattr_hook
         self.field_transformer = field_transformer
+        self.cooperative_setattr = cooperative_setattr
 
     @property
     def is_hashable(self):

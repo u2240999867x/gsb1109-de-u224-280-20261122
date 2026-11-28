@@ -770,6 +770,9 @@ All setters in ``attrs.setters`` are also available from ``attr.setters`` (it's 
 .. autofunction:: convert
 .. autofunction:: pipe
 
+.. autoclass:: DeferredAssignment
+   :members: arm, resume
+
 .. data:: NO_OP
 
    Sentinel for disabling class-wide *on_setattr* hooks for certain attributes.

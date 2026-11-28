@@ -282,6 +282,7 @@ def attrs(
     field_transformer: _FieldTransformer | None = ...,
     match_args: bool = ...,
     unsafe_hash: bool | None = ...,
+    cooperative_setattr: bool = ...,
 ) -> _C: ...
 @overload
 @dataclass_transform(order_default=True, field_specifiers=(attrib, field))
@@ -310,6 +311,7 @@ def attrs(
     field_transformer: _FieldTransformer | None = ...,
     match_args: bool = ...,
     unsafe_hash: bool | None = ...,
+    cooperative_setattr: bool = ...,
 ) -> Callable[[_C], _C]: ...
 def fields(cls: type[AttrsInstance] | AttrsInstance) -> Any: ...
 def fields_dict(cls: type[AttrsInstance]) -> dict[str, Attribute[Any]]: ...
@@ -348,6 +350,7 @@ def make_class(
     collect_by_mro: bool = ...,
     on_setattr: _OnSetAttrArgType | None = ...,
     field_transformer: _FieldTransformer | None = ...,
+    cooperative_setattr: bool = ...,
 ) -> type: ...
 
 # _funcs --

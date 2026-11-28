@@ -521,6 +521,66 @@ set x to 420
 ```
 
 
+## Cooperative and Deferred Assignments
+
+By default *attrs* writes the converted value straight onto the instance.
+If your class sits in an inheritance chain of hand-written layers (for example an old form class, an audit layer, and a legacy ledger descriptor), pass `cooperative_setattr=True` so that the generated `__setattr__` forwards every assignment with `super().__setattr__` instead.
+Each *attrs* class then only runs the hooks for the attributes it declares itself, and non-*attrs* layers keep participating in the same write chain:
+
+```{doctest}
+>>> import attr
+>>> from attrs import setters
+
+>>> class Ledger:
+...     def __setattr__(self, name, value):
+...         print(f"ledger stores {name}={value!r}")
+...         object.__setattr__(self, name, value)
+
+>>> @define(cooperative_setattr=True, slots=False, on_setattr=setters.NO_OP)
+... class Sheet(Ledger):
+...     pieces: int = field(default=0, on_setattr=lambda i, a, v: v * 8)
+
+>>> sheet = Sheet()
+>>> sheet.pieces = 2
+ledger stores pieces=16
+>>> sheet.pieces
+16
+```
+
+A hook -- or any layer below it -- may also raise {class}`attrs.setters.DeferredAssignment` to suspend the assignment without changing the current value.
+The nearest cooperative class catches it and arms a `resume()` continuation; call it later to continue below that class, optionally with a confirmed value.
+The hook itself runs at most once:
+
+```{doctest}
+>>> pending = []
+
+>>> def maybe_defer(instance, attribute, value):
+...     deferred = setters.DeferredAssignment(value)
+...     pending.append(deferred)
+...     raise deferred
+
+>>> @define(cooperative_setattr=True, slots=False, on_setattr=setters.NO_OP)
+... class AuditedSheet:
+...     pieces: int = field(default=0, on_setattr=maybe_defer)
+
+>>> audited = AuditedSheet()
+>>> audited.pieces = 16
+>>> audited.pieces
+0
+>>> pending[0].deferred_value
+16
+>>> pending[0].resume()
+>>> audited.pieces
+16
+>>> pending[0].resume(128)
+>>> audited.pieces
+128
+```
+
+Classes created without `cooperative_setattr` keep the regular behavior: a `DeferredAssignment` raised there propagates like any other hook exception and nothing is armed.
+The option cannot be combined with `frozen`.
+
+
 (metadata)=
 
 ## Metadata

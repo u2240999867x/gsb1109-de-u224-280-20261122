@@ -44,6 +44,7 @@ def define(
     field_transformer=None,
     match_args=True,
     force_kw_only=False,
+    cooperative_setattr=False,
 ):
     r"""
     A class decorator that adds :term:`dunder methods` according to
@@ -252,6 +253,17 @@ def define(
             See also `issue #980
             <https://github.com/python-attrs/attrs/issues/980>`_.
 
+        cooperative_setattr (bool):
+            Generate a cooperative ``__setattr__`` that forwards every
+            assignment with ``super().__setattr__`` instead of writing it
+            directly.  This lets non-*attrs* layers participate in the same
+            write chain and allows ``on_setattr`` hooks (or any layer in the
+            chain) to raise `attrs.setters.DeferredAssignment` to suspend an
+            assignment and resume it later, possibly with a confirmed value.
+            Only hooks for attributes declared by the class itself run here;
+            inherited attributes stay owned by the class that declared them.
+            Can't be combined with *frozen*.
+
         getstate_setstate (bool | None):
             .. note::
 
@@ -384,6 +396,7 @@ def define(
             field_transformer=field_transformer,
             match_args=match_args,
             force_kw_only=force_kw_only,
+            cooperative_setattr=cooperative_setattr,
         )
 
     def wrap(cls):

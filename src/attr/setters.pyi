@@ -5,6 +5,13 @@ from attrs import _OnSetAttrType
 
 _T = TypeVar("_T")
 
+class DeferredAssignment(Exception):
+    deferred_value: Any
+
+    def __init__(self, deferred_value: Any) -> None: ...
+    def arm(self, continuation: Any) -> None: ...
+    def resume(self, confirmed_value: Any = ...) -> Any: ...
+
 def frozen(
     instance: Any, attribute: Attribute[Any], new_value: Any
 ) -> NoReturn: ...

@@ -186,6 +186,7 @@ def define(
     on_setattr: _OnSetAttrArgType | None = ...,
     field_transformer: _FieldTransformer | None = ...,
     match_args: bool = ...,
+    cooperative_setattr: bool = ...,
 ) -> _C: ...
 @overload
 @dataclass_transform(  # type: ignore[misc]
@@ -215,6 +216,7 @@ def define(
     on_setattr: _OnSetAttrArgType | None = ...,
     field_transformer: _FieldTransformer | None = ...,
     match_args: bool = ...,
+    cooperative_setattr: bool = ...,
 ) -> Callable[[_C], _C]: ...
 
 mutable = define
@@ -304,6 +306,7 @@ class ClassProps:
     added_pickling: bool
     on_setattr_hook: _OnSetAttrType | None
     field_transformer: Callable[[Attribute[Any]], Attribute[Any]] | None
+    cooperative_setattr: bool
 
     def __init__(
         self,
@@ -325,6 +328,7 @@ class ClassProps:
         added_pickling: bool,
         on_setattr_hook: _OnSetAttrType,
         field_transformer: Callable[[Attribute[Any]], Attribute[Any]],
+        cooperative_setattr: bool = ...,
     ) -> None: ...
     @property
     def is_hashable(self) -> bool: ...
