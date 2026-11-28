@@ -384,6 +384,25 @@ If you're using streaming responses in any of these ways then the `response.cont
 ...         print(r.text)
 ```
 
+### Resumable downloads
+
+A streaming `GET` may optionally continue after a dropped connection by issuing
+validated `Range` requests against the same URL. This requires the initial
+response to include a strong `ETag` and the complete `Content-Length`:
+
+```pycon
+>>> with httpx.stream("GET", "https://www.example.com/report", resume=True) as r:
+...     for chunk in r.iter_bytes(8192):
+...         print(chunk)
+```
+
+Each continuation reuses the original URL, sends `Range: bytes=<offset>-`
+together with `If-Range: <strong-etag>`, and validates that the partial
+response agrees with the original ETag, complete length, and content encoding.
+A request limit can be supplied with `resume=<max_requests>`, or via a
+`ResumePolicy` instance. The same option is also available on
+`client.get(..., resume=...)` and on `iter_bytes()` / `aiter_bytes()`.
+
 ## Cookies
 
 Any cookies that are set on the response can be easily accessed:

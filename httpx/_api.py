@@ -53,6 +53,8 @@ def request(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    resume: typing.Any = None,
+    **resume_options: typing.Any,
 ) -> Response:
     """
     Sends an HTTP request.
@@ -117,6 +119,8 @@ def request(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            resume=resume,
+            **resume_options,
         )
 
 
@@ -138,6 +142,8 @@ def stream(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    resume: typing.Any = None,
+    **resume_options: typing.Any,
 ) -> typing.Iterator[Response]:
     """
     Alternative to `httpx.request()` that streams the response body
@@ -167,6 +173,8 @@ def stream(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            resume=resume,
+            **resume_options,
         ) as response:
             yield response
 
@@ -183,6 +191,8 @@ def get(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    resume: typing.Any = None,
+    **resume_options: typing.Any,
 ) -> Response:
     """
     Sends a `GET` request.
@@ -204,6 +214,8 @@ def get(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        resume=resume,
+        **resume_options,
     )
 
 

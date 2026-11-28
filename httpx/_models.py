@@ -543,6 +543,10 @@ class Response:
         self.is_closed = False
         self.is_stream_consumed = False
 
+        # Set by the client, used for optional resumable streaming.
+        self._resume_client = None
+        self._resume_default: typing.Any = None
+
         self.default_encoding = default_encoding
 
         if stream is None:
@@ -863,7 +867,15 @@ class Response:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+            if name
+            not in [
+                "extensions",
+                "stream",
+                "is_closed",
+                "_decoder",
+                "_resume_client",
+                "_resume_default",
+            ]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:
@@ -872,6 +884,8 @@ class Response:
         self.is_closed = True
         self.extensions = {}
         self.stream = UnattachedStream()
+        self._resume_client = None
+        self._resume_default = None
 
     def read(self) -> bytes:
         """
@@ -881,11 +895,22 @@ class Response:
             self._content = b"".join(self.iter_bytes())
         return self._content
 
-    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+    def iter_bytes(
+        self,
+        chunk_size: int | None = None,
+        *,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
+    ) -> typing.Iterator[bytes]:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+
+        Passing an optional ``resume=True`` (or a resume request limit) opts
+        into resumable streaming for this iterator.
         """
+        self._resolve_iterator_resume(resume, resume_options)
+
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -903,6 +928,60 @@ class Response:
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():
                     yield chunk
+
+    def _resolve_iterator_resume(
+        self,
+        resume: typing.Any,
+        resume_options: dict[str, typing.Any],
+        *,
+        mode: str = "sync",
+    ) -> typing.Any:
+        from ._resume import RESUME_KEYS, resolve_resume_policy
+
+        if resume is None and not any(key in resume_options for key in RESUME_KEYS):
+            policy = self._resume_default
+        else:
+            policy = resolve_resume_policy(resume, resume_options)
+        if resume_options:
+            unexpected = next(iter(resume_options))
+            raise TypeError(
+                f"iter_bytes() got an unexpected keyword argument {unexpected!r}"
+            )
+        if policy is not None:
+            if mode == "async":
+                self._attach_resumable_async(policy)
+            else:
+                self._attach_resumable_sync(policy)
+        return policy
+
+    def _attach_resumable_sync(self, policy: typing.Any) -> None:
+        from ._resume import RESUME_EXTENSION, ResumableSyncStream, coerce_resume_policy
+
+        if self._resume_client is None or self._request is None:
+            raise RuntimeError(
+                "Resumable streaming requires a response created by a Client."
+            )
+        if self.is_stream_consumed:
+            return
+        if not self.is_success:
+            return
+        if isinstance(self.stream, ResumableSyncStream):
+            return
+        from ._types import SyncByteStream
+
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to use a sync iterator on an async stream.")
+        if RESUME_EXTENSION not in self._request.extensions:
+            self._request.extensions = dict(
+                **self._request.extensions, **{RESUME_EXTENSION: policy}
+            )
+        assert self._request is not None
+        self.stream = ResumableSyncStream(
+            client=self._resume_client,
+            request=self._request,
+            response=self,
+            policy=coerce_resume_policy(policy),
+        )
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -980,12 +1059,21 @@ class Response:
         return self._content
 
     async def aiter_bytes(
-        self, chunk_size: int | None = None
+        self,
+        chunk_size: int | None = None,
+        *,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> typing.AsyncIterator[bytes]:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+
+        Passing an optional ``resume=True`` (or a resume request limit) opts
+        into resumable streaming for this iterator.
         """
+        self._resolve_iterator_resume(resume, resume_options, mode="async")
+
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -1003,6 +1091,39 @@ class Response:
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():
                     yield chunk
+
+    def _attach_resumable_async(self, policy: typing.Any) -> None:
+        from ._resume import (
+            RESUME_EXTENSION,
+            ResumableAsyncStream,
+            coerce_resume_policy,
+        )
+
+        if self._resume_client is None or self._request is None:
+            raise RuntimeError(
+                "Resumable streaming requires a response created by a Client."
+            )
+        if self.is_stream_consumed:
+            return
+        if not self.is_success:
+            return
+        if isinstance(self.stream, ResumableAsyncStream):
+            return
+        from ._types import AsyncByteStream
+
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to use an async iterator on a sync stream.")
+        if RESUME_EXTENSION not in self._request.extensions:
+            self._request.extensions = dict(
+                **self._request.extensions, **{RESUME_EXTENSION: policy}
+            )
+        assert self._request is not None
+        self.stream = ResumableAsyncStream(
+            client=self._resume_client,
+            request=self._request,
+            response=self,
+            policy=coerce_resume_policy(policy),
+        )
 
     async def aiter_text(
         self, chunk_size: int | None = None

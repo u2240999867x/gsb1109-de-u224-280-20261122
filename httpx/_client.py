@@ -27,6 +27,15 @@ from ._exceptions import (
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._resume import (
+    RESUME_EXTENSION,
+    RESUME_KEYS,
+    ResumableAsyncStream,
+    ResumableSyncStream,
+    ResumePolicy,
+    coerce_resume_policy,
+    resolve_resume_policy,
+)
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -218,6 +227,7 @@ class BaseClient:
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
+        self._resume: ResumePolicy | None = None
         self._state = ClientState.UNOPENED
 
     @property
@@ -351,6 +361,8 @@ class BaseClient:
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> Request:
         """
         Build and return a request instance.
@@ -358,6 +370,8 @@ class BaseClient:
         * The `params`, `headers` and `cookies` arguments
         are merged with any values set on the client.
         * The `url` argument is merged with any `base_url` set on the client.
+        * The optional `resume` argument enables resumable streaming for the
+        request. Use `True` (or an integer request limit) to enable it.
 
         See also: [Request instances][0]
 
@@ -375,6 +389,22 @@ class BaseClient:
                 else Timeout(timeout)
             )
             extensions = dict(**extensions, timeout=timeout.as_dict())
+        policy = self._resolve_resume_policy(resume, resume_options)
+        if resume_options:
+            unexpected = next(iter(resume_options))
+            raise TypeError(
+                f"build_request() got an unexpected keyword argument {unexpected!r}"
+            )
+        if policy is None and RESUME_EXTENSION in extensions:
+            policy = coerce_resume_policy(extensions[RESUME_EXTENSION])
+        if policy is not None:
+            extensions = dict(**extensions, **{RESUME_EXTENSION: policy})
+        elif RESUME_EXTENSION in extensions:
+            extensions = {
+                key: value
+                for key, value in extensions.items()
+                if key != RESUME_EXTENSION
+            }
         return Request(
             method,
             url,
@@ -409,6 +439,17 @@ class BaseClient:
             merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
             return self.base_url.copy_with(raw_path=merge_raw_path)
         return merge_url
+
+    def _resolve_resume_policy(
+        self,
+        resume: typing.Any,
+        resume_options: dict[str, typing.Any],
+    ) -> ResumePolicy | None:
+        if resume is False:
+            return None
+        if resume is not None or any(key in resume_options for key in RESUME_KEYS):
+            return resolve_resume_policy(resume, resume_options)
+        return self._resume
 
     def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
         """
@@ -634,6 +675,8 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **resume** - *(optional)* Enables resumable streaming responses by default.
+    Use `True`, an integer request limit, or a `ResumePolicy` instance.
     """
 
     def __init__(
@@ -658,6 +701,8 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -672,6 +717,14 @@ class Client(BaseClient):
             trust_env=trust_env,
             default_encoding=default_encoding,
         )
+        self._resume = coerce_resume_policy(
+            resolve_resume_policy(resume, resume_options)
+        )
+        if resume_options:
+            unexpected = next(iter(resume_options))
+            raise TypeError(
+                f"Client() got an unexpected keyword argument {unexpected!r}"
+            )
 
         if http2:
             try:
@@ -784,6 +837,8 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> Response:
         """
         Build and send a request.
@@ -821,6 +876,8 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -841,6 +898,8 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> typing.Iterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -864,6 +923,8 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
         response = self.send(
             request=request,
@@ -918,6 +979,7 @@ class Client(BaseClient):
             history=[],
         )
         try:
+            self._attach_resumable_stream(request, response)
             if not stream:
                 response.read()
 
@@ -926,6 +988,26 @@ class Client(BaseClient):
         except BaseException as exc:
             response.close()
             raise exc
+
+    def _attach_resumable_stream(self, request: Request, response: Response) -> None:
+        policy = request.extensions.get(RESUME_EXTENSION)
+        if policy is None:
+            return
+        if request.method != "GET":
+            return
+        if response.is_stream_consumed:
+            return
+        if not response.is_success:
+            return
+        if isinstance(response.stream, ResumableSyncStream):
+            return
+        assert isinstance(response.stream, SyncByteStream)
+        response.stream = ResumableSyncStream(
+            client=self,
+            request=request,
+            response=response,
+            policy=policy,
+        )
 
     def _send_handling_auth(
         self,
@@ -1021,6 +1103,9 @@ class Client(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response._resume_client = self
+        if RESUME_EXTENSION in request.extensions:
+            response._resume_default = request.extensions[RESUME_EXTENSION]
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1044,6 +1129,8 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> Response:
         """
         Send a `GET` request.
@@ -1060,6 +1147,8 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
 
     def options(
@@ -1348,6 +1437,8 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **resume** - *(optional)* Enables resumable streaming responses by default.
+    Use `True`, an integer request limit, or a `ResumePolicy` instance.
     """
 
     def __init__(
@@ -1372,6 +1463,8 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1386,6 +1479,14 @@ class AsyncClient(BaseClient):
             trust_env=trust_env,
             default_encoding=default_encoding,
         )
+        self._resume = coerce_resume_policy(
+            resolve_resume_policy(resume, resume_options)
+        )
+        if resume_options:
+            unexpected = next(iter(resume_options))
+            raise TypeError(
+                f"AsyncClient() got an unexpected keyword argument {unexpected!r}"
+            )
 
         if http2:
             try:
@@ -1498,6 +1599,8 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> Response:
         """
         Build and send a request.
@@ -1536,6 +1639,8 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -1556,6 +1661,8 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> typing.AsyncIterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -1579,6 +1686,8 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
         response = await self.send(
             request=request,
@@ -1633,6 +1742,7 @@ class AsyncClient(BaseClient):
             history=[],
         )
         try:
+            self._attach_resumable_async_stream(request, response)
             if not stream:
                 await response.aread()
 
@@ -1641,6 +1751,28 @@ class AsyncClient(BaseClient):
         except BaseException as exc:
             await response.aclose()
             raise exc
+
+    def _attach_resumable_async_stream(
+        self, request: Request, response: Response
+    ) -> None:
+        policy = request.extensions.get(RESUME_EXTENSION)
+        if policy is None:
+            return
+        if request.method != "GET":
+            return
+        if response.is_stream_consumed:
+            return
+        if not response.is_success:
+            return
+        if isinstance(response.stream, ResumableAsyncStream):
+            return
+        assert isinstance(response.stream, AsyncByteStream)
+        response.stream = ResumableAsyncStream(
+            client=self,
+            request=request,
+            response=response,
+            policy=policy,
+        )
 
     async def _send_handling_auth(
         self,
@@ -1736,6 +1868,9 @@ class AsyncClient(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        response._resume_client = self
+        if RESUME_EXTENSION in request.extensions:
+            response._resume_default = request.extensions[RESUME_EXTENSION]
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1759,6 +1894,8 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        resume: typing.Any = None,
+        **resume_options: typing.Any,
     ) -> Response:
         """
         Send a `GET` request.
@@ -1775,6 +1912,8 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            resume=resume,
+            **resume_options,
         )
 
     async def options(

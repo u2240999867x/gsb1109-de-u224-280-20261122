@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add optional resumable streaming for `GET` responses, using `Range` and
+  `If-Range` continuation requests. Enabled with `resume=True` on streaming
+  requests, `Client`/`AsyncClient`, or the byte iterators.
 
 ## 0.28.1 (6th December, 2024)
 
