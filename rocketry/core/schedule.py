@@ -13,7 +13,7 @@ from queue import Empty
 
 from rocketry._base import RedBase
 from rocketry.core.condition import BaseCondition, AlwaysFalse
-from rocketry.core.task import Task
+from rocketry.core.task import Task, TaskRun
 from rocketry.exc import SchedulerRestart, SchedulerExit, TaskLoggingError, TaskSetupError
 from rocketry.core.hook import _Hooker
 
@@ -282,9 +282,27 @@ class Scheduler(RedBase):
                     # Take the return value from the record and delete
                     # Note that record has attr __return__ only if task running as process
                     return_value = record.__return__
-                    task._handle_return(return_value)
+                    run = self._get_record_run(task, record)
+                    task._handle_return(
+                        return_value,
+                        task_run=run,
+                        created=getattr(record, "created", None),
+                    )
                     del record.__return__
                 self._log_task(task, "log_record", record)
+
+    @staticmethod
+    def _get_record_run(task: 'Task', record):
+        "Find the run of a success record so its return is stored per run."
+        run_id = getattr(record, "run_id", None)
+        if run_id is None:
+            return None
+        created = getattr(record, "created", None)
+        return TaskRun(
+            start=created if created is not None else task.session.get_time(),
+            task=None,
+            run_id=run_id,
+        )
 
     async def _hibernate(self):
         """Go to sleep and wake up when next task can be executed."""

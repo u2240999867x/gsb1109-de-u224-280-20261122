@@ -24,3 +24,17 @@ class TaskSetupError(Exception):
 
 class TaskLoggingError(Exception):
     """Task's logging failed"""
+
+
+class RunNotAvailable(KeyError):
+    """A run accepted by a handoff has no return value available.
+
+    This is raised instead of silently falling back to another run of
+    the same task.  It is a ``KeyError`` for backwards compatibility
+    with callers that treat missing returns as key errors.
+    """
+
+    def __str__(self):
+        # KeyError adds quotes around the message; keep it readable.
+        return str(self.args[0]) if self.args else ""
+

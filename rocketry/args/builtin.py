@@ -139,6 +139,12 @@ class Return(BaseArgument):
     Return is an argument which value represents
     the return of a task.
 
+    When the argument is materialized for a run that has a handoff
+    (an explicit list of accepted upstream runs), the value is read
+    from the accepted run only.  It never falls back to another run of
+    the same task.  Without a handoff, the latest successful return is
+    used as before.
+
     Parameters
     ----------
     name : str
@@ -164,23 +170,102 @@ class Return(BaseArgument):
             ...
     """
 
-    def __init__(self, task_name, default:Union[NotSet, str]=NOTSET):
+    def __init__(self, task_name, default:Union[NotSet, str]=NOTSET, run=None, run_id=None):
         self.task_name = task_name
         self.default = default
+        self.run = run if run is not None else run_id
 
-    def get_value(self, task=None, session=None, **kwargs) -> Any:
+    def _get_handoff(self, task=None, **kwargs):
+        from rocketry.core.handoff import as_handoff
+        handoff = kwargs.get("_handoff_")
+        if handoff is None and task is not None:
+            handoff = getattr(task, "_active_handoff", None)
+        return as_handoff(handoff)
+
+    def get_value(self, task=None, session=None, run=None, **kwargs) -> Any:
         if session is None:
-            session = task.session
+            session = task.session if task is not None else self.session
+        if session is None:
+            raise TypeError("Return argument requires a session or a task")
         try:
             input_task = session[self.task_name]
         except KeyError:
             raise ValueError(f"Task {repr(self.task_name)} does not exists. Cannot get return value")
+
+        handoff = self._get_handoff(task=task, **kwargs)
+        reference = None
+        if handoff is not None:
+            reference = handoff.get_reference(input_task)
+            if reference is None:
+                withdrawn = handoff.get_withdrawn(input_task)
+                if withdrawn is not None:
+                    from rocketry.exc import RunNotAvailable
+                    token = withdrawn.run_id or withdrawn.created
+                    raise RunNotAvailable(
+                        f"Accepted run {token!r} of task {input_task.name!r} is not available"
+                    )
+        if run is None:
+            run = self.run
+
+        created = None
+        if run is not None and not isinstance(run, str):
+            created = run
+            run = None
+
         try:
+            if reference is not None:
+                return session.returns.get_value(
+                    input_task,
+                    run_id=reference.run_id,
+                    created=reference.created,
+                )
+            if run is not None or created is not None:
+                return session.returns.get_value(input_task, run_id=run, created=created)
             return session.returns[input_task]
-        except KeyError:
+        except KeyError as exc:
+            from rocketry.exc import RunNotAvailable
+            if isinstance(exc, RunNotAvailable):
+                raise
             if self.default is NOTSET:
-                raise KeyError(f"Return value not found for {repr(task)}")
+                raise KeyError(f"Return value not found for {repr(task)}") from exc
             return self.default
+
+    def stage(self, **kwargs) -> 'Return':
+        """Prepare the argument for a child process or thread.
+
+        Process runs copy the session without tasks, so the value must
+        be resolved before pickling.  Thread runs must resolve at the
+        thread entry (``get_value``) so the accepted handoff wins over
+        any later run of the same task.
+        """
+        task = kwargs.get("task")
+        execution = getattr(task, "get_execution", lambda: None)()
+        if execution == "process":
+            from rocketry.core.handoff import as_handoff
+            from rocketry.exc import RunNotAvailable
+            handoff = kwargs.get("_handoff_")
+            if handoff is None and task is not None:
+                handoff = getattr(task, "_active_handoff", None)
+            handoff = as_handoff(handoff)
+            try:
+                kwargs = {key: value for key, value in kwargs.items() if key != "_handoff_"}
+                return SimpleArg(self.get_value(_handoff_=handoff, **kwargs))
+            except RunNotAvailable:
+                raise
+            except (KeyError, ValueError):
+                if self.default is NOTSET:
+                    raise
+                return SimpleArg(self.default)
+        return self
+
+    @classmethod
+    def of(cls, task, run_id=None, **kwargs) -> 'Return':
+        """Create a Return bound to one explicit run."""
+        return cls(task, run=run_id, **kwargs)
+
+    def with_run(self, run_id=None, created=None) -> 'Return':
+        """Copy this argument bound to one explicit run."""
+        return type(self)(self.task_name, default=self.default, run=run_id or created)
 
     def __repr__(self):
         return f'Return({repr(self.task_name)}{"" if self.default is None else ", default=" + repr(self.default)})'

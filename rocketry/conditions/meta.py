@@ -16,9 +16,10 @@ class _FuncTaskCondWrapper(FuncTask):
     session: _Session
     name: Optional[str] = Field(description="Name of the task. Must be unique")
 
-    def _handle_return(self, value):
+    def _handle_return(self, value, task_run=None, created=None):
         # Handle the return value of the function
         self.session._cond_states[self.name] = value
+        super()._handle_return(value, task_run=task_run, created=created)
 
 class TaskCond(BaseCondition):
     """Condition which state is defined by a task

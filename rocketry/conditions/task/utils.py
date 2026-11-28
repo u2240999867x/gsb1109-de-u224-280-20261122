@@ -9,7 +9,6 @@ from rocketry.pybox.time import to_timestamp
 from rocketry.log.utils import get_field_value
 
 class DependMixin(BaseCondition):
-
     _dep_actions = None
 
     def __init__(self, depend_task, task=None):
@@ -34,6 +33,16 @@ class DependMixin(BaseCondition):
         return Any(*(cls(depend_task=dep_task, task=task) for dep_task in tasks))
 
     def get_state(self, task=Task(default=None), session=Session()):
+        state, _ = self._resolve(task=task, session=session)
+        return state
+
+    def observe_with_handoff(self, task=Task(default=None), session=Session()):
+        return self._resolve(task=task, session=session)
+
+    def _resolve(self, task=None, session=None):
+        """Read the upstream record once and return (state, handoff)."""
+        from rocketry.core.handoff import Handoff
+
         actual_task = session[self.task] if self.task is not None else task
         depend_task = session[self.depend_task]
 
@@ -43,12 +52,29 @@ class DependMixin(BaseCondition):
 
         if not last_depend_finish:
             # Depend has not run at all
-            return False
-        if not last_actual_start:
-            # Depend has succeeded but the actual task has not
-            return True
+            return False, None
+        if last_actual_start and not (
+            get_field_value(last_depend_finish, "created") > get_field_value(last_actual_start, "created")
+        ):
+            # Depend has not finished after the actual task started
+            return False, None
 
-        return get_field_value(last_depend_finish, "created") > get_field_value(last_actual_start, "created")
+        try:
+            run_id = get_field_value(last_depend_finish, "run_id")
+        except (KeyError, AttributeError):
+            run_id = None
+        created = get_field_value(last_depend_finish, "created")
+        reference = session.returns.resolve_reference(
+            depend_task,
+            run_id=None if run_id is None else str(run_id),
+            created=created,
+        )
+        return True, Handoff(reference)
+
+    def get_handoff(self, task=Task(default=None), session=Session()):
+        """Return the concrete upstream run this condition accepted."""
+        state, handoff = self._resolve(task=task, session=session)
+        return handoff if state else None
 
 class TaskStatusMixin(BaseComparable):
 

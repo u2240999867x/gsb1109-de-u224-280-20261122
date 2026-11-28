@@ -56,6 +56,9 @@ class TaskRun:
     event_running: Optional[threading.Event] = None
     exception: Exception = None
 
+    # Handoff: the concrete upstream runs this run accepted.
+    handoff: object = None
+
     def is_alive(self) -> bool:
         if self.is_main:
             return True
@@ -249,6 +252,7 @@ class Task(RedBase, BaseModel):
     _run_stack: List[TaskRun] = PrivateAttr(default_factory=list)
     _lock: Optional[Type] = PrivateAttr(default=None)
     _main_alive: bool = PrivateAttr(default=False)
+    _pending_handoff: Any = PrivateAttr(default=None)
 
     _mark_running = False
 
@@ -301,6 +305,14 @@ class Task(RedBase, BaseModel):
     def logger(self):
         logger = logging.getLogger(self.logger_name)
         return TaskAdapter(logger, task=self)
+
+    @property
+    def _active_handoff(self):
+        "Handoff of the currently running run (if any)."
+        for run in reversed(self._run_stack):
+            if run.handoff is not None:
+                return run.handoff
+        return None
 
     def __init__(self, **kwargs):
 
@@ -387,7 +399,7 @@ class Task(RedBase, BaseModel):
     def __hash__(self):
         return id(self)
 
-    def run(self, _params:Union[Parameters, Dict]=None, **kwargs):
+    def run(self, _params:Union[Parameters, Dict]=None, _handoff_=None, **kwargs):
         """Set the task running (with given parameters)
 
         Creates a run batch that will set the task running
@@ -400,6 +412,10 @@ class Task(RedBase, BaseModel):
         ----------
         _params : dict, Parameters, optional
             Parameters for the batch
+        _handoff_ : Handoff, dict, iterable, optional
+            Concrete upstream runs this queued run accepts.  The
+            ticket is consumed by the next start.  It can also be
+            passed as the parameter ``_handoff_`` inside ``_params``.
         **kwargs
             Parameters for the batch
         """
@@ -408,7 +424,67 @@ class Task(RedBase, BaseModel):
             params.update(_params)
         if kwargs:
             params.update(kwargs)
+
+        from rocketry.core.handoff import as_handoff
+        handoff = _handoff_
+        if handoff is None:
+            handoff = params.to_dict().get("_handoff_")
+        handoff = as_handoff(handoff)
+        if handoff is None:
+            handoff = self._get_queue_handoff()
+        if handoff is not None:
+            params["_handoff_"] = handoff
         self.batches.append(params)
+
+    def _get_queue_handoff(self):
+        """Capture the run currently accepted by the start condition.
+
+        This is what makes a queued downstream run keep the upstream
+        run that was true when it was queued, even if other upstream
+        runs finish before the downstream run starts.
+        """
+        try:
+            cond, handoff = self.start_cond.observe_with_handoff(task=self, session=self.session)
+        except AttributeError:
+            cond = self.start_cond.observe(task=self)
+            handoff = None
+        return handoff if cond else None
+
+    def queue_handoff(self, handoff):
+        """Attach a handoff to the next run of this task."""
+        from rocketry.core.handoff import as_handoff
+        handoff = as_handoff(handoff)
+        if handoff is None:
+            return None
+        pending = self._pending_handoff
+        if pending is None:
+            self._pending_handoff = handoff
+        else:
+            pending.accept(handoff)
+            self._pending_handoff = pending
+        return handoff
+
+    def pop_handoff(self):
+        "Take the handoff queued for the next run."
+        handoff = self._pending_handoff
+        self._pending_handoff = None
+        return handoff
+
+    @property
+    def pending_handoff(self):
+        "Handoff waiting for the next run."
+        return self._pending_handoff
+
+    @property
+    def handoff(self):
+        "Handoff waiting for the next run."
+        return self._pending_handoff
+
+    @handoff.setter
+    def handoff(self, value):
+        self.queue_handoff(value)
+
+    set_handoff = queue_handoff
 
     def delete(self):
         """Delete the task from the session.
@@ -479,10 +555,34 @@ class Task(RedBase, BaseModel):
         task_run = TaskRun(start=self.session.get_time(), task=None)
         try:
             self.force_run = False
+
+            from rocketry.core.handoff import as_handoff
+            handoff = kwargs.pop("_handoff_", None)
+            if isinstance(params, Parameters):
+                handoff = params.to_dict().get("_handoff_", handoff)
+            elif isinstance(params, dict):
+                handoff = params.get("_handoff_", handoff)
+            params = self._without_handoff(params, Parameters)
+
             params = self.get_extra_params(params, execution=execution)
             direct_params = self._get_direct_params()
+            direct_handoff = direct_params.to_dict().get("_handoff_")
+            if direct_handoff is not None:
+                direct_params = self._without_handoff(direct_params, Parameters)
+                handoff = direct_handoff
 
-            task_run.run_id = self.get_run_id(task_run, params=params | direct_params)
+            handoff = as_handoff(handoff) or self.pop_handoff()
+            task_run.handoff = handoff
+
+            # The handoff also reaches parameter materialization so
+            # ``Return`` can bind to the accepted run at the thread entry.
+            if handoff is not None:
+                params["_handoff_"] = handoff
+
+            task_run.run_id = self.get_run_id(
+                task_run,
+                params=self._without_handoff(params, Parameters) | direct_params,
+            )
 
             # Run the actual task
             if execution in ("main", "async"):
@@ -563,7 +663,16 @@ class Task(RedBase, BaseModel):
         if self.disabled:
             return False
 
-        cond = self.start_cond.observe(task=self)
+        try:
+            cond, handoff = self.start_cond.observe_with_handoff(task=self, session=self.session)
+        except AttributeError:
+            cond = self.start_cond.observe(task=self)
+            handoff = None
+        if cond and handoff:
+            # Bind the concrete run(s) the condition accepted to this
+            # start so the parameters are handed off from exactly that
+            # run even if another run finishes in between.
+            self.queue_handoff(handoff)
 
         return cond
 
@@ -590,7 +699,9 @@ class Task(RedBase, BaseModel):
         exc_info = (None, None, None)
         params = self.postfilter_params(params)
         params = Parameters(params) | Parameters(direct_params)
-        params = params.materialize(task=self, session=self.session)
+        handoff = getattr(task_run, "handoff", None)
+        params = params.materialize(task=self, session=self.session, _handoff_=handoff)
+        params.pop("_handoff_", None)
 
         try:
             if inspect.iscoroutinefunction(self.execute):
@@ -642,10 +753,15 @@ class Task(RedBase, BaseModel):
                 raise
 
         else:
-            # Store the output
+            # Store the output before logging so the success record can
+            # be matched back to this run even if the log has no run_id.
             if execution != 'process':
-                self._handle_return(output)
+                self._handle_return(output, task_run=task_run)
             self.log_success(output, task_run=task_run)
+            if execution != 'process' and task_run.run_id is not None:
+                self.session.returns.set_created(
+                    self, task_run.run_id, self.session.get_time()
+                )
             #self.logger.info(f'Task {self.name} succeeded', extra={"action": "success"})
             status = "succeeded"
 
@@ -660,8 +776,8 @@ class Task(RedBase, BaseModel):
 
         terminate_event = params.get('_thread_terminate_', threading.Event())
 
-        params = params.pre_materialize(task=self, session=self.session, terminate_event=terminate_event)
-        direct_params = direct_params.pre_materialize(task=self, session=self.session, terminate_event=terminate_event)
+        params = params.pre_materialize(task=self, session=self.session, terminate_event=terminate_event, _handoff_=task_run.handoff)
+        direct_params = direct_params.pre_materialize(task=self, session=self.session, terminate_event=terminate_event, _handoff_=task_run.handoff)
 
         thread = threading.Thread(target=self._run_as_thread, args=(params, direct_params, task_run))
         task_run.task = thread
@@ -709,8 +825,8 @@ class Task(RedBase, BaseModel):
 
         session = self.session
 
-        params = params.pre_materialize(task=self, session=session)
-        direct_params = direct_params.pre_materialize(task=self, session=session)
+        params = params.pre_materialize(task=self, session=session, _handoff_=task_run.handoff)
+        direct_params = direct_params.pre_materialize(task=self, session=session, _handoff_=task_run.handoff)
 
         # Daemon resolution: task.daemon >> scheduler.tasks_as_daemon
         log_queue = session.scheduler._log_queue if log_queue is None else log_queue
@@ -806,6 +922,15 @@ class Task(RedBase, BaseModel):
             direct_params.update(self.batches.pop(0))
         return direct_params
 
+    @staticmethod
+    def _without_handoff(params, as_type=dict):
+        "Drop the framework-only ``_handoff_`` parameter."
+        if params is None:
+            return as_type()
+        data = params.to_dict() if isinstance(params, Parameters) else dict(params)
+        data.pop("_handoff_", None)
+        return as_type(data)
+
     def get_task_params(self):
         "Get parameters passed to the task"
         return self.parameters.copy()
@@ -829,7 +954,13 @@ class Task(RedBase, BaseModel):
         Parameters : dict, rocketry.core.Parameters
             Filtered parameters.
         """
-        return filter_keyword_args(self.execute, params)
+        filtered = filter_keyword_args(self.execute, params)
+        handoff = params.to_dict().get("_handoff_")
+        if handoff is not None:
+            # Framework parameter, not a task argument; keep it so the
+            # worker can bind Return to the accepted run.
+            filtered["_handoff_"] = handoff
+        return filtered
 
     def postfilter_params(self, params:Parameters):
         """Post filter the parameters.
@@ -1331,9 +1462,68 @@ class Task(RedBase, BaseModel):
         # what we return here will be stored in the pickle
         return state
 
-    def _handle_return(self, value):
+    def _handle_return(self, value, task_run:TaskRun=None, created:float=None):
         "Handle the return value (ie. store to parameters)"
+        run_id = task_run.run_id if task_run is not None else None
+        if created is None:
+            created = self.session.get_time()
+        self.session.returns.add_run(self, run_id, value, created=created)
         self.session.returns[self] = value
+
+    def withdraw_run(self, run_id:str=None, reason:str=None):
+        """Withdraw a run's return value so it cannot be handed off.
+
+        The run itself is not affected; only its return value becomes
+        unavailable to ``Return``.
+        """
+        self.session.returns.withdraw(self, run_id=run_id, reason=reason)
+
+    def withdraw_handoff(self, accepted_run=None, reason:str=None):
+        """Withdraw the accepted upstream run (or all accepted runs).
+
+        Unlike deleting a value, this leaves a tombstone in the ticket
+        and in the return store so a queued run must fail as
+        unavailable rather than quietly fall back to another run.
+        """
+        handoff = self._pending_handoff
+        handoffs = []
+        if handoff is not None:
+            handoffs.append(handoff)
+        for batch in self.batches:
+            batch_handoff = batch.to_dict().get("_handoff_")
+            if batch_handoff is not None and batch_handoff not in handoffs:
+                handoffs.append(batch_handoff)
+        if not handoffs:
+            queued = self._get_queue_handoff()
+            if queued is not None:
+                handoffs.append(queued)
+        if not handoffs:
+            return None
+
+        if accepted_run is None:
+            references = [ref for handoff in handoffs for ref in handoff]
+        else:
+            ref = accepted_run
+            if not hasattr(ref, "task_name"):
+                from rocketry.core.handoff import RunReference
+                if isinstance(ref, tuple):
+                    ref = RunReference.from_value(*ref)
+                else:
+                    ref = handoffs[0].get_reference(ref)
+            references = [ref] if ref is not None else []
+
+        for handoff in handoffs:
+            for ref in references:
+                self.session.returns.withdraw(
+                    ref.task_name,
+                    run_id=ref.run_id,
+                    created=ref.created,
+                    reason=reason,
+                )
+                handoff.withdraw_reference(ref)
+        if handoff is not None:
+            self._pending_handoff = handoff
+        return handoff if handoff is not None else handoffs[0]
 
     def _get_hooks(self, name:str):
         return getattr(self.session.hooks, name)

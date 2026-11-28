@@ -217,12 +217,16 @@ class Session(RedBase):
         self.scheduler = Scheduler(self)
         self.tasks = set()
         self.hooks = Hooks()
-        self.returns = self._get_parameters(None)
+        self.returns = self._get_returns(None)
         self._cond_parsers = self._cls_cond_parsers.copy()
         self._cond_cache: Dict = {} # Cached by CondParser to speed up expensive conditions
         self._cond_states = {} # Used by FuncConds to relay condiiton states to conditions
         if delete_existing_loggers:
             self.delete_task_loggers()
+
+    def _get_returns(self, value):
+        from rocketry.core.returns import ensure_returns
+        return ensure_returns(value)
 
     def __getitem__(self, task:Union['Task', str]):
         "Get a task from the session"

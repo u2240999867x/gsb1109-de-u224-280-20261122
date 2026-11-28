@@ -174,6 +174,43 @@ of another task. It is useful for pipelining tasks' outputs.
     You can also pass ``default`` which is used
     if the return value is not found: ``Return('mytask', default="a value")``
 
+Return and accepted runs
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default ``Return`` reads the latest successful return of the
+task. When the same task can run multiple times, that is ambiguous:
+a run may read a value from a different run than the one its start
+condition actually accepted.
+
+A task start can carry a handoff (a ticket) listing the concrete
+upstream runs it accepts:
+
+.. code-block:: python
+
+    from rocketry.core.handoff import Handoff
+
+    # The next run of 'do_second' accepts run 'A1' of 'do_first'
+    app.session['do_second'].run(_handoff_=Handoff("do_first", "A1"))
+
+Dependency conditions create this ticket automatically: when a task
+starts because of ``after task 'do_first' succeeded``, the run that
+caused the condition to be true is attached to the start. ``Return``
+then reads that run only. If the accepted run is withdrawn (for
+example, its input file failed validation), ``Return`` raises
+``rocketry.exc.RunNotAvailable`` instead of silently falling back to
+another run.
+
+.. code-block:: python
+
+    from rocketry.core.handoff import Handoff
+
+    runs = Handoff({"do_first": "A1"})
+    app.session['do_second'].run(_handoff_=runs)
+
+    # Inspect or withdraw an accepted run before the task starts
+    ticket = app.session['do_second'].pending_handoff
+    app.session['do_first'].withdraw_run("A1", reason="file rejected")
+
 Task
 ----
 

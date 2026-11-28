@@ -66,6 +66,28 @@ class BaseCondition(RedBase):
         param_dict = cond_params.materialize(**kwargs)
         return self.get_state(**param_dict)
 
+    def get_handoff(self, **kwargs):
+        """Get the concrete upstream runs this condition accepted.
+
+        Conditions that select a specific run (such as dependency
+        conditions) override this.  The returned object is a
+        :class:`rocketry.core.handoff.Handoff` or ``None``.
+        """
+        return None
+
+    def observe_with_handoff(self, **kwargs):
+        """Observe the condition and capture the run it accepted.
+
+        Returns
+        -------
+        tuple
+            ``(state, handoff)``.  The default implementation keeps
+            the two calls separate; dependency conditions read the
+            upstream record once so the state and the ticket cannot
+            disagree.
+        """
+        return self.observe(**kwargs), self.get_handoff(**kwargs)
+
     def __bool__(self) -> bool:
         """Check whether the condition holds."""
         return self.observe()
@@ -156,6 +178,22 @@ class Any(_ConditionContainer, BaseCondition):
                 return True
         return False
 
+    def observe_with_handoff(self, **kwargs):
+        handoffs = []
+        state = False
+        for subcond in self.subconditions:
+            cond, handoff = subcond.observe_with_handoff(**kwargs)
+            if cond:
+                state = True
+                if handoff is not None:
+                    handoffs.append(handoff)
+        if not handoffs:
+            return state, None
+        result = handoffs[0]
+        for handoff in handoffs[1:]:
+            result = result + handoff
+        return state, result
+
     def __str__(self):
         try:
             return super().__str__()
@@ -180,6 +218,21 @@ class All(_ConditionContainer, BaseCondition):
             if not subcond.observe(**kwargs):
                 return False
         return True
+
+    def observe_with_handoff(self, **kwargs):
+        handoffs = []
+        for subcond in self.subconditions:
+            cond, handoff = subcond.observe_with_handoff(**kwargs)
+            if not cond:
+                return False, None
+            if handoff is not None:
+                handoffs.append(handoff)
+        if not handoffs:
+            return True, None
+        result = handoffs[0]
+        for handoff in handoffs[1:]:
+            result = result + handoff
+        return True, result
 
     def __str__(self):
         try:
@@ -209,10 +262,15 @@ class Not(_ConditionContainer, BaseCondition):
             string = str(self.condition)
             return f'~{string}'
 
+    def observe_with_handoff(self, **kwargs):
+        state = self.observe(**kwargs)
+        if state:
+            return True, self.condition.get_handoff(**kwargs)
+        return False, None
+
     @property
     def subconditions(self):
         return (self.condition,)
-
     def __invert__(self):
         "inverse of inverse is the actual condition"
         return self.condition
