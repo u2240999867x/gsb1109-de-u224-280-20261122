@@ -1720,6 +1720,38 @@ As mentioned above, using `remap` will **copy** events and transitions since the
 If a reused state machine does not have a final state, you can of course add the transitions manually.
 If 'counter' had no 'done' state, we could just add `['done', 'counter_3', 'waiting']` to achieve the same behaviour.
 
+##### Exit mapping of embedded machines
+
+`remap` moves a state out of the embedded machine and therefore also reorders and rewrites its rules.
+If an embedded machine should keep its internal structure (and thus its rule order) and only redirect selected exits, use
+`exit_mapping` instead. An `exit_mapping` maps a state of the embedded machine to a state of the embedding machine.
+All other states and transitions stay untouched and remain in the embedded machine's scope.
+
+```python
+template = HierarchicalMachine(
+    states=['waiting', 'cleared', 'repair', 'quarantine'],
+    transitions=[
+        {'trigger': 'submit', 'source': 'waiting', 'dest': 'cleared'},
+        {'trigger': 'submit', 'source': 'waiting', 'dest': 'repair'},
+        {'trigger': 'submit', 'source': 'waiting', 'dest': 'quarantine'},
+    ], initial='waiting')
+
+package = HierarchicalMachine(
+    states=[
+        'handoff', 'manual', 'parked',
+        {'name': 'inspect', 'children': template,
+         'exit_mapping': {'cleared': 'handoff', 'quarantine': 'manual'}}],
+    transitions=[{'trigger': 'submit', 'source': 'inspect', 'dest': 'parked'}],
+    initial='inspect')
+```
+
+The rules are attempted in their original order: `cleared` maps to `handoff`, `repair` stays local (`inspect_repair`)
+and `quarantine` maps to `manual`. Only when all embedded rules fail, the package's own `inspect -> parked`
+transition is considered. `exit_mapping` may also be applied when a machine instance is passed (instead of its states)
+and can be chained, i.e. the resulting `package` can be installed with another `exit_mapping` again.
+Mapped installations clone the mounted states and transitions so that the same machine can be mounted into several
+parents without sharing the rewritten transitions.
+
 In cases where you want states and transitions to be copied by value rather than reference (for instance, if you want to keep the pre-0.8 behaviour) you can do so by creating a `NestedState` and assigning deep copies of the machine's events and states to it.
 
 ```python

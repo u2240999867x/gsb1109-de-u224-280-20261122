@@ -589,23 +589,29 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
 
     async def _can_trigger(self, model, trigger, *args, **kwargs):
         state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
-        ordered_states = resolve_order(state_tree)
-        for state_path in ordered_states:
-            with self():
-                return await self._can_trigger_nested(model, trigger, state_path, *args, **kwargs)
+        with self():
+            return await self._can_trigger_nested(model, trigger, state_tree, *args, **kwargs)
 
-    async def _can_trigger_nested(self, model, trigger, path, *args, **kwargs):
+    async def _can_trigger_nested(self, model, trigger, state_tree, *args, **kwargs):
+        for key, value in state_tree.items():
+            if value:
+                with self(key):
+                    if await self._can_trigger_nested(model, trigger, value, *args, **kwargs):
+                        return True
         if trigger in self.events:
-            source_path = copy.copy(path)
-            while source_path:
-                event_data = AsyncEventData(self.get_state(source_path), AsyncEvent(name=trigger, machine=self), self,
-                                            model, args, kwargs)
-                state_name = self.state_cls.separator.join(source_path)
+            event_data = AsyncEventData(None, AsyncEvent(name=trigger, machine=self), self, model, args, kwargs)
+            for state_path in resolve_order(state_tree):
+                state_name = self.state_cls.separator.join(state_path)
                 for transition in self.events[trigger].transitions.get(state_name, []):
-                    try:
-                        _ = self.get_state(transition.dest) if transition.dest is not None else transition.source
-                    except ValueError:
-                        continue
+                    if transition.dest is not None:
+                        if self._resolve_destination_path(transition.dest) is None:
+                            continue
+                    else:
+                        try:
+                            self.get_state(transition.source)
+                        except ValueError:
+                            continue
+                    event_data.state = self.get_state(state_path)
                     event_data.transition = transition
                     try:
                         await self.callbacks(self.prepare_event, event_data)
@@ -618,10 +624,6 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
                             await self.callbacks(self.on_exception, event_data)
                         else:
                             raise
-                source_path.pop(-1)
-        if path:
-            with self(path.pop(0)):
-                return await self._can_trigger_nested(model, trigger, path, *args, **kwargs)
         return False
 
 

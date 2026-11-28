@@ -538,3 +538,166 @@ class TestReuse(TestCase):
         # selfs should only contain references to the same model. If the set is larger than one this means
         # that at some poin the model was falsely copied.
         self.assertEqual(1, len(set(selfs)))
+
+
+class TestExitMapping(TestCase):
+    """Tests for the ``exit_mapping`` installation option of nested machines."""
+
+    def setUp(self):
+        self.log = []
+        test_case = self
+
+        class QualityService(object):
+            def __init__(self):
+                self.passed = False
+                self.repairable = False
+                self.sample = False
+
+            def record(self, rule):
+                def callback(event):
+                    test_case.log.append((rule, event.machine.get_global_name('repair')))
+                return callback
+
+            def is_clear(self, event):
+                return self.passed
+
+            def is_repairable(self, event):
+                return self.repairable
+
+            def may_sample(self, event):
+                return self.sample
+
+        self.quality_service = QualityService()
+
+    def _template(self):
+        q = self.quality_service
+        return HierarchicalMachine(states=['waiting', 'cleared', 'repair', 'quarantine'], transitions=[
+            {'trigger': 'submit', 'source': 'waiting', 'dest': 'cleared',
+             'conditions': q.is_clear, 'prepare': q.record('clear')},
+            {'trigger': 'submit', 'source': 'waiting', 'dest': 'repair',
+             'conditions': q.is_repairable, 'prepare': q.record('repair')},
+            {'trigger': 'submit', 'source': 'waiting', 'dest': 'quarantine',
+             'conditions': q.may_sample, 'prepare': q.record('sample')},
+        ], initial='waiting', name='template', send_event=True)
+
+    def _package(self, template=None):
+        return HierarchicalMachine(states=[
+            'handoff', 'manual', 'parked',
+            {'name': 'inspect', 'children': template or self._template(),
+             'exit_mapping': {'cleared': 'handoff', 'quarantine': 'manual'}}],
+            transitions=[{'trigger': 'submit', 'source': 'inspect', 'dest': 'parked'}],
+            initial='inspect', name='package', send_event=True)
+
+    def _north(self, package):
+        return HierarchicalMachine(states=[
+            'northstore', 'northreview',
+            {'name': 'channel', 'children': package,
+             'exit_mapping': {'handoff': 'northstore', 'manual': 'northreview'}}],
+            initial='channel', name='north', send_event=True)
+
+    def _south(self, package):
+        return HierarchicalMachine(states=[
+            'southstore', 'south_manual', 'manual',
+            {'name': 'channel', 'children': package,
+             'exit_mapping': {'handoff': 'southstore', 'manual': 'south_manual'}}],
+            initial='channel', name='south', send_event=True)
+
+    def _log(self):
+        entries = list(self.log)
+        self.log.clear()
+        return entries
+
+    def test_rule_order_is_preserved(self):
+        template = self._template()
+        package = self._package(template)
+        transitions = package.get_state('inspect').events['submit'].transitions['waiting']
+        self.assertEqual(['handoff', 'repair', 'manual'], [trans.dest for trans in transitions])
+
+    def test_template_standalone_is_unchanged(self):
+        template = self._template()
+        self.quality_service.passed = True
+        template.submit()
+        self.assertEqual('cleared', template.state)
+        self.assertEqual([('clear', 'repair')], self._log())
+        self.assertEqual(['waiting', 'cleared', 'repair', 'quarantine'],
+                         template.get_nested_state_names())
+
+    def test_clear_wins_with_only_first_record(self):
+        north = self._north(self._package())
+        self.quality_service.passed = True
+        self.quality_service.repairable = True
+        north.submit()
+        self.assertEqual('northstore', north.state)
+        self.assertEqual([('clear', 'channel_inspect_repair')], self._log())
+
+    def test_local_repair_uses_installation_scope(self):
+        north = self._north(self._package())
+        self.quality_service.repairable = True
+        north.submit()
+        self.assertEqual('channel_inspect_repair', north.state)
+        self.assertEqual([('clear', 'channel_inspect_repair'),
+                          ('repair', 'channel_inspect_repair')], self._log())
+
+    def test_north_sample_maps_to_review(self):
+        north = self._north(self._package())
+        self.quality_service.sample = True
+        north.submit()
+        self.assertEqual('northreview', north.state)
+        self.assertEqual([('clear', 'channel_inspect_repair'),
+                          ('repair', 'channel_inspect_repair'),
+                          ('sample', 'channel_inspect_repair')], self._log())
+
+    def test_south_sample_ignores_outer_manual(self):
+        south = self._south(self._package())
+        self.quality_service.sample = True
+        south.submit()
+        self.assertEqual('south_manual', south.state)
+        self.assertTrue(south.is_south_manual())
+        self.assertEqual([('clear', 'channel_inspect_repair'),
+                          ('repair', 'channel_inspect_repair'),
+                          ('sample', 'channel_inspect_repair')], self._log())
+
+    def test_fallback_goes_to_parked(self):
+        north = self._north(self._package())
+        north.submit()
+        self.assertEqual('channel_parked', north.state)
+        self.assertEqual([('clear', 'channel_inspect_repair'),
+                          ('repair', 'channel_inspect_repair'),
+                          ('sample', 'channel_inspect_repair')], self._log())
+
+    def test_may_submit_matches_submit(self):
+        for mode in ('passed', 'repairable', 'sample', None):
+            self.quality_service.passed = False
+            self.quality_service.repairable = False
+            self.quality_service.sample = False
+            north = self._north(self._package())
+            if mode is not None:
+                setattr(self.quality_service, mode, True)
+            self.assertTrue(north.may_submit())
+            may_state = north.state
+            may_log = self._log()
+            north.submit()
+            self.assertEqual(may_log, self._log())
+            if mode == 'passed':
+                self.assertEqual('northstore', north.state)
+            elif mode == 'repairable':
+                self.assertEqual('channel_inspect_repair', north.state)
+            elif mode == 'sample':
+                self.assertEqual('northreview', north.state)
+            else:
+                self.assertEqual('channel_parked', north.state)
+            self.assertNotEqual(may_state, north.state)
+
+    def test_shared_template_mounts_are_isolated(self):
+        template = self._template()
+        package = self._package(template)
+        north = self._north(package)
+        south = self._south(package)
+        self.quality_service.sample = True
+        north.submit()
+        self.assertEqual('northreview', north.state)
+        self._log()
+        south.submit()
+        self.assertEqual('south_manual', south.state)
+        self.assertEqual(['waiting', 'cleared', 'repair', 'quarantine'],
+                         template.get_nested_state_names())

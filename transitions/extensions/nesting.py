@@ -237,13 +237,25 @@ class NestedTransition(Transition):
     """A transition which handles entering and leaving nested states."""
 
     def _resolve_transition(self, event_data):
-        dst_name_path = self.dest.split(event_data.machine.state_cls.separator)
-        _ = event_data.machine.get_state(dst_name_path)
+        machine = event_data.machine
+        destination = machine._resolve_destination_path(self.dest)
+        if destination is None:
+            destination = self.dest.split(machine.state_cls.separator)
+            _ = machine.get_state(destination)
+        prefix = machine.prefix_path
+        if destination[:len(prefix)] == prefix:
+            local_destination = destination[len(prefix):]
+            if not local_destination:
+                local_destination = [destination[-1]]
+            return self._resolve_transition_at(event_data, local_destination, prefix)
+        with machine():
+            return self._resolve_transition_at(event_data, destination, [])
+
+    def _resolve_transition_at(self, event_data, dst_name_path, scope):
         state_tree = event_data.machine.build_state_tree(
             listify(getattr(event_data.model, event_data.machine.model_attribute)),
             event_data.machine.state_cls.separator)
 
-        scope = event_data.machine.get_global_name(join=False)
         tmp_tree = state_tree.get(dst_name_path[0], None)
         root = []
         while tmp_tree is not None:
@@ -508,6 +520,23 @@ class HierarchicalMachine(Machine):
             **kwargs additional keyword arguments used by state mixins.
         """
         remap = kwargs.pop('remap', None)
+        exit_mapping = kwargs.pop('exit_mapping', None)
+        exit_mapping_qualified = kwargs.pop('_exit_mapping_qualified', False)
+        clone_mounted = kwargs.pop('_clone_mounted', False)
+        # aliases for the optional exit mapping
+        for alias in ('exit_map', 'exit_remap', 'remap_exits', 'exits'):
+            if alias in kwargs:
+                if exit_mapping is None:
+                    exit_mapping = kwargs.pop(alias)
+                else:
+                    kwargs.pop(alias)
+        if isinstance(exit_mapping, bool):
+            # `remap` mapping plus `exit_mapping=True` is the flag-style variant
+            exit_mapping = remap if exit_mapping else None
+            remap = None
+        if exit_mapping is not None and not exit_mapping_qualified:
+            exit_mapping = self._qualify_exit_mapping(self.prefix_path, exit_mapping)
+        clone_mounted = clone_mounted or exit_mapping is not None
         ignore = self.ignore_invalid_triggers if ignore_invalid_triggers is None else ignore_invalid_triggers
 
         for state in listify(states):
@@ -521,14 +550,15 @@ class HierarchicalMachine(Machine):
             elif isinstance(state, Enum):
                 self._add_enum_state(state, on_enter, on_exit, ignore, remap, **kwargs)
             elif isinstance(state, dict):
-                self._add_dict_state(state, ignore, remap, **kwargs)
+                self._add_dict_state(state, ignore, remap, exit_mapping,
+                                     _clone_mounted=clone_mounted, **kwargs)
             elif isinstance(state, NestedState):
                 if state.name in self.states:
                     raise ValueError("State {0} cannot be added since it already exists.".format(state.name))
                 self.states[state.name] = state
                 self._init_state(state)
             elif isinstance(state, HierarchicalMachine):
-                self._add_machine_states(state, remap)
+                self._add_machine_states(state, remap, exit_mapping, clone=clone_mounted)
             elif isinstance(state, State) and not isinstance(state, NestedState):
                 raise ValueError("A passed state object must derive from NestedState! "
                                  "A default State object is not sufficient")
@@ -761,25 +791,29 @@ class HierarchicalMachine(Machine):
 
     def _can_trigger(self, model, trigger, *args, **kwargs):
         state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
-        ordered_states = resolve_order(state_tree)
         with self():
-            return any(
-                self._can_trigger_nested(model, trigger, state_path, *args, **kwargs)
-                for state_path in ordered_states
-            )
+            return self._can_trigger_nested(model, trigger, state_tree, *args, **kwargs)
 
-    def _can_trigger_nested(self, model, trigger, path, *args, **kwargs):
+    def _can_trigger_nested(self, model, trigger, state_tree, *args, **kwargs):
+        for key, value in state_tree.items():
+            if value:
+                with self(key):
+                    if self._can_trigger_nested(model, trigger, value, *args, **kwargs):
+                        return True
         if trigger in self.events:
-            source_path = copy.copy(path)
-            while source_path:
-                event_data = EventData(self.get_state(source_path), Event(name=trigger, machine=self), self, model,
-                                       args, kwargs)
-                state_name = self.state_cls.separator.join(source_path)
+            event_data = NestedEventData(None, Event(name=trigger, machine=self), self, model, args, kwargs)
+            for state_path in resolve_order(state_tree):
+                state_name = self.state_cls.separator.join(state_path)
                 for transition in self.events[trigger].transitions.get(state_name, []):
-                    try:
-                        _ = self.get_state(transition.dest) if transition.dest is not None else transition.source
-                    except ValueError:
-                        continue
+                    if transition.dest is not None:
+                        if self._resolve_destination_path(transition.dest) is None:
+                            continue
+                    else:
+                        try:
+                            self.get_state(transition.source)
+                        except ValueError:
+                            continue
+                    event_data.state = self.get_state(state_path)
                     event_data.transition = transition
                     try:
                         self.callbacks(self.prepare_event, event_data)
@@ -792,10 +826,6 @@ class HierarchicalMachine(Machine):
                             self.callbacks(self.on_exception, event_data)
                         else:
                             raise
-                source_path.pop(-1)
-        if path:
-            with self(path.pop(0)):
-                return self._can_trigger_nested(model, trigger, path, *args, **kwargs)
         return False
 
     def get_triggers(self, *args):
@@ -958,11 +988,21 @@ class HierarchicalMachine(Machine):
             for a_state in self.states.values():
                 self._add_model_to_state(a_state, model)
 
-    def _add_dict_state(self, state, ignore_invalid_triggers, remap, **kwargs):
+    def _add_dict_state(self, state, ignore_invalid_triggers, remap, exit_mapping=None, **kwargs):
+        clone_mounted = kwargs.pop('_clone_mounted', False)
         if remap is not None and state['name'] in remap:
             return
         state = state.copy()  # prevent messing with the initially passed dict
         remap = state.pop('remap', None)
+        state_exit_mapping = state.pop('exit_mapping', None)
+        for alias in ('exit_map', 'exit_remap', 'remap_exits', 'exits'):
+            state_exit_mapping = state.pop(alias, state_exit_mapping)
+        if isinstance(state_exit_mapping, bool):
+            state_exit_mapping = remap if state_exit_mapping else None
+            remap = None
+        if state_exit_mapping is not None:
+            exit_mapping = self._qualify_exit_mapping(self.prefix_path, state_exit_mapping)
+            clone_mounted = True
         if 'ignore_invalid_triggers' not in state:
             state['ignore_invalid_triggers'] = ignore_invalid_triggers
 
@@ -980,11 +1020,14 @@ class HierarchicalMachine(Machine):
         self._init_state(new_state)
         remapped_transitions = []
         with self(new_state.name):
-            self.add_states(state_children, remap=remap, **kwargs)
+            self.add_states(state_children, remap=remap,
+                            _exit_mapping_qualified=True, _clone_mounted=clone_mounted, **kwargs)
             if transitions:
                 self.add_transitions(transitions)
             if remap is not None:
                 remapped_transitions.extend(self._remap_state(new_state, remap))
+            if exit_mapping is not None:
+                self._apply_exit_mapping(new_state, exit_mapping)
 
         self.add_transitions(remapped_transitions)
 
@@ -1002,17 +1045,40 @@ class HierarchicalMachine(Machine):
         self.states[new_state.name] = new_state
         self._init_state(new_state)
 
-    def _add_machine_states(self, state, remap):
-        new_states = [s for s in state.states.values() if remap is None or (s.name if hasattr(s, "name") else s) not in remap]
-        self.add_states(new_states)
-        for evt in state.events.values():
-            # skip auto transitions
-            if state.auto_transitions and evt.name.startswith('to_') and evt.name[3:] in state.states:
-                continue
-            if evt.transitions and evt.name not in self.events:
-                self.events[evt.name] = evt
-                for model in self.models:
-                    self._add_trigger_to_model(evt.name, model)
+    def _add_machine_states(self, state, remap, exit_mapping=None, clone=False):
+        if clone or exit_mapping is not None:
+            new_states = []
+            for child in state.states.values():
+                if remap is not None and (child.name if hasattr(child, "name") else child) in remap:
+                    continue
+                new_states.append(self._clone_state_tree(child))
+            self.add_states(new_states)
+            cloned_events = []
+            for evt in state.events.values():
+                if state.auto_transitions and evt.name.startswith('to_') and evt.name[3:] in state.states:
+                    continue
+                if evt.transitions and evt.name not in self.events:
+                    cloned = self._clone_event(evt)
+                    cloned_events.append(cloned)
+                    self.events[evt.name] = cloned
+                    for model in self.models:
+                        self._add_trigger_to_model(evt.name, model)
+            if exit_mapping is not None:
+                for new_state in new_states:
+                    self._apply_exit_mapping(new_state, exit_mapping)
+                for event in cloned_events:
+                    self._apply_event_exit_mapping(event, exit_mapping)
+        else:
+            new_states = [s for s in state.states.values() if remap is None or (s.name if hasattr(s, "name") else s) not in remap]
+            self.add_states(new_states)
+            for evt in state.events.values():
+                # skip auto transitions
+                if state.auto_transitions and evt.name.startswith('to_') and evt.name[3:] in state.states:
+                    continue
+                if evt.transitions and evt.name not in self.events:
+                    self.events[evt.name] = evt
+                    for model in self.models:
+                        self._add_trigger_to_model(evt.name, model)
         if self.scoped.initial is None:
             self.scoped.initial = state.initial
 
@@ -1228,6 +1294,98 @@ class HierarchicalMachine(Machine):
         for d_event in drop_event:
             del self.events[d_event]
         return remapped_transitions
+
+    def _qualify_exit_mapping(self, scope, exit_mapping):
+        """Resolve exit target names relative to the installing scope.
+
+        Names which are already absolute in the target machine (i.e. they
+        contain the separator) or which cannot be found in the installing
+        scope are kept verbatim so that ancestor states can be targeted too.
+        """
+        qualified = {}
+        for source, target in exit_mapping.items():
+            if isinstance(target, string_types) and self.state_cls.separator not in target:
+                candidate = list(scope) + [target]
+                try:
+                    with self():
+                        self.get_state(candidate)
+                    target = self.state_cls.separator.join(candidate)
+                except ValueError:
+                    pass
+            qualified[source] = target
+        return qualified
+
+    def _apply_exit_mapping(self, state, exit_mapping):
+        """Rewrite the destinations of a mounted machine's transitions in place.
+
+        Unlike ``remap``, state and transition order is preserved. ``exit_mapping``
+        maps a local state of the mounted machine to a state of the surrounding
+        machine (or any of its ancestors). Rules which do not leave the mounted
+        machine keep their local scope and therefore remain able to refer to
+        local states such as ``repair``.
+        """
+        for event in state.events.values():
+            self._apply_event_exit_mapping(event, exit_mapping)
+        for child in state.states.values():
+            self._apply_exit_mapping(child, exit_mapping)
+
+    def _apply_event_exit_mapping(self, event, exit_mapping):
+        for transitions in event.transitions.values():
+            for transition in transitions:
+                if transition.dest in exit_mapping:
+                    transition.dest = exit_mapping[transition.dest]
+
+    def _clone_event(self, event):
+        cloned = self.event_cls(event.name, self)
+        for source, transitions in event.transitions.items():
+            for transition in transitions:
+                new_transition = copy.copy(transition)
+                new_transition.conditions = copy.copy(transition.conditions)
+                new_transition.prepare = copy.copy(transition.prepare)
+                new_transition.before = copy.copy(transition.before)
+                new_transition.after = copy.copy(transition.after)
+                cloned.transitions[source].append(new_transition)
+        return cloned
+
+    def _clone_state_tree(self, state):
+        cloned = copy.copy(state)
+        cloned.on_enter = copy.copy(state.on_enter)
+        cloned.on_exit = copy.copy(state.on_exit)
+        if hasattr(state, 'on_final'):
+            cloned.on_final = copy.copy(state.on_final)
+        if hasattr(state, 'events'):
+            cloned.events = {name: self._clone_event(event) for name, event in state.events.items()}
+        if hasattr(state, 'states'):
+            cloned.states = OrderedDict(
+                (name, self._clone_state_tree(child)) for name, child in state.states.items())
+        if hasattr(cloned, '_scope'):
+            cloned._scope = []
+        return cloned
+
+    def _resolve_destination_path(self, destination):
+        """Resolve a destination name relative to the current scope.
+
+        The current scope is searched first, followed by its ancestors. This
+        enables a mounted machine to exit into a state of a surrounding
+        machine while keeping identically named local states reachable.
+        """
+        if isinstance(destination, Enum):
+            path = self._get_enum_path(destination)
+        elif isinstance(destination, string_types):
+            path = destination.split(self.state_cls.separator)
+        else:
+            path = list(destination)
+        if not path:
+            return None
+        for index in range(len(self.prefix_path), -1, -1):
+            candidate = self.prefix_path[:index] + path
+            try:
+                with self():
+                    self.get_state(candidate)
+                return candidate
+            except ValueError:
+                continue
+        return None
 
     def _resolve_initial(self, models, state_name_path, prefix=None):
         prefix = prefix or []

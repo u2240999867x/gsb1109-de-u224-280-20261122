@@ -2,6 +2,9 @@
 
 ## 0.9.4 ()
 
+- Feature: `HierarchicalMachine.add_states` supports `exit_mapping` for mounted machines. Unlike `remap`, `exit_mapping` keeps a mounted machine's states, rules and rule order intact and only redirects the listed exit states into the embedding machine. Mapped installations clone their events so a machine can be mounted in several parents without sharing rewritten transitions.
+- Feature: `may_<trigger>` now evaluates nested transitions in the same depth-first order as event processing.
+
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
