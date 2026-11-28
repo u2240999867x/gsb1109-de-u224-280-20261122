@@ -6,6 +6,7 @@ from ._config import *
 from ._content import *
 from ._exceptions import *
 from ._models import *
+from ._multipart import *
 from ._status_codes import *
 from ._transports import *
 from ._types import *
@@ -50,6 +51,7 @@ __all__ = [
     "DecodingError",
     "delete",
     "DigestAuth",
+    "FileRange",
     "FunctionAuth",
     "get",
     "head",
@@ -62,6 +64,9 @@ __all__ = [
     "LocalProtocolError",
     "main",
     "MockTransport",
+    "MultipartError",
+    "MultipartRangeError",
+    "MultipartStreamConsumed",
     "NetRCAuth",
     "NetworkError",
     "options",
@@ -80,6 +85,7 @@ __all__ = [
     "Request",
     "RequestError",
     "RequestNotRead",
+    "RequestNotReplayable",
     "Response",
     "ResponseNotRead",
     "stream",

@@ -491,6 +491,18 @@ class BaseClient:
             extensions=request.extensions,
         )
 
+    @staticmethod
+    def _assert_stream_replayable(
+        stream: SyncByteStream | AsyncByteStream | None,
+    ) -> None:
+        """
+        Raise before a redirected request is sent if its body cannot be
+        produced again from the start.
+        """
+        assert_replayable = getattr(stream, "assert_replayable", None)
+        if assert_replayable is not None:
+            assert_replayable()
+
     def _redirect_method(self, request: Request, response: Response) -> str:
         """
         When being redirected we may want to change the method of the request
@@ -989,6 +1001,8 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
+                    if request.method == response.request.method:
+                        self._assert_stream_replayable(request.stream)
                     response.read()
                 else:
                     response.next_request = request
@@ -1705,6 +1719,8 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
+                    if request.method == response.request.method:
+                        self._assert_stream_replayable(request.stream)
                     await response.aread()
                 else:
                     response.next_request = request

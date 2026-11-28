@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `httpx.FileRange` for explicit half-open byte-range multipart uploads,
+  supporting concurrent uploads from a shared file object and replayable
+  redirects.
 
 ## 0.28.1 (6th December, 2024)
 

@@ -29,6 +29,10 @@ Our exception hierarchy:
   x StreamClosed
   x ResponseNotRead
   x RequestNotRead
+  x RequestNotReplayable
+  x MultipartError
+    - MultipartRangeError
+    - MultipartStreamConsumed
 """
 
 from __future__ import annotations
@@ -49,6 +53,9 @@ __all__ = [
     "HTTPStatusError",
     "InvalidURL",
     "LocalProtocolError",
+    "MultipartError",
+    "MultipartRangeError",
+    "MultipartStreamConsumed",
     "NetworkError",
     "PoolTimeout",
     "ProtocolError",
@@ -58,6 +65,7 @@ __all__ = [
     "RemoteProtocolError",
     "RequestError",
     "RequestNotRead",
+    "RequestNotReplayable",
     "ResponseNotRead",
     "StreamClosed",
     "StreamConsumed",
@@ -359,6 +367,54 @@ class RequestNotRead(StreamError):
             " without having called `read()`."
         )
         super().__init__(message)
+
+
+class MultipartError(StreamError, EOFError):
+    """
+    A multipart upload could not produce the declared content.
+
+    Raised when a byte range upload reads past the end of its file, or when the
+    file provides fewer bytes than the range requested.
+    """
+
+
+class MultipartRangeError(MultipartError, ValueError):
+    """
+    A byte range upload was declared with invalid bounds.
+    """
+
+
+class MultipartStreamConsumed(MultipartError):
+    """
+    A multipart upload attempted to replay content that can only be read once.
+    """
+
+    def __init__(self, part: str) -> None:
+        message = (
+            f"The {part!r} part of this multipart upload has already been read "
+            "and cannot be sent again. A request body containing a non-seekable, "
+            "unknown-length part cannot be replayed for a redirect or "
+            "authentication flow."
+        )
+        super().__init__(message)
+        self.part = part
+
+
+class RequestNotReplayable(StreamError):
+    """
+    A redirect required resending a request body that is no longer available.
+
+    This is raised before the redirected request is sent, if the original
+    multipart body has already been partly consumed and cannot be rebuilt from
+    the start of the form.
+    """
+
+    def __init__(self, reason: str) -> None:
+        message = (
+            f"The request body cannot be replayed to follow the redirect: {reason}"
+        )
+        super().__init__(message)
+        self.reason = reason
 
 
 @contextlib.contextmanager

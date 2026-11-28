@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
     from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._multipart import FileRange  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -72,15 +73,32 @@ ResponseExtensions = Mapping[str, Any]
 RequestData = Mapping[str, Any]
 
 FileContent = Union[IO[bytes], bytes, str]
+FileRangeSpec = Union["FileRange", slice, range, Tuple[int, Optional[int]]]
 FileTypes = Union[
     # file (or bytes)
     FileContent,
+    # a half-open byte range from a file
+    "FileRange",
     # (filename, file (or bytes))
     Tuple[Optional[str], FileContent],
     # (filename, file (or bytes), content_type)
     Tuple[Optional[str], FileContent, Optional[str]],
     # (filename, file (or bytes), content_type, headers)
     Tuple[Optional[str], FileContent, Optional[str], Mapping[str, str]],
+    # (filename, file (or bytes), content_type, headers, byte range)
+    Tuple[
+        Optional[str],
+        FileContent,
+        Optional[str],
+        Mapping[str, str],
+        FileRangeSpec,
+    ],
+    # (filename, file (or bytes), byte range)
+    Tuple[Optional[str], FileContent, FileRangeSpec],
+    # (filename, file (or bytes), start, stop)
+    Tuple[Optional[str], FileContent, int, Optional[int]],
+    # (file (or bytes), byte range)
+    Tuple[FileContent, FileRangeSpec],
 ]
 RequestFiles = Union[Mapping[str, FileTypes], Sequence[Tuple[str, FileTypes]]]
 

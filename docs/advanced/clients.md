@@ -326,3 +326,48 @@ For instance this request sends 2 files, `foo.png` and `bar.png` in one request 
 ...     ]
 ...     r = httpx.post("https://httpbin.org/post", files=files)
 ```
+
+### Uploading a byte range
+
+Use `httpx.FileRange` to upload an explicit half-open byte range `[start, stop)`
+from an existing file, instead of the complete file:
+
+```pycon
+>>> with open('archive.bin', 'rb') as archive:
+...     files = {
+...         'first': httpx.FileRange(archive, 65532, 131080),
+...         'second': httpx.FileRange(archive, 65528, 65540),
+...     }
+...     r = httpx.post("https://example.org/import", files=files)
+```
+
+The same range may be given inside a file tuple, as a `slice`, `range`, or
+`(start, stop)` pair:
+
+```pycon
+>>> files = {'segment': ('archive.bin', archive, 'application/octet-stream', 65532, 131080)}
+>>> files = {'segment': ('archive.bin', archive, slice(65532, 131080))}
+```
+
+Ranges from the same file object are read with positional I/O where the
+underlying object provides a file descriptor, and otherwise under a per-file
+lock with the shared cursor restored after each chunk. Several requests can
+therefore read different ranges, or a range and the complete file, from the
+same object concurrently. The archive is never copied into memory or a
+temporary file, and the caller's own file position is left where it was.
+
+A `Content-Length` is included for ranges whose length is known, and the
+multipart body of a range upload can be replayed from the start of the form for
+redirects and authentication flows, even if a previous attempt was abandoned
+part-way through.
+
+If a range extends beyond the end of the file, the request fails with a
+`httpx.MultipartError` that identifies the affected form part.
+
+When a range upload also includes a part that has no known length and can only
+be read once (such as a streaming sanitizer log), the request uses
+`Transfer-Encoding: chunked`, as before. If a redirect is received before that
+part has been read, the redirected request replays the whole form, including the
+range and the one-shot part. If the part has already started streaming, the
+redirect cannot be replayed; `httpx.RequestNotReplayable` is raised before the
+second request is sent, rather than sending a truncated form.
