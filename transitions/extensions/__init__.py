@@ -10,6 +10,10 @@ and made easier to access with a convenience factory.
 from .diagrams import GraphMachine, HierarchicalGraphMachine
 from .nesting import HierarchicalMachine
 from .locking import LockedMachine
+from .publishing import (CommandConflict, CommandResult, DeferredResponse, DeferredWarehouse,
+                         Manifest, NoAcceptedCandidate, PendingCommandError, PublishingError,
+                         PublishingMachine, Receipt, ResponseLost, ResponseNotReady,
+                         SQLiteCommandStore, StaleReceiptError, VersionConflict, Warehouse)
 
 from .factory import MachineFactory, LockedHierarchicalGraphMachine
 from .factory import LockedHierarchicalMachine, LockedGraphMachine

@@ -54,6 +54,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
     - [Hierarchical State Machine](#hsm)
     - [Diagrams](#diagrams)
     - [Threading](#threading)
+    - [Recoverable publication commands](#publishing)
     - [Async](#async)
     - [State features](#state-features)
     - [Django](#django-support)
@@ -1360,6 +1361,7 @@ Even though the core of transitions is kept lightweight, there are a variety of 
 - **Hierarchical State Machines** for nesting and reuse
 - **Diagrams** to visualize the current state of a machine
 - **Threadsafe Locks** for parallel execution
+- **Recoverable publication commands** with a SQLite journal and warehouse receipts
 - **Async callbacks** for asynchronous execution
 - **Custom States** for extended state-related behaviour
 
@@ -1998,6 +2000,44 @@ machine.add_model(model, model_context=lock3)
 
 It's important that all user-provided context managers are re-entrant since the state machine will call them multiple
 times, even in the context of a single trigger invocation.
+
+#### <a name="publishing"></a> Recoverable publication commands
+
+`PublishingMachine` adds an opt-in, recoverable command path to a regular trigger. Without a `command_id`, the
+configured publish trigger behaves exactly like a normal transition. With a `command_id`, cleaning and trial callbacks
+run for every candidate, trial results and the selected manifest are written to SQLite before sending, and the local
+confirmation only advances after the warehouse returns a receipt.
+
+```python
+from transitions.extensions import DeferredWarehouse, PublishingMachine
+
+warehouse = DeferredWarehouse()
+machine = PublishingMachine(
+    model, states=['ready'], initial='ready', send_event=True,
+    transitions=[['publish', 'ready', 'ready']],
+    warehouse=warehouse, db_path='publication.sqlite3',
+    partition='east/2026-11-27', clean='clean_candidate', trial='candidate_passes')
+
+machine.seed(40)  # previous confirmed version
+prepared = machine.prepare_command('C41', candidates=['a', 'bb'])
+# process exits before sending; another process opens the same SQLite file
+successor = PublishingMachine(model, ..., warehouse=warehouse, db_path='publication.sqlite3',
+                              partition='east/2026-11-27')
+pending = successor.resume_command('C41')     # warehouse accepted, response withheld
+assert pending.pending and successor.get_confirmed_version() == 40
+confirmed = successor.publish_command('C41', candidates=['a', 'bb'])
+assert confirmed.receipt.version == 41
+```
+
+Warehouse rules:
+
+- A manifest must reference the current receipt of its partition as predecessor.
+- Repeating the same partition, command id and manifest content returns the first receipt, even after newer versions.
+- Reusing a command id with different content raises `CommandConflict` without changing local or remote state.
+- Each partition and version accepts exactly one manifest.
+- `DeferredWarehouse`, `ResponseLost` and `deliver`/`release_response` model a response which is accepted remotely but
+  missing locally. Repeating the command returns the original receipt; a late receipt never rolls back a newer local
+  confirmation.
 
 #### <a name="async"></a> Using async callbacks
 
