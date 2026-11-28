@@ -236,6 +236,49 @@ def _mergesorted(key=None, reverse=False, *iterables):
         return _heapqmergesorted(key, *iterables)
 
 
+class _SortCache(object):
+
+    def __init__(self):
+        self.header = None
+        self.getkey = None
+        self.memory = None
+        self.files = None
+        self.source_iterator = None
+        self.error = None
+        self.reader_count = 0
+
+    def add_reader(self):
+        self.reader_count += 1
+
+    def remove_reader(self):
+        self.reader_count -= 1
+
+    def release(self):
+        debug('releasing sort cache')
+        self.close_source()
+        self.files = None
+
+    def close_source(self):
+        source_iterator = self.source_iterator
+        if source_iterator is not None:
+            self.source_iterator = None
+            close = getattr(source_iterator, 'close', None)
+            if close is not None:
+                close()
+
+
+class _HeaderlessSource(object):
+
+    def __init__(self, iterator, header):
+        self.iterator = iterator
+        self.header = header
+
+    def __iter__(self):
+        yield tuple(self.header)
+        for row in self.iterator:
+            yield row
+
+
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
                  tempdir=None, cache=True):
@@ -252,129 +295,208 @@ class SortView(Table):
         self._memcache = None
         self._filecache = None
         self._getkey = None
+        self._current_cache = None
+        self._old_caches = []
 
     def clearcache(self):
         debug('clear cache')
-        self._hdrcache = None
-        self._memcache = None
-        self._filecache = None
-        self._getkey = None
+        cache = self._current_cache
+        self._set_current_cache(None)
+        if cache is not None and cache.reader_count == 0:
+            cache.release()
+        elif cache is not None:
+            self._old_caches.append(cache)
 
     def __iter__(self):
-        source = self.source
-        key = self.key
-        reverse = self.reverse
-        if self._cache and self._memcache is not None:
-            return self._iterfrommemcache()
-        elif self._cache and self._filecache is not None:
-            return self._iterfromfilecache()
+        if self._cache:
+            return self._iterfromcurrentcache()
         else:
-            return self._iternocache(source, key, reverse)
+            return self._iternocache(self.source, self.key, self.reverse)
 
-    def _iterfrommemcache(self):
-        debug('iterate from memory cache')
-        yield tuple(self._hdrcache)
-        for row in self._memcache:
-            yield tuple(row)
+    def _set_current_cache(self, cache):
+        self._current_cache = cache
+        self._hdrcache = cache.header if cache is not None else None
+        self._memcache = cache.memory if cache is not None else None
+        self._filecache = cache.files if cache is not None else None
+        self._getkey = cache.getkey if cache is not None else None
 
-    def _iterfromfilecache(self):
-        # create a reference to the filecache here, so cleanup happens in the
-        # correct order
-        filecache = self._filecache
-        filenames = list(map(operator.attrgetter('name'), filecache))
-        debug('iterate from file cache: %r', filenames)
-        yield tuple(self._hdrcache)
-        chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+    def _open_cache(self):
+        cache = _SortCache()
+        source_iterator = iter(self.source)
         try:
-            for row in rows:
-                yield tuple(row)
-        finally:
-            debug('attempt cleanup from generator')
-            # N.B., need to ensure that any open files are closed **before**
-            # temporary files are deleted, as deletion will fail on Windows
-            # if file is in use (i.e., still open)
-            del chunkiters
-            del rows
-            del filecache
-            debug('exiting generator')
+            try:
+                header = next(source_iterator)
+            except StopIteration:
+                if self.key is None:
+                    return cache
+                header = []
 
-    def _iternocache(self, source, key, reverse):
-        debug('iterate without cache')
-        self.clearcache()
-        it = iter(source)
+            if self.key is not None:
+                indices = asindices(header, self.key)
+            else:
+                indices = range(len(header))
 
+            cache.header = tuple(header)
+            cache.getkey = comparable_itemgetter(*indices)
+            cache.source_iterator = source_iterator
+            return cache
+        except Exception:
+            close = getattr(source_iterator, 'close', None)
+            if close is not None:
+                close()
+            raise
+
+    def _iterfromcurrentcache(self):
+        if self._current_cache is None:
+            self._set_current_cache(self._open_cache())
+        cache = self._current_cache
+        for row in self._iterfromcache(cache):
+            yield row
+
+    def _materialise_cache(self, cache):
+        if cache.memory is not None or cache.files is not None:
+            return
+
+        rows = self._iternocache(_HeaderlessSource(cache.source_iterator,
+                                                   cache.header),
+                                 self.key, self.reverse, cache)
+        for _ in rows:
+            pass
+        if self._current_cache is cache:
+            self._set_current_cache(cache)
+
+    def _iterfromcache(self, cache):
+        cache.add_reader()
+        debug('iterate from sort cache')
         try:
-            hdr = next(it)
-        except StopIteration:
-            if key is None:
-                return  # nothing to do on a table without headers
-            hdr = []
-        yield tuple(hdr)
+            if cache.header is None:
+                return
 
-        if key is not None:
-            # convert field selection into field indices
-            indices = asindices(hdr, key)
-        else:
-            indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+            yield cache.header
 
-        # TODO support native comparison
+            while cache.memory is None and cache.files is None:
+                try:
+                    if cache.error is not None:
+                        raise cache.error
+                    self._materialise_cache(cache)
+                except Exception as error:
+                    cache.error = error
+                    cache.close_source()
+                    if cache is self._current_cache:
+                        self._set_current_cache(None)
+                    else:
+                        if cache in self._old_caches:
+                            self._old_caches.remove(cache)
+                    cache.release()
+                    raise
 
-        # initialise the first chunk
-        rows = list(itertools.islice(it, 0, self.buffersize))
-        rows.sort(key=getkey, reverse=reverse)
-
-        # have we exhausted the source iterator?
-        if self.buffersize is None or len(rows) < self.buffersize:
-            # yes, table fits within sort buffer
-
-            if self._cache:
-                debug('caching mem')
-                self._hdrcache = hdr
-                self._memcache = rows
-                # actually not needed to iterate from memcache
-                self._getkey = getkey
-
-            for row in rows:
-                yield tuple(row)
-
-        else:
-            # no, table is too big, need to sort in chunks
-
-            chunkfiles = []
-
-            while rows:
-
-                # dump the chunk
-                with NamedTemporaryFile(dir=self.tempdir, delete=False,
-                                        mode='wb') as f:
-                    # N.B., we **don't** want the file to be deleted on close,
-                    # but we **do** want the file to be deleted when self
-                    # is garbage collected, or when the program exits. When
-                    # all references to the wrapper are gone, the file should
-                    # get deleted.
-                    wrapper = _NamedTempFileDeleteOnGC(f.name)
-                    debug('created temporary chunk file %s' % f.name)
+            if cache.memory is not None:
+                for row in cache.memory:
+                    yield tuple(row)
+            else:
+                filecache = cache.files
+                filenames = [f.name for f in filecache]
+                debug('iterate from file cache: %r', filenames)
+                chunkiters = [_iterchunk(fn) for fn in filenames]
+                rows = _mergesorted(cache.getkey, self.reverse,
+                                    *chunkiters)
+                try:
                     for row in rows:
-                        pickle.dump(row, f, protocol=-1)
-                    f.flush()
-                    chunkfiles.append(wrapper)
+                        yield tuple(row)
+                finally:
+                    debug('attempt cleanup from generator')
+                    # N.B., need to ensure that any open files are closed
+                    # **before** temporary files are deleted, as deletion
+                    # will fail on Windows if a file is still open.
+                    del chunkiters
+                    del rows
+                    del filecache
+                    debug('exiting generator')
+        finally:
+            cache.remove_reader()
+            if (cache.reader_count == 0 and cache is not self._current_cache
+                    and cache in self._old_caches):
+                self._old_caches.remove(cache)
+                cache.release()
 
-                # grab the next chunk
-                rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+    def _iternocache(self, source, key, reverse, cache_target=None):
+        debug('iterate without cache')
+        it = iter(source)
+        chunkfiles = []
 
-            if self._cache:
-                debug('caching files')
-                self._hdrcache = hdr
-                self._filecache = chunkfiles
-                self._getkey = getkey
+        try:
+            try:
+                hdr = next(it)
+            except StopIteration:
+                if key is None:
+                    return  # nothing to do on a table without headers
+                hdr = []
+            yield tuple(hdr)
 
-            chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
-                yield tuple(row)
+            if key is not None:
+                # convert field selection into field indices
+                indices = asindices(hdr, key)
+            else:
+                indices = range(len(hdr))
+            # now use field indices to construct a _getkey function
+            getkey = comparable_itemgetter(*indices)
+
+            # TODO support native comparison
+
+            # initialise the first chunk
+            rows = list(itertools.islice(it, 0, self.buffersize))
+            rows.sort(key=getkey, reverse=reverse)
+
+            # have we exhausted the source iterator?
+            if self.buffersize is None or len(rows) < self.buffersize:
+                # yes, table fits within sort buffer
+
+                if cache_target is not None:
+                    cache_target.memory = rows
+                    cache_target.source_iterator = None
+                    return
+
+                for row in rows:
+                    yield tuple(row)
+
+            else:
+                # no, table is too big, need to sort in chunks
+
+                while rows:
+
+                    # dump the chunk
+                    with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                            mode='wb') as f:
+                        # N.B., we **don't** want the file to be deleted on
+                        # close, but we **do** want the file to be deleted
+                        # when self is garbage collected, or when the program
+                        # exits. When all references to the wrapper are gone,
+                        # the file should get deleted.
+                        wrapper = _NamedTempFileDeleteOnGC(f.name)
+                        debug('created temporary chunk file %s' % f.name)
+                        for row in rows:
+                            pickle.dump(row, f, protocol=-1)
+                        f.flush()
+                        chunkfiles.append(wrapper)
+
+                    # grab the next chunk
+                    rows = list(itertools.islice(it, 0, self.buffersize))
+                    rows.sort(key=getkey, reverse=reverse)
+
+                if cache_target is not None:
+                    cache_target.files = chunkfiles
+                    cache_target.source_iterator = None
+                    return
+
+                chunkiters = [_iterchunk(f.name) for f in chunkfiles]
+                for row in _mergesorted(getkey, reverse, *chunkiters):
+                    yield tuple(row)
+        finally:
+            if cache_target is not None and cache_target.files is None and \
+                    cache_target.memory is None:
+                for wrapper in chunkfiles:
+                    wrapper.delete()
+                chunkfiles = []
 
 
 class _NamedTempFileDeleteOnGC(object):
@@ -387,6 +509,8 @@ class _NamedTempFileDeleteOnGC(object):
         try:
             log('deleting %s' % name)
             unlink(name)
+        except FileNotFoundError:
+            pass
         except Exception as e:
             log('exception deleting %s: %s' % (name, e))
             raise

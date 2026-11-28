@@ -4,6 +4,8 @@ from __future__ import absolute_import, print_function, division
 import os
 import gc
 import logging
+import gzip
+import csv
 from datetime import datetime
 import platform
 
@@ -355,6 +357,163 @@ def test_sort_buffered_cleanup_open_iterator():
     gc.collect()
     for fn in filenames:
         assert not os.path.exists(fn), fn
+
+
+class _BatchSource(object):
+
+    def __init__(self, batches, initial_batch):
+        self.batches = batches
+        self.batch = initial_batch
+        self.opens = 0
+        self.data_rows_read = 0
+
+    def use_batch(self, batch):
+        self.batch = batch
+
+    def __iter__(self):
+        self.opens += 1
+        batch = self.batches[self.batch]
+        for index, row in enumerate(batch):
+            if index:
+                self.data_rows_read += 1
+            yield tuple(row)
+
+
+def test_sort_cache_retains_batch_for_open_readers(tmp_path):
+    batches = {
+        'A': (
+            ('id', 'amount'),
+            ('A2', '12'),
+            ('A1', '11'),
+            ('A3', '13'),
+        ),
+        'B': (
+            ('amount', 'id'),
+            ('23', 'B3'),
+            ('21', 'B1'),
+            ('22', 'B2'),
+        ),
+        'C': (
+            ('id', 'amount'),
+            ('C3', '33'),
+            ('C1', '31'),
+            ('C2', '32'),
+        ),
+    }
+    source = _BatchSource(batches, 'A')
+    archive_dir = tmp_path / 'archives'
+    archive_dir.mkdir()
+    table = sort(source, 'id', buffersize=2, tempdir=str(tmp_path))
+
+    expected_a = (
+        ('id', 'amount'),
+        ('A1', '11'),
+        ('A2', '12'),
+        ('A3', '13'),
+    )
+    ieq(expected_a, table)
+    assert source.opens == 1
+    a_filenames = [wrapper.name for wrapper in table._filecache]
+
+    a_path = str(archive_dir / 'a.csv.gz')
+    a_archive = iter(table.teecsv(a_path, encoding='ascii'))
+    eq_(('id', 'amount'), next(a_archive))
+    assert source.opens == 1
+    assert source.data_rows_read == 3
+
+    source.use_batch('B')
+    table.clearcache()
+    b_preview = iter(table)
+    b_archive = iter(table)
+    eq_(('amount', 'id'), next(b_preview))
+    eq_(('amount', 'id'), next(b_archive))
+    assert source.opens == 2
+    assert source.data_rows_read == 3
+
+    source.use_batch('C')
+    table.clearcache()
+    c_path = str(archive_dir / 'c.csv.gz')
+    expected_c = (
+        ('id', 'amount'),
+        ('C1', '31'),
+        ('C2', '32'),
+        ('C3', '33'),
+    )
+    ieq(expected_c, table.teecsv(c_path, encoding='ascii'))
+    assert source.opens == 3
+    c_filenames = [wrapper.name for wrapper in table._filecache]
+    for filename in a_filenames:
+        assert os.path.exists(filename), filename
+
+    b_preview.close()
+    eq_(('21', 'B1'), next(b_archive))
+    b_cache = next(cache for cache in table._old_caches
+                   if cache.header == ('amount', 'id'))
+    b_filenames = [wrapper.name for wrapper in b_cache.files]
+    for filename in b_filenames:
+        assert os.path.exists(filename), filename
+    eq_((('21', 'B1'), ('22', 'B2'), ('23', 'B3')),
+        (('21', 'B1'),) + tuple(b_archive))
+    eq_((('A1', '11'), ('A2', '12'), ('A3', '13')),
+        tuple(a_archive))
+    assert source.opens == 3
+    assert source.data_rows_read == 9
+    for filename in a_filenames:
+        assert not os.path.exists(filename), filename
+    for filename in b_filenames:
+        assert not os.path.exists(filename), filename
+    for filename in c_filenames:
+        assert os.path.exists(filename), filename
+
+    with gzip.open(a_path, 'rt', newline='') as f:
+        eq_([list(row) for row in expected_a], list(csv.reader(f)))
+    with gzip.open(c_path, 'rt', newline='') as f:
+        eq_([list(row) for row in expected_c], list(csv.reader(f)))
+
+    ieq(expected_c, table)
+    assert source.opens == 3
+
+    if platform.python_implementation() != 'PyPy':
+        eq_(2, len(list(tmp_path.iterdir())) - 1)
+        table.clearcache()
+        eq_(1, len(list(tmp_path.iterdir())))
+        for filename in c_filenames:
+            assert not os.path.exists(filename), filename
+
+
+def test_sort_disabled_cache_reads_source_each_time():
+    rows = (
+        ('id', 'amount'),
+        ('2', 'b'),
+        ('1', 'a'),
+    )
+    source = _BatchSource({'only': rows}, 'only')
+    table = sort(source, 'id', cache=False)
+
+    ieq((('id', 'amount'), ('1', 'a'), ('2', 'b')), table)
+    ieq((('id', 'amount'), ('1', 'a'), ('2', 'b')), table)
+    eq_(2, source.opens)
+
+
+def test_sort_header_cache_survives_reader_exit():
+    rows = (
+        ('id', 'amount'),
+        ('2', 'b'),
+        ('1', 'a'),
+        ('3', 'c'),
+    )
+    source = _BatchSource({'only': rows}, 'only')
+    table = sort(source, 'id', buffersize=2)
+
+    first = iter(table)
+    eq_(('id', 'amount'), next(first))
+    first.close()
+    eq_(1, source.opens)
+    eq_(0, source.data_rows_read)
+
+    ieq((('id', 'amount'), ('1', 'a'), ('2', 'b'), ('3', 'c')), table)
+    eq_(1, source.opens)
+    eq_(3, source.data_rows_read)
 
 
 def test_sort_empty():
