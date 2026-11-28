@@ -14,16 +14,19 @@ class InstanceLoader:
         default_filetype: str = "json",
         force_filetype: str | None = None,
         data_transform: Transform | None = None,
+        handoff: bool = False,
     ) -> None:
         self._files = files
         self._default_filetype = default_filetype
         self._force_filetype = force_filetype
+        self._handoff = handoff
         self._data_transform = (
             data_transform if data_transform is not None else Transform()
         )
 
         self._parsers = ParserSet(
-            modify_yaml_implementation=self._data_transform.modify_yaml_implementation
+            modify_yaml_implementation=self._data_transform.modify_yaml_implementation,
+            handoff=handoff,
         )
 
     def iter_files(self) -> t.Iterator[tuple[str, ParseError | t.Any]]:
@@ -46,7 +49,12 @@ class InstanceLoader:
                 except ParseError as err:
                     data = err
                 else:
-                    data = self._data_transform(data)
+                    if self._handoff:
+                        # handoff parsers return a HandoffDocument; any data
+                        # transform still applies to the JSON-compatible payload
+                        data.data = self._data_transform(data.data)
+                    else:
+                        data = self._data_transform(data)
             finally:
                 file.close()
             yield (name, data)

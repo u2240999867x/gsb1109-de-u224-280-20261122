@@ -268,6 +268,30 @@ whenever they are encountered prior to validation.
     In particular, the behavior of ``check-jsonschema`` is undefined when multiple
     defaults are specified via ``anyOf``, ``oneOf``, or other forms of polymorphism.
 
+``--handoff``
+~~~~~~~~~~~~~
+
+``--handoff`` enables strict handoff mode. Instance files are interpreted as
+the data that will be handed off to a JSON-based contract, using the decoded
+JSON field names of mapping keys:
+
+- the YAML integer key ``1`` becomes the field name ``"1"``
+- the YAML boolean key ``true`` becomes the field name ``"True"``
+- string keys keep their decoded spelling (so ``"1"`` is ``"1"``)
+
+Two source keys which resolve to the same field name are reported as
+``duplicate_key`` handoff errors, with the position of every offending key.
+Non-finite numbers, such as YAML ``.inf`` or a JSON ``1e999`` that overflows,
+are reported as ``non_finite_number`` handoff errors, since they cannot be
+delivered as JSON numbers. YAML ``<<`` merges still apply, and each alias used
+to reach inherited text is reported with its own position.
+
+Each handoff error gives the final field's JSON Pointer and 1-based
+line/column positions in the original source. Files with handoff errors fail
+without being checked against the schema; the remaining files continue to be
+validated normally. Without ``--handoff``, the regular parsers and their
+existing behavior are used unchanged.
+
 ``--base-uri``
 ~~~~~~~~~~~~~~
 

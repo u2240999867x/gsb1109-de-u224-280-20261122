@@ -35,6 +35,7 @@ class ParseResult:
         # validation behavioral controls
         self.validator_class: type[jsonschema.protocols.Validator] | None = None
         self.fill_defaults: bool = False
+        self.handoff: bool = False
         # regex format options
         self.disable_all_formats: bool = False
         self.disable_formats: tuple[str, ...] = ()

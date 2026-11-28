@@ -14,9 +14,15 @@ import click
 import jsonschema
 
 from . import format_errors
+from .handoff import HandoffIssue
 from .parsers import ParseError
 from .result import CheckResult
 from .utils import iter_validation_error
+
+_HANDOFF_CATEGORY_MESSAGES = {
+    "duplicate_key": "multiple source keys resolve to the same JSON field name",
+    "non_finite_number": "value is not a finite JSON number",
+}
 
 
 class Reporter(abc.ABC):
@@ -119,6 +125,21 @@ class TextReporter(Reporter):
             mode = "full"
         self._echo(textwrap.indent(format_errors.format_error(err, mode=mode), "  "))
 
+    def _show_handoff_error(self, filename: str, issue: HandoffIssue) -> None:
+        message = _HANDOFF_CATEGORY_MESSAGES.get(issue.category, issue.category)
+        loc = click.style(f"{filename}::{issue.pointer}", fg="yellow")
+        self._echo(f"{loc}: {click.style(issue.category, fg='red')}: {message}", indent=2)
+        for location in issue.locations:
+            self._echo(
+                f"source: line {location.line}, column {location.column}", indent=4
+            )
+        for alias_use in issue.alias_uses:
+            self._echo(
+                f"via alias *{alias_use.anchor} at line {alias_use.line}, "
+                f"column {alias_use.column}",
+                indent=4,
+            )
+
     def report_errors(self, result: CheckResult) -> None:
         if self.verbosity < 1:
             return
@@ -127,6 +148,11 @@ class TextReporter(Reporter):
             for filename, errors in result.parse_errors.items():
                 for err in errors:
                     self._show_parse_error(filename, err)
+        if result.handoff_errors:
+            self._echo("Handoff errors were encountered.")
+            for filename, issues in result.handoff_errors.items():
+                for issue in issues:
+                    self._show_handoff_error(filename, issue)
         if result.validation_errors:
             self._echo("Schema validation errors were encountered.")
             for filename, parse_errors in result.validation_errors.items():
@@ -198,6 +224,32 @@ class JsonReporter(Reporter):
                     "message": str(err),
                 }
 
+    def _dump_handoff_errors(
+        self,
+        error_map: dict[str, list[HandoffIssue]],
+    ) -> t.Iterator[dict[str, t.Any]]:
+        for filename, issues in error_map.items():
+            for issue in issues:
+                item: dict[str, t.Any] = {
+                    "filename": filename,
+                    "category": issue.category,
+                    "pointer": issue.pointer,
+                    "locations": [
+                        {"line": location.line, "column": location.column}
+                        for location in issue.locations
+                    ],
+                }
+                if issue.alias_uses:
+                    item["alias_uses"] = [
+                        {
+                            "anchor": alias_use.anchor,
+                            "line": alias_use.line,
+                            "column": alias_use.column,
+                        }
+                        for alias_use in issue.alias_uses
+                    ]
+                yield item
+
     def report_errors(self, result: CheckResult) -> None:
         report_obj: dict[str, t.Any] = {"status": "fail"}
         if self.verbosity > 1:
@@ -206,6 +258,9 @@ class JsonReporter(Reporter):
             report_obj["errors"] = list(self._dump_error_map(result.validation_errors))
             report_obj["parse_errors"] = list(
                 self._dump_parse_errors(result.parse_errors)
+            )
+            report_obj["handoff_errors"] = list(
+                self._dump_handoff_errors(result.handoff_errors)
             )
         self._dump(report_obj)
 

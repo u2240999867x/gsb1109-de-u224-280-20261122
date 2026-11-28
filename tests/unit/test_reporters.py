@@ -261,3 +261,71 @@ def test_text_print_parse_error_with_cause(capsys):
               whoopsie during parsing
                 JSONDecodeError: a bad thing happened: line 1 column 2 (char 1)
             """) in captured.out
+
+
+def _make_handoff_result():
+    from check_jsonschema.handoff import (
+        HandoffAliasUse,
+        HandoffIssue,
+        HandoffLocation,
+    )
+
+    result = CheckResult()
+    result.record_handoff_errors(
+        "warehouse.yaml",
+        [
+            HandoffIssue(
+                category="duplicate_key",
+                pointer="/east/bins/1",
+                locations=(
+                    HandoffLocation(line=4, column=7),
+                    HandoffLocation(line=5, column=7),
+                ),
+                alias_uses=(
+                    HandoffAliasUse(anchor="common", line=11, column=8),
+                ),
+            ),
+            HandoffIssue(
+                category="non_finite_number",
+                pointer="/east/bins/1/count",
+                locations=(HandoffLocation(line=4, column=18),),
+            ),
+        ],
+    )
+    return result
+
+
+def test_text_reporter_handoff_error(capsys):
+    TextReporter(verbosity=1).report_result(_make_handoff_result())
+    out = capsys.readouterr().out
+    assert "Handoff errors were encountered." in out
+    assert "warehouse.yaml::/east/bins/1" in out
+    assert "line 4, column 7" in out
+    assert "line 5, column 7" in out
+    assert "via alias *common at line 11, column 8" in out
+    assert "line 4, column 18" in out
+
+
+def test_json_reporter_handoff_error(capsys):
+    JsonReporter(verbosity=1, pretty=False).report_result(
+        _make_handoff_result()
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "fail"
+    assert data["errors"] == []
+    handoff = data["handoff_errors"]
+    assert [item["category"] for item in handoff] == [
+        "duplicate_key",
+        "non_finite_number",
+    ]
+    duplicate = handoff[0]
+    assert duplicate["filename"] == "warehouse.yaml"
+    assert duplicate["pointer"] == "/east/bins/1"
+    assert duplicate["locations"] == [
+        {"line": 4, "column": 7},
+        {"line": 5, "column": 7},
+    ]
+    assert duplicate["alias_uses"] == [
+        {"anchor": "common", "line": 11, "column": 8}
+    ]
+    assert "alias_uses" not in handoff[1]

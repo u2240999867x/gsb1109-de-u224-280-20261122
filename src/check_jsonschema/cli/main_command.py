@@ -193,6 +193,18 @@ The '--disable-formats' flag supports the following formats:
     is_flag=True,
 )
 @click.option(
+    "--handoff",
+    help=(
+        "Enable strict handoff mode. Instance files are checked as they will "
+        "be handed off to a JSON-based contract, using the decoded JSON field "
+        "names of mapping keys. Reports source keys which collide onto one "
+        "field name and non-finite numbers (such as YAML '.inf' or JSON "
+        "'1e999'), with JSON Pointers and source line/column positions. Files "
+        "with handoff errors fail without running the schema check."
+    ),
+    is_flag=True,
+)
+@click.option(
     "--validator-class",
     help=(
         "The fully qualified name of a python validator to use in place of "
@@ -249,6 +261,7 @@ def main(
     traceback_mode: t.Literal["full", "short"],
     data_transform: t.Literal["azure-pipelines", "gitlab-ci"] | None,
     fill_defaults: bool,
+    handoff: bool,
     validator_class: type[jsonschema.protocols.Validator] | None,
     output_format: t.Literal["text", "json"],
     verbose: int,
@@ -277,6 +290,7 @@ def main(
     args.default_filetype = default_filetype
     args.force_filetype = force_filetype
     args.fill_defaults = fill_defaults
+    args.handoff = handoff
     if data_transform is not None:
         args.data_transform = TRANSFORM_LIBRARY[data_transform]
 
@@ -318,6 +332,7 @@ def build_instance_loader(args: ParseResult) -> InstanceLoader:
         default_filetype=args.default_filetype,
         force_filetype=args.force_filetype,
         data_transform=args.data_transform,
+        handoff=args.handoff,
     )
 
 
@@ -338,6 +353,7 @@ def build_checker(args: ParseResult) -> SchemaChecker:
         regex_impl=RegexImplementation(args.regex_variant),
         traceback_mode=args.traceback_mode,
         fill_defaults=args.fill_defaults,
+        handoff=args.handoff,
     )
 
 

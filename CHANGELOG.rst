@@ -8,6 +8,13 @@ CHANGELOG
 Unreleased
 ----------
 
+- Added an opt-in ``--handoff`` strict handoff mode. In this mode, instance
+  files are checked against the JSON field names they will deliver, reporting
+  source keys which collide onto one field name and non-finite numbers with
+  JSON Pointers and source line/column positions. YAML ``<<`` merges and alias
+  usage positions are tracked. Files with handoff errors fail without running
+  the schema check; other files continue to be validated.
+
 .. vendor-insert-here
 
 - Update vendored schemas: mergify, renovate (2026-11-01)

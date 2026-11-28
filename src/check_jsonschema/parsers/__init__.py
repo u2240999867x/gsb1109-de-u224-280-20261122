@@ -47,6 +47,7 @@ class ParserSet:
         *,
         modify_yaml_implementation: t.Callable[[ruamel.yaml.YAML], None] | None = None,
         supported_formats: t.Sequence[str] | None = None,
+        handoff: bool = False,
     ) -> None:
         yaml_impl = yaml.construct_yaml_implementation()
         failover_yaml_impl = yaml.construct_yaml_implementation(pure=True)
@@ -57,6 +58,15 @@ class ParserSet:
             "yaml": yaml.impl2loader(yaml_impl, failover_yaml_impl),
             **DEFAULT_LOAD_FUNC_BY_TAG,
         }
+        if handoff:
+            from ..handoff import json_parser, toml_parser, yaml_parser
+
+            base_by_tag = {
+                "json": json_parser.load,
+                "toml": toml_parser.load,
+                "yaml": yaml_parser.load,
+            }
+        self._handoff = handoff
         if supported_formats is None:
             self._by_tag = base_by_tag
         else:
@@ -96,11 +106,16 @@ class ParserSet:
         force_filetype: str | None = None,
     ) -> t.Any:
         loadfunc = self.get(path, default_filetype, force_filetype)
+        error_types = LOADING_FAILURE_ERROR_TYPES
+        if self._handoff:
+            from ..handoff.json_parser import JsonParseError
+
+            error_types = (*error_types, JsonParseError)
         try:
             if isinstance(data, bytes):
                 data = io.BytesIO(data)
             return loadfunc(data)
-        except LOADING_FAILURE_ERROR_TYPES as e:
+        except error_types as e:
             raise FailedFileLoadError(f"Failed to parse {path}") from e
 
     def parse_file(

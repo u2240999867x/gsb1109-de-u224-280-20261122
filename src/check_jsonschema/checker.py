@@ -9,6 +9,7 @@ import referencing.exceptions
 
 from . import format_errors
 from .formats import FormatOptions
+from .handoff import HandoffDocument
 from .instance_loader import InstanceLoader
 from .parsers import ParseError
 from .regex_variants import RegexImplementation
@@ -34,6 +35,7 @@ class SchemaChecker:
         regex_impl: RegexImplementation,
         traceback_mode: t.Literal["minimal", "short", "full"] = "short",
         fill_defaults: bool = False,
+        handoff: bool = False,
     ) -> None:
         self._schema_loader = schema_loader
         self._instance_loader = instance_loader
@@ -43,6 +45,7 @@ class SchemaChecker:
         self._regex_impl = regex_impl
         self._traceback_mode = traceback_mode
         self._fill_defaults = fill_defaults
+        self._handoff = handoff
 
     def _fail(self, msg: str, err: Exception | None = None) -> t.NoReturn:
         click.echo(msg, err=True)
@@ -71,14 +74,21 @@ class SchemaChecker:
         for path, data in self._instance_loader.iter_files():
             if isinstance(data, ParseError):
                 result.record_parse_error(path, data)
-            else:
-                validator = self.get_validator(path, data)
-                passing = True
-                for err in validator.iter_errors(data):
-                    result.record_validation_error(path, err)
-                    passing = False
-                if passing:
-                    result.record_validation_success(path)
+                continue
+            if isinstance(data, HandoffDocument):
+                if data.issues:
+                    # files with handoff errors are rejected before the
+                    # contract ever sees them
+                    result.record_handoff_errors(path, data.issues)
+                    continue
+                data = data.data
+            validator = self.get_validator(path, data)
+            passing = True
+            for err in validator.iter_errors(data):
+                result.record_validation_error(path, err)
+                passing = False
+            if passing:
+                result.record_validation_success(path)
         return result
 
     def _run(self) -> None:

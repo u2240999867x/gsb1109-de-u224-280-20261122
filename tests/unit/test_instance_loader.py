@@ -188,6 +188,37 @@ a:
     assert data == [(str(f), {"a": {"b": [1, 2], "c": "d"}})]
 
 
+def test_instanceloader_handoff_wraps_data(tmp_path, open_wide):
+    from check_jsonschema.handoff import HandoffDocument
+
+    f = tmp_path / "foo.yaml"
+    f.write_text("1: {count: .inf}\n\"1\": {count: 2}\n")
+    loader = InstanceLoader(open_wide(f), handoff=True)
+    path, data = list(loader.iter_files())[0]
+    assert path == str(f)
+    assert isinstance(data, HandoffDocument)
+    assert data.data == {"1": {"count": 2}}
+    assert {issue.category for issue in data.issues} == {
+        "duplicate_key",
+        "non_finite_number",
+    }
+
+
+def test_instanceloader_handoff_json_independent_of_optional_parser(
+    tmp_path, open_wide
+):
+    from check_jsonschema.handoff import HandoffDocument
+
+    f = tmp_path / "foo.json"
+    f.write_text('{"bins":{"1":1e999},"\\u0031":1}')
+    loader = InstanceLoader(open_wide(f), handoff=True)
+    path, data = list(loader.iter_files())[0]
+    assert isinstance(data, HandoffDocument)
+    # one non-finite overflow value; the two top-level keys have distinct names
+    assert len(data.issues) == 1
+    assert data.issues[0].category == "non_finite_number"
+
+
 @pytest.mark.parametrize(
     "file_format, filename, content",
     [

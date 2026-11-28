@@ -110,6 +110,21 @@ def test_no_cache_flag_is_true(cli_runner, mock_parse_result, in_tmp_dir, tmp_pa
     assert mock_parse_result.disable_cache is True
 
 
+def test_handoff_defaults_false(cli_runner, mock_parse_result, in_tmp_dir, tmp_path):
+    touch_files(tmp_path, "foo.json")
+    cli_runner.invoke(cli_main, ["--schemafile", "schema.json", "foo.json"])
+    assert mock_parse_result.handoff is False
+
+
+def test_handoff_flag_is_true(cli_runner, mock_parse_result, in_tmp_dir, tmp_path):
+    touch_files(tmp_path, "foo.json")
+    cli_runner.invoke(
+        cli_main,
+        ["--schemafile", "schema.json", "--handoff", "foo.json"],
+    )
+    assert mock_parse_result.handoff is True
+
+
 @pytest.mark.parametrize(
     "cmd_args",
     [
