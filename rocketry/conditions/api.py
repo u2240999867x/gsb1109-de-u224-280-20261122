@@ -124,8 +124,8 @@ class TimeActionWrapper(BaseCondition):
 
 class RetryWrapper(BaseCondition):
 
-    def __call__(self, n:int):
-        return Retry(n)
+    def __call__(self, n:int=1, recovery=None, partitions=None, **kwargs):
+        return Retry(n, recovery=recovery, partitions=partitions, **kwargs)
 
     def observe(self, **kwargs):
         return self.get_cond().observe(**kwargs)

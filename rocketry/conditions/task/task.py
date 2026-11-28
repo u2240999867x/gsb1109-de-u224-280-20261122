@@ -455,14 +455,171 @@ class DependFailure(DependMixin):
         return f"task '{depend_task_name}' failed before '{task_name}' started"
 
 class Retry(BaseCondition):
-    """Condition for retrying failed attempts"""
-    def __init__(self, n: Optional[int] = 1):
+    """Condition for retrying failed attempts
+
+    Parameters
+    ----------
+    n : int, optional
+        Maximum number of retries. ``-1`` means unlimited and ``0`` disables
+        retrying entirely.
+    recovery : PartitionRecovery, RecoveryRecord, BaseStateStore, str, optional
+        Opt-in partition aware recovery.  When given, retries are only issued
+        for confirmed failures in the *current* declaration batch of each
+        partition and each failed run is dispatched at most once.  When left
+        as ``None`` the condition behaves exactly as before.
+    partitions : list of str, optional
+        Partitions to account for when ``recovery`` is not passed explicitly.
+    dispatch : bool, default True
+        Whether a recovery evaluation registers the backfill transaction.
+        Set to ``False`` to only inspect eligibility.
+    """
+    def __init__(
+        self,
+        n: Optional[int] = 1,
+        recovery=None,
+        partitions=None,
+        dispatch: bool = True,
+        **kwargs,
+    ):
         self.n = int(n) if n is not None else -1
+        # Accept a few natural aliases for the recovery object.
+        for alias in (
+            "journal", "record", "state", "ledger", "store", "path",
+            "recovery_record", "recovery_store", "recover",
+        ):
+            value = kwargs.pop(alias, None)
+            if value is not None and recovery is None:
+                recovery = value
+        # A single partition is also accepted.
+        if partitions is None:
+            partitions = kwargs.pop("partition", None)
+        # Backfill execution callback aliases.
+        self.executor = None
+        for alias in ("executor", "backfill", "backfill_func", "on_backfill", "run_backfill"):
+            value = kwargs.pop(alias, None)
+            if value is not None and self.executor is None:
+                self.executor = value
+        if kwargs:
+            raise TypeError(
+                f"Unexpected Retry argument(s): {', '.join(sorted(kwargs))}"
+            )
+        self.recovery = recovery
+        self.partition_batches = dict(partitions) if isinstance(partitions, dict) else None
+        if self.partition_batches is not None:
+            self.partitions = list(self.partition_batches)
+        else:
+            self.partitions = (
+                [partitions] if isinstance(partitions, str)
+                else list(partitions) if partitions is not None
+                else None
+            )
+        self.dispatch = dispatch
         super().__init__()
+
+    def _get_recovery(self, task, session):
+        """Normalize the different accepted ``recovery`` values."""
+        recovery = self.recovery
+
+        # ``recovery=True`` is a switch: use the task/session recovery or
+        # create a fresh in-memory one.  ``recovery=False`` explicitly keeps
+        # the legacy behaviour.
+        if recovery is False:
+            return None
+        if recovery is None or recovery is True:
+            try:
+                candidate = getattr(task, "recovery", None)
+            except Exception:
+                candidate = None
+            if candidate is None:
+                try:
+                    candidate = getattr(session, "recovery", None)
+                except Exception:
+                    candidate = None
+            if candidate is None:
+                try:
+                    candidate = session.config.recovery
+                except Exception:
+                    candidate = None
+            if candidate is not None:
+                recovery = candidate
+            elif recovery is True or self.partitions is not None:
+                from rocketry.recovery import PartitionRecovery
+                recovery = PartitionRecovery(
+                    partitions=self.partitions, task=task, session=session
+                )
+                if self.executor is not None:
+                    recovery.executor = self.executor
+                self.recovery = recovery
+                self._declare_batches(recovery)
+                return recovery
+            else:
+                return None
+
+        from rocketry.recovery import (
+            PartitionRecovery, RecoveryRecord, Recovery, BackfillLedger,
+            MemoryStateStore, BaseStateStore,
+        )
+
+        if callable(recovery) and not isinstance(recovery, (PartitionRecovery, RecoveryRecord, BackfillLedger, BaseStateStore)):
+            # A factory is a convenient way to keep one manager per task.
+            recovery = recovery()
+            self.recovery = recovery
+
+        if isinstance(recovery, PartitionRecovery):
+            manager = recovery
+        elif isinstance(recovery, RecoveryRecord):
+            manager = PartitionRecovery(record=recovery)
+        elif isinstance(recovery, BackfillLedger):
+            manager = PartitionRecovery(ledger=recovery)
+        elif isinstance(recovery, BaseStateStore):
+            manager = PartitionRecovery(store=recovery)
+        elif isinstance(recovery, (str, bytes)) or hasattr(recovery, "__fspath__"):
+            manager = Recovery(path=recovery)
+        elif isinstance(recovery, dict):
+            if "partitions" in recovery or "cursors" in recovery:
+                manager = PartitionRecovery(record=RecoveryRecord.from_dict(recovery))
+            else:
+                manager = PartitionRecovery(store=MemoryStateStore(recovery))
+        else:
+            raise TypeError(f"Unsupported retry recovery: {type(recovery)!r}")
+
+        if manager.task is None:
+            manager.task = task
+        if manager.session is None:
+            manager.session = session
+        if self.executor is not None and manager.executor is None:
+            manager.executor = self.executor
+        self._declare_batches(manager)
+        return manager
+
+    def _declare_batches(self, manager):
+        if self.partition_batches:
+            for partition, batch in self.partition_batches.items():
+                manager.declare_batch(partition, batch)
+        elif self.partitions:
+            for partition in self.partitions:
+                manager.ensure_partition(partition)
 
     def get_state(self, task=Task(default=None), session=Session()):
         if self.n == 0:
             return False
+
+        recovery = self._get_recovery(task=task, session=session)
+        if recovery is not None:
+            # Pull new receipts from the task log continuation (if the task
+            # logger carries recovery receipts) before deciding.
+            try:
+                recovery.ingest_task_log(task=task)
+            except Exception:
+                if not session.config.silence_cond_check:
+                    raise
+            # With recovery enabled the legacy failure count is not used:
+            # only confirmed failures of the current batch are retried.
+            return bool(recovery.retry_required(
+                task=task,
+                dispatch=self.dispatch,
+            ))
+
         if task.get_status() != "fail":
             # Previously did not fail, no need to retry
             return False
@@ -481,3 +638,17 @@ class Retry(BaseCondition):
             action='fail'
         ).count()
         return self.n >= n_failed_in_row
+
+    def __str__(self):
+        if hasattr(self, "_str"):
+            return self._str
+        n = "infinite" if self.n == -1 else self.n
+        if self.recovery is not None or self.partitions is not None:
+            partitions = self.partitions
+            if partitions is None and self.recovery is not None:
+                partitions = getattr(self.recovery, "partitions", None)
+            return f"retry({n}, partitions={partitions})"
+        return f"retry({n})"
+
+    def __repr__(self):
+        return str(self)

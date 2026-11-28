@@ -226,6 +226,65 @@ the task is allowed to run:
     def do_things():
         ...
 
-The above runs once a day between 10:00 and 12:00. It will also retry 
+The above runs once a day between 10:00 and 12:00. It will also retry
 maximum of three times if it fails and time is still between 10:00 and 12:00.
+
+Partitioned Recovery
+^^^^^^^^^^^^^^^^^^^^
+
+If a task collects data for several partitions (for example a nightly
+collection split into north and south), the ordinary retry counter cannot
+tell which partition actually failed, and a task log rotation or a scheduler
+restart easily loses the run that should be backfilled.
+
+``rocketry.recovery`` adds an opt-in layer for this.  Every partition keeps
+its own declaration batch, the receipts seen for each run and the position
+where the task log was last read.  Only a confirmed failure (a failure
+receipt) of the *current* batch is eligible for a backfill.  Runs without an
+end receipt stay ``pending`` (待确认) and are never backfilled.  Old batches
+can still receive late results for auditing, but cannot start a new backfill.
+
+.. code-block:: python
+
+    from rocketry.conditions import Retry
+    from rocketry.recovery import Recovery, Receipt
+
+    recovery = Recovery(path="recovery.json")
+    recovery.declare_batch("north", "A")
+    recovery.declare_batch("south", "B")
+
+    @app.task(Retry(recovery=recovery))
+    def collect():
+        ...
+
+Receipts can be fed with :meth:`PartitionRecovery.process_receipt` /
+:meth:`PartitionRecovery.consume_log`.  A log record carrying ``partition``,
+``batch`` and ``run_id`` is also recognized by
+:meth:`PartitionRecovery.ingest_task_log`, which reads only the continuation
+after the stored cursor.
+
+Backfill results are stored through an idempotent ledger.  The business
+transaction id identifies the dispatch; inserting the same id twice (or
+submitting another id for a run that already has a transaction) returns the
+original success receipt instead of creating a second row.  The success
+receipt records ``original_run_id`` so the backfilled run can be traced, and
+it is written back to the Rocketry task log by ``Retry`` once the work is
+done.
+
+.. code-block:: python
+
+    receipt = recovery.insert_backfill(
+        transaction_id="biz-B",
+        partition="south",
+        batch="B",
+        run_id="run-b-17",
+    )
+
+    # After an unexpected shutdown, finish registered dispatches and write
+    # success receipts that were not yet logged.
+    recovery.resume()
+
+The dedicated condition :class:`rocketry.recovery.PartitionRetry` is a
+drop-in alternative.  Tasks without ``recovery`` keep the original ``Retry``
+behaviour unchanged.
 

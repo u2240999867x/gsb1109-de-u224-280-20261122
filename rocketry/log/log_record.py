@@ -1,5 +1,5 @@
 import datetime
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field, validator
 
 from rocketry.pybox.time import to_datetime, to_timedelta
@@ -71,3 +71,30 @@ class RunRecord(LogRecord):
 
 class TaskRunRecord(TaskLogRecord):
     run_id: Optional[str]
+
+class RecoveryRecord(TaskRunRecord):
+    """Task log record that also carries partition recovery receipts.
+
+    Use this model when backfill success receipts are written back to the
+    Rocketry task log and must survive a restart.  Plain
+    :class:`TaskRunRecord` models silently drop the extra fields.
+    """
+    partition: Optional[str]
+    batch: Optional[str]
+    source_seq: Optional[int]
+    source_event_seq: Optional[int]
+    original_run_id: Optional[str]
+    transaction_id: Optional[str]
+    source: Optional[str]
+    result: Optional[Any]
+
+
+class MinimalRecoveryRecord(MinimalRunRecord):
+    partition: Optional[str]
+    batch: Optional[str]
+    source_seq: Optional[int]
+    source_event_seq: Optional[int]
+    original_run_id: Optional[str]
+    transaction_id: Optional[str]
+    source: Optional[str]
+    result: Optional[Any]

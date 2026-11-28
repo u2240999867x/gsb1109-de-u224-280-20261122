@@ -239,6 +239,15 @@ class Task(RedBase, BaseModel):
     on_shutdown: bool = False
     func_run_id: Callable = None
 
+    recovery: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Optional partition recovery. When set, Retry conditions on this "
+            "task use partition aware backfills instead of the plain counter."
+        )
+    )
+
     _last_run: Optional[float]
     _last_success: Optional[float]
     _last_fail: Optional[float]
@@ -1309,6 +1318,9 @@ class Task(RedBase, BaseModel):
         dict_state = state['__dict__']
         dict_state['start_cond'] = None
         dict_state['end_cond'] = None
+        # Recovery is scheduler-side bookkeeping (and may hold locks or a
+        # reference back to this task); the child process does not need it.
+        dict_state['recovery'] = None
 
         # Removing possibly unpicklable manually. There is a problem in Pydantic
         # and for some reason it does not use Session's pickling

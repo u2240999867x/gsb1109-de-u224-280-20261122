@@ -2,6 +2,15 @@
 Version history
 ===============
 
+- Unreleased
+
+    - Add: Optional partition-aware recovery for ``Retry`` (``rocketry.recovery``).
+      A recovery record keeps each partition's current declaration batch, the
+      receipts seen per run and the task log cursor so backfills survive log
+      rotation and scheduler restarts.  Backfill inserts are idempotent by
+      business transaction id and the success receipt is written back to the
+      Rocketry task log.
+
 - ``2.5.1``
 
     - Fix: Pydantic validation bug in ``TaskLogRecord`` and ``TaskRunRecord``

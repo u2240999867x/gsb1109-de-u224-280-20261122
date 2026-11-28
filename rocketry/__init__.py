@@ -22,3 +22,6 @@ from .tasks import FuncTask
 _setup_defaults()
 session = Session(config={"execution": "process"})
 session.set_as_default()
+
+# Imported after the default session exists so a recovery can attach to it.
+from . import recovery

@@ -12,7 +12,7 @@ import threading
 import warnings
 
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Dict, List, Optional, Set, Tuple, Type, Union
 from pydantic import BaseModel, root_validator, validator
 from rocketry.pybox.time import to_timedelta
 from rocketry.log.defaults import create_default_handler
@@ -75,6 +75,8 @@ class Config(BaseModel):
 
     timezone: Optional[datetime.tzinfo] = None
     time_func: Callable = None
+
+    recovery: Optional[Any] = None
 
     @validator('execution', pre=True, always=True)
     def parse_task_execution(cls, value):
@@ -533,13 +535,14 @@ class Session(RedBase):
         state["session"] = None
         #state["parameters"] = None
         state['scheduler'] = None
+        state['recovery'] = None
         return state
 
     def _copy_pickle(self):
         # Copy and remove typically unpicklable attrs.
         # Used when creating a child process
         unpicklable_conf = {'shut_cond'}
-        unpicklable = {'tasks', '_cond_cache', 'session', '_cond_parsers', 'parameters'}
+        unpicklable = {'tasks', '_cond_cache', 'session', '_cond_parsers', 'parameters', 'recovery'}
         new_self = copy(self)
         for attr in unpicklable:
             setattr(new_self, attr, None)
