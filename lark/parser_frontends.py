@@ -1,9 +1,10 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Collection, Union, TYPE_CHECKING, Generic, Iterator, Tuple, TypeVar
+from copy import copy
+from typing import Any, Callable, Dict, List, Optional, Collection, Union, TYPE_CHECKING, Generic, Iterator, Tuple, TypeVar
 
 from .exceptions import ConfigurationError, GrammarError, LexError, UnexpectedInput, assert_config
 from .utils import get_regexp_width, Serialize, TextOrSlice, TextSlice, LarkInput
-from .lexer import LexerThread, LineCounter, Token, _TextSlice_WithLineCount, BasicLexer, ContextualLexer, Lexer
+from .lexer import LexerState, LexerThread, LineCounter, Token, _TextSlice_WithLineCount, BasicLexer, ContextualLexer, Lexer
 from .parsers import earley, xearley, cyk
 from .parsers.lalr_parser import LALR_Parser
 from .tree import Tree
@@ -153,6 +154,9 @@ class ParsingFrontend(Serialize):
         if self.parser_conf.parser_type != 'lalr':
             raise ConfigurationError("parse_interactive() currently only works with parser='lalr' ")
         stream = self._make_lexer_thread(text)
+        if self.lexer_conf.postlex is not None and not self.skip_lexer:
+            lexer = self.lexer.lexer if isinstance(self.lexer, PostLexConnector) else self.lexer
+            stream = _PostLexThread.from_lexer_thread(LexerThread(lexer, stream.state), self.lexer_conf.postlex)
         return self.parser.parse_interactive(stream, chosen_start)
 
     def scan(self, text: TextOrSlice, start: Optional[str]=None) -> Iterator[ScanMatch]:
@@ -263,6 +267,137 @@ class PostLexConnector:
     def lex(self, lexer_state, parser_state):
         i = self.lexer.lex(lexer_state, parser_state)
         return self.postlexer.process(i)
+
+
+class _PostLexThread:
+    """An interactive lexer thread that checkpoints the postlexer between tokens.
+
+    ``PostLexConnector`` hides the postlexer inside a generator and resets it every time
+    ``process()`` is called. Interactive parsing needs the opposite: the lexer position and the
+    postlexer state must both survive ``InteractiveParser.copy()`` so that branches can continue
+    independently -- including when the newline token has been delivered but the INDENT it
+    produced is still queued.
+
+    Each thread owns its lexer state, postlexer, and postlex output queue. Copying gives a branch
+    its own copies. ``with_text()`` additionally points a branch at a different continuation text
+    without re-lexing the already-consumed prefix.
+    """
+
+    _Token = Token
+
+    def __init__(self, lexer: Lexer, postlexer: Any, state: Optional[LexerState],
+                 output_queue: List[Token], finished: bool):
+        self.lexer = lexer
+        self.postlexer = postlexer
+        self.state = state
+        self._output_queue = output_queue
+        self._finished = finished
+        self._raw_stream: Optional[Iterator[Token]] = None
+
+    @classmethod
+    def from_lexer_thread(cls, lexer_thread: LexerThread, postlexer: Any) -> '_PostLexThread':
+        state = copy(lexer_thread.state) if lexer_thread.state is not None else None
+        return cls(lexer_thread.lexer, copy(postlexer), state, [], False)
+
+    @property
+    def last_token(self) -> Optional[Token]:
+        return self.state.last_token if self.state is not None else None
+
+    def lex(self, parser_state) -> Iterator[Token]:
+        if self.state is None:
+            raise TypeError("Cannot lex: No text assigned to lexer state")
+
+        while True:
+            if self._output_queue:
+                yield self._output_queue.pop(0)
+                continue
+
+            if self._finished:
+                return
+
+            token = self._next_raw_token(parser_state)
+            if token is None:
+                self._finished = True
+                self._output_queue.extend(self.postlexer.finish(self.last_token))
+            else:
+                self._output_queue.extend(self.postlexer.process_token(token))
+
+    def _next_raw_token(self, parser_state) -> Optional[Token]:
+        if self._raw_stream is None:
+            self._raw_stream = self.lexer.lex(self.state, parser_state)
+        try:
+            return next(self._raw_stream)
+        except StopIteration:
+            self._raw_stream = None
+            return None
+
+    def copy(self) -> '_PostLexThread':
+        """Branch from the current token boundary.
+
+        The next token has not been lexed yet, so the branch can be advanced independently of
+        every other branch. Queued postlex tokens (such as an INDENT after a NEWLINE) are copied
+        along with the postlexer's indentation/parenthesis state.
+        """
+        return type(self)(
+            self.lexer,
+            copy(self.postlexer),
+            copy(self.state) if self.state is not None else None,
+            list(self._output_queue),
+            self._finished,
+        )
+
+    def __copy__(self):
+        return self.copy()
+
+    def with_text(self, text: TextOrSlice, continuation: bool=False) -> '_PostLexThread':
+        """Branch from the current boundary, continuing with ``text``.
+
+        Unless ``continuation`` is true, ``text`` may be:
+
+        - the branch's complete source text (starting with the already consumed prefix), or
+        - only the text from the current lexer position or after the original input.
+
+        With ``continuation=True`` it is always treated as text following the current lexer
+        position. In every case the consumed prefix is not lexed again, and token positions
+        continue in the original coordinate system.
+        """
+        if self.state is None:
+            raise TypeError("Cannot branch: No text assigned to lexer state")
+
+        old_state = self.state
+        consumed_end = old_state.line_ctr.char_pos
+        old_text = old_state.text
+        consumed = old_text.text[:consumed_end]
+
+        new_slice = TextSlice.cast_from(text)
+        new_text = new_slice.text[new_slice.start:new_slice.end]
+
+        if not continuation and new_text.startswith(consumed) and len(new_text) > len(consumed):
+            # Complete source text. It keeps its own absolute coordinate base.
+            branch_slice = new_slice
+            branch_pos = new_slice.start + len(consumed)
+            line_start_pos = old_state.line_ctr.line_start_pos + new_slice.start - old_text.start
+        else:
+            # Text after the original input. Keep the original coordinates: the branch is the
+            # original input plus the new continuation. (Any unconsumed text of the old branch is
+            # replaced by the continuation.)
+            branch_slice = TextSlice.cast_from(old_text.text[:old_text.end] + new_text)
+            branch_pos = consumed_end
+            line_start_pos = old_state.line_ctr.line_start_pos
+
+        line_ctr = copy(old_state.line_ctr)
+        line_ctr.char_pos = branch_pos
+        line_ctr.line_start_pos = line_start_pos
+        line_ctr.column = branch_pos - line_start_pos + 1
+
+        branch = type(self)(
+            self.lexer,
+            copy(self.postlexer),
+            LexerState(branch_slice, line_ctr, old_state.last_token),
+            list(self._output_queue),
+            False,
+        )
+        return branch
 
 
 

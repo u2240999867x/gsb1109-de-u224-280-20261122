@@ -1,11 +1,12 @@
 # This module provides a LALR interactive parser, which is used for debugging and error handling
 
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 from copy import copy
 import warnings
 
 from lark.exceptions import UnexpectedToken
 from lark.lexer import Token, LexerThread
+from lark.utils import TextOrSlice
 from .lalr_parser_state import ParserState
 
 ###{standalone
@@ -67,8 +68,50 @@ class InteractiveParser:
         return self.copy()
 
     def copy(self, deepcopy_values=True):
+        """Create a new interactive parser with a separate state.
+
+        The copy starts at the same token boundary: feeding tokens to either instance does not
+        affect the other. If the parser has a postlexer, its state (including tokens it has
+        queued but not yet handed to the parser) is copied as well.
+        """
         parser_state = self.parser_state.copy(deepcopy_values=deepcopy_values)
         return type(self)(self.parser, parser_state, parser_state.lexer)
+
+    def fork(self, text: Optional[TextOrSlice]=None, deepcopy_values=True):
+        """Branch from the current token boundary, optionally with a different continuation.
+
+        The branch keeps the parser stack, the lexer position, and the postlexer state reached
+        so far. ``text`` is the branch's source text. It may be the complete text (whose already
+        consumed prefix must match) or just the text following the prefix. The shared prefix is
+        never lexed again, and token positions continue in the original coordinate system.
+
+        With ``text=None`` this is equivalent to ``copy()``. Branches are independent: finishing,
+        failing, or copying one does not affect any other.
+        """
+        parser_state = self.parser_state.copy(deepcopy_values=deepcopy_values)
+        lexer_thread = parser_state.lexer
+        if text is not None:
+            if not hasattr(lexer_thread, 'with_text'):
+                raise TypeError("fork(text=...) requires a parser with a postlexer")
+            lexer_thread = lexer_thread.with_text(text)
+            parser_state.lexer = lexer_thread
+        return type(self)(self.parser, parser_state, lexer_thread)
+
+    def fork_continuation(self, text: TextOrSlice, deepcopy_values=True):
+        """Branch from the current token boundary, using only the text that follows it.
+
+        Unlike ``fork()``, ``text`` is never interpreted as a complete source text; it is always
+        the continuation. Token positions still continue in the original coordinate system.
+        """
+        lexer_thread = self.parser_state.lexer
+        if not hasattr(lexer_thread, 'with_text'):
+            raise TypeError("fork_continuation() requires a parser with a postlexer")
+        parser_state = self.parser_state.copy(deepcopy_values=deepcopy_values)
+        lexer_thread = lexer_thread.with_text(text, continuation=True)
+        parser_state.lexer = lexer_thread
+        return type(self)(self.parser, parser_state, lexer_thread)
+
+    branch = fork
 
     def __eq__(self, other):
         if not isinstance(other, InteractiveParser):

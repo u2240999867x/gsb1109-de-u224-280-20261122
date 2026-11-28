@@ -196,6 +196,32 @@ def parse_with_progress(parser: Lark, text: str, start=None):
 Keep in mind that this implementation relies on the `InteractiveParser` and, therefore, only works with the `LALR(1)` parser, and not `Earley`.
 
 
+## Branching an Interactive Parse
+
+When a parser is used with a postlexer such as `Indenter`, an `InteractiveParser` checkpoint also
+holds the postlexer's state, including tokens it has already queued. For example, after a newline
+has been fed, the `INDENT` token it produced may still be waiting.
+
+`copy()` duplicates that whole checkpoint. `fork()` and `fork_continuation()` additionally let a
+branch continue with different text, without re-lexing the text that was already consumed:
+
+```python
+checkpoint = parser.parse_interactive("source:\n  stage(a,")
+for token in checkpoint.iter_parse():
+    if token.type == '_NL':
+        break
+
+left = checkpoint.fork_continuation("\n        b)\n  sink\nnext\n")
+right = checkpoint.fork_continuation("\n        c)\n  audit\nnext\n")
+# Advance left and right independently, then finish each with resume_parse().
+```
+
+`fork(text)` accepts either the complete branch text (whose consumed prefix must match) or just the
+continuation. `fork_continuation(text)` always treats its argument as the continuation. Branches
+are independent: finishing, failing, or copying one does not affect the others, and their token
+positions match those of a single non-branched parse.
+
+
 ## Parsing a Language with Significant Indentation
 
 If your grammar needs to support significant indentation (e.g. Python, YAML), you will need to use

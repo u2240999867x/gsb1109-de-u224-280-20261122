@@ -2872,6 +2872,141 @@ def _make_parser_test(LEXER, PARSER):
                 m, = parser.scan("aa")
                 self.assertEqual((m.range, m.value), ((0, 2), Tree('start', [])))
 
+        @unittest.skipIf(PARSER != 'lalr' or LEXER not in ('basic', 'contextual'),
+                         "interactive postlex checkpoints require a built-in LALR lexer")
+        def test_interactive_postlex_checkpoint_branches(self):
+            class CheckpointIndenter(Indenter):
+                NL_type = '_NL'
+                OPEN_PAREN_types = ['LPAR']
+                CLOSE_PAREN_types = ['RPAR']
+                INDENT_type = '_INDENT'
+                DEDENT_type = '_DEDENT'
+                tab_len = 8
+
+            grammar = r"""
+            start: "source" ":" _NL _INDENT action+ _DEDENT "next" _NL
+            action: NAME [ "(" NAME "," NAME ")" ] _NL
+            NAME: /[a-z]+/
+            _NL: /\n[ \t]*/
+            %ignore /[ \t]+/
+            %declare _INDENT _DEDENT
+            """
+            prefix = "source:\n  stage(a,"
+            tails = ["\n        b)\n  sink\nnext\n", "\n        c)\n  audit\nnext\n"]
+
+            seen_name_positions = []
+            def name_callback(t):
+                seen_name_positions.append(t.start_pos)
+                return t
+
+            parser = _Lark(grammar, postlex=CheckpointIndenter(),
+                           lexer_callbacks={'NAME': name_callback})
+
+            def feed_until(ip, token_type):
+                fed = []
+                for token in ip.lexer_thread.lex(ip.parser_state):
+                    ip.feed_token(token)
+                    fed.append(token)
+                    if token.type == token_type:
+                        return fed
+                return fed
+
+            def feed_all(ip):
+                tokens = []
+                for token in ip.lexer_thread.lex(ip.parser_state):
+                    ip.feed_token(token)
+                    tokens.append(token)
+                return tokens
+
+            def token_sig(tokens):
+                return [(t.type, str(t), t.start_pos, t.end_pos, t.line, t.column,
+                         t.end_line, t.end_column) for t in tokens]
+
+            expected = [parser.parse(prefix + tail) for tail in tails]
+
+            # Copy after _NL was fed, while the INDENT it generated is still queued.
+            checkpoint = parser.parse_interactive(prefix)
+            fed = feed_until(checkpoint, '_NL')
+            self.assertEqual([t.type for t in fed], ['SOURCE', 'COLON', '_NL'])
+            self.assertIn('_INDENT', checkpoint.choices())
+            self.assertEqual(checkpoint.lexer_thread.postlexer.indent_level, [0, 2])
+
+            common_prefix_calls = len(seen_name_positions)
+            branches = [checkpoint.fork_continuation(tail) for tail in tails]
+            full_text_branch = checkpoint.fork(prefix + tails[0])
+
+            # Interleave the branches, one token per branch per round.
+            delivered = [[], []]
+            iterators = [branch.lexer_thread.lex(branch.parser_state) for branch in branches]
+            finished = [False, False]
+            while not all(finished):
+                for i, branch in enumerate(branches):
+                    if finished[i]:
+                        continue
+                    try:
+                        token = next(iterators[i])
+                    except StopIteration:
+                        finished[i] = True
+                        continue
+                    branch.feed_token(token)
+                    delivered[i].append(token)
+
+            results = [branch.feed_eof(branch.lexer_thread.state.last_token) for branch in branches]
+            self.assertEqual(results, expected)
+
+            # The shared prefix was never re-lexed. Only tail tokens fired callbacks.
+            tail_name_calls = sum(t.type == 'NAME' for ts in delivered for t in ts)
+            self.assertEqual(len(seen_name_positions), common_prefix_calls + tail_name_calls)
+
+            # A branch can also be given its complete text; the consumed prefix is not re-lexed.
+            self.assertEqual(full_text_branch.resume_parse(), expected[0])
+
+            # copy() at the checkpoint also carries the queued INDENT and postlexer state.
+            copied = checkpoint.copy()
+            self.assertIsNot(copied.lexer_thread, checkpoint.lexer_thread)
+            self.assertIsNot(copied.lexer_thread.postlexer, checkpoint.lexer_thread.postlexer)
+            self.assertEqual(copied.lexer_thread.postlexer.indent_level, [0, 2])
+            self.assertEqual(copied.fork_continuation(tails[1]).resume_parse(), expected[1])
+            self.assertEqual(checkpoint.fork_continuation(tails[0]).resume_parse(), expected[0])
+
+            # Finishing, copying, or failing one branch must not affect the others.
+            unfinished = parser.parse_interactive(prefix)
+            feed_until(unfinished, '_NL')
+            first = unfinished.fork_continuation(tails[0])
+            second = unfinished.fork_continuation(tails[1])
+            self.assertEqual(first.resume_parse(), expected[0])
+            second_copy = second.copy()
+            self.assertEqual(second_copy.resume_parse(), expected[1])
+            self.assertEqual(second.resume_parse(), expected[1])
+
+            # Each branch's tail tokens have the same positions as a single full parse.
+            for i, tail in enumerate(tails):
+                direct_tokens = feed_all(parser.parse_interactive(prefix + tail))
+                self.assertEqual(token_sig(delivered[i]), token_sig(direct_tokens[-len(delivered[i]):]))
+
+            # Forking after LPAR is also a stable checkpoint. The common text already ends inside
+            # the parentheses, so each branch continues with its own tail.
+            for tail, tree in zip(tails, expected):
+                ip = parser.parse_interactive(prefix)
+                feed_until(ip, 'LPAR')
+                branch = ip.fork_continuation(tail)
+                branch.exhaust_lexer()
+                self.assertEqual(branch.feed_eof(branch.lexer_thread.state.last_token), tree)
+
+            # An unclosed parenthesis fails only in its own branch.
+            ip = parser.parse_interactive(prefix)
+            feed_until(ip, '_NL')
+            closed = ip.fork_continuation(tails[0])
+            unclosed = ip.fork_continuation("\n        b)\n  sink\nnext")
+            self.assertEqual(closed.resume_parse(), expected[0])
+            with self.assertRaises(UnexpectedInput):
+                unclosed.resume_parse()
+
+            # Non-postlex interactive parsers are unchanged.
+            plain = _Lark('start: A+\nA: "a"')
+            plain_ip = plain.parse_interactive("aa")
+            self.assertRaises(TypeError, plain_ip.fork, "aaa")
+
 
     _NAME = "Test" + PARSER.capitalize() + LEXER.capitalize()
     _TestParser.__name__ = _NAME

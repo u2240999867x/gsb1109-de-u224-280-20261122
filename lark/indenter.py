@@ -53,27 +53,54 @@ class Indenter(PostLex, ABC):
     def _process(self, stream):
         token = None
         for token in stream:
-            if token.type == self.NL_type:
-                yield from self.handle_NL(token)
-            else:
-                yield token
+            yield from self.process_token(token)
 
-            if token.type in self.OPEN_PAREN_types:
-                self.paren_level += 1
-            elif token.type in self.CLOSE_PAREN_types:
-                self.paren_level -= 1
-                assert self.paren_level >= 0
+        yield from self.finish(token)
 
+    def process(self, stream):
+        self.paren_level = 0
+        self.indent_level = [0]
+        return self._process(stream)
+
+    def process_token(self, token: Token) -> Iterator[Token]:
+        """Process a single lexed token, without resetting the indenter.
+
+        This makes it possible to checkpoint the indenter between tokens, e.g. when an
+        interactive parse is branched.
+        """
+        if token.type == self.NL_type:
+            yield from self.handle_NL(token)
+        else:
+            yield token
+
+        if token.type in self.OPEN_PAREN_types:
+            self.paren_level += 1
+        elif token.type in self.CLOSE_PAREN_types:
+            self.paren_level -= 1
+            assert self.paren_level >= 0
+
+    def finish(self, token: Token = None) -> Iterator[Token]:
+        """Flush the pending DEDENT tokens at the end of a token stream.
+
+        ``process()`` calls this automatically. Callers using ``process_token()`` must
+        call it once, after the last token.
+        """
         while len(self.indent_level) > 1:
             self.indent_level.pop()
             yield Token.new_borrow_pos(self.DEDENT_type, '', token) if token else Token(self.DEDENT_type, '', 0, 0, 0, 0, 0, 0)
 
         assert self.indent_level == [0], self.indent_level
 
-    def process(self, stream):
-        self.paren_level = 0
-        self.indent_level = [0]
-        return self._process(stream)
+    def copy(self) -> 'Indenter':
+        """Return an independent copy of the indenter's current state."""
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new.paren_level = self.paren_level
+        new.indent_level = list(self.indent_level)
+        return new
+
+    def __copy__(self):
+        return self.copy()
 
     # XXX Hack for ContextualLexer. Maybe there's a more elegant solution?
     @property
