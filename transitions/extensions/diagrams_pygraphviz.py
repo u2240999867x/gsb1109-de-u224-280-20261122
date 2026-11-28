@@ -52,7 +52,9 @@ class Graph(BaseGraph):
         self._add_edges(transitions, self.fsm_graph)
         setattr(self.fsm_graph, 'style_attributes', self.machine.style_attributes)
 
-    def get_graph(self, title=None, roi_state=None):
+    def get_graph(self, title=None, roi_state=None, history=None):
+        if history is not None:
+            raise NotImplementedError("History graphs are only supported by the mermaid graph engine.")
         if title:
             self.fsm_graph.graph_attr['label'] = title
         if roi_state:

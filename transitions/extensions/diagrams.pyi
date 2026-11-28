@@ -14,10 +14,13 @@ _LOGGER: Logger
 # mypy does not support cyclic definitions (yet)
 # thus we cannot use Dict[str, 'GraphvizParameters'] and have to fall back to Any
 GraphvizParameters = Dict[str, Union[str, Dict[str, Any]]]
+TransitionHistoryEntry = Dict[str, Any]
+
 
 class TransitionGraphSupport(Transition):
     label: str
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    def execute(self, event_data: EventData) -> bool: ...
     def _change_state(self, event_data: EventData) -> None: ...
 
 
@@ -27,6 +30,7 @@ class GraphMachine(MarkupMachine):
     machine_attributes: Dict[str, str]
     style_attributes: Dict[str, Union[str, Dict[str, Union[str, Dict[str, Any]]]]]
     model_graphs: Dict[int, BaseGraph]
+    transition_history: Dict[int, List[TransitionHistoryEntry]]
     title: str
     show_conditions: bool
     show_state_attributes: bool
@@ -52,6 +56,10 @@ class GraphMachine(MarkupMachine):
     def _init_graphviz_engine(self, graph_engine: str) -> Type[BaseGraph]: ...
     def _get_graph(self, model: GraphModelProtocol, title: Optional[str] = ..., force_new: bool = ...,
                    show_roi: bool = ...) -> GraphProtocol: ...
+    def record_transition(self, event_data: EventData, transition: Transition, outcome: str,
+                          error: Optional[BaseException] = ...) -> None: ...
+    def get_history_graph(self, model: GraphModelProtocol, title: Optional[str] = ...,
+                          trigger: Optional[str] = ..., show_roi: bool = ...) -> GraphProtocol: ...
     def get_combined_graph(self, title: Optional[str] = ..., force_new: bool = ...,
                            show_roi: bool = ...) -> GraphProtocol: ...
     def add_model(self, model: Union[Union[Literal['self'], object], List[Union[Literal['self'], object]]],

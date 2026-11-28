@@ -81,7 +81,9 @@ class Graph(BaseGraph):
             raise Exception("AGraph diagram requires graphviz")
         # we cannot really generate a graph in advance with graphviz
 
-    def get_graph(self, title=None, roi_state=None):
+    def get_graph(self, title=None, roi_state=None, history=None):
+        if history is not None:
+            raise NotImplementedError("History graphs are only supported by the mermaid graph engine.")
         title = title if title else self.machine.title
 
         fsm_graph = pgv.Digraph(

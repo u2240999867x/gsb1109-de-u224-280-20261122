@@ -9,6 +9,7 @@
 - Feature #710: `experimental.utils.generate_base_model` can now be called with an instance of MarkupMachine directly (thanks @patrickwolf)
 - Bug #715: `HierarchicalMachine._final_check` wrongly determined a parallel state final when the last child was final (thanks @DenizKucukozturk)
 - Bug #716: `HierarchicalMachine` caused an `AssertionError` when `model_override` was `True` and `NestedSeperator` differed from `_` (thanks @pritam-dey3)
+- Feature: Mermaid graph machines now record transition attempts per model and can render a runtime history graph via `Model.get_history_graph()`. Edges are annotated with their recorded outcome (`success`, `rejected`, `error`) without re-evaluating conditions or state callbacks. A trigger filter and `show_roi` allow replaying a single failed event.
 
 ## 0.9.3 (July 2024)
 

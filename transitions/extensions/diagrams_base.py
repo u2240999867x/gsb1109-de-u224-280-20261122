@@ -53,14 +53,38 @@ class BaseGraph(object):
         """
 
     @abc.abstractmethod
-    def get_graph(self, title=None, roi_state=None):
+    def get_graph(self, title=None, roi_state=None, history=None):
         """Returns a graph object.
         Args:
             title (str): Title of the generated graph
             roi_state (State): If not None, the returned graph will only contain edges and states connected to it.
+            history (list): If not None, only the transition attempts stored in this list are rendered as
+                edges, annotated with their recorded outcome. No condition or callback will be re-evaluated.
         Returns:
              A graph instance with a `draw` that allows to render the graph.
         """
+
+    def _history_elements(self, history):
+        """Converts recorded transition attempts into markup-like transition dicts and collects the
+            states involved.
+        """
+        transitions = []
+        state_names = set()
+        for entry in history:
+            source = entry["source"]
+            dest = source if entry["internal"] else entry["dest"]
+            state_names.update([source, dest])
+            transition = {
+                "trigger": entry["trigger"],
+                "source": source,
+                "outcome": entry["outcome"],
+                "attempt": entry["attempt"],
+                "error": entry["error"],
+            }
+            if not entry["internal"]:
+                transition["dest"] = dest
+            transitions.append(transition)
+        return transitions, state_names
 
     def _convert_state_attributes(self, state):
         label = state.get("label", state["name"])

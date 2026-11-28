@@ -1856,6 +1856,29 @@ stateDiagram-v2
   [*] --> A
 ```
 
+##### Runtime history graphs (mermaid)
+
+The standard graph only renders the static machine configuration and highlights the last transition.
+For a post-mortem of what actually happened during a trigger (for example when backfilling failed transitions),
+every mermaid `GraphMachine` records the transition attempts of each model. `Model.get_history_graph()` renders
+these recorded attempts without evaluating conditions or state callbacks again. Edges are annotated with their
+recorded outcome (`success`, `rejected` when a condition failed, or `error` when a callback raised) and coloured
+accordingly. Nodes keep the style of the state the region ended up in.
+
+```python
+# 'go' has two candidates with the same source and destination; the first one is rejected by its condition
+m.go("run-42")
+
+# all attempts of the model
+m.get_history_graph(title="run history").draw(None)
+# only the attempts of one trigger, restricted to the relevant region of interest
+m.get_history_graph(trigger="go", show_roi=True, title="run-42 replay").draw(None)
+```
+
+History is stored per model, so attempts of one model never show up in the graph of another model. The regular
+`get_graph()` entry point keeps rendering the static structure and is unaffected by the recorded history.
+History graphs are only available with `graph_engine="mermaid"`.
+
 To use more sophisticated graphing functionality, you'll need to have `graphviz` and/or `pygraphviz` installed.
 To generate graphs with the package `graphviz`, you need to install [Graphviz](https://graphviz.org/) manually or via a package manager.
 

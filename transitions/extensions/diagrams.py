@@ -38,6 +38,20 @@ class TransitionGraphSupport(Transition):
         if label:
             self.label = label
 
+    def execute(self, event_data):
+        """Executes the transition and records the attempt in the transition history of the model. The
+            history entries are written once while the trigger is processed rather than being derived
+            from repeated condition or callback evaluations.
+        """
+        machine = event_data.machine
+        try:
+            result = super(TransitionGraphSupport, self).execute(event_data)
+        except BaseException as err:  # pylint: disable=broad-except; re-raised after recording
+            machine.record_transition(event_data, self, "error", error=err)
+            raise
+        machine.record_transition(event_data, self, "success" if result else "rejected")
+        return result
+
     def _change_state(self, event_data):
         graph = event_data.machine.model_graphs[id(event_data.model)]
         graph.reset_styling()
@@ -87,8 +101,17 @@ class GraphMachine(MarkupMachine):
             },
             "active": {"color": "red", "fillcolor": "darksalmon", "peripheries": "2"},
             "previous": {"color": "blue", "fillcolor": "azure", "peripheries": "1"},
+            "success": {"color": "#1b5e20", "fillcolor": "#c8e6c9", "peripheries": "1"},
+            "rejected": {"color": "#f57f17", "fillcolor": "#fff9c4", "peripheries": "1"},
+            "error": {"color": "#b71c1c", "fillcolor": "#ffcdd2", "peripheries": "2"},
         },
-        "edge": {"default": {"color": "black"}, "previous": {"color": "blue"}},
+        "edge": {
+            "default": {"color": "black"},
+            "previous": {"color": "blue"},
+            "success": {"color": "#2e7d32"},
+            "rejected": {"color": "#f9a825"},
+            "error": {"color": "#c62828"},
+        },
         "graph": {
             "default": {"color": "black", "fillcolor": "white", "style": "solid"},
             "previous": {"color": "blue", "fillcolor": "azure", "style": "filled"},
@@ -127,6 +150,7 @@ class GraphMachine(MarkupMachine):
         # keep 'auto_transitions_markup' for backwards compatibility
         kwargs["auto_transitions_markup"] = show_auto_transitions
         self.model_graphs = {}
+        self.transition_history = {}
         if use_pygraphviz is False:
             warnings.warn("Please replace 'use_pygraphviz=True' with graph_engine='graphviz'.",
                           category=DeprecationWarning)
@@ -193,6 +217,47 @@ class GraphMachine(MarkupMachine):
             graph = self.model_graphs[id(model)]
         return graph.get_graph(title=title, roi_state=getattr(model, self.model_attribute) if show_roi else None)
 
+    def record_transition(self, event_data, transition, outcome, error=None):
+        """Stores the outcome of a single transition attempt for later history graph rendering.
+            Only information observed while the trigger was processed is stored. Condition checks and
+            state callbacks are never evaluated again when a history graph is requested.
+        Args:
+            event_data (EventData): Event data of the processed trigger.
+            transition (Transition): Transition that has been attempted.
+            outcome (str): One of 'success', 'rejected' or 'error'.
+            error (BaseException or None): Exception raised while executing the transition, if any.
+        """
+        model = event_data.model
+        model_history = self.transition_history.setdefault(id(model), [])
+        source_name = getattr(event_data, "source_name", None) or transition.source
+        model_history.append({
+            "model_id": id(model),
+            "attempt": len(model_history) + 1,
+            "trigger": event_data.event.name,
+            "source": source_name,
+            "dest": transition.dest,
+            "internal": transition.dest is None,
+            "outcome": outcome,
+            "error": type(error).__name__ if error is not None else None,
+        })
+
+    def get_history_graph(self, model, title=None, trigger=None, show_roi=False):
+        """Renders a graph from the recorded transition attempts of one model instead of evaluating
+            the machine configuration again.
+        Args:
+            model (object): Model whose transition history should be rendered.
+            title (str): Title of the resulting graph.
+            trigger (str or None): If set, only entries created by this trigger are included.
+            show_roi (bool): If set to True, the graph is restricted to the states and edges touched
+                by the recorded entries (and the currently active states).
+        Returns: A graph instance with a `draw` that allows to render the history graph.
+        """
+        history = [entry for entry in self.transition_history.get(id(model), [])
+                   if trigger is None or entry["trigger"] == trigger]
+        roi_state = getattr(model, self.model_attribute) if show_roi else None
+        return self.model_graphs[id(model)].get_graph(
+            title=title, roi_state=roi_state, history=history)
+
     def get_combined_graph(self, title=None, force_new=False, show_roi=False):
         """This method is currently equivalent to 'get_graph' of the first machine's model.
         In future releases of transitions, this function will return a combined graph with active states
@@ -221,6 +286,7 @@ class GraphMachine(MarkupMachine):
                     "Model already has a get_graph attribute. Graph retrieval cannot be bound."
                 )
             setattr(mod, "get_graph", partial(self._get_graph, mod))
+            setattr(mod, "get_history_graph", partial(self.get_history_graph, mod))
             _ = mod.get_graph(title=self.title, force_new=True)  # initialises graph
 
     def add_states(

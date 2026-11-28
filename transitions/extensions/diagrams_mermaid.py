@@ -58,13 +58,71 @@ class Graph(BaseGraph):
             for dst, labels in dests.items():
                 container.append("{} --> {}: {}".format(src, dst, " | ".join(labels)))
 
+    def _history_active_states(self, history_states, roi_state):
+        active_states = set(history_states)
+        if roi_state:
+            sep = getattr(self.machine.state_cls, "separator", None)
+            for state in self._flatten(roi_state):
+                active_states.add(state)
+                if sep:
+                    state = sep.join(state.split(sep)[:-1])
+                    while state:
+                        active_states.add(state)
+                        state = sep.join(state.split(sep)[:-1])
+        return active_states
+
+    def _apply_history_node_styles(self, history_transitions, roi_state=None):
+        if roi_state:
+            for state in self._flatten(roi_state):
+                self.set_node_style(state, "active")
+        for transition in history_transitions:
+            source = transition["source"]
+            dest = transition.get("dest", source)
+            outcome = transition["outcome"]
+            if outcome == "success":
+                self.set_node_style(dest, "success")
+                if not self.custom_styles["node"][source]:
+                    self.set_node_style(source, "previous")
+            elif outcome == "error":
+                self.set_node_style(source, "error")
+            elif outcome == "rejected" and not self.custom_styles["node"][source]:
+                self.set_node_style(source, "rejected")
+
+    def _history_edge_label(self, transition):
+        label = "{} [{}]".format(transition["trigger"], transition["outcome"])
+        if transition.get("error"):
+            label += ": {}".format(transition["error"])
+        if "dest" not in transition:
+            label += " [internal]"
+        return label
+
+    def _add_history_edges(self, history_transitions, container):
+        grouped = defaultdict(lambda: {"labels": [], "outcomes": set()})
+        for transition in history_transitions:
+            source = transition["source"]
+            dest = transition.get("dest", source)
+            edge = grouped[(source, dest)]
+            edge["labels"].append(self._history_edge_label(transition))
+            edge["outcomes"].add(transition["outcome"])
+        link_styles = []
+        # initial and final arrows declared inside state blocks count as links too
+        offset = sum(1 for line in container if "-->" in line)
+        edge_styles = self.machine.style_attributes["edge"]
+        for index, ((source, dest), edge) in enumerate(grouped.items()):
+            container.append("{} --> {}: {}".format(source, dest, " | ".join(edge["labels"])))
+            outcome = next((name for name in ("error", "rejected", "success") if name in edge["outcomes"]),
+                           "success")
+            link_styles.append("linkStyle {} stroke:{}".format(
+                offset + index, edge_styles[outcome]["color"]))
+        return link_styles
+
     def generate(self):
         """Triggers the generation of a graph. With graphviz backend, this does nothing since graph trees need to be
         built from scratch with the configured styles.
         """
         # we cannot really generate a graph in advance with graphviz
 
-    def get_graph(self, title=None, roi_state=None):
+    def get_graph(self, title=None, roi_state=None, history=None):
         title = title if title else self.machine.title
 
         fsm_graph = ['---', title, '---', 'stateDiagram-v2']
@@ -76,33 +134,53 @@ class Graph(BaseGraph):
                     style_name, ','.join(_to_mermaid(style_attrs, ":"))))
         fsm_graph.append("")
         states, transitions = self._get_elements()
-        if roi_state:
-            active_states = set()
-            sep = getattr(self.machine.state_cls, "separator", None)
-            for state in self._flatten(roi_state):
-                active_states.add(state)
-                if sep:
-                    state = sep.join(state.split(sep)[:-1])
-                    while state:
-                        active_states.add(state)
-                        state = sep.join(state.split(sep)[:-1])
-            transitions = [
-                t
-                for t in transitions
-                if t["source"] in active_states or self.custom_styles["edge"][t["source"]][t["dest"]]
+        link_styles = []
+        saved_styles = copy.deepcopy(self.custom_styles) if history is not None else None
+        if history is not None:
+            history_transitions, history_states = self._history_elements(history)
+            active_states = self._history_active_states(history_states, roi_state)
+            history_transitions = [
+                transition for transition in history_transitions
+                if transition["source"] in active_states
+                or transition.get("dest", transition["source"]) in active_states
             ]
-            active_states = active_states.union({
-                t
-                for trans in transitions
-                for t in [trans["source"], trans.get("dest", trans["source"])]
-            })
-            active_states = active_states.union({k for k, style in self.custom_styles["node"].items() if style})
-            states = filter_states(copy.deepcopy(states), active_states, self.machine.state_cls)
-        self._add_nodes(states, fsm_graph)
-        fsm_graph.append("")
-        self._add_edges(transitions, fsm_graph)
+            if roi_state:
+                states = filter_states(copy.deepcopy(states), active_states, self.machine.state_cls)
+            self._apply_history_node_styles(history_transitions, roi_state)
+            self._add_nodes(states, fsm_graph)
+            fsm_graph.append("")
+            link_styles = self._add_history_edges(history_transitions, fsm_graph)
+        else:
+            if roi_state:
+                active_states = set()
+                sep = getattr(self.machine.state_cls, "separator", None)
+                for state in self._flatten(roi_state):
+                    active_states.add(state)
+                    if sep:
+                        state = sep.join(state.split(sep)[:-1])
+                        while state:
+                            active_states.add(state)
+                            state = sep.join(state.split(sep)[:-1])
+                transitions = [
+                    t
+                    for t in transitions
+                    if t["source"] in active_states or self.custom_styles["edge"][t["source"]][t["dest"]]
+                ]
+                active_states = active_states.union({
+                    t
+                    for trans in transitions
+                    for t in [trans["source"], trans.get("dest", trans["source"])]
+                })
+                active_states = active_states.union({k for k, style in self.custom_styles["node"].items() if style})
+                states = filter_states(copy.deepcopy(states), active_states, self.machine.state_cls)
+            self._add_nodes(states, fsm_graph)
+            fsm_graph.append("")
+            self._add_edges(transitions, fsm_graph)
         if self.machine.initial and (roi_state is None or roi_state == self.machine.initial):
             fsm_graph.append("[*] --> {}".format(self.machine.initial))
+        fsm_graph.extend(link_styles)
+        if saved_styles is not None:
+            self.custom_styles = saved_styles
 
         indent = 0
         for i in range(len(fsm_graph)):
@@ -137,6 +215,7 @@ class NestedGraph(Graph):
 
     def __init__(self, *args, **kwargs):
         self._cluster_states = []
+        self._node_classes = []
         super(NestedGraph, self).__init__(*args, **kwargs)
 
     def set_node_style(self, state, style):
@@ -148,7 +227,10 @@ class NestedGraph(Graph):
         self.set_node_style(src, "previous")
 
     def _add_nodes(self, states, container):
+        self._node_classes = []
         self._add_nested_nodes(states, container, prefix="", default_style="default")
+        for name, style in self._node_classes:
+            container.append("Class {} s_{}".format(name.replace(" ", ""), style))
 
     def _add_nested_nodes(self, states, container, prefix, default_style):
         for state in states:
@@ -157,8 +239,9 @@ class NestedGraph(Graph):
             if state.get("final", False):
                 container.append("{} --> [*]".format(name))
             if not prefix:
-                container.append("Class {} s_{}".format(name.replace(" ", ""),
-                                                        self.custom_styles["node"][name] or default_style))
+                self._node_classes.append((name, self.custom_styles["node"][name] or default_style))
+            elif self.custom_styles["node"][name]:
+                self._node_classes.append((name, self.custom_styles["node"][name]))
             if state.get("children", None) is not None:
                 container.append("state {} {{".format(name))
                 self._cluster_states.append(name)
