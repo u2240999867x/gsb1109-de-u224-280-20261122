@@ -1,0 +1,78 @@
+{
+  "batch": "B314",
+  "scenario": "S0-clean",
+  "run": "iter-err",
+  "fault_plan": {
+    "out": "ok",
+    "err": "ok"
+  },
+  "flushes": [
+    {
+      "stream": "err",
+      "had_content": true,
+      "content": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": true,
+      "content": "A,7\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": true,
+      "content": "B,4\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": false,
+      "content": "",
+      "result": "ok"
+    },
+    {
+      "stream": "err",
+      "had_content": false,
+      "content": "",
+      "result": "ok"
+    }
+  ],
+  "thread_exceptions": [],
+  "iter": {
+    "stream": "err",
+    "lines": [
+      "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+    ],
+    "ewouldblock": 7,
+    "outcome": "ended (StopIteration)",
+    "phase_at_observation": "child exited, flushes attempted",
+    "ewouldblock_at_observation": 7,
+    "files_at_observation": {
+      "details": "A,7\nB,4\n",
+      "receipt": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+    },
+    "exit_code_at_observation": 0,
+    "ewouldblock_total": 7
+  },
+  "files": {
+    "details": "A,7\nB,4\n",
+    "receipt": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+  },
+  "receipt_check": {
+    "receipt_on_disk": true,
+    "lines": {
+      "line1:A,7": {
+        "on_disk": true,
+        "confirmed_by_receipt": true
+      },
+      "line2:B,4": {
+        "on_disk": true,
+        "confirmed_by_receipt": true
+      }
+    }
+  },
+  "exit_code": 0,
+  "output_thread_exc_queue": [],
+  "output_thread_alive": false
+}

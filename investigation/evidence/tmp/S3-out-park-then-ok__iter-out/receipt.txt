@@ -1,0 +1,1 @@
+receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383

@@ -1,0 +1,107 @@
+{
+  "batch": "B314",
+  "scenario": "S0-clean",
+  "run": "wait-timeout-first",
+  "fault_plan": {
+    "out": "ok",
+    "err": "ok"
+  },
+  "flushes": [
+    {
+      "stream": "err",
+      "had_content": true,
+      "content": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": true,
+      "content": "A,7\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": true,
+      "content": "B,4\n",
+      "result": "ok"
+    },
+    {
+      "stream": "out",
+      "had_content": false,
+      "content": "",
+      "result": "ok"
+    },
+    {
+      "stream": "err",
+      "had_content": false,
+      "content": "",
+      "result": "ok"
+    }
+  ],
+  "thread_exceptions": [],
+  "wait_timeout_first": {
+    "phase_at_observation": "child exited, flushes attempted",
+    "wait_timeout": "returned after 0.00s, exit_code=0",
+    "files_when_wait_timeout_returned": {
+      "details": "A,7\nB,4\n",
+      "receipt": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+    },
+    "flush_log_when_wait_timeout_returned": [
+      {
+        "stream": "err",
+        "had_content": true,
+        "content": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n",
+        "result": "ok"
+      },
+      {
+        "stream": "out",
+        "had_content": true,
+        "content": "A,7\n",
+        "result": "ok"
+      },
+      {
+        "stream": "out",
+        "had_content": true,
+        "content": "B,4\n",
+        "result": "ok"
+      },
+      {
+        "stream": "out",
+        "had_content": false,
+        "content": "",
+        "result": "ok"
+      },
+      {
+        "stream": "err",
+        "had_content": false,
+        "content": "",
+        "result": "ok"
+      }
+    ],
+    "plain_wait_afterwards": "returned after 0.000s",
+    "files_at_end": {
+      "details": "A,7\nB,4\n",
+      "receipt": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+    }
+  },
+  "files": {
+    "details": "A,7\nB,4\n",
+    "receipt": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n"
+  },
+  "receipt_check": {
+    "receipt_on_disk": true,
+    "lines": {
+      "line1:A,7": {
+        "on_disk": true,
+        "confirmed_by_receipt": true
+      },
+      "line2:B,4": {
+        "on_disk": true,
+        "confirmed_by_receipt": true
+      }
+    }
+  },
+  "exit_code": 0,
+  "output_thread_exc_queue": [],
+  "output_thread_alive": false
+}

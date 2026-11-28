@@ -1,0 +1,56 @@
+{
+  "batch": "B314",
+  "scenario": "S6-err-receipt-flush-fails",
+  "run": "await",
+  "fault_plan": {
+    "out": "ok",
+    "err": "fail_last_content"
+  },
+  "flushes": [
+    {
+      "stream": "err",
+      "had_content": true,
+      "content": "receipt batch=B314 lines=1,2 ck1=aa45b10c26ba ck2=b54957644383\n",
+      "result": "OSError"
+    }
+  ],
+  "thread_exceptions": [
+    {
+      "thread": "STDOUT/ERR thread for pid 64563",
+      "exc": "OSError",
+      "msg": "handoff fault: flush failed"
+    }
+  ],
+  "await": {
+    "phase_at_observation": "child exited, flushes attempted",
+    "await_done_at_observation": false,
+    "files_at_observation": {
+      "details": "",
+      "receipt": ""
+    },
+    "exit_code_at_observation": 0,
+    "final": "await still waiting (aio_output_complete never set)"
+  },
+  "files": {
+    "details": "",
+    "receipt": ""
+  },
+  "receipt_check": {
+    "receipt_on_disk": false,
+    "lines": {
+      "line1:A,7": {
+        "on_disk": false,
+        "confirmed_by_receipt": false
+      },
+      "line2:B,4": {
+        "on_disk": false,
+        "confirmed_by_receipt": false
+      }
+    }
+  },
+  "exit_code": 0,
+  "output_thread_exc_queue": [
+    "OSError: handoff fault: flush failed"
+  ],
+  "output_thread_alive": false
+}
