@@ -18,6 +18,7 @@ from botocore import (
     xform_name,
 )
 from botocore.args import ClientArgsCreator
+from botocore.athena import register_athena_work_orders
 from botocore.auth import (
     AUTH_TYPE_MAPS,
     resolve_auth_scheme_preference,
@@ -184,6 +185,7 @@ class ClientCreator:
         self._register_s3express_events(client=service_client)
         self._register_s3_control_events(client=service_client)
         self._register_importexport_events(client=service_client)
+        self._register_athena_work_orders(client=service_client)
         self._register_endpoint_discovery(
             service_client, endpoint_url, client_config
         )
@@ -511,6 +513,11 @@ class ClientCreator:
         self._set_importexport_signature_version(
             client.meta, client_config, scoped_config
         )
+
+    def _register_athena_work_orders(self, client):
+        if client.meta.service_model.service_name != 'athena':
+            return
+        register_athena_work_orders(client)
 
     def _set_importexport_signature_version(
         self, client_meta, client_config, scoped_config

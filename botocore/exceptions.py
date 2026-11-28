@@ -861,3 +861,61 @@ class UnsupportedServiceProtocolsError(BotoCoreError):
         'Botocore supports {botocore_supported_protocols}, but service {service} only '
         'supports {service_supported_protocols}.'
     )
+
+
+class AthenaWorkOrderError(BotoCoreError):
+    """Base error for Athena resumable work-order submissions."""
+
+
+class InvalidWorkOrderError(AthenaWorkOrderError):
+    """Raised when a work-order submission is missing required information."""
+
+    fmt = 'Invalid Athena work order: {reason}'
+
+
+class WorkOrderConflictError(AthenaWorkOrderError):
+    """Raised when a work order conflicts with an existing submission.
+
+    ``original_work_order_id`` identifies the work order that already owns
+    the token or configuration, so callers can route the conflict back to the
+    correct ingestion line.
+    """
+
+    fmt = (
+        'Athena work order {work_order_id} conflicts with original work '
+        'order {original_work_order_id}: {reason}'
+    )
+
+    def __init__(self, **kwargs):
+        self.original_work_order_id = kwargs.get(
+            'original_work_order_id'
+        )
+        self.original_ticket_id = kwargs.get('original_ticket_id')
+        self.original_line = kwargs.get('original_line')
+        self.token = kwargs.get('token')
+        self.target = kwargs.get('target')
+        super().__init__(**kwargs)
+
+
+class WorkOrderTokenConflictError(WorkOrderConflictError):
+    """Raised when a ``ClientRequestToken`` belongs to another work order."""
+
+    fmt = (
+        'ClientRequestToken {token!r} at execution target {target} is '
+        'already owned by original work order {original_work_order_id}.'
+    )
+
+
+class WorkOrderConfigurationConflictError(WorkOrderConflictError):
+    """Raised when a resubmitted work order changes its query configuration."""
+
+    fmt = (
+        'Athena work order {work_order_id} was originally submitted as work '
+        'order {original_work_order_id} with a different configuration: '
+        '{differences}'
+    )
+
+
+# Common alternative spellings used by callers when reporting conflicts.
+ClientRequestTokenConflictError = WorkOrderTokenConflictError
+WorkOrderConfigurationMismatchError = WorkOrderConfigurationConflictError

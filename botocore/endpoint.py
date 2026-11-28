@@ -382,6 +382,12 @@ class Endpoint:
             return True
 
     def _send(self, request):
+        guards = request.context.get('send_guards')
+        if guards:
+            for guard in guards:
+                response = guard(request)
+                if response is not None:
+                    return response
         return self.http_session.send(request)
 
 

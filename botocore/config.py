@@ -299,6 +299,14 @@ class Config:
         auth scheme names used to determine the client's auth scheme preference.
 
         Defaults to None.
+
+    :type athena_work_order_cache: str
+    :param athena_work_order_cache: Directory used to persist resumable
+        Athena work-order submissions.  The directory records which
+        ``ClientRequestToken`` belongs to which work order and execution
+        target so that submissions can be resumed across processes.
+
+        Defaults to ``~/.aws/boto/cache/athena-work-orders``.
     """
 
     OPTION_DEFAULTS = OrderedDict(
@@ -333,6 +341,7 @@ class Config:
             ('response_checksum_validation', None),
             ('account_id_endpoint_mode', None),
             ('auth_scheme_preference', None),
+            ('athena_work_order_cache', None),
         ]
     )
 

@@ -7,3 +7,4 @@ Botocore Topic Guides
    events
    paginators
    document_type
+   athena_work_orders
