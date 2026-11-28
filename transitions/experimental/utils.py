@@ -1,6 +1,8 @@
 from collections import deque, defaultdict
+from enum import Enum
+from functools import partial
 
-from transitions.core import Machine, listify
+from transitions.core import Event, EventData, Machine, listify
 from transitions.extensions.markup import HierarchicalMarkupMachine, MarkupMachine
 
 
@@ -109,22 +111,283 @@ class BaseModel(metaclass=ABCMeta):
 def with_model_definitions(cls):
     add_model = getattr(cls, "add_model")
 
-    def add_model_override(self, model, initial=None):
-        self.model_override = True
-        for model in listify(model):
-            model = self if model == "self" else model
-            for name, specs in TriggerPlaceholder.definitions.get(model.__class__, {}).items():
-                for spec in specs:
-                    if isinstance(spec, list):
-                        self.add_transition(name, *spec)
-                    elif isinstance(spec, dict):
-                        self.add_transition(name, **spec)
-                    else:
-                        raise ValueError("Cannot add {} for event {} to machine", spec, name)
-        add_model(self, model, initial)
+    if getattr(cls, "_model_definitions_machine", False):
+        return cls
 
-    setattr(cls, 'add_model', add_model_override)
-    return cls
+    class ModelDefinitionMachine(cls):
+        _model_definitions_machine = True
+
+        def __init__(self, *args, **kwargs):
+            self._model_attachment_tokens = {}
+            self._next_model_attachment_token = 0
+            super(ModelDefinitionMachine, self).__init__(*args, **kwargs)
+
+        def add_model(self, model, initial=None):
+            self.model_override = True
+            models = listify(model)
+            new_models = []
+            for raw_model in models:
+                mod = self if raw_model == self.self_literal else raw_model
+                if mod in self.models:
+                    continue
+                new_models.append(mod)
+                token = self._next_model_attachment_token
+                self._next_model_attachment_token += 1
+                self._model_attachment_tokens[id(mod)] = token
+                for trigger, specs in _model_definitions(mod.__class__).items():
+                    for spec in specs:
+                        self._add_model_definition_transition(mod, token, trigger, spec)
+
+            if new_models:
+                add_model(self, new_models, initial)
+                for mod in new_models:
+                    token = self._model_attachment_tokens[id(mod)]
+                    trigger_func = partial(self._get_model_trigger, mod, token)
+                    may_trigger_func = partial(self._can_model_trigger, mod, token)
+                    self._assign_model_entry(mod, "trigger", trigger_func)
+                    self._assign_model_entry(mod, "may_trigger", may_trigger_func)
+
+        def remove_model(self, model):
+            models = listify(model)
+            normalized_models = [
+                self if mod == self.self_literal else mod for mod in models]
+            super(ModelDefinitionMachine, self).remove_model(model)
+            for mod in normalized_models:
+                token = self._model_attachment_tokens.pop(id(mod), None)
+                if token is not None:
+                    for event in self.events.values():
+                        if isinstance(event, ModelDefinitionEvent):
+                            event.model_transitions.pop(token, None)
+
+        def add_transition(self, trigger, source, dest, conditions=None,
+                           unless=None, before=None, after=None, prepare=None, **kwargs):
+            super(ModelDefinitionMachine, self).add_transition(
+                trigger, source, dest, conditions=conditions, unless=unless, before=before,
+                after=after, prepare=prepare, **kwargs)
+
+        def remove_transition(self, trigger, source="*", dest="*"):
+            event = self.events.get(trigger)
+            if not isinstance(event, ModelDefinitionEvent):
+                super(ModelDefinitionMachine, self).remove_transition(trigger, source, dest)
+                if hasattr(self, "_needs_update"):
+                    self._needs_update = True
+                return
+
+            source_names, dest_names = self._normalize_transition_filters(source, dest)
+            for state_name, transitions in list(event.transitions.items()):
+                event.transitions[state_name] = [
+                    transition for transition in transitions
+                    if self._keep_transition(transition, source_names, dest_names)]
+            event.transitions = defaultdict(list, {
+                state_name: transitions for state_name, transitions in event.transitions.items()
+                if transitions})
+            if hasattr(self, "_needs_update"):
+                self._needs_update = True
+
+        def _add_trigger_to_model(self, trigger, model):
+            event = self.events.get(trigger)
+            token = self._model_attachment_tokens.get(id(model))
+            if isinstance(event, ModelDefinitionEvent) and token is not None:
+                if isinstance(getattr(model.__class__, trigger, None), TriggerPlaceholder):
+                    self._checked_assignment(model, trigger, partial(event.trigger, model, token))
+                may_trigger = "may_%s" % trigger
+                may_func = partial(event.may, model, token)
+                if hasattr(model, may_trigger):
+                    self._checked_assignment(model, may_trigger, may_func)
+                else:
+                    setattr(model, may_trigger, may_func)
+            else:
+                super(ModelDefinitionMachine, self)._add_trigger_to_model(trigger, model)
+
+        def _add_model_definition_transition(self, model, token, trigger, spec):
+            if trigger == self.model_attribute:
+                raise ValueError("Trigger name cannot be same as model attribute name.")
+            if isinstance(spec, dict):
+                kwargs = spec.copy()
+                source = kwargs.pop("source")
+                dest = kwargs.pop("dest")
+            elif isinstance(spec, (list, tuple)):
+                kwargs = {}
+                source, dest = spec
+            else:
+                raise ValueError("Cannot add {} for event {} to machine".format(spec, trigger))
+
+            source_names, dest_names = self._normalize_transition_targets(source, dest)
+            event = self.events.setdefault(trigger, ModelDefinitionEvent(trigger, self))
+            for state_name, dest_name in zip(source_names, dest_names):
+                transition = self._create_transition(state_name, dest_name, **kwargs)
+                event.add_model_transition(token, transition)
+
+        def _normalize_transition_targets(self, source, dest):
+            if source == self.wildcard_all:
+                source_names = list(self.states.keys())
+            else:
+                source_names = [self._state_name(state) for state in listify(source)]
+
+            if dest == self.wildcard_same:
+                dest_names = list(source_names)
+            elif dest is None:
+                dest_names = [None] * len(source_names)
+            elif isinstance(dest, (list, tuple)) and len(dest) == len(source_names):
+                dest_names = [self._state_name(state) for state in dest]
+            else:
+                dest_name = self._state_name(dest)
+                dest_names = [dest_name] * len(source_names)
+            return source_names, dest_names
+
+        def _normalize_transition_filters(self, source, dest):
+            source_names = "*" if source == "*" else [
+                self._state_name(state) for state in listify(source)]
+            dest_names = "*" if dest == "*" else [
+                self._state_name(state) for state in listify(dest)]
+            return source_names, dest_names
+
+        @staticmethod
+        def _keep_transition(transition, source_names, dest_names):
+            source_mismatch = source_names and transition.source not in source_names
+            dest_mismatch = dest_names and transition.dest not in dest_names
+            return source_mismatch or dest_mismatch
+
+        @staticmethod
+        def _state_name(state):
+            return state.name if isinstance(state, Enum) else state
+
+        @staticmethod
+        def _assign_model_entry(model, name, func):
+            setattr(model, name, func)
+
+        def _is_current_model_attachment(self, model, token):
+            return self._model_attachment_tokens.get(id(model)) == token
+
+        def _get_model_trigger(self, model, token, trigger_name, *args, **kwargs):
+            if not self._is_current_model_attachment(model, token):
+                return False
+            event = self.events.get(trigger_name)
+            if isinstance(event, ModelDefinitionEvent):
+                return event.trigger(model, token, *args, **kwargs)
+            if event is not None:
+                return event.trigger(model, *args, **kwargs)
+            return self._get_trigger(model, trigger_name, *args, **kwargs)
+
+        def _can_model_trigger(self, model, token, trigger_name, *args, **kwargs):
+            if not self._is_current_model_attachment(model, token):
+                return False
+            event = self.events.get(trigger_name)
+            if isinstance(event, ModelDefinitionEvent):
+                return event.may(model, token, *args, **kwargs)
+            if event is not None:
+                return self._can_trigger(model, trigger_name, *args, **kwargs)
+            return False
+
+    return ModelDefinitionMachine
+
+
+def _model_definitions(model_class):
+    definitions = {}
+    for klass in reversed(model_class.__mro__):
+        for name, value in vars(klass).items():
+            if isinstance(value, TriggerPlaceholder):
+                definitions[name] = list(value.configs)
+    return definitions
+
+
+class ModelDefinitionEvent(Event):
+
+    def __init__(self, name, machine):
+        super(ModelDefinitionEvent, self).__init__(name, machine)
+        self.model_transitions = {}
+
+    def add_model_transition(self, token, transition):
+        transitions = self.model_transitions.setdefault(token, defaultdict(list))
+        transitions[transition.source].append(transition)
+
+    def trigger(self, model, token, *args, **kwargs):
+        if not self.machine._is_current_model_attachment(model, token):
+            return False
+        if not self._has_visible_transition(model, token):
+            return False
+        event_data = EventData(None, self, self.machine, model, args=args, kwargs=kwargs)
+        if self.machine.has_queue and self.machine._transition_queue:
+            self.machine._transition_queue.append(partial(self._trigger, event_data))
+            return True
+        return self.machine._process(partial(self._trigger, event_data))
+
+    def may(self, model, token, *args, **kwargs):
+        if not self.machine._is_current_model_attachment(model, token):
+            return False
+        return self._evaluate(model, token, args, kwargs, run_prepare=True)
+
+    def _has_visible_transition(self, model, token):
+        if not self.machine._is_current_model_attachment(model, token):
+            return False
+        state = self.machine.get_model_state(model)
+        for transition in self._transitions(token, state.name):
+            if transition.dest is None:
+                return True
+            try:
+                self.machine.get_state(transition.dest)
+            except ValueError:
+                continue
+            return True
+        return False
+
+    def _evaluate(self, model, token, args, kwargs, run_prepare):
+        state = self.machine.get_model_state(model)
+        event_data = EventData(state, self, self.machine, model, args=args, kwargs=kwargs)
+        for transition in self._transitions(token, state.name):
+            try:
+                if transition.dest is not None:
+                    self.machine.get_state(transition.dest)
+                event_data.transition = transition
+                self.machine.callbacks(self.machine.prepare_event, event_data)
+                if run_prepare:
+                    self.machine.callbacks(transition.prepare, event_data)
+                if all(condition.check(event_data) for condition in transition.conditions):
+                    return True
+            except ValueError:
+                continue
+            except BaseException as err:
+                event_data.error = err
+                if self.machine.on_exception:
+                    self.machine.callbacks(self.machine.on_exception, event_data)
+                else:
+                    raise
+        return False
+
+    def _trigger(self, event_data):
+        event_data.state = self.machine.get_model_state(event_data.model)
+        try:
+            if self._is_valid_source(event_data):
+                self._process(event_data)
+        except BaseException as err:
+            event_data.error = err
+            if self.machine.on_exception:
+                self.machine.callbacks(self.machine.on_exception, event_data)
+            else:
+                raise
+        finally:
+            self.machine.callbacks(self.machine.finalize_event, event_data)
+        return event_data.result
+
+    def _process(self, event_data):
+        self.machine.callbacks(self.machine.prepare_event, event_data)
+        for transition in self._transitions(event_data):
+            event_data.transition = transition
+            if transition.execute(event_data):
+                event_data.result = True
+                break
+
+    def _is_valid_source(self, event_data):
+        return bool(self._transitions(event_data))
+
+    def _transitions(self, token_or_event_data, state_name=None):
+        if isinstance(token_or_event_data, EventData):
+            token = self.machine._model_attachment_tokens.get(id(token_or_event_data.model))
+            state_name = token_or_event_data.state.name
+        else:
+            token = token_or_event_data
+        model_transitions = self.model_transitions.get(token, {}).get(state_name, [])
+        return list(model_transitions) + list(self.transitions.get(state_name, []))
 
 
 class TriggerPlaceholder:

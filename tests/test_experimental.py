@@ -262,6 +262,167 @@ class TestExperimental(TestCase):
         self.assertTrue(model.event(param=True))
         self.assertTrue(model.state == "B")
 
+    def test_model_definitions_follow_attachments_and_share_generic_transitions(self):
+        class BasePlugin:
+            state = "pending"
+            generic_log = []
+
+            def __init__(self):
+                self.declaration_log = []
+
+            def trigger(self, *args, **kwargs):
+                raise RuntimeError("placeholder")
+
+            def may_trigger(self, *args, **kwargs):
+                raise RuntimeError("placeholder")
+
+            probe = event(transition(source="pending", dest="accepted", conditions="can_probe",
+                                     prepare="prepare_probe"))
+            accept = event(transition(source="pending", dest="accepted", conditions="can_accept",
+                                      prepare="prepare_base_accept"))
+
+            def can_probe(self, batch_id):
+                return batch_id == "probe"
+
+            def can_accept(self, batch_id):
+                return batch_id == "parent"
+
+            def prepare_probe(self, batch_id):
+                self.declaration_log.append(("probe", batch_id))
+
+            def prepare_base_accept(self, batch_id):
+                self.declaration_log.append(("base-accept", batch_id))
+
+            def on_enter_accepted(self, *args, **kwargs):
+                pass
+
+        class Plugin(BasePlugin):
+            def __init__(self, name):
+                super(Plugin, self).__init__()
+                self.name = name
+                self.preparation_log = []
+                self.accepted = []
+                self.callback_count = 0
+
+            accept = event(
+                transition(source="pending", dest="pending",
+                           prepare="prepare_reject", conditions="reject"),
+                transition(source="pending", dest="accepted", prepare="prepare_accept",
+                           conditions="is_legal"))
+
+            def prepare_reject(self, batch_id):
+                self.preparation_log.append(("reject", batch_id))
+
+            def reject(self, batch_id):
+                return False
+
+            def prepare_accept(self, batch_id):
+                self.preparation_log.append(("accept", batch_id))
+
+            def is_legal(self, batch_id):
+                return batch_id.startswith("legal")
+
+            def on_enter_accepted(self, *args, **kwargs):
+                self.callback_count += 1
+                self.accepted.append(self.name)
+                if self.name == "B" and self.callback_count == 1:
+                    old_a_accept("old")
+                    machine.remove_model(plugin_a)
+                    machine.remove_transition("accept", "pending", "accepted")
+                    machine.add_model(plugin_a)
+
+        class ThirdParty:
+            state = "pending"
+
+            def __init__(self):
+                self.normal_accepts = []
+
+            def trigger(self, *args, **kwargs):
+                raise RuntimeError("placeholder")
+
+            def may_trigger(self, *args, **kwargs):
+                raise RuntimeError("placeholder")
+
+            def accept(self, batch_id):
+                self.normal_accepts.append(batch_id)
+                return "normal"
+
+            def on_enter_accepted(self, *args, **kwargs):
+                pass
+
+        machine = self.trigger_machine(
+            model=None, states=["pending", "accepted"], initial="pending", queued=True,
+            auto_transitions=False)
+        plugin_a = Plugin("A")
+        plugin_b = Plugin("B")
+        parent = BasePlugin()
+        third_party = ThirdParty()
+
+        machine.add_model([plugin_a, plugin_b, parent, third_party])
+        old_a_accept = plugin_a.accept
+        old_a_trigger = plugin_a.trigger
+        old_a_may_accept = plugin_a.may_accept
+        old_a_may_trigger = plugin_a.may_trigger
+        b_may_accept = plugin_b.may_accept
+
+        self.assertTrue(plugin_a.may_accept("legal-1"))
+        self.assertEqual(plugin_a.preparation_log, [("reject", "legal-1"), ("accept", "legal-1")])
+        self.assertFalse(plugin_a.may_accept("backfill"))
+        self.assertEqual(plugin_a.preparation_log.count(("reject", "backfill")), 1)
+        self.assertTrue(plugin_a.may_trigger("probe", "probe"))
+        self.assertFalse(plugin_a.may_trigger("probe", "not-probe"))
+
+        machine.add_transition(
+            "accept", "pending", "accepted",
+            conditions=lambda batch_id: batch_id == "backfill",
+            prepare=lambda batch_id: BasePlugin.generic_log.append(batch_id))
+
+        self.assertTrue(plugin_a.may_accept("backfill"))
+        self.assertTrue(plugin_a.trigger("accept", "illegal-queued"))
+        self.assertEqual(plugin_a.state, "pending")
+        self.assertTrue(plugin_a.trigger("accept", "backfill"))
+        self.assertEqual(plugin_a.state, "accepted")
+        self.assertEqual(third_party.accept("direct"), "normal")
+        self.assertEqual(third_party.normal_accepts, ["direct"])
+        self.assertTrue(third_party.trigger("accept", "backfill"))
+        self.assertEqual(third_party.state, "accepted")
+        machine.set_state("pending", third_party)
+        self.assertEqual(
+            BasePlugin.generic_log,
+            ["backfill", "illegal-queued", "backfill", "backfill"])
+
+        machine.set_state("pending", plugin_a)
+        plugin_a.accepted.clear()
+        self.assertTrue(parent.may_accept("parent"))
+        self.assertTrue(parent.trigger("accept", "parent"))
+        self.assertEqual(parent.state, "accepted")
+        self.assertEqual(
+            parent.declaration_log,
+            [("base-accept", "parent"), ("base-accept", "parent")])
+
+        self.assertTrue(plugin_b.trigger("accept", "legal-b"))
+        self.assertFalse(old_a_accept("old"))
+        self.assertFalse(old_a_trigger("accept", "old"))
+        self.assertFalse(old_a_may_accept("old"))
+        self.assertFalse(old_a_may_trigger("accept", "old"))
+        self.assertNotIn(("reject", "old"), plugin_a.preparation_log)
+        self.assertIsNot(plugin_a.accept, old_a_accept)
+        self.assertIsNot(plugin_a.trigger, old_a_trigger)
+        self.assertIsNot(plugin_a.may_accept, old_a_may_accept)
+        self.assertIsNot(plugin_a.may_trigger, old_a_may_trigger)
+        self.assertTrue(plugin_a.trigger("accept", "legal-new"))
+
+        self.assertEqual(plugin_a.state, "accepted")
+        self.assertEqual(plugin_b.state, "accepted")
+        self.assertEqual(plugin_b.callback_count, 1)
+        self.assertEqual(plugin_a.accepted, ["A"])
+        self.assertEqual(plugin_b.accepted, ["B"])
+        machine.set_state("pending", plugin_b)
+        self.assertTrue(b_may_accept("legal-b-2"))
+        self.assertEqual(third_party.accept("still-direct"), "normal")
+        self.assertFalse(third_party.trigger("accept", "backfill"))
+        self.assertEqual(third_party.state, "pending")
+
 
 class TestHSMExperimental(TestExperimental):
 
