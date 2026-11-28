@@ -7,6 +7,8 @@
 
 from collections import Counter
 from threading import Timer
+import copy
+from functools import partial
 import logging
 import inspect
 
@@ -89,6 +91,7 @@ class Timeout(State):
         else:
             self._on_timeout = kwargs.pop('on_timeout', [])
         self.runner = {}
+        self._timeout_generation = {}
         super(Timeout, self).__init__(*args, **kwargs)
 
     def enter(self, event_data):
@@ -96,24 +99,90 @@ class Timeout(State):
             when the state is entered and self.timeout is larger than 0.
         """
         if self.timeout > 0:
-            timer = Timer(self.timeout, self._process_timeout, args=(event_data,))
-            timer.daemon = True
-            timer.start()
-            self.runner[id(event_data.model)] = timer
+            # Hierarchical machines start timers when a state tree has been committed. In that case
+            # callbacks are not a reliable indicator for an actual state change since a preceding
+            # callback may have raised or a sibling callback may not have been executed at all.
+            armed = getattr(event_data, '_timeout_armed', None)
+            if armed is None or (id(self), id(event_data.model)) not in armed:
+                self._start_timeout(event_data)
         return super(Timeout, self).enter(event_data)
 
     def exit(self, event_data):
         """Extends `transitions.core.State.exit` by canceling a timer for the current model."""
-        timer = self.runner.get(id(event_data.model), None)
-        if timer is not None and timer.is_alive():
-            timer.cancel()
+        if not getattr(event_data, '_manage_timeouts', False):
+            self._cancel_timeout(event_data)
         return super(Timeout, self).exit(event_data)
 
+    def _start_timeout(self, event_data, scope=None):
+        """Starts a timeout for the current model and state. Any previous timer is invalidated."""
+        if self.timeout <= 0:
+            return
+        model = event_data.model
+        key = id(model)
+        timer = self.runner.get(key, None)
+        if timer is not None and timer.is_alive():
+            timer.cancel()
+        generation = self._timeout_generation.get(key, 0) + 1
+        self._timeout_generation[key] = generation
+        armed = getattr(event_data, '_timeout_armed', None)
+        if armed is None:
+            armed = set()
+            setattr(event_data, '_timeout_armed', armed)
+        armed.add((id(self), key))
+        timeout_event = self._create_timeout_event_data(event_data, scope)
+        timeout_event._timeout_generation = generation
+        timer = Timer(self.timeout, self._process_timeout, args=(timeout_event,))
+        timer.daemon = True
+        timer.start()
+        self.runner[key] = timer
+
+    def _cancel_timeout(self, event_data):
+        """Invalidates and cancels a running timeout for the current model."""
+        key = id(event_data.model)
+        self._timeout_generation[key] = self._timeout_generation.get(key, 0) + 1
+        timer = self.runner.get(key, None)
+        if timer is not None and timer.is_alive():
+            timer.cancel()
+
+    def _create_timeout_event_data(self, event_data, scope=None):
+        """Creates a snapshot of the event that caused a state to be entered. The snapshot is not
+            modified by transitions triggered from timeout callbacks."""
+        if not hasattr(event_data, 'source_path') and not hasattr(self, '_scope'):
+            return event_data
+        timeout_event = copy.copy(event_data)
+        timeout_event.args = tuple(event_data.args)
+        timeout_event.kwargs = dict(event_data.kwargs)
+        timeout_event.result = False
+        timeout_event.error = None
+        state = copy.copy(self)
+        if hasattr(state, '_scope'):
+            state._scope = list(scope or [])
+        timeout_event.state = state
+        if hasattr(state, '_scope'):
+            timeout_event.source_path = state.name.split(event_data.machine.state_cls.separator)
+            timeout_event.source_name = state.name
+        return timeout_event
+
+    def _is_current_timeout(self, key, generation):
+        return generation is None or self._timeout_generation.get(key) == generation
+
     def _process_timeout(self, event_data):
-        _LOGGER.debug("%sTimeout state %s. Processing callbacks...", event_data.machine.name, self.name)
+        key = id(event_data.model)
+        generation = getattr(event_data, '_timeout_generation', None)
+        _LOGGER.debug("%sTimeout state %s. Processing callbacks...", event_data.machine.name,
+                      getattr(event_data.state, 'name', self.name))
+        event_data.machine.callback(partial(self._execute_timeout, event_data, key, generation), event_data)
+        _LOGGER.info("%sTimeout state %s processed.", event_data.machine.name,
+                     getattr(event_data.state, 'name', self.name))
+
+    def _execute_timeout(self, event_data, key, generation, *args, **kwargs):
+        # Re-check the generation while holding the machine lock. A timer that has already reached
+        # its deadline but was blocked while another transition (re-)armed this state must not
+        # process any timeout callbacks.
+        if not self._is_current_timeout(key, generation):
+            return
         for callback in self.on_timeout:
             event_data.machine.callback(callback, event_data)
-        _LOGGER.info("%sTimeout state %s processed.", event_data.machine.name, self.name)
 
     @property
     def on_timeout(self):

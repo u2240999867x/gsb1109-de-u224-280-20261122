@@ -282,15 +282,41 @@ class NestedTransition(Transition):
 
     def _change_state(self, event_data):
         state_tree, exit_partials, enter_partials = self._resolve_transition(event_data)
+        self._prepare_timeouts(event_data)
         for func in exit_partials:
             func()
         self._update_model(event_data, state_tree)
+        self._update_timeouts(event_data, exit_partials, enter_partials)
         for func in enter_partials:
             func()
         with event_data.machine():
             on_final_cbs, _ = self._final_check(event_data, state_tree, enter_partials)
             for on_final_cb in on_final_cbs:
                 on_final_cb()
+
+    @staticmethod
+    def _prepare_timeouts(event_data):
+        # Timeout timers are managed when the state tree has been committed. Callbacks are not a
+        # reliable indicator for an actual state change: an earlier callback may raise or a sibling
+        # callback may never be executed. Disable the callback-based timer handling for this event.
+        setattr(event_data, '_manage_timeouts', True)
+
+    @staticmethod
+    def _get_timeout_scope(func):
+        state = getattr(getattr(func, 'func', None), '__self__', None)
+        args = getattr(func, 'args', ())
+        scope = args[1] if len(args) > 1 else []
+        return state, scope
+
+    def _update_timeouts(self, event_data, exit_partials, enter_partials):
+        for func in exit_partials:
+            state, _ = self._get_timeout_scope(func)
+            if hasattr(state, '_cancel_timeout'):
+                state._cancel_timeout(event_data)
+        for func in enter_partials:
+            state, scope = self._get_timeout_scope(func)
+            if hasattr(state, '_start_timeout'):
+                state._start_timeout(event_data, scope)
 
     def _final_check(self, event_data, state_tree, enter_partials):
         on_final_cbs = []
