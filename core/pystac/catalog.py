@@ -1203,6 +1203,42 @@ class Catalog(STACObject):
 
         return self.map_items(item_mapper)
 
+    def repack_assets(
+        self,
+        manifest: dict[str, Any] | str,
+    ) -> Catalog:
+        """Creates a copy of a catalog in which supplier-provided combined
+        band assets replace the original per-band assets of selected items.
+
+        The manifest describes, for each affected item, its new assets and how
+        every new band is derived from the pre-replacement bands as a linear
+        combination plus a constant. The Render extension cards used to view
+        the items are rewritten to use the new bands while preserving their
+        pixel values and no-data positions exactly. If any card cannot be
+        preserved, a :class:`~pystac.errors.STACError` is raised, no change is
+        written, and this catalog can be retried unchanged. Requires the
+        ``pystac-ext-render`` package.
+
+        Args:
+            manifest : A supplier manifest, either as a mapping or a JSON
+                string. Maps item ids to per-item replacement asset
+                definitions, each carrying the affine band formulas.
+
+        Returns:
+            Catalog: A full copy of this catalog with the manifest applied.
+        """
+        try:
+            from pystac.extensions.repack import repack_catalog
+        except ModuleNotFoundError as e:
+            if e.name == "pystac.extensions.repack":
+                raise pystac.STACError(
+                    "Catalog.repack_assets requires the 'pystac-ext-render' "
+                    "package. Install it to repack catalog assets."
+                ) from e
+            raise
+
+        return repack_catalog(self, manifest)
+
     def describe(self, include_hrefs: bool = False, _indent: int = 0) -> None:
         """Prints out information about this Catalog and all contained
         STACObjects.
