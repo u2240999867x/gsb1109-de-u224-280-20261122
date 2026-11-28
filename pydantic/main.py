@@ -435,6 +435,91 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
 
         return copied
 
+    def model_patch(self, update: Mapping[str, Any], /) -> Self:
+        """!!! abstract "Usage Documentation"
+            [`model_patch`](../concepts/models.md#model-patch)
+
+        Returns a copy of the model, with the provided raw values validated and applied.
+
+        This method is meant to amend already validated models. Unlike
+        [`model_copy()`][pydantic.BaseModel.model_copy] (which applies updates *without*
+        validation) and [`model_validate()`][pydantic.BaseModel.model_validate] (which revalidates
+        *every* field), only the provided values go through validation:
+
+        - Only the fields present in `update` have their (raw, unvalidated) values validated,
+          using the same rules (validation aliases, validators, etc.) as during normal validation.
+          The input is deep copied first, so that validators mutating the data they receive
+          (e.g. `mode='before'` validators) don't affect the caller's objects, even if validation
+          ultimately fails.
+        - Fields not present in `update` are kept as is: their validators are not rerun and their
+          defaults (or default factories) are not recomputed. The corresponding values are shared
+          with the original instance.
+        - Model validators still run, against the data resulting from the application of the patch.
+        - The [`model_fields_set`][pydantic.BaseModel.model_fields_set] of the returned instance
+          is the union of the original one and the fields actually provided in `update`, so that
+          e.g. explicitly setting a field to `None` remains distinguishable from not mentioning
+          it, and fields only set by their default keep their "unset" status.
+
+        If validation of the patch fails, a [`ValidationError`][pydantic_core.ValidationError] is
+        raised and the original instance is left untouched.
+
+        Args:
+            update: A mapping of raw values to validate and apply to the copied model.
+                Keys can be field names or validation aliases.
+
+        Returns:
+            New model instance with the patch applied.
+        """
+        cls = type(self)
+        fields = cls.model_fields
+
+        patched_names: set[str] = set()
+        for key in update:
+            if key in fields:
+                patched_names.add(key)
+                continue
+            for name, field in fields.items():
+                validation_alias = field.validation_alias
+                if (
+                    (isinstance(validation_alias, str) and key == validation_alias)
+                    or (
+                        isinstance(validation_alias, AliasChoices)
+                        and any(isinstance(choice, str) and key == choice for choice in validation_alias.choices)
+                    )
+                    or key == field.alias
+                ):
+                    patched_names.add(name)
+                    break
+
+        # Build a throwaway model class where the fields not being patched are turned into
+        # (unvalidated) defaults holding their current values. This way, only the patched fields
+        # get validated, while model validators still see the whole patched data:
+        overrides: dict[str, Any] = {
+            name: (field.annotation, self.__dict__[name]) for name, field in fields.items() if name not in patched_names
+        }
+        patch_model = create_model(
+            f'{cls.__name__}Patch',
+            __base__=cls,
+            __module__=cls.__module__,
+            **overrides,
+        )
+
+        # Deep copy the input so that validators mutating the data they receive
+        # don't affect the caller's objects:
+        validated = patch_model.model_validate(deepcopy(dict(update)))
+
+        patched = self.__copy__()
+        for name in validated.__pydantic_fields_set__:
+            if name in fields:
+                patched.__dict__[name] = validated.__dict__[name]
+            elif validated.__pydantic_extra__ is not None:
+                # Extra data (only possible when the model allows extra values):
+                if patched.__pydantic_extra__ is None:
+                    patched.__pydantic_extra__ = {}
+                patched.__pydantic_extra__[name] = validated.__pydantic_extra__[name]
+        patched.__pydantic_fields_set__.update(validated.__pydantic_fields_set__)
+        return patched
+
     def model_dump(
         self,
         *,

@@ -161,6 +161,8 @@ Model classes possess the following methods and attributes:
 * [`model_dump_json()`][pydantic.main.BaseModel.model_dump_json]: Returns a JSON string representation of [`model_dump()`][pydantic.main.BaseModel.model_dump]. See [Serialization](serialization.md#json-mode).
 * [`model_copy()`][pydantic.main.BaseModel.model_copy]: Returns a copy (by default, shallow copy) of the model. See
     [Model copy](#model-copy).
+* [`model_patch()`][pydantic.main.BaseModel.model_patch]: Returns a copy of the model, with the provided raw values
+    validated and applied. See [Model patch](#model-patch).
 * [`model_json_schema()`][pydantic.main.BaseModel.model_json_schema]: Returns a jsonable dictionary representing the model's JSON Schema. See [JSON Schema](json_schema.md).
 * [`model_fields`][pydantic.main.BaseModel.model_fields]: A mapping between field names and their definitions ([`FieldInfo`][pydantic.fields.FieldInfo] instances).
 * [`model_computed_fields`][pydantic.main.BaseModel.model_computed_fields]: A mapping between computed field names and their definitions ([`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] instances).
@@ -786,6 +788,39 @@ print(id(m.bar) == id(m.model_copy().bar))
 print(id(m.bar) == id(m.model_copy(deep=True).bar))
 #> False
 ```
+
+## Model patch
+
+??? api "API Documentation"
+    [`pydantic.main.BaseModel.model_patch`][pydantic.main.BaseModel.model_patch]<br>
+
+The [`model_patch()`][pydantic.BaseModel.model_patch] method amends an already validated model: the provided
+raw values are validated (unlike [`model_copy()`][pydantic.BaseModel.model_copy] updates), while the fields that
+aren't mentioned are kept as is — their validators are not rerun and their defaults are not recomputed
+(unlike a full [`model_validate()`][pydantic.BaseModel.model_validate] call). Model validators still run,
+against the data resulting from the application of the patch.
+
+```python
+from pydantic import BaseModel, Field
+
+
+class User(BaseModel):
+    name: str
+    age: int = Field(validation_alias='ageInYears')
+
+
+user = User(name='John', ageInYears='42')
+
+patched = user.model_patch({'ageInYears': '43'})
+print(patched.age)
+#> 43
+# the original model is left untouched:
+print(user.age)
+#> 42
+```
+
+If validation of the patch fails, a [`ValidationError`][pydantic_core.ValidationError] is raised and the
+original model is left untouched.
 
 ## Generic models
 

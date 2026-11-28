@@ -40,6 +40,7 @@ from pydantic_core import (
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
@@ -55,6 +56,7 @@ from pydantic import (
     computed_field,
     constr,
     field_validator,
+    model_validator,
 )
 from pydantic._internal._generate_schema import GenerateSchema
 from pydantic._internal._mock_val_ser import MockCoreSchema
@@ -2868,6 +2870,160 @@ def test_model_copy_extra():
     m5 = m.model_copy(update={'x': 4, 'b': 3})
     assert m5.model_dump() == {'x': 4, 'b': 3}
     assert m5.model_extra == {'b': 3}
+
+
+def test_model_patch() -> None:
+    calls = []
+
+    def labeled_to_pieces(value: Any) -> Any:
+        if isinstance(value, dict) and 'labeled' in value:
+            calls.append('convert')
+            # Note: intentionally mutates the list it receives:
+            labeled = value['labeled'].pop()
+            return {'supplier': value['supplier'], 'pieces': int(labeled)}
+        return value
+
+    class Box(BaseModel):
+        supplier: str
+        pieces: int
+
+    class PackingList(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        first_box: Annotated[Box, BeforeValidator(labeled_to_pieces)] = Field(validation_alias='firstBox')
+        second_box: Annotated[Box, BeforeValidator(labeled_to_pieces)] = Field(validation_alias='secondBox')
+        total_pieces: int = Field(validation_alias='totalPieces')
+        remark: str | None = None
+        batch_code: str = Field(default_factory=lambda: calls.append('factory') or 'BATCH-1')
+
+        @model_validator(mode='after')
+        def check_total(self):
+            if self.first_box.pieces + self.second_box.pieces != self.total_pieces:
+                raise ValueError('total mismatch')
+            return self
+
+    order = PackingList.model_validate(
+        {
+            'firstBox': {'supplier': 'ACME', 'labeled': ['2']},
+            'secondBox': {'supplier': 'Globex', 'labeled': ['3']},
+            'totalPieces': 5,
+        }
+    )
+    assert order.first_box.pieces == 2
+    assert order.second_box.pieces == 3
+    assert order.model_fields_set == {'first_box', 'second_box', 'total_pieces'}
+    assert calls == ['convert', 'convert', 'factory']
+
+    patch = {'firstBox': {'supplier': 'ACME', 'labeled': ['4']}, 'totalPieces': 7, 'remark': None}
+    patched = order.model_patch(patch)
+
+    # Only the patched fields were revalidated, against the raw input:
+    assert patched.first_box.pieces == 4
+    assert patched.total_pieces == 7
+    assert calls == ['convert', 'convert', 'factory', 'convert']
+
+    # Untouched fields were not reconverted and default factories were not rerun;
+    # the unchanged box is shared with the original model:
+    assert patched.second_box is order.second_box
+    assert patched.batch_code == 'BATCH-1'
+
+    # Explicitly provided fields are marked as set (even when set to None),
+    # while fields only set by their default keep their unset status:
+    assert patched.remark is None
+    assert patched.model_fields_set == {'first_box', 'second_box', 'total_pieces', 'remark'}
+    assert 'batch_code' not in patched.model_fields_set
+    assert patched.model_dump(exclude_unset=True) == {
+        'first_box': {'supplier': 'ACME', 'pieces': 4},
+        'second_box': {'supplier': 'Globex', 'pieces': 3},
+        'total_pieces': 7,
+        'remark': None,
+    }
+
+    # The original model and the caller's raw patch data are left untouched:
+    assert order.first_box.pieces == 2
+    assert 'remark' not in order.model_fields_set
+    assert patch == {'firstBox': {'supplier': 'ACME', 'labeled': ['4']}, 'totalPieces': 7, 'remark': None}
+
+
+def test_model_patch_failure_leaves_everything_untouched() -> None:
+    def labeled_to_pieces(value: Any) -> Any:
+        if isinstance(value, dict) and 'labeled' in value:
+            # Note: intentionally mutates the list it receives:
+            labeled = value['labeled'].pop()
+            return {'supplier': value['supplier'], 'pieces': int(labeled)}
+        return value
+
+    class Box(BaseModel):
+        supplier: str
+        pieces: int
+
+    class PackingList(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        first_box: Annotated[Box, BeforeValidator(labeled_to_pieces)] = Field(validation_alias='firstBox')
+        second_box: Annotated[Box, BeforeValidator(labeled_to_pieces)] = Field(validation_alias='secondBox')
+        total_pieces: int = Field(validation_alias='totalPieces')
+
+        @model_validator(mode='after')
+        def check_total(self):
+            if self.first_box.pieces + self.second_box.pieces != self.total_pieces:
+                raise ValueError('total mismatch')
+            return self
+
+    order = PackingList.model_validate(
+        {
+            'firstBox': {'supplier': 'ACME', 'labeled': ['2']},
+            'secondBox': {'supplier': 'Globex', 'labeled': ['3']},
+            'totalPieces': 5,
+        }
+    )
+
+    # The new total does not match the patched boxes, so the model validator fails:
+    bad_patch = {'firstBox': {'supplier': 'ACME', 'labeled': ['4']}, 'totalPieces': 8}
+    with pytest.raises(ValidationError, check=lambda err: err.errors()[0]['type'] == 'value_error'):
+        order.model_patch(bad_patch)
+
+    # The original model, the shared unchanged box and the caller's raw patch
+    # data (whose list would have been mutated by the before validator) are intact:
+    assert order.first_box.pieces == 2
+    assert order.second_box.pieces == 3
+    assert bad_patch == {'firstBox': {'supplier': 'ACME', 'labeled': ['4']}, 'totalPieces': 8}
+
+    # A subsequent correct patch still starts from the original model:
+    fixed = order.model_patch({'firstBox': {'supplier': 'ACME', 'labeled': ['4']}, 'totalPieces': 7})
+    assert fixed.first_box.pieces == 4
+    assert fixed.total_pieces == 7
+    assert fixed.second_box is order.second_box
+
+
+def test_model_patch_field_validation_error() -> None:
+    class Model(BaseModel):
+        x: int
+        y: str = 'y'
+
+    m = Model(x=1)
+    with pytest.raises(ValidationError, check=lambda err: err.errors()[0]['loc'] == ('x',)):
+        m.model_patch({'x': 'not an int'})
+
+    assert m.x == 1
+    assert m.model_fields_set == {'x'}
+
+
+def test_model_patch_extra() -> None:
+    class Model(BaseModel, extra='allow'):
+        x: int
+
+    m = Model(x=1, y=2)
+    m2 = m.model_patch({'x': '3', 'z': 4})
+    assert m2.model_dump() == {'x': 3, 'y': 2, 'z': 4}
+    assert m2.model_extra == {'y': 2, 'z': 4}
+    assert m2.model_fields_set == {'x', 'y', 'z'}
+
+    class ForbidModel(BaseModel, extra='forbid'):
+        x: int
+
+    with pytest.raises(ValidationError, check=lambda err: err.errors()[0]['type'] == 'extra_forbidden'):
+        ForbidModel(x=1).model_patch({'unknown': 1})
 
 
 def test_model_parametrized_name_not_generic():
