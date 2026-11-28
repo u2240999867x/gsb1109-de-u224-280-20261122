@@ -1307,3 +1307,41 @@ try:
 except PydanticUserError as exc_info:
     assert exc_info.code == 'validate-by-alias-and-name-false'
 ```
+
+## Manifest reconciliation row type is not a dataclass {#manifest-reconciliation-row-type}
+
+This error is raised when `ManifestReconciliation` is given a `row_type` that is not a
+dataclass. Only Pydantic dataclass rows can be reconciled, because the feature needs to
+observe the validated `InitVar` values received during construction.
+
+```python
+from pydantic import PydanticUserError
+from pydantic.experimental.manifest_reconciliation import ManifestReconciliation
+
+try:
+    ManifestReconciliation(
+        int,
+        resolve=lambda row, init_only: ('cold', 0),
+        select_rows=lambda manifest: [],
+        capacity={'cold': 12},
+    )
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'manifest-reconciliation-row-type'
+```
+
+## Manifest reconciliation is not configured {#manifest-reconciliation-not-configured}
+
+This error is raised when a `validate_*_with_manifest_reconciliation` method is called on a
+`TypeAdapter` that was created without a `ManifestReconciliation`. Pass a
+`ManifestReconciliation` instance to the `TypeAdapter` constructor first.
+
+```python
+from pydantic import PydanticUserError, TypeAdapter
+
+adapter = TypeAdapter(list[int])
+
+try:
+    adapter.validate_python_with_manifest_reconciliation([1, 2])
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'manifest-reconciliation-not-configured'
+```

@@ -494,3 +494,85 @@ args, kwargs = val.validate_json('{"args": ["arg1"], "kwargs": {"extra": 1}}')
 print(args, kwargs)
 #> ('arg1',) {'extra': 1}
 ```
+
+## Manifest reconciliation
+
+The experimental [`ManifestReconciliation`][pydantic.experimental.manifest_reconciliation.ManifestReconciliation]
+lets a [`TypeAdapter`][pydantic.TypeAdapter] validate a manifest and, in the same run, reconcile the final
+rows against warehouse zone capacity.
+
+It targets Pydantic dataclass row types that receive their packing specification through `InitVar` fields.
+You declare how a fully initialized row and its validated `InitVar` values map to a storage zone and a
+number of cells, how to select the final rows from the validated manifest, and the capacity of each zone.
+The row class, its constructor hooks and its exported structure are unchanged: the adapter builds a
+separate, instrumented validator.
+
+Rows constructed outside the adapter validation (for example preview rows built directly inside a wrap
+validator) have no construction basis and are reported at their actual index in the final list, even when
+they compare equal to rows that were constructed during validation.
+
+??? api "API Documentation"
+    [`pydantic.experimental.manifest_reconciliation`][pydantic.experimental.manifest_reconciliation]<br>
+
+```python
+from dataclasses import InitVar
+from typing import Optional
+
+import pydantic
+from pydantic import TypeAdapter, model_validator
+
+from pydantic.experimental.manifest_reconciliation import ManifestReconciliation
+
+
+@pydantic.dataclasses.dataclass(frozen=True, slots=True)
+class BoxLine:
+    declaration: str
+    zone: str = 'cold'
+    box_spec: InitVar[Optional[dict]] = None
+
+
+@pydantic.dataclasses.dataclass
+class PackingManifest:
+    lines: list[BoxLine]
+
+    @model_validator(mode='wrap')
+    @classmethod
+    def _wrap(cls, data, handler):
+        manifest = handler(data)
+        # Preview only: constructed directly, never part of the final manifest.
+        BoxLine('H', box_spec={'cells': 9})
+        return manifest
+
+
+def resolve(line: BoxLine, init_only: tuple[object, ...]) -> tuple[str, int]:
+    (box_spec,) = init_only
+    return line.zone, box_spec['cells']
+
+
+reconciliation = ManifestReconciliation(
+    BoxLine,
+    resolve=resolve,
+    select_rows=lambda manifest: manifest.lines,
+    capacity={'cold': 12},
+)
+adapter = TypeAdapter(PackingManifest, manifest_reconciliation=reconciliation)
+
+manifest, result = adapter.validate_python_with_manifest_reconciliation(
+    {
+        'lines': [
+            {'declaration': 'B', 'box_spec': {'cells': 6}},
+            {'declaration': 'A', 'box_spec': {'cells': 4}},
+        ]
+    }
+)
+print([line.declaration for line in manifest.lines])
+#> ['B', 'A']
+print(result.zone_usage)
+#> {'cold': 10}
+print([(entry.index, entry.zone, entry.cells) for entry in result.entries])
+#> [(0, 'cold', 6), (1, 'cold', 4)]
+```
+
+When a final row has no construction basis, or a zone exceeds its capacity, the methods raise a regular
+[`ValidationError`][pydantic_core.ValidationError]; if validation itself fails, the original validation
+error is raised and no capacity result is produced.

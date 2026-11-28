@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import is_dataclass
 from types import FrameType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -33,6 +34,9 @@ from .json_schema import (
     JsonSchemaValue,
 )
 from .plugin._schema_validator import PluggableSchemaValidator, create_schema_validator
+
+if TYPE_CHECKING:
+    from .experimental.manifest_reconciliation import ManifestReconciliation, ManifestReconciliationResult
 
 T = TypeVar('T')
 R = TypeVar('R')
@@ -97,6 +101,10 @@ class TypeAdapter(Generic[T]):
                 with potential change in behavior/support. It's default value is 2 because internally,
                 the `TypeAdapter` class makes another call to fetch the frame.
         module: The module that passes to plugin if provided.
+        manifest_reconciliation: Optional experimental
+            [`ManifestReconciliation`][pydantic.experimental.manifest_reconciliation.ManifestReconciliation]
+            used by the `*_with_manifest_reconciliation` validation methods to reconcile a
+            validated manifest against warehouse zone capacity.
 
     Attributes:
         core_schema: The core schema for the type.
@@ -164,6 +172,7 @@ class TypeAdapter(Generic[T]):
         config: ConfigDict | None = None,
         _parent_depth: int = 2,
         module: str | None = None,
+        manifest_reconciliation: ManifestReconciliation[Any] | None = None,
     ) -> None:
         if _type_has_config(type) and config is not None:
             raise PydanticUserError(
@@ -177,6 +186,7 @@ class TypeAdapter(Generic[T]):
         self._type = type
         self._config = config
         self._parent_depth = _parent_depth
+        self._manifest_reconciliation = manifest_reconciliation
         self.pydantic_complete = False
 
         parent_frame = self._fetch_parent_frame()
@@ -531,6 +541,141 @@ class TypeAdapter(Generic[T]):
             The default value wrapped in a `Some` if there is one or None if not.
         """
         return self.validator.get_default_value(strict=strict, context=context)
+
+    def _run_manifest_reconciliation(
+        self, method_name: str, object: Any, validation_kwargs: dict[str, Any]
+    ) -> tuple[T, 'ManifestReconciliationResult']:
+        reconciliation = self._manifest_reconciliation
+        if reconciliation is None:
+            raise PydanticUserError(
+                'This method requires a `ManifestReconciliation` to be passed to the `TypeAdapter` constructor.',
+                code='manifest-reconciliation-not-configured',
+            )
+        manifest, result = reconciliation.validate(self, method_name, object, validation_kwargs)
+        return cast(T, manifest), result
+
+    def validate_python_with_manifest_reconciliation(
+        self,
+        object: Any,
+        /,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> tuple[T, 'ManifestReconciliationResult']:
+        """Validate a Python object and reconcile the resulting manifest against zone capacity.
+
+        Behaves like [`validate_python`][pydantic.TypeAdapter.validate_python], but uses an
+        instrumented validator that records each constructed row together with its validated
+        `InitVar` values. The row classes themselves and their regular validators are not
+        modified, so rows constructed outside this validation have no construction basis.
+
+        Returns:
+            A tuple of the validated manifest and the
+            [`ManifestReconciliationResult`][pydantic.experimental.manifest_reconciliation.ManifestReconciliationResult].
+        """
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+        return self._run_manifest_reconciliation(
+            'validate_python',
+            object,
+            {
+                'strict': strict,
+                'extra': extra,
+                'from_attributes': from_attributes,
+                'context': context,
+                'allow_partial': experimental_allow_partial,
+                'by_alias': by_alias,
+                'by_name': by_name,
+            },
+        )
+
+    def validate_json_with_manifest_reconciliation(
+        self,
+        data: str | bytes | bytearray,
+        /,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: Any | None = None,
+        experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> tuple[T, 'ManifestReconciliationResult']:
+        """Validate JSON data and reconcile the resulting manifest against zone capacity.
+
+        Behaves like [`validate_json`][pydantic.TypeAdapter.validate_json], but uses an
+        instrumented validator that records each constructed row together with its validated
+        `InitVar` values.
+
+        Returns:
+            A tuple of the validated manifest and the
+            [`ManifestReconciliationResult`][pydantic.experimental.manifest_reconciliation.ManifestReconciliationResult].
+        """
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+        return self._run_manifest_reconciliation(
+            'validate_json',
+            data,
+            {
+                'strict': strict,
+                'extra': extra,
+                'context': context,
+                'allow_partial': experimental_allow_partial,
+                'by_alias': by_alias,
+                'by_name': by_name,
+            },
+        )
+
+    def validate_strings_with_manifest_reconciliation(
+        self,
+        obj: Any,
+        /,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: Any | None = None,
+        experimental_allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> tuple[T, 'ManifestReconciliationResult']:
+        """Validate an object containing string data and reconcile its manifest against capacity.
+
+        Behaves like [`validate_strings`][pydantic.TypeAdapter.validate_strings], but uses an
+        instrumented validator that records each constructed row together with its validated
+        `InitVar` values.
+
+        Returns:
+            A tuple of the validated manifest and the
+            [`ManifestReconciliationResult`][pydantic.experimental.manifest_reconciliation.ManifestReconciliationResult].
+        """
+        if by_alias is False and by_name is not True:
+            raise PydanticUserError(
+                'At least one of `by_alias` or `by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+        return self._run_manifest_reconciliation(
+            'validate_strings',
+            obj,
+            {
+                'strict': strict,
+                'extra': extra,
+                'context': context,
+                'allow_partial': experimental_allow_partial,
+                'by_alias': by_alias,
+                'by_name': by_name,
+            },
+        )
 
     def dump_python(
         self,

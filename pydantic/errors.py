@@ -67,6 +67,8 @@ PydanticErrorCodes = Literal[
     'overlapping-unpack-typed-dict',
     'invalid-self-type',
     'validate-by-alias-and-name-false',
+    'manifest-reconciliation-row-type',
+    'manifest-reconciliation-not-configured',
 ]
 
 
