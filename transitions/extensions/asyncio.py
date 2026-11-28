@@ -206,6 +206,10 @@ class AsyncEvent(Event):
             try:
                 await self.machine.callbacks(self.machine.finalize_event, event_data)
                 _LOGGER.debug("%sExecuted machine finalize callbacks", self.machine.name)
+            except asyncio.CancelledError:
+                # Cancellation must not be swallowed here. Internal cancellation is identified
+                # in process_context by CANCELLED_MSG while external cancellation has to propagate.
+                raise
             except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
                 _LOGGER.error("%sWhile executing finalize callbacks a %s occurred: %s.",
                               self.machine.name,
@@ -307,6 +311,7 @@ class AsyncMachine(Machine):
     async_tasks = {}
     protected_tasks = []
     current_context = contextvars.ContextVar('current_context', default=None)
+    callback_context = contextvars.ContextVar('callback_context', default=None)
 
     def __init__(self, model=Machine.self_literal, states=None, initial='initial', transitions=None,
                  send_event=False, auto_transitions=True,
@@ -315,6 +320,9 @@ class AsyncMachine(Machine):
                  queued=False, prepare_event=None, finalize_event=None, model_attribute='state',
                  model_override=False, on_exception=None, on_final=None, **kwargs):
 
+        # Running tasks are tracked per machine. Machines sharing a model must not cancel
+        # each other's transitions, e.g. an acquisition machine and a review machine.
+        self.async_tasks = {}
         super().__init__(model=None, states=states, initial=initial, transitions=transitions,
                          send_event=send_event, auto_transitions=auto_transitions,
                          ordered_transitions=ordered_transitions, ignore_invalid_triggers=ignore_invalid_triggers,
@@ -364,9 +372,16 @@ class AsyncMachine(Machine):
                 from (if event sending is disabled).
         """
         func = self.resolve_callable(func, event_data)
-        res = func(event_data) if self.send_event else func(*event_data.args, **event_data.kwargs)
-        if inspect.isawaitable(res):
-            await res
+        token = None
+        if self.current_context.get() is not None:
+            token = self.callback_context.set(asyncio.current_task())
+        try:
+            res = func(event_data) if self.send_event else func(*event_data.args, **event_data.kwargs)
+            if inspect.isawaitable(res):
+                await res
+        finally:
+            if token is not None:
+                self.callback_context.reset(token)
 
     @staticmethod
     async def await_all(callables):
@@ -417,12 +432,14 @@ class AsyncMachine(Machine):
         Returns:
             bool: returns the success state of the triggered event
         """
-        if self.current_context.get() is None:
-            token = self.current_context.set(asyncio.current_task())
-            if id(model) in self.async_tasks:
-                self.async_tasks[id(model)].append(asyncio.current_task())
-            else:
-                self.async_tasks[id(model)] = [asyncio.current_task()]
+        task = asyncio.current_task()
+        # An operation that is awaited directly by a callback belongs to the currently processed
+        # transition. An operation started with `asyncio.create_task` runs in a different task and
+        # thus is a new, independent transition -- even when both are initiated in the same callback.
+        nested = self.current_context.get() is task or self.callback_context.get() is task
+        if not nested:
+            token = self.current_context.set(task)
+            self.async_tasks.setdefault(id(model), []).append(task)
             try:
                 res = await self._process_async(func, model)
             except asyncio.CancelledError as err:
@@ -433,7 +450,7 @@ class AsyncMachine(Machine):
                     raise
                 res = False
             finally:
-                self.async_tasks[id(model)].remove(asyncio.current_task())
+                self.async_tasks[id(model)].remove(task)
                 self.current_context.reset(token)
                 if len(self.async_tasks[id(model)]) == 0:
                     del self.async_tasks[id(model)]
@@ -562,6 +579,10 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
             try:
                 await self.callbacks(self.finalize_event, event_data)
                 _LOGGER.debug("%sExecuted machine finalize callbacks", self.name)
+            except asyncio.CancelledError:
+                # Do not swallow cancellations here; internal and external cancellation
+                # is distinguished in `process_context` by the CANCELLED_MSG marker.
+                raise
             except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
                 _LOGGER.error("%sWhile executing finalize callbacks a %s occurred: %s.",
                               self.name,

@@ -87,6 +87,7 @@ class AsyncMachine(Machine):
     queued: Union[bool, Literal["model"]]
     protected_tasks: List[Task[Any]]
     current_context: ContextVar[Optional[Task[Any]]]
+    callback_context: ContextVar[Optional[Task[Any]]]
     _transition_queue_dict: Dict[int, Deque[AsyncCallbackFunc]]
     _queued = Union[bool, str]
     def __init__(self, model: Optional[ModelParameter] = ...,

@@ -741,6 +741,154 @@ class TestAsync(TestTransitions):
                 await machine.switch_model_context(self)
                 self.assertEqual(len(w), 1)
 
+    @skipIf(sys.version_info < (3, 11), "Cancel requires Python 3.11+")
+    def test_review_replacement_cancellation(self):
+        class Order:
+            def __init__(self, name):
+                self.name = name
+                self.acquisition = None
+                self.review_state = None
+                self.reviewing = None
+
+        orders = [Order("A"), Order("B")]
+        order_a, order_b = orders
+        confirm = {order: asyncio.Event() for order in orders}
+        note_gate = {order: asyncio.Event() for order in orders}
+        spawn_gate = asyncio.Event()
+        spawned = {}
+        note_started = asyncio.Event()
+
+        async def confirm_file(event_data):
+            await confirm[event_data.model].wait()
+
+        async def note(event_data):
+            event_data.model.reviewing = event_data.kwargs["version"]
+            note_started.set()
+            await spawn_gate.wait()
+            if event_data.kwargs["version"] == 1:
+                order = event_data.model
+                spawned[id(order)] = asyncio.create_task(getattr(order, "review")(version=3))
+            await note_gate[event_data.model].wait()
+
+        async def before_review(event_data):
+            if event_data.kwargs["version"] == 1:
+                await getattr(event_data.model, "note")(version=1)
+
+        async def hold_review(event_data):
+            await note_gate[event_data.model].wait()
+
+        acquire = self.machine_cls(model=orders, states=["idle", "confirm", "done"], initial="idle",
+                                   model_attribute="acquisition", auto_transitions=False, send_event=True)
+        review = self.machine_cls(model=orders, states=["pending", "approved"], initial="pending",
+                                  model_attribute="review_state", auto_transitions=False, send_event=True)
+        acquire.add_transition("begin", "idle", "confirm", before=confirm_file)
+        acquire.add_transition("finish", "confirm", "done")
+        review.add_transition("review", "pending", "approved",
+                              conditions=lambda event_data: event_data.kwargs["version"] in (1, 3),
+                              before=before_review)
+        review.add_transition("note", "*", None, before=note)
+        review.add_transition("hold", "pending", "approved", before=hold_review)
+        for order in orders:
+            acquire.add_model(order, initial="idle")
+            review.add_model(order, initial="pending")
+
+        async def run():
+            acquisition_tasks = [asyncio.create_task(order.begin()) for order in orders]
+            held_review = asyncio.create_task(order_b.hold())
+            await asyncio.sleep(0.05)
+
+            v1 = asyncio.create_task(order_a.review(version=1))
+            await asyncio.wait_for(note_started.wait(), 1)
+            self.assertEqual("pending", order_a.review_state)
+            self.assertEqual(1, order_a.reviewing)
+            self.assertFalse(v1.done())
+
+            # A failing version must neither cancel v1 nor the note(v1) it awaits.
+            self.assertFalse(await order_a.review(version=2))
+            await asyncio.sleep(0.05)
+            self.assertFalse(v1.done())
+            self.assertEqual(1, order_a.reviewing)
+            self.assertEqual("pending", order_a.review_state)
+
+            # v3 is spawned with create_task from note's callback and is a new piece of work.
+            spawn_gate.set()
+            for _ in range(100):
+                if id(order_a) in spawned:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(id(order_a), spawned)
+            self.assertFalse(await v1)
+            self.assertEqual("approved", order_a.review_state)
+            self.assertTrue(await spawned[id(order_a)])
+            self.assertEqual("approved", order_a.review_state)
+
+            confirm[order_a].set()
+            confirm[order_b].set()
+            await asyncio.wait_for(asyncio.gather(*acquisition_tasks), 1)
+            self.assertTrue(await order_a.finish())
+            self.assertTrue(await order_b.finish())
+            note_gate[order_b].set()
+            await asyncio.wait_for(held_review, 1)
+            self.assertEqual("done", order_a.acquisition)
+            self.assertEqual("done", order_b.acquisition)
+            self.assertEqual("approved", order_b.review_state)
+            self.assertEqual(0, len(review.async_tasks))
+            self.assertEqual(0, len(acquire.async_tasks))
+
+        asyncio.run(run())
+
+    @skipIf(sys.version_info < (3, 11), "Cancel requires Python 3.11+")
+    def test_external_cancel_during_finalize(self):
+        finalize_calls = []
+        finalize_gate = asyncio.Event()
+        note_started = asyncio.Event()
+        spawned = {}
+
+        async def note(event_data):
+            note_started.set()
+            if event_data.kwargs["version"] == 1:
+                spawned["v3"] = asyncio.create_task(getattr(event_data.model, "review")(version=3))
+            await asyncio.Event().wait()
+
+        async def before_review(event_data):
+            if event_data.kwargs["version"] == 1:
+                await getattr(event_data.model, "note")(version=1)
+
+        async def finalize(event_data):
+            if event_data.event.name == "review" and event_data.kwargs.get("version") == 1:
+                finalize_calls.append(1)
+                await finalize_gate.wait()
+
+        review = self.machine_cls(states=["pending", "approved"], initial="pending",
+                                  auto_transitions=False, send_event=True, finalize_event=finalize)
+        review.add_transition("review", "pending", "approved",
+                              conditions=lambda event_data: event_data.kwargs["version"] in (1, 3),
+                              before=before_review)
+        review.add_transition("note", "*", None, before=note)
+        review.add_transition("reset", "approved", "pending")
+
+        async def run():
+            v1 = asyncio.create_task(review.review(version=1))
+            await asyncio.wait_for(note_started.wait(), 1)
+            for _ in range(100):
+                if finalize_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([1], finalize_calls)
+
+            v1.cancel()
+            with self.assertRaises(CancelledError):
+                await v1
+
+            finalize_gate.set()
+            self.assertTrue(await asyncio.wait_for(spawned["v3"], 1))
+            self.assertTrue(review.is_approved())
+            self.assertEqual([1], finalize_calls)
+            self.assertEqual(0, len(review.async_tasks))
+            # the machine still accepts new orders after finalization finished
+            self.assertTrue(await review.reset())
+            self.assertTrue(await review.review(version=3))
+
         asyncio.run(run())
 
 
