@@ -74,6 +74,7 @@ class LarkOptions(Serialize):
     edit_terminals: Optional[Callable[[TerminalDef], TerminalDef]]
     import_paths: 'List[Union[str, Callable[[Union[None, str, PackageResource], str], Tuple[str, str]]]]'
     source_path: Optional[str]
+    nfkc_terminals: Collection[str]
 
     OPTIONS_DOC = r"""
     **===  General Options  ===**
@@ -154,6 +155,12 @@ class LarkOptions(Serialize):
             A List of either paths or loader functions to specify from where grammars are imported
     source_path
             Override the source of from where the grammar was loaded. Useful for relative imports and unconventional grammar loading
+    nfkc_terminals
+            A collection of terminal names that should be matched against the NFKC-normalized
+            form of the input text (e.g. keywords and identifiers, so that full-width or
+            decomposed characters still match). Tokens for these terminals carry the normalized
+            text as their value, while their positions and ``raw`` attribute refer to the
+            original input. Only affects the 'basic' and 'contextual' lexers. (Default: ``()``)
 
     **=== End of Options ===**
     """
@@ -192,6 +199,7 @@ class LarkOptions(Serialize):
         'import_paths': [],
         'source_path': None,
         '_plugins': {},
+        'nfkc_terminals': (),
     }
 
     def __init__(self, options_dict: Dict[str, Any]) -> None:
@@ -246,7 +254,7 @@ class LarkOptions(Serialize):
 
 # Options that can be passed to the Lark parser, even when it was loaded from cache/standalone.
 # These options are only used outside of `load_grammar`.
-_LOAD_ALLOWED_OPTIONS = {'postlex', 'transformer', 'lexer_callbacks', 'use_bytes', 'debug', 'g_regex_flags', 'regex', 'propagate_positions', 'tree_class', '_plugins'}
+_LOAD_ALLOWED_OPTIONS = {'postlex', 'transformer', 'lexer_callbacks', 'use_bytes', 'debug', 'g_regex_flags', 'regex', 'propagate_positions', 'tree_class', '_plugins', 'nfkc_terminals'}
 
 _VALID_PRIORITY_OPTIONS = ('auto', 'normal', 'invert', None)
 _VALID_AMBIGUITY_OPTIONS = ('auto', 'resolve', 'explicit', 'forest')
@@ -472,6 +480,14 @@ class Lark(Serialize, Generic[_Return_T]):
                 self.options.lexer_callbacks, self.options.g_regex_flags, use_bytes=self.options.use_bytes, strict=self.options.strict
             )
 
+        if self.options.nfkc_terminals:
+            if self.options.use_bytes:
+                raise ConfigurationError('nfkc_terminals is not supported with use_bytes=True')
+            unknown_nfkc = set(self.options.nfkc_terminals) - {t.name for t in self.terminals}
+            if unknown_nfkc:
+                raise ConfigurationError('nfkc_terminals contains undefined terminals: %s' % sorted(unknown_nfkc))
+            self.lexer_conf.nfkc_terminals = frozenset(self.options.nfkc_terminals)
+
         if self.options.parser:
             self.parser = self._build_parser()
         elif lexer:
@@ -554,6 +570,7 @@ class Lark(Serialize, Generic[_Return_T]):
         lexer_conf.g_regex_flags = options.g_regex_flags
         lexer_conf.skip_validation = True
         lexer_conf.postlex = options.postlex
+        lexer_conf.nfkc_terminals = frozenset(options.nfkc_terminals)
         return lexer_conf
 
     def _load(self: _T, f: Any, **kwargs) -> _T:

@@ -4,7 +4,7 @@ from abc import abstractmethod, ABC
 import re
 from typing import (
     TypeVar, Type, Dict, Iterator, Collection, Callable, Optional, FrozenSet, Any,
-    AnyStr, ClassVar, TYPE_CHECKING, overload
+    AnyStr, ClassVar, TYPE_CHECKING, overload, List
 )
 from types import ModuleType
 import warnings
@@ -25,6 +25,8 @@ from .grammar import TOKEN_DEFAULT_PRIORITY
 from contextlib import suppress
 from copy import copy
 from dataclasses import dataclass
+from bisect import bisect_right
+import unicodedata
 
 try:  # For the standalone parser, we need to make sure that has_interegular is False to avoid NameErrors later on
     has_interegular = bool(interegular)
@@ -159,8 +161,11 @@ class Token(str):
             if the token is a single character with a column value of 4,
             end_column will be 5.
         end_pos: the index where the token ends (basically ``start_pos + len(token)``)
+        raw: The original slice of the input text that produced this token, when the
+            token was matched via NFKC normalization (see the ``nfkc_terminals``
+            option). ``None`` for tokens that were not normalized.
     """
-    __slots__ = ('type', 'start_pos', 'value', 'line', 'column', 'end_line', 'end_column', 'end_pos')
+    __slots__ = ('type', 'start_pos', 'value', 'line', 'column', 'end_line', 'end_column', 'end_pos', 'raw')
 
     __match_args__ = ('type', 'value')
 
@@ -172,6 +177,7 @@ class Token(str):
     end_line: Optional[int]
     end_column: Optional[int]
     end_pos: Optional[int]
+    raw: Optional[Any]
 
 
     @overload
@@ -224,6 +230,7 @@ class Token(str):
         inst.end_line = end_line
         inst.end_column = end_column
         inst.end_pos = end_pos
+        inst.raw = None
         return inst
 
     @overload
@@ -353,6 +360,92 @@ class UnlessCallback:
         return t
 
 
+def _hangul_compose_pair(a: str, b: str) -> bool:
+    # Conjoining Hangul jamo are the only starters (combining class 0) that
+    # canonically compose with a following starter: L + V, and LV-syllable + T.
+    oa, ob = ord(a), ord(b)
+    if 0x1100 <= oa <= 0x1112 and 0x1161 <= ob <= 0x1175:
+        return True
+    return 0xAC00 <= oa <= 0xD7A3 and (oa - 0xAC00) % 28 == 0 and 0x11A8 <= ob <= 0x11C2
+
+
+class _NfkcView:
+    """An NFKC-normalized view of a text, with a bidirectional offset map.
+
+    The text is split into segments that normalization cannot cross: each segment
+    starts at a starter (combining class 0) and extends to the next starter, so
+    that letters built from multiple codepoints (e.g. a letter and its combining
+    marks) stay within a single normalizable unit. The concatenation of the
+    normalized segments then equals the normalization of the whole text, and every
+    normalized offset can be mapped back to an offset in the original text.
+    """
+
+    __slots__ = ('text', 'norm_starts', 'orig_starts', 'orig_ends', 'slice')
+
+    text: str
+    norm_starts: List[int]
+    orig_starts: List[int]
+    orig_ends: List[int]
+    slice: TextSlice
+
+    def __init__(self, text: str, end: int) -> None:
+        bounds = [0]
+        prev = ''
+        for i, ch in enumerate(text):
+            if i and not unicodedata.combining(ch) and not _hangul_compose_pair(prev, ch):
+                bounds.append(i)
+            prev = ch
+        bounds.append(len(text))
+
+        norm_parts = []
+        self.norm_starts = []
+        self.orig_starts = []
+        self.orig_ends = []
+        norm_pos = 0
+        for seg_start, seg_end in zip(bounds, bounds[1:]):
+            norm_seg = unicodedata.normalize('NFKC', text[seg_start:seg_end])
+            norm_parts.append(norm_seg)
+            self.norm_starts.append(norm_pos)
+            self.orig_starts.append(seg_start)
+            self.orig_ends.append(seg_end)
+            norm_pos += len(norm_seg)
+        self.text = ''.join(norm_parts)
+        self.norm_starts.append(norm_pos)  # Sentinel: end of the normalized text
+
+        if self.text != unicodedata.normalize('NFKC', text):
+            # The segmentation assumption didn't hold for this text (extremely rare).
+            # Fall back to a single segment: values stay correct, positions degrade.
+            self.text = unicodedata.normalize('NFKC', text)
+            self.norm_starts = [0, len(self.text)]
+            self.orig_starts = [0]
+            self.orig_ends = [len(text)]
+
+        self.slice = TextSlice(self.text, 0, self.norm_index(end))
+
+    def norm_index(self, orig_pos: int) -> int:
+        """Map an original offset to a normalized offset.
+
+        Segment interiors (e.g. between a letter and its combining mark) round up
+        to the next segment boundary.
+        """
+        i = bisect_right(self.orig_starts, orig_pos) - 1
+        if self.orig_starts[i] == orig_pos:
+            return self.norm_starts[i]
+        return self.norm_starts[i + 1]
+
+    def orig_end_index(self, norm_pos: int) -> int:
+        """Map a normalized exclusive-end offset to an original exclusive-end offset.
+
+        Normalized offsets inside a segment map to the original end of that segment,
+        so a token always spans its full original characters.
+        """
+        i = bisect_right(self.norm_starts, norm_pos) - 1
+        if i >= len(self.orig_ends):
+            return self.orig_ends[-1]
+        if self.norm_starts[i] == norm_pos:
+            return self.orig_starts[i]
+        return self.orig_ends[i]
+
 class CallChain:
     def __init__(self, callback1, callback2, cond):
         self.callback1 = callback1
@@ -388,7 +481,14 @@ def _create_unless(terminals, g_regex_flags, re_, use_bytes):
             callback[retok.name] = UnlessCallback(Scanner(unless, g_regex_flags, re_, use_bytes=use_bytes))
 
     new_terminals = [t for t in terminals if t not in embedded_strs]
-    return new_terminals, callback
+    # Map each embedded string terminal to the regexp terminal it was embedded into
+    embedded = {}
+    for retok in tokens_by_type.get(PatternRE, []):
+        for strtok in embedded_strs:
+            if strtok.priority == retok.priority and strtok.pattern.flags <= retok.pattern.flags \
+                    and strtok.pattern.value == _get_match(re_, retok.pattern.to_regexp(), strtok.pattern.value, g_regex_flags):
+                embedded[strtok.name] = retok.name
+    return new_terminals, callback, embedded
 
 
 class Scanner:
@@ -459,11 +559,12 @@ class LexerState:
     (Lexer objects are only instantiated per grammar, not per text)
     """
 
-    __slots__ = 'text', 'line_ctr', 'last_token'
+    __slots__ = 'text', 'line_ctr', 'last_token', '_nfkc_view'
 
     text: TextSlice
     line_ctr: LineCounter
     last_token: Optional[Token]
+    _nfkc_view: Optional[_NfkcView]
 
     def __init__(self, text: TextSlice, line_ctr: Optional[LineCounter] = None, last_token: Optional[Token]=None):
         if isinstance(text, TextSlice):
@@ -476,6 +577,7 @@ class LexerState:
         self.text = text
         self.line_ctr = line_ctr
         self.last_token = last_token
+        self._nfkc_view = None
 
 
     def __eq__(self, other):
@@ -593,6 +695,7 @@ class BasicLexer(AbstractBasicLexer):
     user_callbacks: Dict[str, _Callback]
     callback: Dict[str, _Callback]
     re: ModuleType
+    nfkc_types: FrozenSet[str]
 
     def __init__(self, conf: 'LexerConf', comparator=None) -> None:
         terminals = list(conf.terminals)
@@ -637,8 +740,17 @@ class BasicLexer(AbstractBasicLexer):
         self._scanner: Optional[Scanner] = None
         self._search_scanner: Optional[Scanner] = None
 
-    def _build_scanner(self) -> Scanner:
-        terminals, self.callback = _create_unless(self.terminals, self.g_regex_flags, self.re, self.use_bytes)
+        nfkc_names = conf.nfkc_terminals
+        if nfkc_names and self.use_bytes:
+            raise LexError("nfkc_terminals is not supported with use_bytes=True")
+        self.nfkc_types = frozenset(t.name for t in terminals if t.name in nfkc_names)
+        self._terminal_rank = {t.name: i for i, t in enumerate(terminals)}
+        self._embedded_unless: Dict[str, str] = {}
+
+        self._nfkc_scanner: Optional[Scanner] = None
+
+    def _build_scanners(self):
+        terminals, self.callback, self._embedded_unless = _create_unless(self.terminals, self.g_regex_flags, self.re, self.use_bytes)
         assert all(self.callback.values())
 
         for type_, f in self.user_callbacks.items():
@@ -653,13 +765,35 @@ class BasicLexer(AbstractBasicLexer):
             else:
                 self.callback[type_] = f
 
-        return Scanner(terminals, self.g_regex_flags, self.re, self.use_bytes)
+        if not self.nfkc_types:
+            return Scanner(terminals, self.g_regex_flags, self.re, self.use_bytes), None
+
+        # Terminals declared for NFKC normalization are matched against the normalized
+        # text; the rest against the original text. A string terminal that was embedded
+        # into a regexp terminal of the *other* group is kept in its own group, so it
+        # can still match input that the regexp terminal cannot (e.g. its normalized form).
+        raw_terminals = [t for t in terminals if t.name not in self.nfkc_types]
+        raw_terminals += [t for t in self.terminals
+                          if t.name in self._embedded_unless and t.name not in self.nfkc_types
+                          and self._embedded_unless[t.name] in self.nfkc_types]
+        nfkc_terminals = [t for t in terminals if t.name in self.nfkc_types]
+        nfkc_terminals += [t for t in self.terminals
+                           if t.name in self._embedded_unless and t.name in self.nfkc_types
+                           and self._embedded_unless[t.name] not in self.nfkc_types]
+        return (Scanner(raw_terminals, self.g_regex_flags, self.re, self.use_bytes),
+                Scanner(nfkc_terminals, self.g_regex_flags, self.re, self.use_bytes))
 
     @property
     def scanner(self) -> Scanner:
         if self._scanner is None:
-            self._scanner = self._build_scanner()
+            self._scanner, self._nfkc_scanner = self._build_scanners()
         return self._scanner
+
+    @property
+    def nfkc_scanner(self) -> Optional[Scanner]:
+        if self._scanner is None:
+            self._scanner, self._nfkc_scanner = self._build_scanners()
+        return self._nfkc_scanner
 
     @property
     def search_scanner(self) -> Scanner:
@@ -674,25 +808,74 @@ class BasicLexer(AbstractBasicLexer):
     def match(self, text, pos):
         return self.scanner.match(text, pos)
 
+    def _nfkc_view(self, lex_state: LexerState) -> _NfkcView:
+        # The normalized view depends only on the text, so it is built once per
+        # lexed text and shared by all lexers that see this state (contextual lexer).
+        view = lex_state._nfkc_view
+        if view is None:
+            view = _NfkcView(lex_state.text.text, lex_state.text.end)
+            lex_state._nfkc_view = view
+        return view
+
+    def _match(self, lex_state: LexerState, pos: int):
+        """Match the next token. Returns (value, type, raw), where raw is the original
+        text slice for tokens matched via NFKC normalization, and None otherwise."""
+        if not self.nfkc_types:
+            res = self.match(lex_state.text, pos)
+            return (res[0], res[1], None) if res else None
+
+        best = None
+        best_rank = 0
+        res = self.scanner.match(lex_state.text, pos)
+        if res:
+            best = (res[0], res[1], None)
+            best_rank = self._terminal_rank[res[1]]
+
+        view = self._nfkc_view(lex_state)
+        norm_pos = view.norm_index(pos)
+        nres = self.nfkc_scanner.match(view.slice, norm_pos)
+        if nres:
+            nvalue, ntype = nres
+            if best is None:
+                replace = True
+            elif self._embedded_unless.get(ntype) == best[1]:
+                # The normalized match is a string terminal embedded into the regexp
+                # terminal that matched the raw text; the regexp's (longer) match wins.
+                replace = False
+            elif self._embedded_unless.get(best[1]) == ntype:
+                # Symmetric case: the raw match is embedded into the normalized regexp.
+                replace = True
+            else:
+                # Same as a single combined pattern: the highest-ranking terminal wins.
+                replace = self._terminal_rank[ntype] < best_rank
+            if replace:
+                raw = lex_state.text.text[pos:view.orig_end_index(norm_pos + len(nvalue))]
+                best = (nvalue, ntype, raw)
+        return best
+
     def next_token(self, lex_state: LexerState, parser_state: Any = None) -> Token:
         line_ctr = lex_state.line_ctr
         while line_ctr.char_pos < lex_state.text.end:
-            res = self.match(lex_state.text, line_ctr.char_pos)
+            res = self._match(lex_state, line_ctr.char_pos)
             if not res:
                 allowed = self.scanner.allowed_types - self.ignore_types
+                if self.nfkc_scanner is not None:
+                    allowed |= self.nfkc_scanner.allowed_types - self.ignore_types
                 if not allowed:
                     allowed = {"<END-OF-FILE>"}
                 raise UnexpectedCharacters(lex_state.text.text, line_ctr.char_pos, line_ctr.line, line_ctr.column,
                                            allowed=allowed, token_history=lex_state.last_token and [lex_state.last_token],
                                            state=parser_state, terminals_by_name=self.terminals_by_name)
 
-            value, type_ = res
+            value, type_, raw = res
 
             ignored = type_ in self.ignore_types
             t = None
             if not ignored or type_ in self.callback:
                 t = Token(type_, value, line_ctr.char_pos, line_ctr.line, line_ctr.column)
-            line_ctr.feed(value, type_ in self.newline_types)
+                if raw is not None:
+                    t.raw = raw
+            line_ctr.feed(raw if raw is not None else value, type_ in self.newline_types)
             if t is not None:
                 t.end_line = line_ctr.line
                 t.end_column = line_ctr.column

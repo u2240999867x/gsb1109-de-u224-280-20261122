@@ -1,7 +1,7 @@
 from copy import deepcopy
 import sys
 from types import ModuleType
-from typing import Callable, Collection, Dict, Optional, TYPE_CHECKING, List
+from typing import Callable, Collection, Dict, FrozenSet, Optional, TYPE_CHECKING, List
 
 if TYPE_CHECKING:
     from .lark import PostLex
@@ -38,9 +38,11 @@ class LexerConf(Serialize):
     use_bytes: bool
     lexer_type: Optional[_LexerArgType]
     strict: bool
+    nfkc_terminals: FrozenSet[str]
 
     def __init__(self, terminals: Collection[TerminalDef], re_module: ModuleType, ignore: Collection[str]=(), postlex: 'Optional[PostLex]'=None,
-                 callbacks: Optional[Dict[str, _LexerCallback]]=None, g_regex_flags: int=0, skip_validation: bool=False, use_bytes: bool=False, strict: bool=False):
+                 callbacks: Optional[Dict[str, _LexerCallback]]=None, g_regex_flags: int=0, skip_validation: bool=False, use_bytes: bool=False, strict: bool=False,
+                 nfkc_terminals: Collection[str]=()):
         self.terminals = terminals
         self.terminals_by_name = {t.name: t for t in self.terminals}
         assert len(self.terminals) == len(self.terminals_by_name)
@@ -53,9 +55,13 @@ class LexerConf(Serialize):
         self.use_bytes = use_bytes
         self.strict = strict
         self.lexer_type = None
+        self.nfkc_terminals = frozenset(nfkc_terminals)
 
     def _deserialize(self):
         self.terminals_by_name = {t.name: t for t in self.terminals}
+        if not hasattr(self, 'nfkc_terminals'):
+            # Serialized before nfkc_terminals existed
+            self.nfkc_terminals = frozenset()
 
     def __deepcopy__(self, memo=None):
         return type(self)(
@@ -67,6 +73,7 @@ class LexerConf(Serialize):
             deepcopy(self.g_regex_flags, memo),
             deepcopy(self.skip_validation, memo),
             deepcopy(self.use_bytes, memo),
+            nfkc_terminals=self.nfkc_terminals,
         )
 
 class ParserConf(Serialize):
